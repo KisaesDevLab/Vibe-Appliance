@@ -35,7 +35,7 @@ VIBE_ENV_SHARED="${VIBE_ENV_SHARED:-${VIBE_DIR}/env/shared.env}"
 # plugin baked in. Falls back to the upstream image if the custom build
 # isn't available (e.g. very early in bootstrap before Phase 5 runs).
 VIBE_CADDY_IMAGE="${VIBE_CADDY_IMAGE:-vibe-appliance/caddy:cloudflare}"
-VIBE_CADDY_IMAGE_FALLBACK="${VIBE_CADDY_IMAGE_FALLBACK:-caddy:2.8-alpine}"
+VIBE_CADDY_IMAGE_FALLBACK="${VIBE_CADDY_IMAGE_FALLBACK:-caddy:2-alpine}"
 
 render_caddyfile() {
   local tmpl="${APPLIANCE_DIR}/caddy/Caddyfile.tmpl"

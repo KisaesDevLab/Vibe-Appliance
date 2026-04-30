@@ -10,23 +10,28 @@
 # links). Image size lands ~50 MB.
 
 # ---- builder stage -----------------------------------------------------
-# Use `caddy:builder-alpine` — that's the canonical builder tag on
-# Docker Hub. There is no `caddy:<minor>-builder-alpine` (only
-# `caddy:builder`, `caddy:builder-alpine`, and per-patch tags like
-# `caddy:2.8.4-builder-alpine`). Pinning to the unversioned builder
-# is fine because xcaddy below pins the Caddy *binary* version.
+# `caddy:builder-alpine` is the canonical builder tag — it always
+# points at the latest stable Caddy with a version-coherent set of
+# Go module dependencies. Pinning Caddy to an *older* version (e.g.
+# v2.8.4) while letting Go modules resolve to latest produces broken
+# builds when an upstream module breaks API compatibility — exactly
+# what happened with v2.8.4 + the renamed `zapslog.HandlerOptions`
+# in newer go.uber.org/zap. Trusting the builder image's bundled
+# version sidesteps that drift.
 FROM caddy:builder-alpine AS builder
 
-# Build a static Caddy 2.x binary with the cloudflare DNS plugin.
-# Pinning Caddy to 2.x major guards against breaking 3.x changes; the
-# cloudflare plugin's `@latest` resolves at build time.
-RUN xcaddy build v2.8.4 \
-    --with github.com/caddy-dns/cloudflare@latest
+# Don't pin the Caddy binary version — let xcaddy use the builder
+# image's default (latest stable). The cloudflare plugin's @latest
+# resolves at build time and tracks the same Caddy major.
+RUN xcaddy build \
+    --with github.com/caddy-dns/cloudflare
 
 # ---- runtime stage -----------------------------------------------------
-# `caddy:2.8.4-alpine` is a real tag on Docker Hub. We replace the
-# pre-baked /usr/bin/caddy with our xcaddy-built binary; the rest of
-# the image (entrypoint, config defaults, healthcheck) is unchanged.
-FROM caddy:2.8.4-alpine
+# `caddy:2-alpine` is the rolling tag for the latest Caddy 2.x.
+# We replace /usr/bin/caddy with our xcaddy-built binary; the rest
+# of the image (entrypoint, config defaults, healthcheck) is
+# unchanged. The xcaddy binary is statically linked Go, so a minor
+# version drift between builder and runtime is harmless.
+FROM caddy:2-alpine
 
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
