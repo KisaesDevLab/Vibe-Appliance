@@ -294,6 +294,43 @@ table.containers td.col-name { font-family: var(--mono); }
   overflow: auto;
 }
 
+.app-card__badges {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.app-card__history {
+  margin: 0.85rem 0 0;
+}
+
+.app-card__history summary {
+  cursor: pointer;
+  user-select: none;
+  font-size: 0.88rem;
+}
+
+.update-history {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  font-size: 0.88rem;
+}
+
+.update-history li {
+  padding: 0.4rem 0;
+  border-top: 1px solid var(--border);
+  display: grid;
+  grid-template-columns: max-content max-content 1fr;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.update-history li > div {
+  grid-column: 1 / -1;
+}
+
 /* ---------- Doctor ---------- */
 
 .doctor-results {

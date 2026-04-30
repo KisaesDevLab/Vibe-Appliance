@@ -199,7 +199,7 @@ If any audit item fails, open a PR against the app repo before integrating.
 
 ## Phase 7 — Update flow with rollback
 
-**Status:** Not started.
+**Status:** Implemented; awaiting fresh-droplet verification (see completion log).
 
 **Goal.** Customer clicks "Update" on Vibe-TB; new image pulls, DB backed up, migrations run, health-checked. Automatic rollback on failure.
 
@@ -783,3 +783,108 @@ Append to this list as phases complete. Format:
 
   Once those tests pass, append "Phase 6 verified YYYY-MM-DD on DO
   droplet" and Phase 7 (update flow with rollback) may begin.
+
+- Phase 7 implemented 2026-04-29 by Claude (Opus 4.7) on Windows dev host.
+  Deviations from PLAN/PHASES.md:
+  1. **`update.sh` is the single entry**, not a cluster of helpers
+     in lib/. Subcommands: `--check [slug]`, `<slug>`, `<slug>
+     --rollback`. Idempotency: re-running `update <slug>` after a
+     mid-flight kill picks up at the first incomplete step (pull,
+     dump, migrate, up, health) without harm.
+  2. **Rollback uses an image tag, not a backup of the compose file.**
+     Before `docker pull`, the running image is re-tagged as
+     `<image>:vibe-rollback-<slug>`. Compose's
+     `${APP_TAG:-latest}` is overridden to `vibe-rollback-<slug>` on
+     the rollback path so no compose-file mutation is needed. This is
+     simpler than parking previous tags by digest and works through
+     any number of updates (the previous rollback target is silently
+     overwritten on the next successful update).
+  3. **Pre-update DB backups land at**
+     `/opt/vibe/data/apps/<slug>/pre-update-backups/<UTC-timestamp>.sql.gz`,
+     last 5 retained per app. Rotation is in update.sh, not via cron.
+  4. **GHCR `--check`**: the registry-API path uses a public anon
+     token (`https://ghcr.io/token?scope=repository:<repo>:pull`),
+     compares the manifest digest with `RepoDigests[0]` of the local
+     `:latest`. Apps published to private repos would need a token in
+     `~/.docker/config.json` or shared.env — out of scope for Phase 7.
+     Non-GHCR images return `check_failed` with no UI badge.
+  5. **"Nightly cron" is implemented as `setInterval` inside the
+     console process** (24h interval, 5 min after process start so
+     the stack settles). PHASES.md said cron specifically; an
+     in-process timer behaves the same way and avoids a host
+     systemd-timer + sidecar. Manual one-off check via
+     `POST /api/v1/update/check`.
+  6. **Migrations run from the new image** via `docker run --rm
+     --network vibe_net --env-file shared.env --env-file <slug>.env
+     <new_image>:<tag> <migration_cmd>`. Any non-zero exit triggers
+     the full rollback path (DB restore + previous image up).
+  7. The console gained `POST /api/v1/update/:slug`,
+     `POST /api/v1/update/:slug/rollback`, and `POST
+     /api/v1/update/check`. The Apps panel in admin.html now shows an
+     "update available" badge, an Update button (disabled until the
+     check finds a newer image), a Roll back button (when there's an
+     update history to roll back to), and a collapsible 5-entry
+     history pane per app. `update.log` was added to the LOG_NAMES
+     allow-list.
+
+  Tested locally on Windows dev host:
+  - bash -n passes on update.sh and bin/vibe.
+  - node -c passes on the updated console/server.js.
+  - admin.html still parses; styles.css gained `.app-card__badges`,
+    `.app-card__history`, `.update-history` rules.
+  - Not runtime-tested: no Docker daemon to exercise pull/pg_dump/
+    rollback; no GHCR account to push a deliberately-broken image
+    against; no live Postgres container.
+
+  **Owed before Phase 8 starts.** On a Phase-3-verified droplet with
+  Vibe-TB enabled:
+
+  Test 1 — happy-path update.
+  - Note the current digest with `docker inspect
+    --format '{{index .RepoDigests 0}}' ghcr.io/.../vibe-tb-server:latest`.
+  - Push a new tag upstream to GHCR (any inconsequential change).
+  - In `/admin`, wait up to 24h or call
+    `curl -X POST -u admin:<pwd> http://<ip>/api/v1/update/check`.
+  - The Update button becomes active. Click it.
+  - Within 2 minutes: app comes up healthy, badge clears, history shows
+    one `succeeded` row, image tag matches the new digest.
+
+  Test 2 — failure + rollback.
+  - Pin `apps/vibe-tb.yml` to a deliberately-broken tag, e.g.
+    `ghcr.io/kisaesdevlab/vibe-tb-server:broken-test` (or just push a
+    tag whose entrypoint exits 1).
+  - Manually `docker pull ghcr.io/kisaesdevlab/vibe-tb-server:broken-test`
+    and `docker tag` it to `:latest`.
+  - Click Update.
+  - Expected: phase 5 (migrations) or phase 6 (compose up) or phase 7
+    (health check) fails; update.sh restores DB from backup, swings
+    the image back to `vibe-rollback-vibe-tb`, marks status=failed
+    with `update_error`. The app continues serving on the prior
+    version. History shows one `failed-rolled-back` row with the
+    failure reason.
+
+  Test 3 — idempotency mid-flight.
+  - Click Update; while migrations are running, kill the spawned
+    process with `pkill -f update.sh`.
+  - Click Update again. The flow restarts; if the prior partial run
+    left the container stopped, the second run brings it back up. No
+    DB corruption, no duplicate rollback tags (docker tag is
+    idempotent), no new pre-update backup created during step 3 if
+    the timestamp would collide (the file exists guard handles this).
+
+  Test 4 — manual rollback button.
+  - After a successful update, click Roll back. App is restarted
+    with the prior image; status goes from running → updating →
+    running. History gains a `rolled-back` row. Note: the manual
+    rollback path does NOT restore the DB — only the image. This is
+    deliberate; full DB restore is a Phase 8 backup-restore concern.
+
+  Test 5 — update check via background timer.
+  - Start the console fresh. Within ~5 minutes, observe a line in
+    `update.log` starting with "background update check finished".
+    state.json's `apps.<slug>.update_available` reflects whatever the
+    registry comparison decided.
+
+  Once those bullets are confirmed, append "Phase 7 verified
+  YYYY-MM-DD on DO droplet" and Phase 8 (Duplicati + Portainer +
+  Cockpit) may begin.

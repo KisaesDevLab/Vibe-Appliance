@@ -215,7 +215,10 @@
         <article class="app-card" id="app-${escapeHtml(a.slug)}">
           <header class="app-card__head">
             <h3 class="app-card__title">${escapeHtml(a.displayName)}</h3>
-            ${appBadge(a.status)}
+            <div class="app-card__badges">
+              ${appBadge(a.status)}
+              ${a.update_available ? '<span class="badge badge--warn">update available</span>' : ''}
+            </div>
           </header>
           <p class="muted app-card__desc">${escapeHtml(a.description)}</p>
           <dl class="kv app-card__kv">
@@ -227,11 +230,32 @@
                               : '<span class="muted">' + escapeHtml(a.url) + '</span>'}</dd>
           </dl>
           ${a.error ? '<div class="error-banner">' + escapeHtml(a.error) + '</div>' : ''}
+          ${a.update_error ? '<div class="error-banner">last update error: ' + escapeHtml(a.update_error) + '</div>' : ''}
           <div class="app-card__actions">
             ${a.enabled
               ? '<button class="btn btn--ghost" data-action="disable" data-slug="' + escapeHtml(a.slug) + '">Disable</button>'
               : '<button class="btn"             data-action="enable"  data-slug="' + escapeHtml(a.slug) + '">Enable</button>'}
+            ${a.enabled
+              ? '<button class="btn btn--ghost" data-action="update"   data-slug="' + escapeHtml(a.slug) + '"' + (a.update_available ? '' : ' disabled') + '>Update</button>'
+              : ''}
+            ${a.enabled && a.update_history && a.update_history.length
+              ? '<button class="btn btn--ghost" data-action="rollback" data-slug="' + escapeHtml(a.slug) + '">Roll back</button>'
+              : ''}
           </div>
+          ${a.update_history && a.update_history.length ? `
+            <details class="app-card__history">
+              <summary class="muted">Update history (${a.update_history.length})</summary>
+              <ul class="update-history">
+                ${a.update_history.slice().reverse().map(h => `
+                  <li>
+                    <span class="badge ${h.status === 'succeeded' ? 'badge--good' : h.status === 'rolled-back' ? 'badge--warn' : 'badge--bad'}">${escapeHtml(h.status)}</span>
+                    <span class="mono muted">${escapeHtml(h.at)}</span>
+                    <span class="mono">${escapeHtml(h.from)} → ${escapeHtml(h.to)}</span>
+                    ${h.error ? '<div class="muted">' + escapeHtml(h.error) + '</div>' : ''}
+                  </li>
+                `).join('')}
+              </ul>
+            </details>` : ''}
           <pre class="app-card__output" hidden></pre>
         </article>
       `).join('');
@@ -245,18 +269,28 @@
       const slug   = btn.dataset.slug;
       const action = btn.dataset.action;
       btn.disabled = true;
-      btn.textContent = action === 'enable' ? 'Enabling…' : 'Disabling…';
+      btn.textContent =
+        action === 'enable'   ? 'Enabling…' :
+        action === 'disable'  ? 'Disabling…' :
+        action === 'update'   ? 'Updating…' :
+        action === 'rollback' ? 'Rolling back…' : 'Working…';
 
       const card = document.getElementById('app-' + slug);
       const out = card.querySelector('.app-card__output');
       out.hidden = true;
       out.textContent = '';
 
+      // Map UI action → API path.
+      const apiPath =
+        action === 'enable'   ? '/api/v1/enable/'   + encodeURIComponent(slug) :
+        action === 'disable'  ? '/api/v1/disable/'  + encodeURIComponent(slug) :
+        action === 'update'   ? '/api/v1/update/'   + encodeURIComponent(slug) :
+        action === 'rollback' ? '/api/v1/update/'   + encodeURIComponent(slug) + '/rollback' :
+        null;
+      if (!apiPath) return;
+
       try {
-        const r = await fetch('/api/v1/' + action + '/' + encodeURIComponent(slug), {
-          method: 'POST',
-          credentials: 'same-origin',
-        });
+        const r = await fetch(apiPath, { method: 'POST', credentials: 'same-origin' });
         const data = await r.json();
         if (!r.ok) {
           out.hidden = false;

@@ -37,6 +37,7 @@ const MANIFESTS_DIR  = path.join(__dirname, 'manifests');
 const ENABLE_SCRIPT  = path.join(APPLIANCE_DIR, 'lib', 'enable-app.sh');
 const DISABLE_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'disable-app.sh');
 const DOCTOR_SCRIPT  = path.join(APPLIANCE_DIR, 'doctor.sh');
+const UPDATE_SCRIPT  = path.join(APPLIANCE_DIR, 'update.sh');
 const LOGS_DIR       = path.join(VIBE_DIR, 'logs');
 
 // Whitelist of log file basenames the admin tail endpoint will serve.
@@ -47,6 +48,7 @@ const LOG_NAMES = new Set([
   'doctor.log',
   'enable-app.log',
   'disable-app.log',
+  'update.log',
 ]);
 
 // Slug pattern: must match manifest.schema.json's slug constraint. Used
@@ -245,6 +247,9 @@ app.get('/api/v1/apps', requireAdmin, (_req, res) => {
         last_at: s.at || null,
         error: s.error || null,
         firstLogin: m.firstLogin || null,
+        update_available: !!s.update_available,
+        update_error: s.update_error || null,
+        update_history: (s.update_history || []).slice(-5),
       };
     })
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
@@ -258,6 +263,52 @@ app.post('/api/v1/enable/:slug', requireAdmin, async (req, res) => {
 app.post('/api/v1/disable/:slug', requireAdmin, async (req, res) => {
   await runToggle(req, res, DISABLE_SCRIPT, 'disable');
 });
+
+// --- Update endpoints --------------------------------------------------
+
+app.post('/api/v1/update/:slug', requireAdmin, async (req, res) => {
+  const slug = req.params.slug;
+  if (!SLUG_RE.test(slug)) return res.status(400).json({ error: 'invalid slug' });
+  if (!MANIFESTS[slug])    return res.status(404).json({ error: 'unknown app' });
+  await runShell(res, [UPDATE_SCRIPT, slug], 'update', { slug });
+});
+
+app.post('/api/v1/update/:slug/rollback', requireAdmin, async (req, res) => {
+  const slug = req.params.slug;
+  if (!SLUG_RE.test(slug)) return res.status(400).json({ error: 'invalid slug' });
+  if (!MANIFESTS[slug])    return res.status(404).json({ error: 'unknown app' });
+  await runShell(res, [UPDATE_SCRIPT, slug, '--rollback'], 'rollback', { slug });
+});
+
+// One-off update check that the operator can fire by hand.
+app.post('/api/v1/update/check', requireAdmin, async (_req, res) => {
+  await runShell(res, [UPDATE_SCRIPT, '--check'], 'update-check');
+});
+
+async function runShell(res, args, action, extra = {}) {
+  log('info', 'spawn shell', { action, ...extra });
+  const child = spawn('/bin/bash', args, {
+    env: { ...process.env, APPLIANCE_DIR, VIBE_DIR, NO_COLOR: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = ''; let stderr = '';
+  child.stdout.on('data', (d) => { stdout += d.toString(); });
+  child.stderr.on('data', (d) => { stderr += d.toString(); });
+  child.on('error', (err) => {
+    log('error', 'shell spawn failed', { action, err: err.message });
+    if (!res.headersSent) res.status(500).json({ error: 'spawn failed', detail: err.message });
+  });
+  child.on('exit', (code) => {
+    log('info', 'shell finished', { action, code, ...extra });
+    res.status(code === 0 ? 200 : 500).json({
+      action,
+      ...extra,
+      exit_code: code,
+      stdout: trim(stdout),
+      stderr: trim(stderr),
+    });
+  });
+}
 
 async function runToggle(req, res, script, action) {
   const slug = req.params.slug;
@@ -484,3 +535,31 @@ server.listen(PORT, '0.0.0.0', () => {
 
 process.on('SIGTERM', shutdown('SIGTERM'));
 process.on('SIGINT',  shutdown('SIGINT'));
+
+// --- Daily update check -----------------------------------------------
+// PHASES.md Phase 7 mentions a "nightly cron". On a single-process
+// long-running server, setInterval is cheaper than a host-level cron
+// + sidecar, and behaves the same way. The check itself runs in a
+// detached child process so it can't block request handling.
+const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const UPDATE_CHECK_INITIAL_DELAY_MS = 5 * 60 * 1000;  // give the stack 5 min to settle on boot
+
+function runUpdateCheckBackground() {
+  log('info', 'background update check starting');
+  const child = spawn('/bin/bash', [UPDATE_SCRIPT, '--check'], {
+    env: { ...process.env, APPLIANCE_DIR, VIBE_DIR, NO_COLOR: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: false,
+  });
+  let stderr = '';
+  child.stderr.on('data', (d) => { stderr += d.toString(); });
+  child.on('exit', (code) => {
+    log('info', 'background update check finished', { code, stderr_bytes: stderr.length });
+  });
+  child.on('error', (err) => {
+    log('warn', 'background update check failed to spawn', { err: err.message });
+  });
+}
+
+setTimeout(runUpdateCheckBackground, UPDATE_CHECK_INITIAL_DELAY_MS);
+setInterval(runUpdateCheckBackground, UPDATE_CHECK_INTERVAL_MS);

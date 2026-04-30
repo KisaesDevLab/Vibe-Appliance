@@ -25,6 +25,10 @@ COMMANDS
   doctor [--json]              Run diagnostics and print PASS/WARN/FAIL.
   enable  <slug>               Bring an app online.
   disable <slug>               Take an app offline (data preserved).
+  update  --check [slug]       Check for available image updates.
+  update  <slug>               Update an app (pre-update DB backup +
+                               rollback on failure).
+  update  <slug> --rollback    Roll back to the prior image.
   status                       Print the current state.json snapshot.
   logs   [name]                Tail /opt/vibe/logs/<name>.log
                                (defaults to bootstrap.log).
@@ -46,6 +50,9 @@ case "$cmd" in
     ;;
   disable)
     exec /bin/bash "${APPLIANCE_DIR}/lib/disable-app.sh" "$@"
+    ;;
+  update)
+    exec /bin/bash "${APPLIANCE_DIR}/update.sh" "$@"
     ;;
   status)
     if [[ -r /opt/vibe/state.json ]]; then
