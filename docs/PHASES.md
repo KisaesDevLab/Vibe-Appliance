@@ -112,7 +112,7 @@ This PR can be opened in parallel with appliance Phase 3 development. The tempor
 
 ## Phase 4 — Doctor command + recovery surface
 
-**Status:** Not started.
+**Status:** Implemented; awaiting fresh-droplet verification (see completion log).
 
 **Goal.** `vibe doctor` produces structured PASS/WARN/FAIL output covering everything in PLAN.md §6.3. Console admin Doctor tab works.
 
@@ -516,3 +516,78 @@ Append to this list as phases complete. Format:
 
   Once those bullets are confirmed, append a line "Phase 3 verified
   YYYY-MM-DD on DO droplet" and Phase 4 may begin.
+
+- Phase 4 implemented 2026-04-29 by Claude (Opus 4.7) on Windows dev host.
+  Deviations from PLAN/PHASES.md:
+  1. Doctor command is `doctor.sh` at the repo root and `vibe doctor`
+     via the new CLI shim. Both produce identical output. The CLI is a
+     symlink at `/usr/local/bin/vibe` installed by bootstrap on every
+     run (idempotent: only re-creates when missing or pointing wrong).
+  2. Doctor's wire format is NDJSON in --json mode (one object per line
+     plus a trailing summary object), not a single big JSON. Reason:
+     it's stream-friendly (Phase 4's success criterion mentions "streams
+     output" though the console reads non-streaming for Phase 4). The
+     console parses NDJSON and renders before the SSE work lands.
+  3. Doctor's "every pre-flight check" set is intentionally a curated
+     subset — pre-flight ran *before* install and gates installation;
+     post-install equivalents have different success conditions (port
+     80 should be bound to Caddy, not free). The curated list: OS,
+     disk free + trend tracking, DNS, outbound HTTPS, container state
+     (4 core + each enabled app), Postgres + Redis connectivity,
+     console /health, per-app /health via vibe_net, per-subdomain DNS
+     vs server IP, per-subdomain TLS expiry, recent error scrape over
+     /opt/vibe/logs.
+  4. Cert expiry thresholds: WARN ≤14 days, FAIL ≤3 days — straight
+     from PHASES.md success criterion. PLAN.md §6.3 said the same.
+  5. /api/v1/logs uses an explicit allow-list of basenames (`bootstrap.log`,
+     `doctor.log`, `enable-app.log`, `disable-app.log`). Reason:
+     filtering by name is simpler and harder to bypass than filtering
+     by path. Future logs need to be added to LOG_NAMES in server.js;
+     this keeps the surface small.
+  6. Recovery-hint audit pass for bootstrap.sh, enable-app.sh,
+     disable-app.sh, db-bootstrap.sh, render-caddyfile.sh: the canonical
+     "what failed → causes → diagnose → fix" structure was already in
+     place from Phase 1's preflight work and the Phase 3 toggle scripts.
+     Phase 4 didn't need to retrofit this — it's worth re-checking on
+     the fresh-droplet test that every error path actually surfaces a
+     useful hint, but no script-level changes were required.
+  7. update.sh is still not implemented (Phase 7 owns it). The
+     PHASES.md Phase 4 deliverable list mentions a "stub" — the stub is
+     unchanged from Phase 1 (`phase_credentials` is the last real
+     phase). When Phase 7 lands, update.sh's error paths will conform
+     to the same recovery-hint format already in use.
+
+  Tested locally on Windows dev host:
+  - bash -n passes on doctor.sh, bin/vibe, and updated bootstrap.sh.
+  - node -c passes on the updated console/server.js.
+  - Not runtime-tested: no Docker daemon to exercise the doctor's
+     container-state checks; no live cert to test expiry parsing
+     against; no enabled app to walk the per-app health path.
+
+  **Owed before Phase 5 starts.**
+
+  On a fresh DO droplet (or a Phase-3-verified droplet), with Vibe-TB
+  enabled in domain mode:
+  - `sudo /opt/vibe/appliance/doctor.sh` exits 0 with all PASS lines.
+  - `sudo vibe doctor` produces identical output.
+  - `sudo vibe doctor --json` emits valid NDJSON; pipe through
+    `python3 -c 'import json,sys;[json.loads(l) for l in sys.stdin]'` to
+    confirm.
+  - **Postgres-down test.** `sudo docker stop vibe-postgres`. Re-run
+    doctor: the "Container Postgres" check FAILs with the recovery
+    hint suggesting `docker compose up -d`. Per-app health for vibe-tb
+    also FAILs. `sudo docker start vibe-postgres`, re-run, all PASS.
+  - **DNS-mismatch test.** Edit `/etc/hosts` to point
+    `tb.<domain>` at a wrong IP (or use Cloudflare's orange-cloud
+    proxy IP). Re-run doctor: the DNS check WARNs with the orange-cloud
+    explanation. Revert.
+  - **Cert-expiry test.** Hardest to fault-test live; verify by reading
+    the cert with `openssl s_client … | openssl x509 -enddate` and
+    confirming doctor's "valid for N more days" matches.
+  - In `/admin` → Doctor section, click "Run doctor". Within 10 s the
+    same checks render with the same statuses.
+  - In `/admin` → Logs section, picker lists `bootstrap.log` and
+    `doctor.log`; selecting one loads the last 300 lines.
+
+  Once those bullets are confirmed, append "Phase 4 verified YYYY-MM-DD
+  on DO droplet" and Phase 5 (the remaining five Vibe apps) may begin.

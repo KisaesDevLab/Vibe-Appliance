@@ -36,6 +36,18 @@ const SQLITE_PATH    = path.join(SQLITE_DIR, 'console.sqlite');
 const MANIFESTS_DIR  = path.join(__dirname, 'manifests');
 const ENABLE_SCRIPT  = path.join(APPLIANCE_DIR, 'lib', 'enable-app.sh');
 const DISABLE_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'disable-app.sh');
+const DOCTOR_SCRIPT  = path.join(APPLIANCE_DIR, 'doctor.sh');
+const LOGS_DIR       = path.join(VIBE_DIR, 'logs');
+
+// Whitelist of log file basenames the admin tail endpoint will serve.
+// Restricting by name (rather than path) blocks ../ shenanigans up
+// front. Anything new is opt-in here.
+const LOG_NAMES = new Set([
+  'bootstrap.log',
+  'doctor.log',
+  'enable-app.log',
+  'disable-app.log',
+]);
 
 // Slug pattern: must match manifest.schema.json's slug constraint. Used
 // to gatekeep enable/disable endpoints — prevents path traversal via
@@ -304,6 +316,98 @@ function appPublicUrl(manifest, config) {
   // string so the UI can render something useful.
   return `(only routed in domain mode for Phase 3)`;
 }
+
+// --- Doctor endpoint --------------------------------------------------
+
+app.get('/api/v1/doctor', requireAdmin, async (_req, res) => {
+  log('info', 'doctor invoked');
+  const child = spawn('/bin/bash', [DOCTOR_SCRIPT, '--json'], {
+    env: { ...process.env, APPLIANCE_DIR, VIBE_DIR, NO_COLOR: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (d) => { stdout += d.toString(); });
+  child.stderr.on('data', (d) => { stderr += d.toString(); });
+
+  child.on('error', (err) => {
+    log('error', 'doctor spawn failed', { err: err.message });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'spawn failed', detail: err.message });
+    }
+  });
+
+  child.on('exit', (code) => {
+    const checks = [];
+    let summary = { pass: 0, warn: 0, fail: 0 };
+    for (const line of stdout.split('\n')) {
+      const s = line.trim();
+      if (!s) continue;
+      try {
+        const obj = JSON.parse(s);
+        if (obj.summary) summary = obj.summary;
+        else if (obj.name) checks.push(obj);
+      } catch (err) {
+        log('warn', 'doctor produced unparsable line', { line: s });
+      }
+    }
+    res.json({
+      exit_code: code,
+      summary,
+      checks,
+      stderr: trim(stderr),
+      now: new Date().toISOString(),
+    });
+  });
+});
+
+// --- Logs endpoints ---------------------------------------------------
+
+app.get('/api/v1/logs', requireAdmin, (_req, res) => {
+  let files = [];
+  try {
+    files = fs.readdirSync(LOGS_DIR).filter((f) => LOG_NAMES.has(f));
+  } catch (err) {
+    log('warn', 'logs dir unreadable', { dir: LOGS_DIR, err: err.code });
+  }
+  const items = files
+    .map((name) => {
+      const full = path.join(LOGS_DIR, name);
+      let size = 0; let mtime = null;
+      try {
+        const st = fs.statSync(full);
+        size = st.size;
+        mtime = st.mtime.toISOString();
+      } catch { /* ignore */ }
+      return { name, size_bytes: size, mtime };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+  res.json({ logs: items });
+});
+
+app.get('/api/v1/logs/:name', requireAdmin, (req, res) => {
+  const name = req.params.name;
+  if (!LOG_NAMES.has(name)) {
+    return res.status(404).type('text/plain').send('Unknown log\n');
+  }
+  const full = path.join(LOGS_DIR, name);
+
+  // Tail the last `lines` lines, defaulting to 200, capped at 2000.
+  let lines = parseInt(req.query.lines || '200', 10);
+  if (!Number.isFinite(lines) || lines <= 0) lines = 200;
+  if (lines > 2000) lines = 2000;
+
+  let content = '';
+  try {
+    content = fs.readFileSync(full, 'utf8');
+  } catch (err) {
+    return res.status(500).type('text/plain').send('Could not read log: ' + err.code + '\n');
+  }
+  const all = content.split('\n');
+  const tail = all.slice(Math.max(0, all.length - lines)).join('\n');
+  res.type('text/plain').send(tail);
+});
 
 // Catch-all 404 with friendly text rather than express's default HTML.
 app.use((_req, res) => {

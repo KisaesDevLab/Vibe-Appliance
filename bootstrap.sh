@@ -484,6 +484,29 @@ phase_credentials() {
   fi
 }
 
+# Install /usr/local/bin/vibe → APPLIANCE_DIR/bin/vibe. Idempotent.
+_install_vibe_cli() {
+  local target="${APPLIANCE_DIR}/bin/vibe"
+  local link="/usr/local/bin/vibe"
+
+  [[ -x "$target" ]] || { log_warn "bin/vibe not executable; skipping CLI install"; return 0; }
+
+  if [[ -L "$link" ]]; then
+    local current
+    current="$(readlink "$link" 2>/dev/null || true)"
+    if [[ "$current" == "$target" ]]; then
+      return 0
+    fi
+    rm -f "$link"
+  elif [[ -e "$link" ]]; then
+    log_warn "$link exists and is not a symlink; refusing to overwrite"
+    return 0
+  fi
+
+  ln -s "$target" "$link"
+  log_info "installed CLI shim" link="$link" target="$target"
+}
+
 # Best-effort public-URL detection. Used only for the printed banner;
 # nothing in the appliance itself depends on the result.
 _resolve_server_url() {
@@ -560,6 +583,11 @@ main() {
   # failures land in the JSONL log.
   log_init
   state_init
+
+  # Install the `vibe` CLI shim into /usr/local/bin (idempotent). Doing
+  # this every bootstrap run keeps the symlink fresh if APPLIANCE_DIR
+  # ever moves, and it's cheap.
+  _install_vibe_cli
 
   # Persist user-supplied config so phase 2 (Phase 2 of build) can read it.
   state_set_config_kv mode               "$CONFIG_MODE"

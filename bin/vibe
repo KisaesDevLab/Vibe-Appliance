@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# bin/vibe — thin CLI wrapper for the Vibe Appliance.
+#
+# Symlinked into /usr/local/bin/vibe by bootstrap.sh so the operator can
+# type `vibe doctor` instead of the full path. Subcommands dispatch to
+# the existing scripts under /opt/vibe/appliance — they're the source of
+# truth.
+#
+# Idempotency: read-only wrapper; running it doesn't mutate state beyond
+#   what the dispatched script already does.
+# Reverse: rm /usr/local/bin/vibe.
+
+set -euo pipefail
+
+APPLIANCE_DIR="${APPLIANCE_DIR:-/opt/vibe/appliance}"
+
+usage() {
+  cat <<'EOF'
+vibe — Vibe Appliance command-line interface.
+
+USAGE
+  vibe <command> [args]
+
+COMMANDS
+  doctor [--json]              Run diagnostics and print PASS/WARN/FAIL.
+  enable  <slug>               Bring an app online.
+  disable <slug>               Take an app offline (data preserved).
+  status                       Print the current state.json snapshot.
+  logs   [name]                Tail /opt/vibe/logs/<name>.log
+                               (defaults to bootstrap.log).
+  bootstrap [args…]            Re-run the full bootstrap.
+
+EOF
+}
+
+cmd="${1:-}"
+[[ -n "$cmd" ]] || { usage; exit 2; }
+shift || true
+
+case "$cmd" in
+  doctor)
+    exec "${APPLIANCE_DIR}/doctor.sh" "$@"
+    ;;
+  enable)
+    exec /bin/bash "${APPLIANCE_DIR}/lib/enable-app.sh" "$@"
+    ;;
+  disable)
+    exec /bin/bash "${APPLIANCE_DIR}/lib/disable-app.sh" "$@"
+    ;;
+  status)
+    if [[ -r /opt/vibe/state.json ]]; then
+      cat /opt/vibe/state.json
+    else
+      echo "no state.json yet — has bootstrap run?" >&2
+      exit 1
+    fi
+    ;;
+  logs)
+    name="${1:-bootstrap}"
+    file="/opt/vibe/logs/${name}.log"
+    if [[ ! -r "$file" ]]; then
+      echo "no such log: $file" >&2
+      echo "available logs:" >&2
+      ls /opt/vibe/logs/ 2>/dev/null >&2 || true
+      exit 1
+    fi
+    exec tail -f -n 200 "$file"
+    ;;
+  bootstrap)
+    exec sudo "${APPLIANCE_DIR}/bootstrap.sh" "$@"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    echo "unknown command: $cmd" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

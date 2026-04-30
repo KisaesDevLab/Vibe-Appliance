@@ -29,6 +29,31 @@
     </section>
 
     <section>
+      <h2>Doctor</h2>
+      <p class="muted">Diagnostics. Stops short of repairs — every FAIL has a recovery hint.</p>
+      <div class="cta-row">
+        <button class="btn" id="doctor-run">Run doctor</button>
+        <span id="doctor-summary" class="muted"></span>
+      </div>
+      <div class="doctor-results" id="doctor-results"></div>
+      <details id="doctor-stderr-wrap" hidden>
+        <summary class="muted">stderr</summary>
+        <pre class="app-card__output" id="doctor-stderr"></pre>
+      </details>
+    </section>
+
+    <section>
+      <h2>Logs</h2>
+      <p class="muted">Tail the structured logs under /opt/vibe/logs.</p>
+      <div class="cta-row">
+        <select id="log-picker" class="btn btn--ghost"></select>
+        <button class="btn btn--ghost" id="log-refresh">Refresh</button>
+        <span id="log-meta" class="muted"></span>
+      </div>
+      <pre class="app-card__output" id="log-tail" style="max-height: 480px;">Pick a log file…</pre>
+    </section>
+
+    <section>
       <h2>Containers</h2>
       <p class="muted" id="container-summary">—</p>
       <table class="containers" id="containers">
@@ -253,6 +278,124 @@
 
     refresh();
     setInterval(refresh, 15000);
+
+    // ---------- Doctor ----------
+    document.getElementById('doctor-run').addEventListener('click', runDoctor);
+
+    async function runDoctor() {
+      const btn = document.getElementById('doctor-run');
+      const sum = document.getElementById('doctor-summary');
+      const out = document.getElementById('doctor-results');
+      const stderrWrap = document.getElementById('doctor-stderr-wrap');
+      const stderrEl = document.getElementById('doctor-stderr');
+
+      btn.disabled = true;
+      btn.textContent = 'Running…';
+      sum.textContent = '';
+      out.innerHTML = '<p class="muted">running diagnostics…</p>';
+      stderrWrap.hidden = true;
+      stderrEl.textContent = '';
+
+      try {
+        const r = await fetch('/api/v1/doctor', { credentials: 'same-origin' });
+        const data = await r.json();
+        renderDoctor(data);
+      } catch (err) {
+        out.innerHTML = '<div class="error-banner">doctor failed: ' + escapeHtml(err.message) + '</div>';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Run doctor';
+      }
+    }
+
+    function renderDoctor(data) {
+      const sum = document.getElementById('doctor-summary');
+      const out = document.getElementById('doctor-results');
+      const stderrWrap = document.getElementById('doctor-stderr-wrap');
+      const stderrEl = document.getElementById('doctor-stderr');
+
+      const s = data.summary || { pass: 0, warn: 0, fail: 0 };
+      sum.innerHTML =
+        '<span class="badge badge--good">' + s.pass + ' PASS</span> ' +
+        '<span class="badge badge--warn">' + s.warn + ' WARN</span> ' +
+        '<span class="badge badge--bad">' + s.fail + ' FAIL</span>' +
+        ' · ' + escapeHtml(data.now || '');
+
+      const checks = data.checks || [];
+      if (!checks.length) {
+        out.innerHTML = '<p class="muted">no check output</p>';
+      } else {
+        out.innerHTML = checks.map(c => {
+          const cls = c.status === 'pass' ? 'badge--good'
+                    : c.status === 'warn' ? 'badge--warn'
+                    : 'badge--bad';
+          return '<div class="doctor-row">'
+            +   '<span class="badge ' + cls + '">' + c.status.toUpperCase() + '</span>'
+            +   '<div class="doctor-row__body">'
+            +     '<div class="doctor-row__name">' + escapeHtml(c.name) + '</div>'
+            +     '<div class="doctor-row__msg">' + escapeHtml(c.message || '') + '</div>'
+            +     (c.hint ? '<pre class="doctor-row__hint">' + escapeHtml(c.hint) + '</pre>' : '')
+            +   '</div>'
+            + '</div>';
+        }).join('');
+      }
+
+      if (data.stderr) {
+        stderrWrap.hidden = false;
+        stderrEl.textContent = data.stderr;
+      }
+    }
+
+    // ---------- Logs ----------
+    const logPicker  = document.getElementById('log-picker');
+    const logRefresh = document.getElementById('log-refresh');
+    const logTail    = document.getElementById('log-tail');
+    const logMeta    = document.getElementById('log-meta');
+
+    logPicker.addEventListener('change', loadLog);
+    logRefresh.addEventListener('click', loadLog);
+
+    async function loadLogList() {
+      try {
+        const r = await fetch('/api/v1/logs', { credentials: 'same-origin' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const data = await r.json();
+        const current = logPicker.value;
+        logPicker.innerHTML = (data.logs || []).map(l =>
+          '<option value="' + escapeHtml(l.name) + '">'
+          + escapeHtml(l.name)
+          + ' (' + fmtBytes(l.size_bytes) + ')'
+          + '</option>'
+        ).join('');
+        if (current && [...logPicker.options].some(o => o.value === current)) {
+          logPicker.value = current;
+        }
+        if (logPicker.value) loadLog();
+      } catch (err) {
+        logMeta.textContent = 'list failed: ' + err.message;
+      }
+    }
+
+    async function loadLog() {
+      const name = logPicker.value;
+      if (!name) return;
+      logMeta.textContent = 'loading ' + name + '…';
+      try {
+        const r = await fetch('/api/v1/logs/' + encodeURIComponent(name) + '?lines=300',
+                              { credentials: 'same-origin' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const text = await r.text();
+        logTail.textContent = text || '(empty)';
+        logMeta.textContent = 'tailing last 300 lines · ' + new Date().toISOString();
+        // Auto-scroll to bottom.
+        logTail.scrollTop = logTail.scrollHeight;
+      } catch (err) {
+        logTail.textContent = 'error: ' + err.message;
+      }
+    }
+
+    loadLogList();
+    setInterval(loadLogList, 30000);
   </script>
 </body>
 </html>
