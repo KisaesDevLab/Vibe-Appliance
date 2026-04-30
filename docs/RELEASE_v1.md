@@ -21,7 +21,10 @@ reversible.
 
 ### Bootstrap (Phases 1–2)
 
-- Single-line install: `curl -fsSL https://install.kisaes.com/vibe.sh | sudo bash`.
+- Single-line install:
+  `curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash`.
+  The shorter `install.kisaes.com/vibe.sh` redirector is a v1.1 plan,
+  not yet live; the GitHub raw URL is the active path.
 - Eight-phase bootstrap, every phase idempotent. Re-running from any
   partial-failure state converges.
 - Pre-flight catches OS, RAM (≥1.5 GiB hard / ≥2 GiB pass), disk (≥20 GiB),

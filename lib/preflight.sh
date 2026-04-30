@@ -90,7 +90,7 @@ preflight_root() {
       "cause:You ran the script directly as a regular user." \
       "diagnose:id" \
       "fix:sudo $0 $*" \
-      "fix:Or pipe the installer through sudo: curl -fsSL https://install.kisaes.com/vibe.sh | sudo bash"
+      "fix:Or pipe the installer through sudo: curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash"
     return 1
   fi
   log_check_pass "$title"

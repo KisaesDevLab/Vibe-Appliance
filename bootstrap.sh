@@ -10,9 +10,17 @@
 #   docker-buildx-plugin docker-compose-plugin && rm -rf /opt/vibe`
 #   reverses what Phase 1 did).
 #
-# Invocation forms:
+# Invocation forms (all equivalent — bootstrap.sh always ends up
+# running from /opt/vibe/appliance):
+#
+#   # Pipe from GitHub raw (works today):
+#   curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh \
+#     | sudo bash -s -- --mode lan
+#
+#   # Aspirational redirector (v1.1+ — not yet live):
 #   curl -fsSL https://install.kisaes.com/vibe.sh | sudo bash
-#   curl -fsSL https://install.kisaes.com/vibe.sh | sudo bash -s -- --mode lan
+#
+#   # Already cloned the repo by hand:
 #   sudo ./bootstrap.sh --mode domain --domain firm.com --email me@firm.com
 #
 # Phases (per docs/PLAN.md §2):
@@ -83,7 +91,7 @@ bootstrap.sh — install / reconfigure the Vibe Appliance.
 
 USAGE
   sudo ./bootstrap.sh [flags]
-  curl -fsSL https://install.kisaes.com/vibe.sh | sudo bash -s -- [flags]
+  curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash -s -- [flags]
 
 FLAGS
   --mode {domain,lan,tailscale}   Deployment mode. Default: lan.

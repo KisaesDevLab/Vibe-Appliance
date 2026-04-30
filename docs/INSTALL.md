@@ -111,7 +111,7 @@ Pick the line that matches your mode. Run it on the server, as root
 ### Domain mode + Cloudflare DNS-01 (recommended)
 
 ```
-curl -fsSL https://install.kisaes.com/vibe.sh | sudo bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash -s -- \
   --mode domain \
   --domain firm.com \
   --email admin@firm.com \
@@ -121,7 +121,7 @@ curl -fsSL https://install.kisaes.com/vibe.sh | sudo bash -s -- \
 ### Domain mode + HTTP-01 fallback (no Cloudflare token)
 
 ```
-curl -fsSL https://install.kisaes.com/vibe.sh | sudo bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash -s -- \
   --mode domain \
   --domain firm.com \
   --email admin@firm.com
@@ -130,10 +130,20 @@ curl -fsSL https://install.kisaes.com/vibe.sh | sudo bash -s -- \
 ### LAN mode (physical box, internal-only)
 
 ```
-curl -fsSL https://install.kisaes.com/vibe.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash
 ```
 
 (LAN is the default mode; no flags needed.)
+
+> **About the URL.** All four commands above pipe `bootstrap.sh` from
+> this repo's `main` branch into bash. The script detects it's running
+> from a pipe, `apt-install`s `git`, clones the repo to
+> `/opt/vibe/appliance`, and re-execs from disk. The shorter
+> `curl https://install.kisaes.com/vibe.sh | sudo bash` URL is the
+> v1.1 redirector plan — not yet live. Use the GitHub raw URL today.
+>
+> If you've already cloned the repo by hand, you can also run
+> `sudo /opt/vibe/appliance/bootstrap.sh` with the same flags.
 
 ### Tailscale mode
 
@@ -142,7 +152,7 @@ Generate an authkey at
 Make it reusable and ephemeral if you might re-install later.
 
 ```
-curl -fsSL https://install.kisaes.com/vibe.sh | sudo bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash -s -- \
   --mode tailscale \
   --tailscale-authkey tskey-auth-XXXXXX
 ```
@@ -150,7 +160,7 @@ curl -fsSL https://install.kisaes.com/vibe.sh | sudo bash -s -- \
 ### Domain + Tailscale (combo)
 
 ```
-curl -fsSL https://install.kisaes.com/vibe.sh | sudo bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash -s -- \
   --mode domain \
   --domain firm.com \
   --email admin@firm.com \
