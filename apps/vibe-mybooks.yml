@@ -1,14 +1,15 @@
 # apps/vibe-mybooks.yml — Vibe MyBooks overlay.
 #
-# Same pattern as apps/vibe-tb.yml. Reads /opt/vibe/env/vibe-mybooks.env
-# (rendered by lib/enable-app.sh) on top of /opt/vibe/env/shared.env.
+# Image refs and ports lifted from KisaesDevLab/Vibe-MyBooks's prod
+# compose. Service names use upstream's `api` / `web` suffix to keep
+# this overlay readable next to the published images.
 
 name: vibe
 
 services:
-  vibe-mybooks-server:
-    image: ghcr.io/kisaesdevlab/vibe-mybooks-server:${APP_TAG:-latest}
-    container_name: vibe-mybooks-server
+  vibe-mybooks-api:
+    image: ghcr.io/kisaesdevlab/vibe-mybooks-api:${APP_TAG:-latest}
+    container_name: vibe-mybooks-api
     restart: unless-stopped
     init: true
     env_file:
@@ -22,15 +23,16 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3001/api/v1/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      # Vibe-MyBooks's api responds at /health (not /api/v1/health) on 3001.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3001/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 12
       start_period: 30s
 
-  vibe-mybooks-client:
-    image: ghcr.io/kisaesdevlab/vibe-mybooks-client:${APP_TAG:-latest}
-    container_name: vibe-mybooks-client
+  vibe-mybooks-web:
+    image: ghcr.io/kisaesdevlab/vibe-mybooks-web:${APP_TAG:-latest}
+    container_name: vibe-mybooks-web
     restart: unless-stopped
     env_file:
       - /opt/vibe/env/shared.env
@@ -38,5 +40,5 @@ services:
     networks:
       - vibe_net
     depends_on:
-      vibe-mybooks-server:
+      vibe-mybooks-api:
         condition: service_healthy

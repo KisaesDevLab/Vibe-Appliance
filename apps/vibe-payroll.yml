@@ -1,12 +1,17 @@
 # apps/vibe-payroll.yml — Vibe Payroll & Time overlay.
-# Same pattern as Vibe-MyBooks; two-tier with explicit migrations.
+#
+# Image refs and ports lifted from KisaesDevLab/Vibe-Payroll-Time's
+# prod compose. api listens on BACKEND_PORT=4000 with health at
+# /api/v1/health; web is nginx on :80. Vibe-Payroll's CORS env is
+# named CORS_ORIGIN (not ALLOWED_ORIGIN) — both are set in the
+# rendered env so either name works.
 
 name: vibe
 
 services:
-  vibe-payroll-server:
-    image: ghcr.io/kisaesdevlab/vibe-payroll-server:${APP_TAG:-latest}
-    container_name: vibe-payroll-server
+  vibe-payroll-api:
+    image: ghcr.io/kisaesdevlab/vibe-payroll-api:${APP_TAG:-latest}
+    container_name: vibe-payroll-api
     restart: unless-stopped
     init: true
     env_file:
@@ -20,15 +25,15 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3001/api/v1/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4000/api/v1/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 12
       start_period: 30s
 
-  vibe-payroll-client:
-    image: ghcr.io/kisaesdevlab/vibe-payroll-client:${APP_TAG:-latest}
-    container_name: vibe-payroll-client
+  vibe-payroll-web:
+    image: ghcr.io/kisaesdevlab/vibe-payroll-web:${APP_TAG:-latest}
+    container_name: vibe-payroll-web
     restart: unless-stopped
     env_file:
       - /opt/vibe/env/shared.env
@@ -36,5 +41,5 @@ services:
     networks:
       - vibe_net
     depends_on:
-      vibe-payroll-server:
+      vibe-payroll-api:
         condition: service_healthy

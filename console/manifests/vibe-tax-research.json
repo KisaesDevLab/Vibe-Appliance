@@ -6,19 +6,19 @@
   "logo": "vibe-tax-research.svg",
 
   "image": {
-    "server":     "ghcr.io/kisaesdevlab/vibe-tax-research-server",
-    "client":     "ghcr.io/kisaesdevlab/vibe-tax-research-client",
+    "server":     "ghcr.io/kisaesdevlab/vibe-tax-api",
+    "client":     "ghcr.io/kisaesdevlab/vibe-tax-web",
     "defaultTag": "latest"
   },
 
   "subdomain": "tax-research",
-  "ports":     { "server": 3001, "client": 80 },
+  "ports":     { "server": 4000, "client": 80 },
 
   "routing": {
-    "default_upstream": "vibe-tax-research-client:80",
+    "default_upstream": "vibe-tax-research-web:80",
     "matchers": [
-      { "name": "api",  "path": "/api/*",  "upstream": "vibe-tax-research-server:3001" },
-      { "name": "chat", "path": "/chat/*", "upstream": "vibe-tax-research-server:3001", "streaming": true }
+      { "name": "api",  "path": "/api/*",  "upstream": "vibe-tax-research-api:4000" },
+      { "name": "chat", "path": "/chat/*", "upstream": "vibe-tax-research-api:4000", "streaming": true }
     ]
   },
 
@@ -49,7 +49,7 @@
     "url":      "/login"
   },
 
-  "health": "/api/v1/health",
+  "health": "/api/health",
 
   "migrations": {
     "command":    ["node", "dist/migrate.js"],

@@ -6,18 +6,18 @@
   "logo": "vibe-mybooks.svg",
 
   "image": {
-    "server":     "ghcr.io/kisaesdevlab/vibe-mybooks-server",
-    "client":     "ghcr.io/kisaesdevlab/vibe-mybooks-client",
+    "server":     "ghcr.io/kisaesdevlab/vibe-mybooks-api",
+    "client":     "ghcr.io/kisaesdevlab/vibe-mybooks-web",
     "defaultTag": "latest"
   },
 
   "subdomain": "mybooks",
-  "ports":     { "server": 3001, "client": 80 },
+  "ports":     { "server": 3001, "client": 5173 },
 
   "routing": {
-    "default_upstream": "vibe-mybooks-client:80",
+    "default_upstream": "vibe-mybooks-web:5173",
     "matchers": [
-      { "name": "api", "path": "/api/*", "upstream": "vibe-mybooks-server:3001" }
+      { "name": "api", "path": "/api/*", "upstream": "vibe-mybooks-api:3001" }
     ]
   },
 
@@ -44,7 +44,7 @@
     "url":      "/login"
   },
 
-  "health": "/api/v1/health",
+  "health": "/health",
 
   "migrations": {
     "command":    ["node", "dist/migrate.js"],

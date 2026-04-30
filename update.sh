@@ -174,21 +174,31 @@ for key in ("server", "client"):
 PYEOF
 }
 
-# Service names for an app inside compose. Convention so far: <slug>-server,
-# <slug>-client. GLM-OCR breaks the pattern with the Ollama sidecar but
-# we don't restart that during update — only the Vibe-app images.
+# Service names for an app inside compose. The naming convention isn't
+# uniform across upstream Vibe-* repos (some use `-api`/`-web`, some
+# use `-server`/`-client`, GLM-OCR is single-tier `<slug>`), so we
+# extract the actual service names from the manifest's routing block
+# rather than rebuilding them from a fixed pattern. Anything that
+# appears as `<service>:<port>` in default_upstream or matchers[].upstream
+# becomes a service name.
 _app_services() {
   local file="$1"
   python3 - "$file" <<'PYEOF'
-import json, sys
+import json, re, sys
 with open(sys.argv[1]) as f:
     m = json.load(f)
-slug = m["slug"]
-img = m.get("image", {})
-out = []
-if img.get("server"): out.append(f"{slug}-server")
-if img.get("client"): out.append(f"{slug}-client")
-print(" ".join(out))
+upstream_re = re.compile(r"^([a-z0-9.-]+):\d+$")
+seen = []
+def add(spec):
+    if not spec: return
+    mm = upstream_re.match(spec)
+    if mm and mm.group(1) not in seen:
+        seen.append(mm.group(1))
+routing = m.get("routing", {})
+add(routing.get("default_upstream", ""))
+for matcher in routing.get("matchers", []) or []:
+    add(matcher.get("upstream", ""))
+print(" ".join(seen))
 PYEOF
 }
 

@@ -6,18 +6,18 @@
   "logo": "vibe-payroll.svg",
 
   "image": {
-    "server":     "ghcr.io/kisaesdevlab/vibe-payroll-server",
-    "client":     "ghcr.io/kisaesdevlab/vibe-payroll-client",
+    "server":     "ghcr.io/kisaesdevlab/vibe-payroll-api",
+    "client":     "ghcr.io/kisaesdevlab/vibe-payroll-web",
     "defaultTag": "latest"
   },
 
   "subdomain": "payroll",
-  "ports":     { "server": 3001, "client": 80 },
+  "ports":     { "server": 4000, "client": 80 },
 
   "routing": {
-    "default_upstream": "vibe-payroll-client:80",
+    "default_upstream": "vibe-payroll-web:80",
     "matchers": [
-      { "name": "api", "path": "/api/*", "upstream": "vibe-payroll-server:3001" }
+      { "name": "api", "path": "/api/*", "upstream": "vibe-payroll-api:4000" }
     ]
   },
 
@@ -28,6 +28,7 @@
       { "name": "JWT_SECRET",      "from": "shared:JWT_SECRET" },
       { "name": "ENCRYPTION_KEY",  "from": "shared:ENCRYPTION_KEY" },
       { "name": "ALLOWED_ORIGIN",  "from": "subdomain-url" },
+      { "name": "CORS_ORIGIN",     "from": "subdomain-url" },
       { "name": "DATABASE_URL",    "from": "database-url" },
       { "name": "REDIS_URL",       "from": "redis-url" },
       { "name": "MIGRATIONS_AUTO", "from": "static:false" }
