@@ -1,0 +1,56 @@
+# Caddyfile.tmpl — rendered to /opt/vibe/data/caddy/Caddyfile by
+# lib/render-caddyfile.sh. DO NOT edit the rendered file by hand; changes
+# will be overwritten on the next bootstrap or app toggle.
+#
+# Phase 2 — only the catch-all console site is rendered.
+# Phase 3+ — per-app vhost blocks are spliced in at @VIBE_VHOSTS@ from
+#   /opt/vibe/state.json's enabled-apps list.
+# Phase 6 — global block (email/acme/etc.) is filled in by snippet
+#   selection (caddy/snippets/{domain,lan,tailscale}.conf).
+
+{
+	# Disable the admin endpoint. We don't need runtime API access from
+	# anywhere — the appliance manages config by re-rendering and
+	# `caddy reload`. Closing the admin endpoint shrinks the attack
+	# surface; re-enable in a snippet if you ever need it.
+	admin off
+
+	# Logging to stdout so `docker logs caddy` captures it. Format
+	# 'console' is human-readable; switch to 'json' if you want to feed
+	# Loki or similar.
+	log {
+		output stdout
+		format console
+	}
+
+@VIBE_GLOBAL_SNIPPET@
+}
+
+# --- catch-all console site -------------------------------------------
+# Until the operator picks a domain (or LAN/Tailscale mode), Caddy serves
+# the console on plain HTTP for any hostname pointing at this server.
+# This is what makes `http://<server-ip>` work in Phase 2.
+#
+# Once a domain is configured (Phase 3 onward), this block coexists with
+# named vhosts; Caddy matches the most-specific hostname first.
+:80 {
+	encode gzip zstd
+
+	# Health endpoint for upstream load balancers. Always 200 if Caddy
+	# is alive — distinct from the console's own /health which exercises
+	# the application stack.
+	handle /caddy-health {
+		respond "ok" 200
+	}
+
+	# Everything else proxies to the console.
+	reverse_proxy console:3000 {
+		# Pass real client IP for logging.
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+}
+
+# --- per-app vhosts (Phase 3+) ----------------------------------------
+@VIBE_VHOSTS@

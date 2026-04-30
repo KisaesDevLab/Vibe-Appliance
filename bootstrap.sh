@@ -16,14 +16,14 @@
 #   sudo ./bootstrap.sh --mode domain --domain firm.com --email me@firm.com
 #
 # Phases (per docs/PLAN.md §2):
-#   1. Pre-flight              [Phase 1, implemented]
-#   2. Install Docker          [Phase 1, implemented]
-#   3. Install Tailscale       [Phase 6, stubbed]
-#   4. Generate secrets        [Phase 2, stubbed]
-#   5. Pull images             [Phase 2, stubbed]
-#   6. Render Caddyfile        [Phase 2, stubbed]
-#   7. Bring up core           [Phase 2, stubbed]
-#   8. Print credentials       [Phase 2, stubbed]
+#   1. Pre-flight              [implemented in build phase 1]
+#   2. Install Docker          [implemented in build phase 1]
+#   3. Install Tailscale       [stubbed; build phase 6]
+#   4. Generate secrets        [implemented in build phase 2]
+#   5. Pull images             [implemented in build phase 2]
+#   6. Render Caddyfile        [implemented in build phase 2]
+#   7. Bring up core           [implemented in build phase 2]
+#   8. Print credentials       [implemented in build phase 2]
 
 set -euo pipefail
 
@@ -293,8 +293,8 @@ EOF
   } >>"$VIBE_LOG_FILE" 2>&1
 }
 
-# Phases 3..8 are stubs in Phase 1. Each prints "not yet implemented" and
-# records a 'skipped' state. Bootstrap exits cleanly after the last stub.
+# Phases still pending implementation print a "not yet implemented" line
+# and record 'skipped'. Bootstrap exits cleanly after them.
 _phase_stub() {
   local n="$1" title="$2" slug="$3" notes="$4"
   log_phase_banner "$n" "$title" "$slug"
@@ -302,12 +302,155 @@ _phase_stub() {
   state_set_phase "$slug" skipped "phase implementation pending"
 }
 
-phase_tailscale() { _phase_stub 3 "Install Tailscale"  tailscale "6"; }
-phase_secrets()   { _phase_stub 4 "Generate secrets"   secrets   "2"; }
-phase_pull()      { _phase_stub 5 "Pull images"        pull      "2"; }
-phase_caddy()     { _phase_stub 6 "Render Caddyfile"   caddy     "2"; }
-phase_core_up()   { _phase_stub 7 "Bring up core"      core      "2"; }
-phase_credentials() { _phase_stub 8 "Print credentials" credentials "2"; }
+# --- Phase 3 (Tailscale) is still a stub; Phase 6 of the build owns it.
+phase_tailscale() { _phase_stub 3 "Install Tailscale" tailscale "6"; }
+
+# --- Phase 4 — generate / preserve secrets in /opt/vibe/env/shared.env ---
+phase_secrets() {
+  log_phase_banner 4 "Generate secrets" "secrets"
+  state_set_phase secrets running
+
+  if ! secrets_render \
+        "${APPLIANCE_DIR}/env-templates/shared.env.tmpl" \
+        "$CONFIG_RESET_ENV"; then
+    state_set_phase secrets failed "render failed"
+    die "Could not render shared.env. See $VIBE_LOG_FILE."
+  fi
+
+  state_set_phase secrets ok
+  log_ok "shared.env populated at $VIBE_ENV_SHARED"
+}
+
+# --- Phase 5 — pull registry images and build the console image -------
+phase_pull() {
+  log_phase_banner 5 "Pull and build images" "pull"
+  state_set_phase pull running
+
+  log_step "pulling caddy / postgres / redis"
+  if ! ( cd "$APPLIANCE_DIR" && \
+         docker compose pull caddy postgres redis ) >>"$VIBE_LOG_FILE" 2>&1; then
+    state_set_phase pull failed "registry pull failed"
+    die "Image pull failed. See $VIBE_LOG_FILE; common cause is a transient registry rate limit — retry in 60s."
+  fi
+
+  log_step "building console image"
+  if ! ( cd "$APPLIANCE_DIR" && \
+         docker compose build console ) >>"$VIBE_LOG_FILE" 2>&1; then
+    state_set_phase pull failed "console build failed"
+    die "Console image build failed. See $VIBE_LOG_FILE."
+  fi
+
+  state_set_phase pull ok
+  log_ok "core images ready"
+}
+
+# --- Phase 6 — render Caddyfile from template + mode snippet ----------
+phase_caddy() {
+  log_phase_banner 6 "Render Caddyfile" "caddy"
+  state_set_phase caddy running
+  if ! render_caddyfile; then
+    state_set_phase caddy failed "render failed"
+    die "Caddyfile render failed. See $VIBE_LOG_FILE."
+  fi
+  state_set_phase caddy ok
+}
+
+# --- Phase 7 — docker compose up + health-check console ---------------
+phase_core_up() {
+  log_phase_banner 7 "Bring up core stack" "core"
+  state_set_phase core running
+
+  log_step "docker compose up -d"
+  if ! ( cd "$APPLIANCE_DIR" && \
+         docker compose up -d ) >>"$VIBE_LOG_FILE" 2>&1; then
+    state_set_phase core failed "compose up failed"
+    log_step "dumping recent compose logs"
+    ( cd "$APPLIANCE_DIR" && docker compose logs --tail=50 ) 2>&1 \
+      | tee -a "$VIBE_LOG_FILE" >&2 || true
+    die "Failed to bring up core stack. Inspect logs above and re-run."
+  fi
+
+  log_step "waiting for console healthcheck (timeout 90s)"
+  local deadline=$(( $(date +%s) + 90 ))
+  while (( $(date +%s) < deadline )); do
+    local health
+    health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' \
+      vibe-console 2>/dev/null || true)"
+    if [[ "$health" == "healthy" ]]; then
+      log_ok "console healthy"
+      state_set_phase core ok
+      return 0
+    fi
+    sleep 2
+  done
+
+  state_set_phase core failed "console health timeout"
+  log_error "console did not become healthy within 90s"
+  log_step "last 50 lines of console logs"
+  ( cd "$APPLIANCE_DIR" && docker compose logs --tail=50 console ) 2>&1 \
+    | tee -a "$VIBE_LOG_FILE" >&2 || true
+  die "Console health-check timed out. Inspect logs above and re-run."
+}
+
+# --- Phase 8 — write CREDENTIALS.txt and print the success banner ----
+phase_credentials() {
+  log_phase_banner 8 "Print credentials" "credentials"
+  state_set_phase credentials running
+
+  local server_url
+  server_url="$(_resolve_server_url)"
+
+  if ! secrets_write_credentials "$server_url"; then
+    state_set_phase credentials failed "credentials write failed"
+    die "Could not write $VIBE_CREDS_FILE. See $VIBE_LOG_FILE."
+  fi
+
+  state_set_phase credentials ok
+
+  printf '\n%s================================================================%s\n' \
+    "$_C_GREEN" "$_C_RESET" >&2
+  printf '%s Vibe Appliance is up.%s\n' "${_C_BOLD}${_C_GREEN}" "$_C_RESET" >&2
+  printf '%s================================================================%s\n' \
+    "$_C_GREEN" "$_C_RESET" >&2
+  if [[ -r "$VIBE_CREDS_FILE" ]]; then
+    cat "$VIBE_CREDS_FILE" >&2
+  else
+    printf '\n  %s exists but is mode 600 root-owned; cat it with sudo to view.\n' \
+      "$VIBE_CREDS_FILE" >&2
+  fi
+}
+
+# Best-effort public-URL detection. Used only for the printed banner;
+# nothing in the appliance itself depends on the result.
+_resolve_server_url() {
+  if [[ "$CONFIG_MODE" == "domain" && -n "$CONFIG_DOMAIN" ]]; then
+    printf 'https://%s' "$CONFIG_DOMAIN"
+    return 0
+  fi
+
+  local ip=""
+
+  # Try cloud metadata services (best-effort, 2s timeout each).
+  ip="$(curl -fsS --max-time 2 \
+        http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address \
+        2>/dev/null || true)"               # DigitalOcean
+  if [[ -z "$ip" ]]; then
+    ip="$(curl -fsS --max-time 2 \
+          http://169.254.169.254/latest/meta-data/public-ipv4 \
+          2>/dev/null || true)"             # AWS
+  fi
+
+  # Fallback: first non-loopback IPv4 the kernel knows about.
+  if [[ -z "$ip" ]]; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+
+  if [[ -n "$ip" && "$ip" =~ ^[0-9.]+$ ]]; then
+    printf 'http://%s' "$ip"
+  else
+    printf 'http://<your-server-ip>'
+  fi
+}
 
 # ----------------------------------------------------------------------
 # Main
@@ -340,7 +483,7 @@ main() {
 
   # Source library files. These live alongside this script.
   local lib="${APPLIANCE_DIR}/lib"
-  for f in log.sh state.sh preflight.sh; do
+  for f in log.sh state.sh preflight.sh secrets.sh render-caddyfile.sh; do
     if [[ ! -f "${lib}/${f}" ]]; then
       _pre_die "missing ${lib}/${f}. Is this a complete clone of the Vibe-Appliance repo?"
     fi
@@ -376,13 +519,10 @@ main() {
   phase_core_up
   phase_credentials
 
-  printf '\n%sBootstrap complete (Phase 1 deliverables only).%s\n' \
-    "${_C_GREEN:-}" "${_C_RESET:-}" >&2
-  printf '  state:  %s\n'        "$VIBE_STATE_FILE" >&2
+  printf '\n  state:  %s\n'      "$VIBE_STATE_FILE" >&2
   printf '  log:    %s\n'        "$VIBE_LOG_FILE"   >&2
   printf '  config: mode=%s domain=%s tailscale=%s\n' \
     "$CONFIG_MODE" "${CONFIG_DOMAIN:-<unset>}" "$CONFIG_TAILSCALE" >&2
-  printf '\n  Phases 3–8 are stubbed and will land in later builds.\n' >&2
 }
 
 main "$@"

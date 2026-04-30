@@ -1,0 +1,139 @@
+# docker-compose.yml — Vibe Appliance core stack.
+#
+# Services:
+#   caddy     — TLS terminator + reverse proxy. Only service that publishes
+#               ports to the host (80 + 443).
+#   postgres  — Shared database. Per-app databases live inside this one
+#               instance (created by lib/db-bootstrap.sh in Phase 3).
+#   redis     — Shared cache. Same idea: one instance, multiple logical
+#               databases per app.
+#   console   — Vibe Appliance management UI. Reads /opt/vibe/data &
+#               /opt/vibe/env. Talks to the docker daemon via /var/run/
+#               docker.sock for container-health reporting in the admin
+#               status panel.
+#
+# Network: vibe_net (internal). Apps added in Phase 3+ join this network
+# so Caddy can reverse-proxy them by service name.
+#
+# All paths under /opt/vibe/data and /opt/vibe/env are bind-mounted from
+# the host so a `tar czf vibe.tgz /opt/vibe/data /opt/vibe/env` migration
+# is straightforward.
+
+name: vibe
+
+networks:
+  vibe_net:
+    name: vibe_net
+    driver: bridge
+
+services:
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: vibe-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"  # HTTP/3
+    volumes:
+      - /opt/vibe/data/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - /opt/vibe/data/caddy/data:/data
+      - /opt/vibe/data/caddy/config:/config
+    networks:
+      - vibe_net
+    depends_on:
+      console:
+        condition: service_healthy
+    healthcheck:
+      # `caddy version` exits 0 when the binary is intact; useful as a
+      # liveness probe without depending on the config being valid.
+      test: ["CMD", "caddy", "version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: vibe-postgres
+    restart: unless-stopped
+    env_file:
+      - /opt/vibe/env/shared.env
+    volumes:
+      - /opt/vibe/data/postgres:/var/lib/postgresql/data
+    networks:
+      - vibe_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    container_name: vibe-redis
+    restart: unless-stopped
+    env_file:
+      - /opt/vibe/env/shared.env
+    # Wrap redis-server in `sh -c` so we can reference $REDIS_PASSWORD.
+    # The literal `$$` in compose escapes one level of variable expansion
+    # so the env var is resolved by the shell inside the container, not
+    # by docker-compose at parse time.
+    command: ["sh", "-c", "redis-server --requirepass \"$$REDIS_PASSWORD\" --appendonly yes --dir /data"]
+    volumes:
+      - /opt/vibe/data/redis:/data
+    networks:
+      - vibe_net
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
+  console:
+    build:
+      context: ./console
+      dockerfile: Dockerfile
+    image: vibe-appliance/console:latest
+    container_name: vibe-console
+    restart: unless-stopped
+    init: true
+    env_file:
+      - /opt/vibe/env/shared.env
+    environment:
+      VIBE_DIR: /opt/vibe
+      NODE_ENV: production
+    volumes:
+      # The whole /opt/vibe tree is mounted as a directory — not as
+      # individual file bind mounts. Why: bootstrap.sh writes state.json
+      # via atomic rename (write-tmp + rename-into-place), which changes
+      # the inode. A file-level bind mount would freeze the container on
+      # the original inode and never see updates. A directory mount
+      # re-resolves the path on every open(), so the container always
+      # sees the latest state.
+      #
+      # Mount mode is rw, but the protection is filesystem permissions:
+      # CREDENTIALS.txt and env/shared.env are mode 600 root-owned, so
+      # the console (running as a non-root container user) can't read
+      # them. shared.env values reach the container via env_file, not
+      # via this mount.
+      - /opt/vibe:/opt/vibe
+      # Docker socket — read by dockerode for container health and
+      # `docker info` in the admin Status panel.
+      # NOTE: even read-only, the socket effectively grants
+      # root-equivalent host access. The console is treated as a trusted
+      # privileged service. Phase 4 may swap this for a
+      # docker-socket-proxy if we tighten the security model.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - vibe_net
+    healthcheck:
+      # Use Node's built-in HTTP module so we don't need to add wget/curl
+      # to the image. Exits 0 only on a 200 response.
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s

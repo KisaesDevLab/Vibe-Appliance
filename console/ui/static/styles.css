@@ -1,0 +1,236 @@
+/* console/ui/static/styles.css — warm editorial style for the Vibe
+   Appliance console. Approximates the typography/colour tokens of the
+   Vibe-TB landing page (system serif for headlines, system sans for
+   body text, cream surfaces, warm-amber accent) without pulling in
+   external web fonts so the appliance still works on a network that
+   blocks fonts.googleapis.com or similar. Phase 9 polish will line up
+   exactly with Vibe-TB's tokens once they're available. */
+
+:root {
+  --bg:           #f7f1e8;
+  --surface:      #fbf6ed;
+  --surface-2:    #f1e9d8;
+  --border:       #e8ddc9;
+  --text:         #2a221b;
+  --text-muted:   #6b5d4f;
+  --accent:       #b86e2c;
+  --accent-soft:  #c47d39;
+  --good:         #2f7d4f;
+  --warn:         #b07a17;
+  --bad:          #b03a2e;
+
+  --serif:        ui-serif, Georgia, "Source Serif Pro", "Times New Roman", serif;
+  --sans:         ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono:         ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: border-color 120ms ease;
+}
+a:hover { border-bottom-color: var(--accent); }
+
+h1, h2, h3 {
+  font-family: var(--serif);
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  color: var(--text);
+}
+
+h1 { font-size: 2.6rem; line-height: 1.1; margin: 0 0 0.6rem; }
+h2 { font-size: 1.5rem; line-height: 1.25; margin: 0 0 0.5rem; }
+h3 { font-size: 1.1rem; line-height: 1.3;  margin: 0 0 0.35rem; }
+
+.lede {
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 1.2rem;
+  color: var(--text-muted);
+  margin: 0 0 2rem;
+}
+
+.muted { color: var(--text-muted); }
+.mono  { font-family: var(--mono); font-size: 0.92em; }
+
+.container {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 4rem 1.5rem 6rem;
+}
+
+.container--admin { max-width: 1080px; }
+
+.eyebrow {
+  font-family: var(--sans);
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 1rem;
+}
+
+.hero {
+  margin-bottom: 3rem;
+  padding-bottom: 2rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.empty-state {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2rem;
+  margin-bottom: 2rem;
+}
+
+.empty-state h2 { margin-top: 0; }
+
+.cta-row {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-top: 1.25rem;
+}
+
+.btn {
+  display: inline-block;
+  padding: 0.55rem 1.1rem;
+  background: var(--accent);
+  color: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  font-weight: 600;
+  font-size: 0.95rem;
+  cursor: pointer;
+  text-decoration: none;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.btn:hover { background: var(--accent-soft); border-color: var(--accent-soft); }
+.btn--ghost {
+  background: transparent;
+  color: var(--accent);
+}
+.btn--ghost:hover { background: var(--surface-2); }
+
+.footer {
+  margin-top: 4rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.88rem;
+  color: var(--text-muted);
+}
+
+/* ---------- Admin status grid ---------- */
+
+.admin-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 1rem;
+  margin-bottom: 2rem;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1.25rem 1.4rem;
+}
+
+.card h3 {
+  font-family: var(--sans);
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin: 0 0 0.65rem;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.25rem 0.85rem;
+  font-size: 0.95rem;
+}
+.kv dt { color: var(--text-muted); font-weight: normal; }
+.kv dd { margin: 0; font-family: var(--mono); }
+
+.bignum {
+  font-family: var(--serif);
+  font-size: 1.8rem;
+  line-height: 1;
+  color: var(--text);
+}
+
+.bignum + .bignum-unit {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin-left: 0.25rem;
+}
+
+table.containers {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.93rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+table.containers th,
+table.containers td {
+  padding: 0.55rem 0.85rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+table.containers th {
+  font-family: var(--sans);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.74rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: var(--surface-2);
+}
+table.containers tr:last-child td { border-bottom: none; }
+table.containers td.col-name { font-family: var(--mono); }
+
+.badge {
+  display: inline-block;
+  padding: 0.1rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border: 1px solid transparent;
+}
+.badge--good   { background: rgba(47,125,79,0.12);  color: var(--good); border-color: rgba(47,125,79,0.3); }
+.badge--warn   { background: rgba(176,122,23,0.13); color: var(--warn); border-color: rgba(176,122,23,0.3); }
+.badge--bad    { background: rgba(176,58,46,0.12);  color: var(--bad);  border-color: rgba(176,58,46,0.3); }
+.badge--muted  { background: var(--surface-2);       color: var(--text-muted); border-color: var(--border); }
+
+.error-banner {
+  background: rgba(176,58,46,0.08);
+  border: 1px solid rgba(176,58,46,0.3);
+  color: var(--bad);
+  padding: 0.85rem 1rem;
+  border-radius: 4px;
+  margin-bottom: 1rem;
+}

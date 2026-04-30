@@ -1,0 +1,19 @@
+{
+  "name": "vibe-appliance-console",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Vibe Appliance management console — landing page and admin UI.",
+  "license": "Elastic-2.0",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "dockerode": "^4.0.2",
+    "express": "^4.21.0"
+  }
+}

@@ -45,7 +45,7 @@ For each phase: list deliverables, success criteria, what's out of scope, and an
 
 ## Phase 2 — Core compose + Caddy templating + Console skeleton
 
-**Status:** Not started.
+**Status:** Implemented; awaiting fresh-droplet verification (see completion log).
 
 **Goal.** Customer can hit `http://<server-ip>` after bootstrap and see a "Vibe Appliance" landing page served by Caddy via the Console container. No apps installed yet.
 
@@ -330,3 +330,72 @@ Append to this list as phases complete. Format:
   Once those six bullets are confirmed on a real droplet, append a second
   line below this one stating "Phase 1 verified YYYY-MM-DD on DO droplet"
   and Phase 2 may begin.
+
+- Phase 2 implemented 2026-04-29 by Claude (Opus 4.7) on Windows dev host.
+  Deviations from PLAN/PHASES.md:
+  1. Switched the console's bind mount from per-file (state.json:ro,
+     env:ro, logs:ro, data/console:rw) to a single /opt/vibe directory
+     mount. Reason: bootstrap writes state.json via atomic mv-rename, and
+     a file-level bind mount freezes the container on the original inode
+     so it never sees updates. A directory mount re-resolves on every
+     open(). File-permission protection on CREDENTIALS.txt + shared.env
+     (mode 600 root-owned) provides the same isolation.
+  2. Console runs as root inside its container for Phase 2. The
+     alternative — non-root + chowning /opt/vibe/data/console at install
+     time — was deferred to keep the install path minimal. Phase 4
+     (doctor + recovery surface) is the natural place to harden this,
+     potentially via a docker-socket-proxy.
+  3. Console healthcheck uses Node's built-in `http.get` instead of wget
+     so the runtime image stays free of additional packages.
+  4. Added `/api/v1/admin/status` (PHASES Phase 2 listed Status panel
+     contents but didn't pin an endpoint name). Returns docker version,
+     host CPU/RAM, disk on /opt/vibe, container list with health.
+  5. Caddyfile.tmpl renders to a catch-all `:80 → console:3000` for
+     Phase 2 — i.e. the appliance is reachable at
+     `http://<server-ip>` regardless of mode flag. TLS / per-app vhosts
+     land in Phase 3 with Vibe-TB integration. The mode-specific snippets
+     (caddy/snippets/{domain,lan,tailscale}.conf) exist but only the LAN
+     snippet has runtime effect right now (it's empty by design); domain
+     and tailscale snippets are skeletons for Phase 3 and Phase 6.
+  6. The ACME email and Cloudflare DNS-01 wildcard cert path are
+     scaffolded in caddy/snippets/domain.conf but not yet wired in. The
+     caddy:2.8-alpine image lacks the cloudflare DNS plugin; Phase 3
+     will swap to a custom-built image (e.g. `caddy/caddy:2.8-builder`
+     plus xcaddy) when DNS-01 actually goes live.
+
+  Tested locally on Windows (git-bash, Node 20):
+  - `bash -n` passes on bootstrap.sh and all six lib/*.sh files.
+  - `node -c console/server.js` passes.
+  - docker-compose.yml passes a structural sanity check (all four
+     services present, indentation parses).
+  - Not runtime-tested: Docker daemon isn't reachable from this host,
+     so the actual `docker compose pull && build && up` flow has not
+     run anywhere. Same caveat as Phase 1.
+
+  **Owed before Phase 3 starts** — a fresh DigitalOcean `s-1vcpu-2gb`
+  Ubuntu 24.04 LTS x64 droplet, no extras. Run
+  `git clone` to /opt/vibe/appliance and `sudo /opt/vibe/appliance/bootstrap.sh`.
+  Verify:
+  - The full eight-phase run completes within 90 seconds (excluding
+    initial docker-ce apt install).
+  - `http://<droplet-ip>/` shows the warm-editorial landing page with
+    the "No apps enabled yet" empty state.
+  - `http://<droplet-ip>/admin` prompts for basic auth, accepts the
+    password from `/opt/vibe/CREDENTIALS.txt`, and shows the Status
+    panel with Docker version, CPU/RAM, disk on /opt/vibe, and the four
+    core containers (caddy, postgres, redis, console) all healthy.
+  - `http://<droplet-ip>/health` returns `{"status":"ok",...}` (200).
+  - `/opt/vibe/CREDENTIALS.txt` is mode 600.
+  - `/opt/vibe/env/shared.env` is mode 600 and contains hex32 values.
+  - Re-running bootstrap is idempotent: secrets are preserved (verify
+    by diffing the password before/after), Docker isn't reinstalled,
+    Caddyfile re-renders to byte-identical output, console restart is
+    clean, landing page still up.
+  - **Atomic-render fault test:** edit caddy/Caddyfile.tmpl to introduce
+    a syntax error (e.g. delete a closing brace), re-run bootstrap.
+    Expect: phase 6 fails before installing the broken file, the live
+    Caddyfile is unchanged, and the landing page still loads. Restore
+    the template, re-run, and verify normal behaviour resumes.
+
+  Once those bullets are confirmed on a real droplet, append a line
+  "Phase 2 verified YYYY-MM-DD on DO droplet" and Phase 3 may begin.
