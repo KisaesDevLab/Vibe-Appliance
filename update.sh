@@ -68,8 +68,10 @@ PYEOF
 _state_app_set() {
   local slug="$1"; shift
   python3 - "$VIBE_STATE_FILE" "$slug" "$@" <<'PYEOF'
-import json, sys, os, datetime
+import json, sys, os, datetime, fcntl
 path, slug, *kvs = sys.argv[1:]
+_lk = open(path + ".lock", "w")
+fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
 try:
     with open(path) as f:
         s = json.load(f)
@@ -96,8 +98,10 @@ PYEOF
 _state_app_history_append() {
   local slug="$1" status="$2" from_tag="$3" to_tag="$4" err="${5:-}"
   python3 - "$VIBE_STATE_FILE" "$slug" "$status" "$from_tag" "$to_tag" "$err" <<'PYEOF'
-import json, sys, os, datetime
+import json, sys, os, datetime, fcntl
 path, slug, status, from_tag, to_tag, err = sys.argv[1:]
+_lk = open(path + ".lock", "w")
+fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
 try:
     with open(path) as f:
         s = json.load(f)
@@ -475,11 +479,12 @@ _wait_for_health() {
     if data["routing"].get("matchers") else data["routing"]["default_upstream"]')"
   health="$(_manifest_field "$manifest" 'data["health"]')"
 
+  # Probe via `docker exec vibe-console curl` — same path enable-app.sh
+  # uses now. Avoids spinning up a curlimages/curl container per probe.
   local deadline=$(( $(date +%s) + 90 ))
   while (( $(date +%s) < deadline )); do
-    if docker run --rm --network vibe_net curlimages/curl:latest \
-         -fsS -o /dev/null --max-time 5 "http://${upstream}${health}" \
-         >>"$VIBE_LOG_FILE" 2>&1; then
+    if docker exec vibe-console curl -fsS -o /dev/null --max-time 5 \
+         "http://${upstream}${health}" >>"$VIBE_LOG_FILE" 2>&1; then
       return 0
     fi
     sleep 3

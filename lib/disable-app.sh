@@ -129,11 +129,14 @@ PYEOF
 
 # Same helper as in enable-app.sh — duplicated rather than sourced both
 # files to keep each script standalone for the console's exec path.
+# Same flock-based concurrency safety as the enable-side copy.
 _state_app_set() {
   local slug="$1"; shift
   python3 - "$VIBE_STATE_FILE" "$slug" "$@" <<'PYEOF'
-import json, sys, os, datetime
+import json, sys, os, datetime, fcntl
 path, slug, *kvs = sys.argv[1:]
+_lk = open(path + ".lock", "w")
+fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
 try:
     with open(path) as f:
         s = json.load(f)

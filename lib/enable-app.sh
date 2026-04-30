@@ -109,18 +109,12 @@ enable_app() {
     log_info "no database section in manifest; skipping DB bootstrap" slug="$slug"
   fi
 
-  # 4. Run migrations (if declared) BEFORE bringing the app up. The
-  # appliance's MIGRATIONS_AUTO=false convention means the app server
-  # won't migrate on its own boot — health-check would 5xx forever
-  # waiting on schema. Run the migration command from the new image
-  # and only proceed to `up` once migrations exit 0.
-  if _manifest_has_migrations "$manifest"; then
-    log_step "running migrations for $slug"
-    if ! _run_migrations "$slug" "$manifest" "$default_tag"; then
-      _state_app_set "$slug" status failed error "migrations failed"
-      die "Migrations failed for $slug. See $VIBE_LOG_FILE."
-    fi
-  fi
+  # 4. (No explicit migration step on enable — the per-app env file
+  # ships `MIGRATIONS_AUTO=true` so the app self-migrates on its
+  # first boot. update.sh uses explicit migrations on the update path
+  # because it has the rollback safety net of a pre-update DB dump;
+  # enable doesn't have that, and a wrong manifest.migrations.command
+  # would unrecoverably fail every first-enable.)
 
   # 5. Bring up the app's services (only theirs — bare `up -d` would
   # un-stop core services the operator may have manually stopped).
@@ -356,9 +350,12 @@ except FileNotFoundError:
 PYEOF
 }
 
-# Wait for the app's /health endpoint via Caddy's internal route. We
-# probe through a one-shot container on vibe_net so we don't depend on
-# external DNS or TLS yet.
+# Wait for the app's /health endpoint via Caddy's internal route.
+# Probes through `docker exec vibe-console curl` rather than a one-shot
+# `docker run --rm curlimages/curl` per probe — the console container
+# is always up and on vibe_net, and it has curl installed (carried in
+# from the docker.com apt setup in console/Dockerfile). Each probe
+# costs ~50 ms instead of 1-2 s of container spawn.
 _wait_for_app_health() {
   local slug="$1" manifest="$2"
   local upstream health
@@ -370,8 +367,8 @@ _wait_for_app_health() {
 
   local deadline=$(( $(date +%s) + 120 ))
   while (( $(date +%s) < deadline )); do
-    if docker run --rm --network vibe_net curlimages/curl:latest \
-         -fsS -o /dev/null --max-time 5 "http://${upstream}${health}" >>"$VIBE_LOG_FILE" 2>&1; then
+    if docker exec vibe-console curl -fsS -o /dev/null --max-time 5 \
+         "http://${upstream}${health}" >>"$VIBE_LOG_FILE" 2>&1; then
       log_ok "$slug is healthy"
       return 0
     fi
@@ -382,11 +379,19 @@ _wait_for_app_health() {
 
 # Update state.json's apps.<slug> object. Pairs of key=value follow the
 # slug. Pass an explicit value for each key.
+#
+# Wraps the read-modify-write in a flock on <path>.lock so concurrent
+# spawns from the console (e.g. operator clicks Enable on two apps in
+# quick succession) can't clobber each other. The lock file descriptor
+# is closed automatically on python interpreter exit, which releases
+# the lock — no explicit unlock needed.
 _state_app_set() {
   local slug="$1"; shift
   python3 - "$VIBE_STATE_FILE" "$slug" "$@" <<'PYEOF'
-import json, sys, os, datetime
+import json, sys, os, datetime, fcntl
 path, slug, *kvs = sys.argv[1:]
+_lk = open(path + ".lock", "w")
+fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
 try:
     with open(path) as f:
         s = json.load(f)

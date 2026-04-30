@@ -49,8 +49,10 @@ EOF
 state_set_phase() {
   local slug="$1" status="$2" err="${3:-}"
   python3 - "$VIBE_STATE_FILE" "$slug" "$status" "$err" "$VIBE_STATE_SCHEMA_VERSION" <<'PYEOF'
-import json, sys, os, datetime
+import json, sys, os, datetime, fcntl
 path, slug, status, err, schema_version = sys.argv[1:6]
+_lk = open(path + ".lock", "w")
+fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
 try:
     with open(path) as f:
         s = json.load(f)
@@ -101,8 +103,10 @@ state_phase_is_ok() {
 state_set_config_kv() {
   local key="$1" val="$2"
   python3 - "$VIBE_STATE_FILE" "$key" "$val" "$VIBE_STATE_SCHEMA_VERSION" <<'PYEOF'
-import json, sys, os
+import json, sys, os, fcntl
 path, key, val, schema_version = sys.argv[1:5]
+_lk = open(path + ".lock", "w")
+fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
 try:
     with open(path) as f:
         s = json.load(f)

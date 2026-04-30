@@ -378,6 +378,53 @@ phase_secrets() {
   log_phase_banner 4 "Generate secrets" "secrets"
   state_set_phase secrets running
 
+  # --reset-env guard: rotating POSTGRES_PASSWORD in shared.env without
+  # also ALTER USER-ing the running postgres would lock the appliance
+  # out of its own data. Postgres reads the password from env at
+  # INITIAL DB creation only; subsequent boots use whatever's in the
+  # data volume. So an env-side rotation alone leaves the rest of the
+  # stack with the new password trying to authenticate against a
+  # postgres still running on the OLD password — every connection
+  # fails until manual reconciliation.
+  #
+  # Refuse the reset if postgres is up. The error points at the manual
+  # ALTER USER procedure that does the right thing.
+  if [[ "$CONFIG_RESET_ENV" == "true" ]]; then
+    if docker ps --filter name=^vibe-postgres$ --filter status=running -q 2>/dev/null | grep -q .; then
+      state_set_phase secrets failed "reset-env blocked: postgres running"
+      die "$(cat <<HELP
+--reset-env was passed but vibe-postgres is currently running.
+Rotating POSTGRES_PASSWORD in shared.env without also updating
+the running postgres would lock the appliance out of its own data.
+
+To rotate safely on a live install, do this manually instead:
+
+  1. Generate a new password and capture it:
+       NEW=\$(openssl rand -hex 32)
+       echo "\$NEW"
+
+  2. ALTER USER on the running postgres (uses the OLD password):
+       sudo docker exec -it vibe-postgres psql -U postgres \\
+         -c "ALTER USER postgres WITH PASSWORD '\$NEW';"
+
+  3. Update /opt/vibe/env/shared.env's POSTGRES_PASSWORD to the same value:
+       sudo nano /opt/vibe/env/shared.env
+
+  4. Restart postgres so the rest of the stack reconnects cleanly:
+       sudo docker compose -f /opt/vibe/appliance/docker-compose.yml restart postgres
+
+For a CLEAN reset that DESTROYS the database, stop postgres first:
+
+  sudo docker compose -f /opt/vibe/appliance/docker-compose.yml stop postgres
+  sudo rm -rf /opt/vibe/data/postgres
+  sudo /opt/vibe/appliance/bootstrap.sh --reset-env
+
+(That second path loses every app's data — only do it on a fresh install.)
+HELP
+)"
+    fi
+  fi
+
   if ! secrets_render \
         "${APPLIANCE_DIR}/env-templates/shared.env.tmpl" \
         "$CONFIG_RESET_ENV"; then
