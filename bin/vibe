@@ -33,6 +33,10 @@ COMMANDS
   logs   [name]                Tail /opt/vibe/logs/<name>.log
                                (defaults to bootstrap.log).
   bootstrap [args…]            Re-run the full bootstrap.
+  uninstall [--remove-data | --full]
+                               Tear down the appliance. Default keeps data;
+                               --remove-data nukes /opt/vibe; --full also
+                               removes Docker / Cockpit / Tailscale / Avahi.
 
 EOF
 }
@@ -75,6 +79,9 @@ case "$cmd" in
     ;;
   bootstrap)
     exec sudo "${APPLIANCE_DIR}/bootstrap.sh" "$@"
+    ;;
+  uninstall)
+    exec sudo "${APPLIANCE_DIR}/uninstall.sh" "$@"
     ;;
   -h|--help|help)
     usage
