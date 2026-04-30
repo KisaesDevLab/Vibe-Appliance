@@ -275,18 +275,25 @@ _render_app_env() {
   local redis_url="redis://:${REDIS_PASSWORD}@redis:6379/${redis_db}"
 
   # Substitute via python so passwords containing '/', '&', etc. don't
-  # break sed. ENCRYPTION_KEY and JWT_SECRET come from the shared.env
-  # we sourced into this shell at enable_app's start; passing them as
-  # argv keeps them out of the env file's plaintext markers.
+  # break sed. Several upstream Vibe-* apps don't read DATABASE_URL —
+  # they read DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD as
+  # individual fields (Vibe-TB) or alias other secret names
+  # (Vibe-Payroll's SECRETS_ENCRYPTION_KEY, Vibe-MyBooks's
+  # PLAID_ENCRYPTION_KEY, Vibe-Tax-Research's MASTER_KEY +
+  # JWT_REFRESH_SECRET). The renderer ships every shared/derived value
+  # as its own marker; the per-app env template picks the names that
+  # particular app expects.
   local tmp
   tmp="$(mktemp "${out}.XXXXXX")"
   chmod 600 "$tmp"
 
   python3 - "$tmpl" "$tmp" \
       "$allowed_origin" "$database_url" "$redis_url" \
-      "${ENCRYPTION_KEY:-}" "${JWT_SECRET:-}" <<'PYEOF'
+      "${ENCRYPTION_KEY:-}" "${JWT_SECRET:-}" \
+      "$db_name" "$db_user" "$db_pass" <<'PYEOF'
 import sys
-src, dst, allowed_origin, database_url, redis_url, encryption_key, jwt_secret = sys.argv[1:8]
+src, dst, allowed_origin, database_url, redis_url, \
+    encryption_key, jwt_secret, db_name, db_user, db_pass = sys.argv[1:11]
 with open(src) as f:
     body = f.read()
 body = body.replace("@ALLOWED_ORIGIN@",  allowed_origin)
@@ -294,6 +301,11 @@ body = body.replace("@DATABASE_URL@",    database_url)
 body = body.replace("@REDIS_URL@",       redis_url)
 body = body.replace("@ENCRYPTION_KEY@",  encryption_key)
 body = body.replace("@JWT_SECRET@",      jwt_secret)
+body = body.replace("@DB_NAME@",         db_name)
+body = body.replace("@DB_USER@",         db_user)
+body = body.replace("@DB_PASSWORD@",     db_pass)
+body = body.replace("@DB_HOST@",         "postgres")
+body = body.replace("@DB_PORT@",         "5432")
 with open(dst, "w") as f:
     f.write(body)
 PYEOF
