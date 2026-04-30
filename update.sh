@@ -475,8 +475,10 @@ _run_migrations() {
 _wait_for_health() {
   local slug="$1" manifest="$2"
   local upstream health
-  upstream="$(_manifest_field "$manifest" 'data["routing"]["matchers"][0]["upstream"]
-    if data["routing"].get("matchers") else data["routing"]["default_upstream"]')"
+  # Single-line python expression — multi-line parses as two
+  # statements and the second's leading whitespace yields
+  # IndentationError. Same fix as enable-app.sh's _wait_for_app_health.
+  upstream="$(_manifest_field "$manifest" 'data["routing"]["matchers"][0]["upstream"] if data["routing"].get("matchers") else data["routing"]["default_upstream"]')"
   health="$(_manifest_field "$manifest" 'data["health"]')"
 
   # Probe via `docker exec vibe-console curl` — same path enable-app.sh

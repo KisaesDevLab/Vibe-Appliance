@@ -348,8 +348,7 @@ check_app_health() {
     return
   fi
   local upstream health
-  upstream="$(_manifest_field "$manifest" 'data["routing"]["matchers"][0]["upstream"]
-    if data["routing"].get("matchers") else data["routing"]["default_upstream"]')"
+  upstream="$(_manifest_field "$manifest" 'data["routing"]["matchers"][0]["upstream"] if data["routing"].get("matchers") else data["routing"]["default_upstream"]')"
   health="$(_manifest_field "$manifest" 'data["health"]')"
 
   if docker run --rm --network vibe_net curlimages/curl:latest \

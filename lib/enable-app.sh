@@ -275,20 +275,25 @@ _render_app_env() {
   local redis_url="redis://:${REDIS_PASSWORD}@redis:6379/${redis_db}"
 
   # Substitute via python so passwords containing '/', '&', etc. don't
-  # break sed.
+  # break sed. ENCRYPTION_KEY and JWT_SECRET come from the shared.env
+  # we sourced into this shell at enable_app's start; passing them as
+  # argv keeps them out of the env file's plaintext markers.
   local tmp
   tmp="$(mktemp "${out}.XXXXXX")"
   chmod 600 "$tmp"
 
   python3 - "$tmpl" "$tmp" \
-      "$allowed_origin" "$database_url" "$redis_url" <<'PYEOF'
+      "$allowed_origin" "$database_url" "$redis_url" \
+      "${ENCRYPTION_KEY:-}" "${JWT_SECRET:-}" <<'PYEOF'
 import sys
-src, dst, allowed_origin, database_url, redis_url = sys.argv[1:6]
+src, dst, allowed_origin, database_url, redis_url, encryption_key, jwt_secret = sys.argv[1:8]
 with open(src) as f:
     body = f.read()
-body = body.replace("@ALLOWED_ORIGIN@", allowed_origin)
-body = body.replace("@DATABASE_URL@",   database_url)
-body = body.replace("@REDIS_URL@",      redis_url)
+body = body.replace("@ALLOWED_ORIGIN@",  allowed_origin)
+body = body.replace("@DATABASE_URL@",    database_url)
+body = body.replace("@REDIS_URL@",       redis_url)
+body = body.replace("@ENCRYPTION_KEY@",  encryption_key)
+body = body.replace("@JWT_SECRET@",      jwt_secret)
 with open(dst, "w") as f:
     f.write(body)
 PYEOF
@@ -361,8 +366,13 @@ PYEOF
 _wait_for_app_health() {
   local slug="$1" manifest="$2"
   local upstream health
-  upstream="$(_manifest_field "$manifest" 'data["routing"]["matchers"][0]["upstream"]
-    if data["routing"].get("matchers") else data["routing"]["default_upstream"]')"
+  # The python expression runs through `eval()`. Multi-line expressions
+  # outside brackets parse as two statements with the second
+  # erroneously indented — that yields an IndentationError at eval
+  # time and `upstream` becomes empty. Then curl probes
+  # `http:///health` and every probe fails until the 120s timeout.
+  # Keep this on a single line.
+  upstream="$(_manifest_field "$manifest" 'data["routing"]["matchers"][0]["upstream"] if data["routing"].get("matchers") else data["routing"]["default_upstream"]')"
   health="$(_manifest_field "$manifest" 'data["health"]')"
 
   log_step "waiting for $slug health" upstream="$upstream" path="$health"
