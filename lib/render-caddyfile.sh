@@ -350,9 +350,29 @@ def main():
         vhost_blocks = "# (no apps enabled yet)\n"
         path_blocks = "\t# (no apps enabled yet)"
 
+    # In LAN mode the catch-all site additionally listens on :443 with
+    # an internally-issued cert (Caddy's local CA). This keeps modern
+    # browsers — which auto-upgrade `<ip>` to `https://<ip>` before
+    # trying HTTP — from getting stuck on ECONNREFUSED. Operator gets a
+    # one-time "your connection is not private" warning per device,
+    # accepts, and HTTPS works thereafter. Plain HTTP on :80 is still
+    # served from the same site.
+    #
+    # Domain mode: per-app subdomains handle :443 with real ACME certs;
+    # the catch-all stays HTTP-only. Tailscale mode: tailscaled
+    # terminates TLS, Caddy stays HTTP-only on the loopback bind.
+    if mode == "lan":
+        listen_addrs = ":80, :443"
+        tls_directive = "\ttls internal"
+    else:
+        listen_addrs = ":80"
+        tls_directive = ""
+
     body = body.replace("@VIBE_GLOBAL_SNIPPET@", global_snippet.rstrip("\n"))
     body = body.replace("@VIBE_VHOSTS@", vhost_blocks.rstrip("\n"))
     body = body.replace("@VIBE_PATH_HANDLERS@", path_blocks.rstrip("\n"))
+    body = body.replace("@VIBE_LISTEN@", listen_addrs)
+    body = body.replace("@VIBE_TLS_DIRECTIVE@", tls_directive)
     body = body.replace("@VIBE_ACME_EMAIL@", email or "admin@example.com")
     body = body.replace("@VIBE_DOMAIN@", domain)
 

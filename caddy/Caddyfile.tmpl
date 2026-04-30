@@ -34,7 +34,8 @@
 # Once a domain is configured (Phase 3 onward), per-app named vhosts at
 # @VIBE_VHOSTS@ below take precedence; this site stays as the safety
 # net for direct-IP hits and the catch-all that surfaces the console.
-:80 {
+@VIBE_LISTEN@ {
+@VIBE_TLS_DIRECTIVE@
 	encode gzip zstd
 
 	# Health endpoint for upstream load balancers. Always 200 if Caddy

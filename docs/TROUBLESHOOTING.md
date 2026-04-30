@@ -314,6 +314,25 @@ sudo gunzip -c /opt/vibe/data/apps/<slug>/pre-update-backups/<TIMESTAMP>.sql.gz 
 
 ## Mode-specific
 
+### LAN mode — browser shows "your connection is not private"
+
+In LAN mode the appliance now listens on both HTTP (`:80`) and HTTPS
+(`:443`). Modern browsers auto-upgrade `<ip>` to `https://<ip>`, so
+landing on the HTTPS port is the common case. The cert is signed by
+Caddy's internal CA, which your browser doesn't trust by default.
+
+**Fix (one-time per browser per device):** click "Advanced" →
+"Proceed to <ip> (unsafe)" or equivalent. The browser caches the
+acceptance and won't ask again for that host.
+
+**Or use HTTP explicitly** by typing `http://<ip>/admin` (with the
+`http://` scheme). Both work.
+
+This is the LAN-mode reality with self-signed certs; it can't be
+avoided without setting up a real domain (use domain mode) or
+publishing Caddy's internal CA to the firm's machines (out of v1
+scope).
+
 ### LAN mode — `<hostname>.local` doesn't resolve from another machine
 
 The other machine's mDNS is misconfigured, or you're on a network
