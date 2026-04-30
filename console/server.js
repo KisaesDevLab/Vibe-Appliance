@@ -285,6 +285,81 @@ app.post('/api/v1/update/check', requireAdmin, async (_req, res) => {
   await runShell(res, [UPDATE_SCRIPT, '--check'], 'update-check');
 });
 
+// --- Infra services (Phase 8) ------------------------------------------
+
+// Mirror of the Caddy-side infra registry in lib/render-caddyfile.sh.
+// Keep these two in sync — when adding a new infra service, add it
+// here AND to INFRA_SERVICES in render-caddyfile.sh.
+const INFRA_SERVICES = [
+  { slug: 'backup',    label: 'Duplicati (backup)',     container: 'vibe-duplicati', subdomain_only: false },
+  { slug: 'portainer', label: 'Portainer (containers)', container: 'vibe-portainer', subdomain_only: false },
+  { slug: 'cockpit',   label: 'Cockpit (host)',         container: null /* host install */, subdomain_only: true },
+];
+
+app.get('/api/v1/infra', requireAdmin, async (_req, res) => {
+  const state = readState();
+  const config = state.config || {};
+  const out = [];
+  for (const svc of INFRA_SERVICES) {
+    let url;
+    if (config.mode === 'domain' && config.domain) {
+      url = `https://${svc.slug}.${config.domain}/`;
+    } else if (svc.subdomain_only) {
+      url = `(domain mode only)`;
+    } else {
+      url = `(non-domain modes: see ${svc.slug} via path-prefix)`;
+    }
+    let running = null;
+    if (svc.container) {
+      try {
+        const c = docker.getContainer(svc.container);
+        const info = await c.inspect();
+        running = info.State && info.State.Running;
+      } catch {
+        running = false;
+      }
+    } else {
+      // Host service (Cockpit) — assume installed if domain renders
+      // its vhost. The doctor's Cockpit check is more authoritative.
+      running = null;
+    }
+    out.push({ ...svc, url, running });
+  }
+  res.json({ infra: out });
+});
+
+// --- First-login info (Phase 8) ----------------------------------------
+
+app.get('/api/v1/first-login', requireAdmin, (_req, res) => {
+  const state = readState();
+  const stateApps = state.apps || {};
+  const items = Object.values(MANIFESTS)
+    .filter(m => m.firstLogin)
+    .map(m => {
+      const s = stateApps[m.slug] || {};
+      const fl = m.firstLogin;
+      let appUrl = appPublicUrl(m, state.config || {});
+      if (appUrl.startsWith('http') && fl.url) {
+        appUrl = appUrl.replace(/\/$/, '') + fl.url;
+      }
+      return {
+        slug: m.slug,
+        displayName: m.displayName,
+        type:     fl.type,
+        username: fl.username || null,
+        password: fl.password || null,
+        login_url: appUrl,
+        enabled:   !!s.enabled,
+        status:    s.status || 'not-installed',
+        // Heuristic: marked as `changed` iff the app explicitly
+        // posted that flag back via /api/v1/state (Phase 9 polish).
+        changed:   !!s.first_login_completed,
+      };
+    })
+    .sort((a, b) => a.displayName.localeCompare(b.displayName));
+  res.json({ first_login: items });
+});
+
 async function runShell(res, args, action, extra = {}) {
   log('info', 'spawn shell', { action, ...extra });
   const child = spawn('/bin/bash', args, {

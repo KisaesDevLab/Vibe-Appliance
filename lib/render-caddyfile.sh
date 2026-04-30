@@ -155,6 +155,81 @@ def render_vhost(slug, manifest, mode, domain, has_cloudflare):
     return "\n".join(lines) + "\n"
 
 
+# Built-in infra services routed by Caddy. These aren't manifest-
+# driven apps — they're long-running infrastructure services that the
+# appliance always exposes (when their containers are running).
+# Cockpit notably DOES NOT support path-prefix routing, so it's
+# subdomain-only.
+INFRA_SERVICES = [
+    {
+        "slug":      "backup",
+        "label":     "Duplicati (backup)",
+        "upstream":  "duplicati:8200",
+        "scheme":    "http",
+        "path_ok":   True,
+    },
+    {
+        "slug":      "portainer",
+        "label":     "Portainer (containers)",
+        "upstream":  "portainer:9000",
+        "scheme":    "http",
+        "path_ok":   True,
+    },
+    {
+        "slug":      "cockpit",
+        "label":     "Cockpit (host)",
+        "upstream":  "host.docker.internal:9090",
+        "scheme":    "https",
+        "path_ok":   False,   # Cockpit insists on running at the root.
+        "tls_skip_verify": True,
+    },
+]
+
+
+def render_infra_vhost(svc, mode, domain):
+    """Render a domain-mode site block for an infra service."""
+    if mode != "domain" or not domain:
+        return ""
+    host = f"{svc['slug']}.{domain}"
+    upstream = svc["upstream"]
+    scheme = svc.get("scheme", "http")
+    proxy_target = f"{scheme}://{upstream}" if scheme == "https" else upstream
+    lines = [f"{host} {{"]
+    lines.append("    encode gzip zstd")
+    lines.append("    log {")
+    lines.append("        output stdout")
+    lines.append("        format console")
+    lines.append("    }")
+    lines.append("")
+    lines.append(f"    reverse_proxy {proxy_target} {{")
+    if svc.get("tls_skip_verify"):
+        lines.append("        transport http {")
+        lines.append("            tls_insecure_skip_verify")
+        lines.append("        }")
+    lines.append("        header_up X-Real-IP {remote_host}")
+    lines.append("        header_up X-Forwarded-For {remote_host}")
+    lines.append("        header_up X-Forwarded-Proto {scheme}")
+    lines.append("    }")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def render_infra_path_handler(svc):
+    """Path-prefix block for an infra service in lan/tailscale modes."""
+    if not svc.get("path_ok"):
+        return ""  # Cockpit etc.
+    upstream = svc["upstream"]
+    lines = []
+    lines.append(f"\t# {svc['label']}")
+    lines.append(f"\t@{svc['slug']}_bare path /{svc['slug']}")
+    lines.append(f"\tredir @{svc['slug']}_bare /{svc['slug']}/ permanent")
+    lines.append(f"\thandle /{svc['slug']}/* {{")
+    lines.append(f"\t\turi strip_prefix /{svc['slug']}")
+    lines.append(f"\t\treverse_proxy {upstream}")
+    lines.append("\t}")
+    return "\n".join(lines) + "\n"
+
+
 def render_path_handler(slug, manifest):
     """
     Emit a `handle /<slug>/*` block (with internal `uri strip_prefix`)
@@ -236,18 +311,29 @@ def main():
 
     enabled = list_enabled_apps(state, manifests_dir)
 
-    if mode == "domain" and domain and enabled:
-        vhost_blocks = "\n".join(
-            render_vhost(slug, m, mode, domain, has_cloudflare)
-            for slug, m in enabled
-        )
-        path_blocks = "\t# (domain mode: apps live at their own subdomains)"
-    elif mode in ("lan", "tailscale") and enabled:
-        # Path-prefix routing inside the catch-all :80 site.
-        path_blocks = "\n".join(
+    if mode == "domain" and domain:
+        # Per-app vhosts (only when there are enabled apps).
+        if enabled:
+            vhost_blocks = "\n".join(
+                render_vhost(slug, m, mode, domain, has_cloudflare)
+                for slug, m in enabled
+            )
+        else:
+            vhost_blocks = "# (no apps enabled yet)\n"
+        # Infra-service vhosts always emitted in domain mode.
+        infra_vhosts = "\n".join(render_infra_vhost(s, mode, domain) for s in INFRA_SERVICES)
+        if infra_vhosts.strip():
+            vhost_blocks = vhost_blocks.rstrip("\n") + "\n\n" + infra_vhosts
+        path_blocks = "\t# (domain mode: apps and infra live at their own subdomains)"
+    elif mode in ("lan", "tailscale"):
+        app_path_blocks = "\n".join(
             render_path_handler(slug, m) for slug, m in enabled
+        ) if enabled else "\t# (no apps enabled yet)"
+        infra_path_blocks = "\n".join(
+            render_infra_path_handler(s) for s in INFRA_SERVICES
         )
-        vhost_blocks = "# (no per-domain vhosts in this mode)\n"
+        path_blocks = app_path_blocks + "\n" + infra_path_blocks
+        vhost_blocks = "# (non-domain mode: see path handlers in the :80 site)\n"
     else:
         vhost_blocks = "# (no apps enabled yet)\n"
         path_blocks = "\t# (no apps enabled yet)"

@@ -147,3 +147,54 @@ services:
       timeout: 5s
       retries: 6
       start_period: 20s
+    extra_hosts:
+      # Lets the console (and via the network, Caddy) reach Cockpit on
+      # the host without depending on a specific docker-bridge IP.
+      # `host-gateway` resolves to the host from inside containers on
+      # Linux ≥ 20.10.
+      - "host.docker.internal:host-gateway"
+
+  duplicati:
+    # Self-hosted backup. Per-backup AES-256 encryption is configured
+    # in Duplicati's UI when the operator sets up a backup job — the
+    # passphrase the appliance generates lives in CREDENTIALS.txt and
+    # is the operator's to type into the form. The destination is
+    # deliberately left blank: PLAN.md §7's "automated source, manual
+    # destination" rule.
+    image: lscr.io/linuxserver/duplicati:latest
+    container_name: vibe-duplicati
+    restart: unless-stopped
+    environment:
+      PUID: "0"
+      PGID: "0"
+      TZ: "Etc/UTC"
+    volumes:
+      - /opt/vibe/data/duplicati:/config
+      # Backup sources — read-only so a misclick in the UI can't
+      # rewrite the appliance's data tree.
+      - /opt/vibe/data:/source/vibe-data:ro
+      - /opt/vibe/env:/source/vibe-env:ro
+    networks:
+      - vibe_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8200 >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  portainer:
+    # Lightweight container UI; admin password is set on first visit
+    # and stored in /opt/vibe/data/portainer. We don't pre-seed it so
+    # the operator goes through Portainer's normal first-run UX.
+    image: portainer/portainer-ce:lts
+    container_name: vibe-portainer
+    restart: unless-stopped
+    volumes:
+      - /opt/vibe/data/portainer:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - vibe_net
+    # No healthcheck: the official portainer-ce image doesn't include
+    # wget/curl/etc., and Portainer's HTTP listener boots in <5 s on
+    # any reasonable host. Caddy's reverse-proxy probe is sufficient.

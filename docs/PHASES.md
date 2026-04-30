@@ -221,7 +221,7 @@ If any audit item fails, open a PR against the app repo before integrating.
 
 ## Phase 8 — Duplicati + Portainer + Cockpit + first-login surfacing
 
-**Status:** Not started.
+**Status:** Implemented; awaiting fresh-droplet verification (see completion log).
 
 **Goal.** Backup, container UI, host UI all installed. Console admin surfaces first-login info per running app.
 
@@ -888,3 +888,110 @@ Append to this list as phases complete. Format:
   Once those bullets are confirmed, append "Phase 7 verified
   YYYY-MM-DD on DO droplet" and Phase 8 (Duplicati + Portainer +
   Cockpit) may begin.
+
+- Phase 8 implemented 2026-04-30 by Claude (Opus 4.7) on Windows dev host.
+  Deviations from PLAN/PHASES.md:
+  1. **Duplicati and Portainer live in `docker-compose.yml` directly,
+     not behind compose-overlay opt-ins.** Reason: they're
+     infrastructure, not user-toggleable apps; the operator either
+     wants them or doesn't, and stopping them is one
+     `docker compose stop <svc>` away. `infra/duplicati-up.sh` and
+     `infra/portainer-up.sh` are now thin idempotent wrappers around
+     `compose up -d <svc>` that the operator can run standalone if
+     they ever stop one of them by hand and want it back.
+  2. **Cockpit goes on the host via apt** (PLAN.md §11), not as a
+     container. The new `infra/cockpit-install.sh` writes a managed
+     `/etc/cockpit/cockpit.conf` with `Origins =`, `ProtocolHeader`,
+     and `AllowUnencrypted = true` so Caddy can front it. The
+     console container has `extra_hosts: host.docker.internal:host-gateway`
+     so Caddy reverse-proxies `https://host.docker.internal:9090`
+     with `tls_insecure_skip_verify` (Cockpit's self-signed cert is
+     irrelevant — Caddy terminates the public TLS).
+  3. **Cockpit is subdomain-only.** Cockpit insists on running at the
+     root of its host and breaks under any non-trivial path-prefix.
+     In LAN/Tailscale modes the rendered Caddyfile does NOT add a
+     `/cockpit/` handler; the operator hits Cockpit directly at
+     `https://<hostname>:9090` (LAN) and lives with the
+     self-signed-cert warning. Documented in `lib/render-caddyfile.sh`
+     `INFRA_SERVICES.path_ok = false`.
+  4. **Phase 8 introduced a separate `phase_infra` step** between
+     `phase_core_up` and `phase_apps`. It runs Cockpit install only;
+     Duplicati and Portainer come up automatically with the core
+     stack in `phase_core_up`. Failures in cockpit-install.sh log a
+     warning rather than abort — Cockpit is optional. New flag
+     `--no-cockpit` skips the install entirely.
+  5. **Backup destination stays unconfigured by design** (PLAN.md §7).
+     `DUPLICATI_PASSPHRASE` is generated and written to CREDENTIALS.txt
+     but is the operator's to type into Duplicati's UI when they
+     configure a backup job. The container's settings encryption is
+     left at Duplicati's defaults (deviated from a flag-based push).
+  6. **First-login info heuristic.** Phase 8 surfaces each app's
+     `firstLogin` block from the manifest with a "still default" /
+     "changed" badge. The "changed" determination is gated on
+     `state.apps.<slug>.first_login_completed` — a flag the appliance
+     does NOT set automatically. It's left as a hook for Phase 9 polish:
+     each app would need to webhook back ("password rotated") for
+     this to flip. Until then the badge always reads "still default"
+     for running apps, which is at least honest.
+  7. **`/api/v1/infra` mirrors `INFRA_SERVICES` from
+     render-caddyfile.sh.** Same list in two places — annotated as
+     "keep in sync". Phase 9 polish could move this into a single
+     JSON file both consume.
+
+  Tested locally on Windows dev host:
+  - bash -n passes on bootstrap.sh, infra/*.sh, lib/*.sh.
+  - node -c passes on the updated console/server.js.
+  - admin.html parses; new sections render placeholder text until
+    /api/v1/infra and /api/v1/first-login resolve.
+  - Not runtime-tested: no Docker, no Cockpit, no Duplicati container.
+
+  **Owed before Phase 9 starts.** On a Phase-3-verified droplet (with
+  Vibe-TB enabled), in domain mode:
+
+  Test 1 — Duplicati.
+  - `https://backup.<domain>/` returns the Duplicati setup screen.
+  - In the Duplicati UI: source picker shows
+    `/source/vibe-data` (read-only) and `/source/vibe-env` (read-only).
+  - Configure a destination to a test S3 / B2 / local path.
+  - Run a backup. Verify it completes.
+  - Restore one file from the backup to a scratch path. Verify
+    contents match.
+
+  Test 2 — Portainer.
+  - `https://portainer.<domain>/` returns Portainer's first-run UX
+    (set admin password, link to local Docker).
+  - After setup, Portainer lists vibe-caddy / vibe-postgres /
+    vibe-redis / vibe-console / vibe-duplicati / vibe-portainer plus
+    every enabled-app container. State of each matches `vibe doctor`'s
+    container check.
+
+  Test 3 — Cockpit.
+  - `https://cockpit.<domain>/` returns the Cockpit login screen.
+  - Login as a sudo user on the host (Cockpit reuses host PAM auth).
+  - The dashboard shows live host metrics (CPU, RAM, disk, services).
+
+  Test 4 — Console links.
+  - `/admin` → "Infra services" section: three cards (Duplicati,
+    Portainer, Cockpit) with running badges; clicking each link
+    opens the URL.
+  - `/admin` → "First-login info" section: one card per enabled app
+    showing username, password, login URL, and a "still default"
+    badge. Clicking the login URL opens the app's login page.
+
+  Test 5 — Backup-restore E2E.
+  - Configure Duplicati to back up `/source/vibe-data` to local
+    `/source/vibe-data/restore-target/`.
+  - Run backup; verify a `.zip.aes` (or `.dlist.zip` etc.) lands in
+    the destination.
+  - In Duplicati: "Restore" → pick the latest backup → restore one
+    file from `vibe-data/postgres/` to a new path. Verify content
+    integrity by diffing against the live source.
+
+  Test 6 — `--no-cockpit` opt-out.
+  - Bootstrap with `--no-cockpit`. Cockpit is not installed; admin
+    "Infra" section still shows the Cockpit card with a "host
+    service" badge and a `(domain mode only)` URL note. The Cockpit
+    subdomain returns a 502 from Caddy.
+
+  Once those bullets are confirmed, append "Phase 8 verified
+  YYYY-MM-DD on DO droplet" and Phase 9 (the v1 ship gate) may begin.

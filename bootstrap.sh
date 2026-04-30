@@ -51,6 +51,10 @@ CONFIG_TAILSCALE="false"
 CONFIG_TAILSCALE_AUTHKEY=""
 CONFIG_RESET_ENV="false"
 CONFIG_FORCE="false"
+# Whether to install Cockpit on the host. Default true; can be turned
+# off via --no-cockpit on hosts that already have their own admin
+# tooling or that don't need a host-OS UI.
+CONFIG_COCKPIT="true"
 # Cloudflare DNS-01 token (required for wildcard certs in domain mode).
 # Read from --cloudflare-api-token flag or the CLOUDFLARE_API_TOKEN env
 # var; persisted to /opt/vibe/env/shared.env after secrets phase. Caddy
@@ -95,6 +99,9 @@ FLAGS
                                   (data preserved; secrets rotated).
   --force                         Continue past WARN-level pre-flight findings.
                                   Does NOT skip pre-flight checks.
+  --no-cockpit                    Skip the host Cockpit install (default is to
+                                  install). Useful on hosts that already have
+                                  their own admin tooling.
   -h | --help                     Show this help.
 
 DOCS
@@ -118,6 +125,7 @@ parse_flags() {
       --cloudflare-api-token=*)   CONFIG_CLOUDFLARE_API_TOKEN="${1#*=}"; shift ;;
       --reset-env)       CONFIG_RESET_ENV="true"; shift ;;
       --force)           CONFIG_FORCE="true"; shift ;;
+      --no-cockpit)      CONFIG_COCKPIT="false"; shift ;;
       -h|--help)         usage; exit 0 ;;
       *)
         _pre_log "Unknown flag: $1"
@@ -454,6 +462,28 @@ phase_core_up() {
   die "Console health-check timed out. Inspect logs above and re-run."
 }
 
+# --- Phase 7+ — install host-side infra (Cockpit) --------------------
+# Duplicati and Portainer come up as part of the core compose stack in
+# phase_core_up. Cockpit is a host install (not a container — see
+# PLAN.md §11) and is wired here. Failures don't abort: the credentials
+# banner still prints so the operator can investigate.
+phase_infra() {
+  log_set_phase "infra"
+
+  if [[ "$CONFIG_COCKPIT" != "true" ]]; then
+    log_info "skipping cockpit install (--no-cockpit)"
+    return 0
+  fi
+
+  log_step "installing cockpit on host"
+  export COCKPIT_DOMAIN="$CONFIG_DOMAIN"
+  if ! ( cd "$APPLIANCE_DIR" && /bin/bash infra/cockpit-install.sh ); then
+    log_warn "cockpit install failed; continuing without it"
+    return 0
+  fi
+  log_ok "cockpit installed"
+}
+
 # --- Phase 7+ — re-enable apps from state.json -----------------------
 # Runs after the core stack is healthy. On a fresh install this is a
 # no-op (no apps marked enabled yet). On a re-run after reboot, or when
@@ -651,6 +681,7 @@ main() {
   phase_pull
   phase_caddy
   phase_core_up
+  phase_infra          # cockpit on host (duplicati/portainer already up via core)
   phase_apps           # re-enable any apps marked enabled in state.json
   phase_credentials
 

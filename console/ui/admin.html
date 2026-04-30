@@ -29,6 +29,18 @@
     </section>
 
     <section>
+      <h2>Infra services</h2>
+      <p class="muted">Backup, container UI, host UI. Configure backup destination inside Duplicati.</p>
+      <div class="apps-list" id="infra-list"></div>
+    </section>
+
+    <section>
+      <h2>First-login info</h2>
+      <p class="muted">Default credentials surfaced from each enabled app's manifest. Change the password as soon as you log in.</p>
+      <div id="first-login-list"></div>
+    </section>
+
+    <section>
       <h2>Doctor</h2>
       <p class="muted">Diagnostics. Stops short of repairs — every FAIL has a recovery hint.</p>
       <div class="cta-row">
@@ -130,9 +142,16 @@
 
     async function refresh() {
       try {
-        const [status, apps] = await Promise.all([loadStatus(), loadApps()]);
+        const [status, apps, infra, firstLogin] = await Promise.all([
+          loadStatus(),
+          loadApps(),
+          fetch('/api/v1/infra',       { credentials: 'same-origin' }).then(r => r.json()),
+          fetch('/api/v1/first-login', { credentials: 'same-origin' }).then(r => r.json()),
+        ]);
         renderStatus(status);
         renderApps(apps.apps || []);
+        renderInfra((infra && infra.infra) || []);
+        renderFirstLogin((firstLogin && firstLogin.first_login) || []);
         document.getElementById('now').textContent =
           'Snapshot at ' + (status.now || new Date().toISOString());
       } catch (err) {
@@ -140,6 +159,64 @@
         el.textContent = 'Could not load: ' + err.message;
         el.hidden = false;
       }
+    }
+
+    function renderInfra(items) {
+      const list = document.getElementById('infra-list');
+      if (!items.length) { list.innerHTML = '<p class="muted">No infra services registered.</p>'; return; }
+      list.innerHTML = items.map(s => {
+        const linkable = s.url && s.url.startsWith('http');
+        const runStat =
+          s.running === true  ? '<span class="badge badge--good">running</span>' :
+          s.running === false ? '<span class="badge badge--bad">stopped</span>'  :
+                                '<span class="badge badge--muted">host service</span>';
+        return `
+          <article class="app-card">
+            <header class="app-card__head">
+              <h3 class="app-card__title">${escapeHtml(s.label)}</h3>
+              ${runStat}
+            </header>
+            <p class="muted app-card__desc">slug: <span class="mono">${escapeHtml(s.slug)}</span></p>
+            <p>${linkable
+              ? '<a href="' + escapeHtml(s.url) + '">' + escapeHtml(s.url) + '</a>'
+              : '<span class="muted">' + escapeHtml(s.url) + '</span>'}</p>
+          </article>`;
+      }).join('');
+    }
+
+    function renderFirstLogin(items) {
+      const list = document.getElementById('first-login-list');
+      if (!items.length) {
+        list.innerHTML = '<p class="muted">No apps with default credentials currently registered.</p>';
+        return;
+      }
+      list.innerHTML = '<div class="apps-list">' + items.map(item => {
+        const enabled = item.enabled && item.status === 'running';
+        const note =
+          item.type === 'default-credentials-forced-reset'
+            ? 'app forces a password reset at first login'
+            : item.type === 'default-credentials-passive'
+              ? 'app does NOT force reset; rotate manually'
+              : '';
+        const stillDefault = item.changed
+          ? '<span class="badge badge--good">changed</span>'
+          : '<span class="badge badge--warn">still default</span>';
+        return `
+          <article class="app-card">
+            <header class="app-card__head">
+              <h3 class="app-card__title">${escapeHtml(item.displayName)}</h3>
+              ${enabled ? stillDefault : '<span class="badge badge--muted">not running</span>'}
+            </header>
+            <dl class="kv app-card__kv">
+              <dt>username</dt><dd>${escapeHtml(item.username || '—')}</dd>
+              <dt>password</dt><dd>${escapeHtml(item.password || '—')}</dd>
+              <dt>login</dt><dd>${enabled && item.login_url.startsWith('http')
+                ? '<a href="' + escapeHtml(item.login_url) + '">' + escapeHtml(item.login_url) + '</a>'
+                : '<span class="muted">' + escapeHtml(item.login_url) + '</span>'}</dd>
+            </dl>
+            ${note ? '<p class="muted">' + escapeHtml(note) + '</p>' : ''}
+          </article>`;
+      }).join('') + '</div>';
     }
 
     // ---------- renderers ----------
