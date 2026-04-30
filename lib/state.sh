@@ -59,7 +59,7 @@ except (FileNotFoundError, ValueError):
 phases = s.setdefault("phases", {})
 entry = {
     "status": status,
-    "at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
 }
 if err:
     entry["error"] = err

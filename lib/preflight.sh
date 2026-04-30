@@ -248,6 +248,20 @@ preflight_port() {
       who="$(ss -Hltnp "sport = :${port}" 2>/dev/null | head -n1)"
     fi
 
+    # Idempotency: if our own Caddy is already running, port 80/443
+    # being held by docker-proxy is the EXPECTED state on a re-run,
+    # not a conflict. Bootstrap must converge on a healthy install.
+    # The check requires both signals — listener is docker-proxy AND
+    # a vibe-caddy container is up — to avoid passing on a port held
+    # by some unrelated docker container.
+    if [[ "$who" == *docker-proxy* ]] \
+       && command -v docker >/dev/null 2>&1 \
+       && docker ps --filter name=^vibe-caddy$ --filter status=running --format '{{.Names}}' 2>/dev/null \
+            | grep -q '^vibe-caddy$'; then
+      log_check_pass "$title (held by vibe-caddy from prior bootstrap)"
+      return 0
+    fi
+
     log_check_fail "$title" \
       "Something is already listening on port ${port}." \
       "cause:An existing web server (Apache, Nginx, Plesk) is bound to ${port}." \

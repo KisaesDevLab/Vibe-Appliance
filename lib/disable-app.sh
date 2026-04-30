@@ -93,7 +93,7 @@ for k in it:
         entry[k] = (v == "true")
     else:
         entry[k] = v
-entry["at"] = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+entry["at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 tmp = path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(s, f, indent=2, sort_keys=True)
