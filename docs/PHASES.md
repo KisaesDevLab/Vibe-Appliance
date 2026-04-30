@@ -243,7 +243,8 @@ If any audit item fails, open a PR against the app repo before integrating.
 
 ## Phase 9 — End-to-end test on three fresh hosts
 
-**Status:** Not started. **This is the v1 ship gate.**
+**Status:** Doc artifacts shipped; three-host verification still owed.
+**This is the v1 ship gate.**
 
 **Goal.** Validated install on three different host types using the documented "novice flow."
 
@@ -995,3 +996,73 @@ Append to this list as phases complete. Format:
 
   Once those bullets are confirmed, append "Phase 8 verified
   YYYY-MM-DD on DO droplet" and Phase 9 (the v1 ship gate) may begin.
+
+- Phase 9 doc artifacts shipped 2026-04-30 by Claude (Opus 4.7) on
+  Windows dev host. Three new files at the repo's documentation
+  surface:
+  - `docs/INSTALL.md` — customer-facing install guide. Audience is a
+    novice operator (a CPA who is going to do the install themselves
+    or watch someone do it). Walks through host provisioning, DNS,
+    the curl|bash command per mode, watching the install, getting
+    the credentials, opening the admin, enabling the first app, and
+    configuring backups. Cross-references TROUBLESHOOTING.md from
+    each "if it doesn't work" sidebar.
+  - `docs/TROUBLESHOOTING.md` — symptom → resolution map. One entry
+    per common failure, each with a Diagnose / Fix / Why structure.
+    Pre-flight failures, bootstrap failures, console reachability,
+    app-toggle failures, cert / DNS issues, update-flow failures,
+    mode-specific (LAN, Tailscale, combo), backup / restore.
+  - `docs/RELEASE_v1.md` — the boundary line. What ships in v1,
+    distilled from the per-phase deliverables. Known limitations,
+    distilled from the deviation logs of Phases 1-8 (every
+    "deferred to v1.1" or "Phase 9 polish" item is captured here).
+    Roadmap to v1.1 / v2.
+
+  README.md updated with operator-doc pointers (INSTALL, TROUBLESHOOTING,
+  RELEASE_v1) above the contributor-doc pointers.
+
+  Deviations from PLAN/PHASES.md:
+  1. **The three-host verification matrix from PHASES.md Phase 9 is
+     NOT yet run** — the dev environment doing this build doesn't
+     have the test infrastructure. The matrix and the failure-injection
+     drills are documented in `docs/RELEASE_v1.md` "Test artifacts
+     (Phase 9 — owed)" as the explicit ship-gate work.
+  2. **The CPA-walkthrough acceptance test is also owed.** PHASES.md
+     Phase 9's actual ship-gate language is "a non-engineer (a CPA,
+     ideally) walks through INSTALL.md on a fresh host and gets to
+     working apps without contacting Kurt for help." The doc was
+     written with that audience in mind, but only a real CPA on a real
+     fresh host will surface the assumptions that are still leaking.
+  3. The Vibe-Connect license PR is the **other** still-open
+     external dependency. Even on a successful three-host test run,
+     v1 ships with 5 of 6 apps active until that PR merges and the
+     `_pending` files are moved per `docs/CONNECT_BLOCKED.md`.
+
+  **Owed before v1 declared shipped.** Three host installs per the
+  matrix in `docs/RELEASE_v1.md`:
+
+  Test target A — DigitalOcean `s-1vcpu-2gb`, Ubuntu 24.04, domain
+  mode, Cloudflare DNS-01, all 5 active apps. Time the curl|bash to
+  "all enabled apps healthy" (target <15 min). Inject a mid-install
+  failure (`docker stop vibe-postgres` during phase 7); re-run
+  bootstrap, verify convergence. Inject post-install failures: corrupt
+  `/opt/vibe/env/vibe-tb.env`, then `vibe doctor` should FAIL the
+  app's /health check with a hint pointing at the env file. Update
+  one app to a deliberately-broken `:broken-test` tag; verify
+  automatic rollback restores prior state.
+
+  Test target B — Hetzner CX22, Ubuntu 24.04, domain mode, HTTP-01
+  fallback (no Cloudflare token), 3 apps (TB + MyBooks +
+  Tax-Research). Same drills as A.
+
+  Test target C — bare-metal NUC or local VM, Ubuntu 24.04, LAN mode,
+  2 apps (TB + MyBooks). Verify mDNS resolution from a second LAN
+  client. Same failure-injection drills.
+
+  Each run: append findings to `docs/TROUBLESHOOTING.md` (anything
+  that surfaced and wasn't already there) and a "verified
+  YYYY-MM-DD on \<host\>" line under this entry.
+
+  When all three lines are present plus a "CPA walkthrough verified
+  YYYY-MM-DD" line, v1 ships. Tag `v1.0.0`, attach
+  `docs/RELEASE_v1.md` as the release notes, announce.

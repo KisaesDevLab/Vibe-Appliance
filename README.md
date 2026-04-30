@@ -14,8 +14,17 @@ curl -fsSL https://install.kisaes.com/vibe.sh | sudo bash
 
 ## Documentation
 
+For operators:
+
+- [`docs/INSTALL.md`](docs/INSTALL.md) — customer-facing install guide
+- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — symptom → resolution map
+- [`docs/RELEASE_v1.md`](docs/RELEASE_v1.md) — what's in v1, what's deferred
+
+For contributors:
+
 - [`docs/PLAN.md`](docs/PLAN.md) — design plan and architecture
 - [`docs/PHASES.md`](docs/PHASES.md) — phased build plan with success criteria
+- [`docs/MANIFEST_SCHEMA.md`](docs/MANIFEST_SCHEMA.md) — per-app manifest schema
 - [`CLAUDE.md`](CLAUDE.md) — operational notes for Claude Code working in this repo
 
 ## License
