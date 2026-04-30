@@ -103,9 +103,9 @@ def list_enabled_apps(state, manifests_dir):
 
 def render_vhost(slug, manifest, mode, domain, has_cloudflare):
     """
-    Emit a single Caddy site block for the app. In domain mode the host
-    is `<subdomain>.<domain>`. In LAN/Tailscale mode for Phase 3 we
-    skip routing entirely — those modes are wired in build phase 6.
+    Emit a single Caddy site block for the app under domain mode at
+    `<subdomain>.<domain>`. Returns empty for non-domain modes — those
+    use path-prefix handlers via render_path_handler() instead.
     """
     if mode != "domain" or not domain:
         return ""
@@ -155,6 +155,49 @@ def render_vhost(slug, manifest, mode, domain, has_cloudflare):
     return "\n".join(lines) + "\n"
 
 
+def render_path_handler(slug, manifest):
+    """
+    Emit a `handle /<slug>/*` block (with internal `uri strip_prefix`)
+    so apps are reachable at `<host-or-tailnet>/<slug>/...` in LAN and
+    Tailscale modes. Sub-path matchers (api, mcp, chat, etc.) live
+    inside the route block.
+
+    The bare `/<slug>` path (no trailing slash) gets a redirect to
+    `/<slug>/` so SPAs find their root.
+    """
+    routing = manifest.get("routing", {})
+    matchers = routing.get("matchers", []) or []
+    default_upstream = routing["default_upstream"]
+
+    lines = []
+    lines.append(f"\t# {slug}")
+    # Bare-prefix redirect.
+    lines.append(f"\t@{slug}_bare path /{slug}")
+    lines.append(f"\tredir @{slug}_bare /{slug}/ permanent")
+    # Main route — strip_prefix happens inside so upstream sees /api etc.
+    lines.append(f"\thandle /{slug}/* {{")
+    lines.append(f"\t\turi strip_prefix /{slug}")
+    for m in matchers:
+        lines.append(f"\t\t@{slug}_{m['name']} path {m['path']}")
+    for m in matchers:
+        lines.append(f"\t\thandle @{slug}_{m['name']} {{")
+        if m.get("streaming"):
+            lines.append(f"\t\t\treverse_proxy {m['upstream']} {{")
+            lines.append("\t\t\t\tflush_interval -1")
+            lines.append("\t\t\t\ttransport http {")
+            lines.append("\t\t\t\t\tread_timeout 3600s")
+            lines.append("\t\t\t\t}")
+            lines.append("\t\t\t}")
+        else:
+            lines.append(f"\t\t\treverse_proxy {m['upstream']}")
+        lines.append("\t\t}")
+    lines.append("\t\thandle {")
+    lines.append(f"\t\t\treverse_proxy {default_upstream}")
+    lines.append("\t\t}")
+    lines.append("\t}")
+    return "\n".join(lines) + "\n"
+
+
 def render_global_snippet(snippets_dir, mode, email, has_cloudflare):
     """Build the contents of @VIBE_GLOBAL_SNIPPET@."""
     snippet_path = os.path.join(snippets_dir, f"{mode}.conf")
@@ -192,21 +235,26 @@ def main():
     global_snippet = render_global_snippet(snippets_dir, mode, email, has_cloudflare)
 
     enabled = list_enabled_apps(state, manifests_dir)
-    if enabled:
+
+    if mode == "domain" and domain and enabled:
         vhost_blocks = "\n".join(
             render_vhost(slug, m, mode, domain, has_cloudflare)
             for slug, m in enabled
         )
-        if not vhost_blocks.strip():
-            vhost_blocks = (
-                "# (apps are enabled but Caddy routing for this mode lands in "
-                "build phase 6)\n"
-            )
+        path_blocks = "\t# (domain mode: apps live at their own subdomains)"
+    elif mode in ("lan", "tailscale") and enabled:
+        # Path-prefix routing inside the catch-all :80 site.
+        path_blocks = "\n".join(
+            render_path_handler(slug, m) for slug, m in enabled
+        )
+        vhost_blocks = "# (no per-domain vhosts in this mode)\n"
     else:
         vhost_blocks = "# (no apps enabled yet)\n"
+        path_blocks = "\t# (no apps enabled yet)"
 
     body = body.replace("@VIBE_GLOBAL_SNIPPET@", global_snippet.rstrip("\n"))
     body = body.replace("@VIBE_VHOSTS@", vhost_blocks.rstrip("\n"))
+    body = body.replace("@VIBE_PATH_HANDLERS@", path_blocks.rstrip("\n"))
     body = body.replace("@VIBE_ACME_EMAIL@", email or "admin@example.com")
     body = body.replace("@VIBE_DOMAIN@", domain)
 

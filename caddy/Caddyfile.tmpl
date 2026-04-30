@@ -27,12 +27,13 @@
 }
 
 # --- catch-all console site -------------------------------------------
-# Until the operator picks a domain (or LAN/Tailscale mode), Caddy serves
-# the console on plain HTTP for any hostname pointing at this server.
-# This is what makes `http://<server-ip>` work in Phase 2.
+# Default site on port 80. In domain mode it acts as a fallback for
+# unknown hostnames; in LAN and Tailscale modes it's where every
+# request lands and per-app traffic is split off by path prefix.
 #
-# Once a domain is configured (Phase 3 onward), this block coexists with
-# named vhosts; Caddy matches the most-specific hostname first.
+# Once a domain is configured (Phase 3 onward), per-app named vhosts at
+# @VIBE_VHOSTS@ below take precedence; this site stays as the safety
+# net for direct-IP hits and the catch-all that surfaces the console.
 :80 {
 	encode gzip zstd
 
@@ -43,14 +44,20 @@
 		respond "ok" 200
 	}
 
-	# Everything else proxies to the console.
-	reverse_proxy console:3000 {
-		# Pass real client IP for logging.
-		header_up X-Real-IP {remote_host}
-		header_up X-Forwarded-For {remote_host}
-		header_up X-Forwarded-Proto {scheme}
+	# Per-app path-prefix handlers — only populated in LAN and Tailscale
+	# modes. In domain mode this marker resolves to a comment because
+	# the apps live at their own subdomains under @VIBE_VHOSTS@.
+@VIBE_PATH_HANDLERS@
+
+	# Default — everything not matched above proxies to the console.
+	handle {
+		reverse_proxy console:3000 {
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
 	}
 }
 
-# --- per-app vhosts (Phase 3+) ----------------------------------------
+# --- per-app vhosts (domain mode) -------------------------------------
 @VIBE_VHOSTS@

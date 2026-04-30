@@ -313,8 +313,49 @@ _phase_stub() {
   state_set_phase "$slug" skipped "phase implementation pending"
 }
 
-# --- Phase 3 (Tailscale) is still a stub; Phase 6 of the build owns it.
-phase_tailscale() { _phase_stub 3 "Install Tailscale" tailscale "6"; }
+# --- Phase 3 — mode-specific host infrastructure ----------------------
+# Tailscale install + bring-up for tailscale mode (or for the
+# domain-with-tailscale combo). Avahi advertise for LAN mode.
+# Domain-only mode: skipped (Caddy + Cloudflare DNS-01 handle it).
+phase_tailscale() {
+  log_phase_banner 3 "Mode-specific infrastructure" "tailscale"
+
+  local needs_tailscale="false" needs_avahi="false"
+
+  if [[ "$CONFIG_MODE" == "tailscale" || "$CONFIG_TAILSCALE" == "true" ]]; then
+    needs_tailscale="true"
+  fi
+  if [[ "$CONFIG_MODE" == "lan" ]]; then
+    needs_avahi="true"
+  fi
+
+  if [[ "$needs_tailscale" == "false" && "$needs_avahi" == "false" ]]; then
+    log_info "mode=$CONFIG_MODE tailscale=$CONFIG_TAILSCALE — no host infra needed"
+    state_set_phase tailscale skipped "not required for this mode"
+    return 0
+  fi
+
+  state_set_phase tailscale running
+
+  if [[ "$needs_avahi" == "true" ]]; then
+    log_step "running infra/avahi-up.sh"
+    if ! ( cd "$APPLIANCE_DIR" && /bin/bash infra/avahi-up.sh ); then
+      state_set_phase tailscale failed "avahi-up failed"
+      die "avahi install/up failed. See $VIBE_LOG_FILE."
+    fi
+  fi
+
+  if [[ "$needs_tailscale" == "true" ]]; then
+    log_step "running infra/tailscale-up.sh"
+    export CONFIG_TAILSCALE_AUTHKEY
+    if ! ( cd "$APPLIANCE_DIR" && /bin/bash infra/tailscale-up.sh ); then
+      state_set_phase tailscale failed "tailscale-up failed"
+      die "tailscale install/up failed. See $VIBE_LOG_FILE."
+    fi
+  fi
+
+  state_set_phase tailscale ok
+}
 
 # --- Phase 4 — generate / preserve secrets in /opt/vibe/env/shared.env ---
 phase_secrets() {

@@ -414,6 +414,67 @@ Fix:      check Caddy logs (docker logs vibe-caddy) for ACME failures"
   fi
 }
 
+check_tailscale_status() {
+  _check_begin "Tailscale daemon"
+  if ! command -v tailscale >/dev/null 2>&1; then
+    _check_warn "tailscale binary not present" \
+      "Fix: sudo /opt/vibe/appliance/bootstrap.sh --tailscale --tailscale-authkey ..."
+    return
+  fi
+  if ! systemctl is-active tailscaled >/dev/null 2>&1; then
+    _check_fail "tailscaled is not running" \
+      "Fix: sudo systemctl enable --now tailscaled"
+    return
+  fi
+  local backend
+  backend="$(tailscale status --json 2>/dev/null | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("BackendState","unknown"))
+except: print("error")' 2>/dev/null || echo error)"
+  case "$backend" in
+    Running)
+      local self
+      self="$(tailscale status --json 2>/dev/null | python3 -c 'import json,sys
+print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null || echo unknown)"
+      _check_pass "authenticated as ${self}"
+      ;;
+    NeedsLogin|NoState)
+      _check_fail "tailscale not authenticated (state=${backend})" \
+        "Fix: sudo tailscale up --authkey=tskey-auth-..."
+      ;;
+    *)
+      _check_warn "tailscale in unexpected state: ${backend}"
+      ;;
+  esac
+}
+
+check_tailscale_serve() {
+  _check_begin "Tailscale serve config"
+  command -v tailscale >/dev/null 2>&1 || { _check_warn "tailscale not installed; skipping"; return; }
+  if tailscale serve status 2>/dev/null | grep -q '127.0.0.1:80'; then
+    _check_pass "tailscale serve → 127.0.0.1:80 configured"
+  else
+    _check_fail "no tailscale serve route to local Caddy" \
+      "Fix: sudo tailscale serve --bg --https=443 http://127.0.0.1:80"
+  fi
+}
+
+check_avahi_status() {
+  _check_begin "Avahi daemon"
+  if ! systemctl is-active avahi-daemon >/dev/null 2>&1; then
+    if dpkg -s avahi-daemon >/dev/null 2>&1; then
+      _check_fail "avahi-daemon is installed but not running" \
+        "Fix: sudo systemctl enable --now avahi-daemon"
+    else
+      _check_warn "avahi-daemon not installed" \
+        "Fix: sudo /opt/vibe/appliance/infra/avahi-up.sh"
+    fi
+    return
+  fi
+  local hn
+  hn="$(hostname)"
+  _check_pass "advertising as ${hn}.local"
+}
+
 check_recent_errors() {
   _check_begin "Recent errors in /opt/vibe/logs"
   local cutoff_min=60
@@ -449,10 +510,20 @@ check_postgres_connectivity
 check_redis_connectivity
 check_console_health
 
-# Per-app checks. mode/domain/server_ip are only meaningful in domain mode.
+# Mode-specific checks. We read state.config to know which mode this
+# install is running in; doctor only runs the relevant checks.
 mode="$(_state_get config.mode)"
 domain="$(_state_get config.domain)"
+tailscale_flag="$(_state_get config.tailscale)"
 server_ip="$(_resolve_server_ip)"
+
+if [[ "$mode" == "tailscale" || "$tailscale_flag" == "true" ]]; then
+  check_tailscale_status
+  check_tailscale_serve
+fi
+if [[ "$mode" == "lan" ]]; then
+  check_avahi_status
+fi
 
 while IFS= read -r slug; do
   [[ -z "$slug" ]] && continue

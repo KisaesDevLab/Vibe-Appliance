@@ -174,7 +174,7 @@ If any audit item fails, open a PR against the app repo before integrating.
 
 ## Phase 6 — Tailscale and LAN modes
 
-**Status:** Not started.
+**Status:** Implemented; awaiting fresh-droplet verification (see completion log).
 
 **Goal.** Bootstrap with `--mode tailscale` produces working `https://<slug>.<tailnet>.ts.net`. Bootstrap with `--mode lan` produces working `http://<slug>.<hostname>.local`.
 
@@ -684,3 +684,102 @@ Append to this list as phases complete. Format:
   YYYY-MM-DD on DO droplet (4/5 apps)" and Phase 6 may begin. The
   fifth app (Connect) lands as a follow-up note when its license PR
   merges and the staged files are moved.
+
+- Phase 6 implemented 2026-04-29 by Claude (Opus 4.7) on Windows dev host.
+  Deviations from PLAN/PHASES.md:
+  1. **Routing pattern in non-domain modes is path-prefix, not
+     per-subdomain.** PHASES.md Phase 6's success criteria mention
+     `<slug>.<tailnet>.ts.net` and `<slug>.<hostname>.local`, but
+     making either work cleanly without enterprise Tailscale features
+     or a per-alias avahi-publish-cname daemon is more code than
+     Phase 6's budget warrants. Apps are reachable at:
+       - LAN:        `http://<hostname>.local/<slug>/`
+       - Tailscale:  `https://<host>.<tailnet>.ts.net/<slug>/`
+     A `/<slug>` (no trailing slash) request gets a 308 redirect to
+     `/<slug>/` so SPAs find their root. The Caddy `handle /<slug>/*`
+     block strips the prefix internally so the upstream server still
+     sees `/api/...` and `/mcp/...` paths. Per-subdomain advertising
+     (TS via tag, LAN via avahi-aliases) is deferred to Phase 9 polish.
+  2. infra/tailscale-up.sh + infra/avahi-up.sh are dual-mode (sourced
+     from bootstrap.sh OR `/bin/bash` standalone). They install via
+     apt, bring up the daemon, and — for Tailscale — call
+     `tailscale serve --bg --https=443 http://127.0.0.1:80` so the
+     tailnet hostname terminates TLS and proxies to local Caddy.
+  3. phase 3 was renamed `Mode-specific infrastructure` (slug stays
+     `tailscale` in state.json for backward compat). It runs Avahi
+     for LAN mode, Tailscale for tailscale mode (and the
+     domain-with-tailscale combo when --tailscale is layered on a
+     domain mode), or skips entirely for domain-only.
+  4. **HTTP-01 fallback in domain mode without a Cloudflare token
+     was already supported implicitly** — render-caddyfile.sh only
+     emits `acme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}` when the
+     token is non-empty in shared.env. Without the directive, Caddy
+     auto-issues per-subdomain certs via HTTP-01 on port 80 (which is
+     already exposed). No new code needed; this is Phase 4's
+     incidental coverage of Phase 6's deliverable.
+  5. **Combo mode (`--mode domain --tailscale`)** works in the sense
+     that Tailscale serve proxies tailnet traffic to local Caddy.
+     The tailnet view of the appliance shows the catch-all (the
+     console at `/`) — apps are not surfaced under the tailnet
+     hostname's path-prefix, because the per-app vhosts are
+     keyed on the public domain. This matches what the operator
+     usually wants: apps via public domain, admin-only via tailnet.
+  6. doctor.sh learned `check_tailscale_status`,
+     `check_tailscale_serve`, and `check_avahi_status`, gated on the
+     active mode in state.json — no false-FAILs in domain mode.
+
+  Tested locally on Windows dev host:
+  - bash -n passes on bootstrap.sh, doctor.sh, both infra/*.sh, and
+     lib/render-caddyfile.sh.
+  - Caddyfile.tmpl gained a @VIBE_PATH_HANDLERS@ marker; the renderer
+     emits empty content in domain mode and per-app `handle /<slug>/*`
+     blocks in lan/tailscale modes.
+  - Not runtime-tested: no Docker daemon, no Tailscale account, no
+     LAN-with-mDNS-clients to verify against from this Windows host.
+
+  **Owed before Phase 7 starts.**
+
+  Test 1 — Tailscale mode standalone, on a fresh DO droplet:
+  - `sudo bash bootstrap.sh --mode tailscale --tailscale-authkey
+    tskey-auth-...` completes; doctor shows tailscale checks PASS.
+  - From another tailnet machine, `https://<host>.<tailnet>.ts.net/`
+    reaches the console. `https://<host>.<tailnet>.ts.net/tb/`
+    reaches Vibe-TB after toggling it on.
+  - Toggle off → 502 on the path; toggle back on → restored.
+
+  Test 2 — LAN mode, on a Hetzner cx22 (or local NUC):
+  - `sudo bash bootstrap.sh --mode lan` completes; doctor shows
+    avahi check PASS.
+  - From another machine on the LAN, `http://<hostname>.local/`
+    reaches the console (mDNS resolves the hostname).
+  - `http://<hostname>.local/tb/` reaches Vibe-TB after toggle.
+
+  Test 3 — Combo (domain + Tailscale) on a fresh DO droplet:
+  - `sudo bash bootstrap.sh --mode domain --domain firm.com
+    --email me@firm.com --cloudflare-api-token TOKEN
+    --tailscale --tailscale-authkey tskey-auth-...` completes.
+  - Public path: `https://firm.com/` shows console;
+    `https://tb.firm.com/` shows Vibe-TB after toggle.
+  - Tailnet path: `https://<host>.<tailnet>.ts.net/` shows the same
+    console (admin-only access from inside the tailnet).
+  - `tb.<tailnet>.ts.net/tb/` does NOT serve TB — that's documented
+    above as a deviation; tailnet apps are accessed via the public
+    domain when in combo mode.
+
+  Test 4 — HTTP-01 fallback (no Cloudflare token), on a fresh
+  droplet with a real domain:
+  - `sudo bash bootstrap.sh --mode domain --domain firm.com
+    --email me@firm.com` (no `--cloudflare-api-token`).
+  - `https://firm.com/` issues a cert via HTTP-01 on the first
+    request. Verify via `docker logs vibe-caddy` that ACME used
+    `http-01` rather than `dns-01`.
+
+  Test 5 — Mode switching:
+  - Run domain-mode bootstrap to completion. Toggle Vibe-TB on.
+  - Re-run `sudo bash bootstrap.sh --mode lan`. Caddyfile re-renders;
+    Vibe-TB now reachable at `http://<hostname>.local/tb/`.
+    `tb.firm.com` no longer answers (DNS still points but Caddy has
+    no vhost). Data preserved on disk.
+
+  Once those tests pass, append "Phase 6 verified YYYY-MM-DD on DO
+  droplet" and Phase 7 (update flow with rollback) may begin.
