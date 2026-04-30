@@ -136,7 +136,7 @@ This PR can be opened in parallel with appliance Phase 3 development. The tempor
 
 ## Phase 5 — Remaining 5 Vibe apps
 
-**Status:** Not started.
+**Status:** Implemented for 4 of 5; Vibe-Connect held back on the license PR (see completion log).
 
 **Goal.** Vibe-MyBooks, Vibe-Connect, Vibe-Tax-Research-Chat, Vibe-Payroll-Time, Vibe-GLM-OCR each independently toggle on/off cleanly.
 
@@ -591,3 +591,96 @@ Append to this list as phases complete. Format:
 
   Once those bullets are confirmed, append "Phase 4 verified YYYY-MM-DD
   on DO droplet" and Phase 5 (the remaining five Vibe apps) may begin.
+
+- Phase 5 implemented 2026-04-29 by Claude (Opus 4.7) on Windows dev host.
+  Apps shipped (4 of 5): Vibe-MyBooks, Vibe-GLM-OCR, Vibe-Tax-Research,
+  Vibe-Payroll. Vibe-Connect is **held back** per the PHASES.md
+  license-blocker note — files are staged under `_pending/` paths and
+  the unblock procedure is documented in `docs/CONNECT_BLOCKED.md`.
+
+  Deviations from PLAN/PHASES.md:
+  1. Slug-to-Redis-DB mapping is encoded in the manifest as the new
+     optional `redis.db` field (0-15, schema-validated) rather than
+     auto-assigned by the appliance. Reason: deterministic per-app
+     mapping survives manifest reloads, doesn't change behind the
+     operator's back, and shows up in code review when a new app is
+     added. Backfilled vibe-tb to `redis.db = 0` (the value it was
+     already implicitly using). Other slots: mybooks 1, connect 2
+     (pending), tax-research 3, payroll 4, glm-ocr 5.
+  2. Vibe-GLM-OCR's overlay includes an `vibe-glm-ocr-ollama` sidecar
+     so the OCR server has an inference endpoint without depending on
+     a separate Ollama install on the host. Models are persisted under
+     `/opt/vibe/data/vibe-glm-ocr/ollama` so a normal data backup
+     captures them. First-request UX note added to the overlay file:
+     pre-pull the model with `docker exec vibe-glm-ocr-ollama ollama
+     pull <model>` before the first user-facing OCR call to avoid a
+     multi-gigabyte download during a request.
+  3. Vibe-Tax-Research declares `streaming: true` on its `/chat/*`
+     matcher (so Caddy emits `flush_interval -1` + 3600s read_timeout
+     for that path). Matches the Vibe-TB `/mcp/*` pattern but is
+     called out separately because the chat tier is the obvious user-
+     facing reason a future operator might wonder why the routing
+     looks heavier than MyBooks/Payroll.
+  4. Per-slug subdomain choices (operator-overridable in future): tb,
+     mybooks, connect, tax-research, payroll, ocr. The slug is what
+     PHASES.md calls "the seventh-app rule": adding a new app is one
+     manifest + one overlay + one env template, with no console-code
+     change.
+  5. Vibe-Connect held back. Three files are staged under
+     `console/manifests/_pending/`, `apps/_pending/`, and
+     `env-templates/per-app/_pending/` (each path the manifest loader
+     and enable script ignore by virtue of looking only at the
+     top-level directory). `docs/CONNECT_BLOCKED.md` documents the
+     three-line `mv` to unblock once the upstream ELv2 PR merges.
+     This deviates from PHASES Phase 5's "five apps" target — by
+     design, per the license blocker that PHASES.md itself flagged.
+
+  Tested locally on Windows dev host:
+  - All five active manifests parse as valid JSON and carry the new
+     fields (subdomain, redis.db, routing).
+  - No two manifests share a Redis DB index.
+  - Schema update is backward-compatible (existing TB manifest still
+     validates after the `redis` field was added as optional).
+  - Not runtime-tested: no GHCR pulls, no app boots. Each app's
+     enable path goes through the same Phase 3 code that vibe-tb
+     already exercises, so the new manifests are testing the
+     manifest-driven extensibility claim, not new code paths.
+
+  **Per-app prerequisites for verification (upstream).** Each app's
+  parallel PR per PHASES.md Phase 5's "Audit per app before
+  integration" — these are PRs against each app's repo, not this
+  one:
+
+  | Repo                              | What's needed                                                                                  |
+  | --------------------------------- | ----------------------------------------------------------------------------------------------- |
+  | KisaesDevLab/Vibe-MyBooks         | ALLOWED_ORIGIN list support, MIGRATIONS_AUTO env var, `.appliance/manifest.json`, GHCR audit    |
+  | KisaesDevLab/Vibe-GLM-OCR         | OLLAMA_URL env var, /api/v1/health, `.appliance/manifest.json`, GHCR audit                      |
+  | KisaesDevLab/Vibe-Tax-Research-Chat | ALLOWED_ORIGIN list, MIGRATIONS_AUTO, /chat streaming verified, ANTHROPIC_API_KEY documented |
+  | KisaesDevLab/Vibe-Payroll-Time    | ALLOWED_ORIGIN list, MIGRATIONS_AUTO, `.appliance/manifest.json`, GHCR audit                    |
+  | KisaesDevLab/Vibe-Connect (BLOCKED) | License → ELv2 (the gating PR), then the same audit as the others                            |
+
+  **Owed before Phase 6 starts.** On a Phase-3-verified droplet:
+  - Each of the four active manifests appears in admin Apps as a card.
+  - Toggle ON each in turn (sequentially, not all at once on a 2 GiB
+    droplet — RAM headroom). For each: subdomain serves within 2
+    minutes; first-login flow per the manifest works; container set
+    is healthy in doctor.
+  - Toggle OFF each: 502 on subdomain; data preserved (verify via
+    `docker exec vibe-postgres psql -U postgres -l` for the apps that
+    have a database).
+  - Re-enable preserves data and operator-set env values
+    (ANTHROPIC_API_KEY etc. on Tax-Research).
+  - Doctor reports the new apps automatically with no doctor-script
+    changes (the per-enabled-app loop reads from state.apps).
+  - GLM-OCR specifically: pre-pull a small vision model (e.g.
+    `docker exec vibe-glm-ocr-ollama ollama pull llava`), enable, send
+    a sample request, verify model resides in
+    `/opt/vibe/data/vibe-glm-ocr/ollama` after restart.
+  - Vibe-Connect: the move-from-_pending procedure in
+    `docs/CONNECT_BLOCKED.md` produces a working manifest entry once
+    the upstream ELv2 PR + GHCR builds land.
+
+  Once those bullets are confirmed, append "Phase 5 verified
+  YYYY-MM-DD on DO droplet (4/5 apps)" and Phase 6 may begin. The
+  fifth app (Connect) lands as a follow-up note when its license PR
+  merges and the staged files are moved.

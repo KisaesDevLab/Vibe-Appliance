@@ -1,0 +1,42 @@
+# apps/vibe-mybooks.yml — Vibe MyBooks overlay.
+#
+# Same pattern as apps/vibe-tb.yml. Reads /opt/vibe/env/vibe-mybooks.env
+# (rendered by lib/enable-app.sh) on top of /opt/vibe/env/shared.env.
+
+name: vibe
+
+services:
+  vibe-mybooks-server:
+    image: ghcr.io/kisaesdevlab/vibe-mybooks-server:${APP_TAG:-latest}
+    container_name: vibe-mybooks-server
+    restart: unless-stopped
+    init: true
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/vibe-mybooks.env
+    networks:
+      - vibe_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3001/api/v1/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  vibe-mybooks-client:
+    image: ghcr.io/kisaesdevlab/vibe-mybooks-client:${APP_TAG:-latest}
+    container_name: vibe-mybooks-client
+    restart: unless-stopped
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/vibe-mybooks.env
+    networks:
+      - vibe_net
+    depends_on:
+      vibe-mybooks-server:
+        condition: service_healthy

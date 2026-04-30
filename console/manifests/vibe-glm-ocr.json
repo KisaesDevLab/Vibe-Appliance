@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "slug": "vibe-glm-ocr",
+  "displayName": "Vibe GLM-OCR",
+  "description": "Document OCR powered by an on-host vision-language model. Server-only, no Postgres.",
+  "logo": "vibe-glm-ocr.svg",
+
+  "image": {
+    "server":     "ghcr.io/kisaesdevlab/vibe-glm-ocr-server",
+    "defaultTag": "latest"
+  },
+
+  "subdomain": "ocr",
+  "ports":     { "server": 3001 },
+
+  "routing": {
+    "default_upstream": "vibe-glm-ocr-server:3001",
+    "matchers": [
+      { "name": "stream", "path": "/api/ocr/stream*", "upstream": "vibe-glm-ocr-server:3001", "streaming": true }
+    ]
+  },
+
+  "depends": ["redis"],
+
+  "env": {
+    "required": [
+      { "name": "JWT_SECRET",      "from": "shared:JWT_SECRET" },
+      { "name": "ENCRYPTION_KEY",  "from": "shared:ENCRYPTION_KEY" },
+      { "name": "ALLOWED_ORIGIN",  "from": "subdomain-url" },
+      { "name": "REDIS_URL",       "from": "redis-url" },
+      { "name": "OLLAMA_URL",      "from": "static:http://vibe-glm-ocr-ollama:11434" }
+    ],
+    "optional": [
+      { "name": "OLLAMA_MODEL", "doc": "Vision-language model name pulled into the Ollama sidecar (defaults to whatever the server image expects)." }
+    ]
+  },
+
+  "redis": { "db": 5 },
+
+  "firstLogin": {
+    "type":     "default-credentials-passive",
+    "username": "admin",
+    "password": "admin",
+    "url":      "/login"
+  },
+
+  "health": "/api/v1/health"
+}

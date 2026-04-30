@@ -119,6 +119,15 @@
       }
     },
 
+    "redis": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "db": { "type": "integer", "minimum": 0, "maximum": 15 }
+      },
+      "description": "Logical Redis DB index (0-15). Each app gets its own to prevent key collisions on the shared Redis instance."
+    },
+
     "firstLogin": {
       "type": "object",
       "required": ["type"],

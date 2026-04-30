@@ -1,0 +1,58 @@
+# apps/vibe-glm-ocr.yml — Vibe GLM-OCR overlay.
+#
+# Different from the other Vibe apps: server-only, no client tier, no
+# Postgres, but with an Ollama sidecar baked into the overlay so the
+# server can call its inference endpoint over the internal vibe_net.
+#
+# The Ollama image is large (~150 MB) and the model files it downloads
+# at runtime are larger still. They live under
+# /opt/vibe/data/vibe-glm-ocr/ollama on the host, so a tar of
+# /opt/vibe/data still captures them for backup and migration.
+#
+# First-run note: Ollama will pull the model the OCR server requests on
+# its first request. The operator can pre-pull via:
+#   sudo docker exec vibe-glm-ocr-ollama ollama pull <model>
+# This keeps the first user-facing OCR call from timing out while a
+# multi-gigabyte model downloads.
+
+name: vibe
+
+services:
+  vibe-glm-ocr-ollama:
+    image: ollama/ollama:latest
+    container_name: vibe-glm-ocr-ollama
+    restart: unless-stopped
+    volumes:
+      - /opt/vibe/data/vibe-glm-ocr/ollama:/root/.ollama
+    networks:
+      - vibe_net
+    # Ollama doesn't ship a healthcheck script in its image, so we use
+    # its HTTP API. /api/tags returns 200 once the daemon is ready.
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget -qO- http://127.0.0.1:11434/api/tags >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  vibe-glm-ocr-server:
+    image: ghcr.io/kisaesdevlab/vibe-glm-ocr-server:${APP_TAG:-latest}
+    container_name: vibe-glm-ocr-server
+    restart: unless-stopped
+    init: true
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/vibe-glm-ocr.env
+    networks:
+      - vibe_net
+    depends_on:
+      vibe-glm-ocr-ollama:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3001/api/v1/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s

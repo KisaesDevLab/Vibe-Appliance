@@ -1,0 +1,45 @@
+# apps/vibe-tax-research.yml — Vibe Tax Research Chat overlay.
+#
+# Two-tier (server + client). The chat endpoint is streaming (SSE) and
+# is matched in the manifest's routing.matchers as `streaming: true`,
+# which makes Caddy emit `flush_interval -1` + a 1h read_timeout for
+# that path. Without that the chat would buffer until the LLM finished
+# its full response, defeating the streaming UX.
+
+name: vibe
+
+services:
+  vibe-tax-research-server:
+    image: ghcr.io/kisaesdevlab/vibe-tax-research-server:${APP_TAG:-latest}
+    container_name: vibe-tax-research-server
+    restart: unless-stopped
+    init: true
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/vibe-tax-research.env
+    networks:
+      - vibe_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3001/api/v1/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  vibe-tax-research-client:
+    image: ghcr.io/kisaesdevlab/vibe-tax-research-client:${APP_TAG:-latest}
+    container_name: vibe-tax-research-client
+    restart: unless-stopped
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/vibe-tax-research.env
+    networks:
+      - vibe_net
+    depends_on:
+      vibe-tax-research-server:
+        condition: service_healthy

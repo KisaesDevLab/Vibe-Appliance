@@ -1,0 +1,62 @@
+{
+  "_appliance_note": "STAGED, NOT LOADED. The console manifest loader scans console/manifests/*.json and ignores subdirectories. This file is parked here until the upstream Vibe-Connect license PR merges (ELv2). Once that lands, move this file up one directory and the appliance picks it up — no code changes needed.",
+  "_blocked_on": "https://github.com/KisaesDevLab/Vibe-Connect — replace 'Proprietary, internal use' README line with ELv2 + add LICENSE file",
+
+  "schemaVersion": 1,
+  "slug": "vibe-connect",
+  "displayName": "Vibe Connect",
+  "description": "Bank feeds, payment connectors, and ledger reconciliation.",
+  "logo": "vibe-connect.svg",
+
+  "image": {
+    "server":     "ghcr.io/kisaesdevlab/vibe-connect-server",
+    "client":     "ghcr.io/kisaesdevlab/vibe-connect-client",
+    "defaultTag": "latest"
+  },
+
+  "subdomain": "connect",
+  "ports":     { "server": 3001, "client": 80 },
+
+  "routing": {
+    "default_upstream": "vibe-connect-client:80",
+    "matchers": [
+      { "name": "api",      "path": "/api/*",      "upstream": "vibe-connect-server:3001" },
+      { "name": "webhooks", "path": "/webhooks/*", "upstream": "vibe-connect-server:3001" }
+    ]
+  },
+
+  "depends": ["postgres", "redis"],
+
+  "env": {
+    "required": [
+      { "name": "JWT_SECRET",      "from": "shared:JWT_SECRET" },
+      { "name": "ENCRYPTION_KEY",  "from": "shared:ENCRYPTION_KEY" },
+      { "name": "ALLOWED_ORIGIN",  "from": "subdomain-url" },
+      { "name": "DATABASE_URL",    "from": "database-url" },
+      { "name": "REDIS_URL",       "from": "redis-url" },
+      { "name": "MIGRATIONS_AUTO", "from": "static:false" }
+    ],
+    "optional": [
+      { "name": "PLAID_CLIENT_ID", "doc": "Plaid client ID for bank-feed connector." },
+      { "name": "PLAID_SECRET",    "secret": true,
+        "doc": "Plaid client secret. Set via 'sudo nano /opt/vibe/env/vibe-connect.env'." }
+    ]
+  },
+
+  "database": { "name": "vibe_connect_db", "user": "vibeconnect" },
+  "redis":    { "db": 2 },
+
+  "firstLogin": {
+    "type":     "default-credentials-forced-reset",
+    "username": "admin",
+    "password": "admin",
+    "url":      "/login"
+  },
+
+  "health": "/api/v1/health",
+
+  "migrations": {
+    "command":    ["node", "dist/migrate.js"],
+    "autoEnvVar": "MIGRATIONS_AUTO"
+  }
+}
