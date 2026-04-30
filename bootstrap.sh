@@ -399,16 +399,34 @@ phase_secrets() {
   log_ok "shared.env populated at $VIBE_ENV_SHARED"
 }
 
-# --- Phase 5 — pull registry images and build the console image -------
+# --- Phase 5 — pull registry images and build local images -----------
+# Two distinct sets:
+#   - REGISTRY_SERVICES: pulled from upstream registries (postgres, redis,
+#                        duplicati, portainer).
+#   - BUILD_SERVICES:    built locally from Dockerfiles in this repo
+#                        (caddy with the cloudflare DNS plugin baked in;
+#                        console — Node 20 + Express + better-sqlite3).
+# Caddy's compose service has BOTH `build:` and `image:`. Listing it in
+# `docker compose pull` causes compose to attempt a pull of the
+# `vibe-appliance/caddy:cloudflare` tag — which exists nowhere — and
+# fail with "manifest unknown" / "pull access denied". Phase 5 must
+# build it locally, not pull.
 phase_pull() {
   log_phase_banner 5 "Pull and build images" "pull"
   state_set_phase pull running
 
-  log_step "pulling caddy / postgres / redis"
+  log_step "pulling registry images (postgres, redis, duplicati, portainer)"
   if ! ( cd "$APPLIANCE_DIR" && \
-         docker compose pull caddy postgres redis ) >>"$VIBE_LOG_FILE" 2>&1; then
+         docker compose pull postgres redis duplicati portainer ) >>"$VIBE_LOG_FILE" 2>&1; then
     state_set_phase pull failed "registry pull failed"
-    die "Image pull failed. See $VIBE_LOG_FILE; common cause is a transient registry rate limit — retry in 60s."
+    die "Registry pull failed. See $VIBE_LOG_FILE — common cause is a transient ghcr.io / docker.io rate limit; retry in 60s."
+  fi
+
+  log_step "building caddy (xcaddy + cloudflare DNS plugin)"
+  if ! ( cd "$APPLIANCE_DIR" && \
+         docker compose build caddy ) >>"$VIBE_LOG_FILE" 2>&1; then
+    state_set_phase pull failed "caddy build failed"
+    die "Caddy image build failed. See $VIBE_LOG_FILE; the xcaddy stage needs network access to fetch Go modules."
   fi
 
   log_step "building console image"
