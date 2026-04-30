@@ -51,6 +51,11 @@ CONFIG_TAILSCALE="false"
 CONFIG_TAILSCALE_AUTHKEY=""
 CONFIG_RESET_ENV="false"
 CONFIG_FORCE="false"
+# Cloudflare DNS-01 token (required for wildcard certs in domain mode).
+# Read from --cloudflare-api-token flag or the CLOUDFLARE_API_TOKEN env
+# var; persisted to /opt/vibe/env/shared.env after secrets phase. Caddy
+# then reads it via env_file at runtime.
+CONFIG_CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
 
 # ----------------------------------------------------------------------
 # Minimal output helpers (used before lib/log.sh is available)
@@ -82,6 +87,10 @@ FLAGS
   --email  EMAIL                  ACME contact email for --mode domain.
   --tailscale                     Also install Tailscale (any mode).
   --tailscale-authkey KEY         Pre-shared authkey for unattended Tailscale up.
+  --cloudflare-api-token TOKEN    Cloudflare API token with Zone:DNS:Edit on the
+                                  target zone. Enables DNS-01 wildcard certs in
+                                  domain mode. Also reads CLOUDFLARE_API_TOKEN
+                                  from the environment.
   --reset-env                     Regenerate /opt/vibe/env/*.env from templates
                                   (data preserved; secrets rotated).
   --force                         Continue past WARN-level pre-flight findings.
@@ -105,6 +114,8 @@ parse_flags() {
       --tailscale)       CONFIG_TAILSCALE="true"; shift ;;
       --tailscale-authkey)        CONFIG_TAILSCALE_AUTHKEY="${2:?--tailscale-authkey requires a value}"; CONFIG_TAILSCALE="true"; shift 2 ;;
       --tailscale-authkey=*)      CONFIG_TAILSCALE_AUTHKEY="${1#*=}"; CONFIG_TAILSCALE="true"; shift ;;
+      --cloudflare-api-token)     CONFIG_CLOUDFLARE_API_TOKEN="${2:?--cloudflare-api-token requires a value}"; shift 2 ;;
+      --cloudflare-api-token=*)   CONFIG_CLOUDFLARE_API_TOKEN="${1#*=}"; shift ;;
       --reset-env)       CONFIG_RESET_ENV="true"; shift ;;
       --force)           CONFIG_FORCE="true"; shift ;;
       -h|--help)         usage; exit 0 ;;
@@ -317,6 +328,16 @@ phase_secrets() {
     die "Could not render shared.env. See $VIBE_LOG_FILE."
   fi
 
+  # Persist CLOUDFLARE_API_TOKEN if provided. Caddy reads it from
+  # /opt/vibe/env/shared.env at runtime via env_file.
+  if [[ -n "${CONFIG_CLOUDFLARE_API_TOKEN:-}" ]]; then
+    secrets_set_kv CLOUDFLARE_API_TOKEN "$CONFIG_CLOUDFLARE_API_TOKEN"
+    log_info "cloudflare API token persisted to shared.env"
+    state_set_config_kv cloudflare_token_present "true"
+  else
+    state_set_config_kv cloudflare_token_present "false"
+  fi
+
   state_set_phase secrets ok
   log_ok "shared.env populated at $VIBE_ENV_SHARED"
 }
@@ -390,6 +411,49 @@ phase_core_up() {
   ( cd "$APPLIANCE_DIR" && docker compose logs --tail=50 console ) 2>&1 \
     | tee -a "$VIBE_LOG_FILE" >&2 || true
   die "Console health-check timed out. Inspect logs above and re-run."
+}
+
+# --- Phase 7+ — re-enable apps from state.json -----------------------
+# Runs after the core stack is healthy. On a fresh install this is a
+# no-op (no apps marked enabled yet). On a re-run after reboot, or when
+# the operator has toggled apps via the console between bootstraps, it
+# brings every state.apps.<slug>.enabled=true app back online.
+#
+# Failures here do NOT abort bootstrap — the core stack and console
+# admin URL still need to come up so the operator can investigate.
+phase_apps() {
+  log_set_phase "apps"
+
+  local slugs
+  slugs="$(python3 - "$VIBE_STATE_FILE" <<'PYEOF' || true
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        s = json.load(f)
+except Exception:
+    sys.exit(0)
+for slug, e in (s.get("apps", {}) or {}).items():
+    if e.get("enabled"):
+        print(slug)
+PYEOF
+)"
+
+  if [[ -z "$slugs" ]]; then
+    log_info "no apps marked enabled — skipping app re-enable step"
+    return 0
+  fi
+
+  log_step "re-enabling apps from state.json"
+
+  local slug
+  while IFS= read -r slug; do
+    [[ -z "$slug" ]] && continue
+    if enable_app "$slug"; then
+      log_ok "app re-enabled" slug="$slug"
+    else
+      log_warn "app re-enable failed; leaving in failed state" slug="$slug"
+    fi
+  done <<<"$slugs"
 }
 
 # --- Phase 8 — write CREDENTIALS.txt and print the success banner ----
@@ -483,7 +547,8 @@ main() {
 
   # Source library files. These live alongside this script.
   local lib="${APPLIANCE_DIR}/lib"
-  for f in log.sh state.sh preflight.sh secrets.sh render-caddyfile.sh; do
+  for f in log.sh state.sh preflight.sh secrets.sh render-caddyfile.sh \
+           db-bootstrap.sh enable-app.sh disable-app.sh; do
     if [[ ! -f "${lib}/${f}" ]]; then
       _pre_die "missing ${lib}/${f}. Is this a complete clone of the Vibe-Appliance repo?"
     fi
@@ -517,6 +582,7 @@ main() {
   phase_pull
   phase_caddy
   phase_core_up
+  phase_apps           # re-enable any apps marked enabled in state.json
   phase_credentials
 
   printf '\n  state:  %s\n'      "$VIBE_STATE_FILE" >&2

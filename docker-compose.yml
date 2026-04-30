@@ -28,13 +28,23 @@ networks:
 
 services:
   caddy:
-    image: caddy:2.8-alpine
+    # Custom build with the cloudflare DNS plugin baked in. Required for
+    # DNS-01 wildcard certs in domain mode. See caddy/Dockerfile.
+    build:
+      context: ./caddy
+      dockerfile: Dockerfile
+    image: vibe-appliance/caddy:cloudflare
     container_name: vibe-caddy
     restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
       - "443:443/udp"  # HTTP/3
+    env_file:
+      # Provides CLOUDFLARE_API_TOKEN at runtime when the operator has
+      # configured it. Caddy references it as {env.CLOUDFLARE_API_TOKEN}
+      # in the rendered Caddyfile.
+      - /opt/vibe/env/shared.env
     volumes:
       - /opt/vibe/data/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - /opt/vibe/data/caddy/data:/data

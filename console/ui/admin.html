@@ -23,6 +23,12 @@
     </section>
 
     <section>
+      <h2>Apps</h2>
+      <p class="muted" id="apps-summary">—</p>
+      <div class="apps-list" id="apps-list"></div>
+    </section>
+
+    <section>
       <h2>Containers</h2>
       <p class="muted" id="container-summary">—</p>
       <table class="containers" id="containers">
@@ -41,7 +47,7 @@
 
     <footer class="footer">
       <p>
-        Phase 2 admin shell — the Apps, DNS, Logs, Doctor, Backup, and First-Login tabs land in later phases. Source:
+        Source:
         <a href="https://github.com/KisaesDevLab/Vibe-Appliance">github.com/KisaesDevLab/Vibe-Appliance</a>.
       </p>
       <p class="muted" id="now">—</p>
@@ -49,6 +55,7 @@
   </main>
 
   <script>
+    // ---------- helpers ----------
     function fmtBytes(n) {
       if (n == null || isNaN(n)) return '—';
       const u = ['B','KiB','MiB','GiB','TiB'];
@@ -57,43 +64,76 @@
       return v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2) + ' ' + u[i];
     }
 
+    function escapeHtml(s) {
+      return String(s ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
     function badge(state, health) {
-      if (health === 'healthy') return '<span class="badge badge--good">healthy</span>';
+      if (health === 'healthy')   return '<span class="badge badge--good">healthy</span>';
       if (health === 'unhealthy') return '<span class="badge badge--bad">unhealthy</span>';
-      if (health === 'starting') return '<span class="badge badge--warn">starting</span>';
-      if (state === 'running') return '<span class="badge badge--muted">no probe</span>';
-      if (state === 'exited' || state === 'dead') return '<span class="badge badge--bad">' + state + '</span>';
+      if (health === 'starting')  return '<span class="badge badge--warn">starting</span>';
+      if (state === 'running')    return '<span class="badge badge--muted">no probe</span>';
+      if (state === 'exited' || state === 'dead')
+        return '<span class="badge badge--bad">' + state + '</span>';
       return '<span class="badge badge--muted">' + (state || '?') + '</span>';
     }
 
-    async function load() {
+    function appBadge(status) {
+      if (status === 'running')   return '<span class="badge badge--good">running</span>';
+      if (status === 'enabling')  return '<span class="badge badge--warn">enabling…</span>';
+      if (status === 'stopping')  return '<span class="badge badge--warn">stopping…</span>';
+      if (status === 'stopped')   return '<span class="badge badge--muted">stopped</span>';
+      if (status === 'failed')    return '<span class="badge badge--bad">failed</span>';
+      return '<span class="badge badge--muted">' + escapeHtml(status || 'unknown') + '</span>';
+    }
+
+    // ---------- data loaders ----------
+    async function loadStatus() {
+      const r = await fetch('/api/v1/admin/status', { credentials: 'same-origin' });
+      if (!r.ok) throw new Error('status: HTTP ' + r.status);
+      return r.json();
+    }
+    async function loadApps() {
+      const r = await fetch('/api/v1/apps', { credentials: 'same-origin' });
+      if (!r.ok) throw new Error('apps: HTTP ' + r.status);
+      return r.json();
+    }
+
+    async function refresh() {
       try {
-        const r = await fetch('/api/v1/admin/status', { credentials: 'same-origin' });
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        const s = await r.json();
-        render(s);
+        const [status, apps] = await Promise.all([loadStatus(), loadApps()]);
+        renderStatus(status);
+        renderApps(apps.apps || []);
+        document.getElementById('now').textContent =
+          'Snapshot at ' + (status.now || new Date().toISOString());
       } catch (err) {
         const el = document.getElementById('error');
-        el.textContent = 'Could not load status: ' + err.message;
+        el.textContent = 'Could not load: ' + err.message;
         el.hidden = false;
       }
     }
 
-    function render(s) {
+    // ---------- renderers ----------
+    function renderStatus(s) {
       const grid = document.getElementById('status-grid');
       grid.removeAttribute('aria-busy');
       const diskTotal = s.disk?.total_bytes;
       const diskFree  = s.disk?.free_bytes;
-      const diskPct   = (diskTotal && diskFree) ? Math.round(100 - (diskFree / diskTotal) * 100) : null;
+      const diskPct   = (diskTotal && diskFree)
+        ? Math.round(100 - (diskFree / diskTotal) * 100) : null;
 
       grid.innerHTML = `
         <div class="card">
           <h3>Docker</h3>
           <dl class="kv">
-            <dt>version</dt><dd>${s.docker?.version ?? '—'}</dd>
-            <dt>kernel</dt><dd>${s.docker?.kernel ?? '—'}</dd>
-            <dt>os</dt><dd>${s.docker?.os ?? '—'}</dd>
-            <dt>arch</dt><dd>${s.docker?.arch ?? '—'}</dd>
+            <dt>version</dt><dd>${escapeHtml(s.docker?.version ?? '—')}</dd>
+            <dt>kernel</dt><dd>${escapeHtml(s.docker?.kernel ?? '—')}</dd>
+            <dt>os</dt><dd>${escapeHtml(s.docker?.os ?? '—')}</dd>
+            <dt>arch</dt><dd>${escapeHtml(s.docker?.arch ?? '—')}</dd>
           </dl>
         </div>
         <div class="card">
@@ -104,7 +144,7 @@
           </dl>
         </div>
         <div class="card">
-          <h3>Disk · ${s.disk?.path ?? VIBE_DIR}</h3>
+          <h3>Disk · ${escapeHtml(s.disk?.path ?? '/opt/vibe')}</h3>
           <p>
             <span class="bignum">${fmtBytes(diskFree)}</span>
             <span class="bignum-unit">free of ${fmtBytes(diskTotal)}</span>
@@ -113,9 +153,9 @@
         </div>
         <div class="card">
           <h3>Mode</h3>
-          <p><span class="bignum">${s.state?.config?.mode ?? 'lan'}</span></p>
+          <p><span class="bignum">${escapeHtml(s.state?.config?.mode ?? 'lan')}</span></p>
           <dl class="kv">
-            <dt>domain</dt><dd>${s.state?.config?.domain || '—'}</dd>
+            <dt>domain</dt><dd>${escapeHtml(s.state?.config?.domain || '—')}</dd>
             <dt>tailscale</dt><dd>${s.state?.config?.tailscale === 'true' ? 'on' : 'off'}</dd>
           </dl>
         </div>
@@ -133,19 +173,86 @@
       `).join('');
       document.getElementById('container-summary').textContent =
         (s.containers || []).length + ' container(s) on this host';
-      document.getElementById('now').textContent = 'Snapshot at ' + (s.now || new Date().toISOString());
     }
 
-    function escapeHtml(s) {
-      return String(s ?? '')
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
+    function renderApps(apps) {
+      const list = document.getElementById('apps-list');
+      const summary = document.getElementById('apps-summary');
+      if (!apps.length) {
+        list.innerHTML = '<p class="muted">No manifests found in /opt/vibe/appliance/console/manifests.</p>';
+        summary.textContent = '0 apps known';
+        return;
+      }
+      summary.textContent = apps.length + ' app(s) registered, ' +
+        apps.filter(a => a.enabled && a.status === 'running').length + ' running';
+
+      list.innerHTML = apps.map(a => `
+        <article class="app-card" id="app-${escapeHtml(a.slug)}">
+          <header class="app-card__head">
+            <h3 class="app-card__title">${escapeHtml(a.displayName)}</h3>
+            ${appBadge(a.status)}
+          </header>
+          <p class="muted app-card__desc">${escapeHtml(a.description)}</p>
+          <dl class="kv app-card__kv">
+            <dt>slug</dt><dd>${escapeHtml(a.slug)}</dd>
+            <dt>subdomain</dt><dd>${escapeHtml(a.subdomain)}</dd>
+            <dt>tag</dt><dd>${escapeHtml(a.image_tag || a.defaultTag || '—')}</dd>
+            <dt>url</dt><dd>${a.enabled && a.status === 'running' && a.url.startsWith('http')
+                              ? '<a href="' + escapeHtml(a.url) + '">' + escapeHtml(a.url) + '</a>'
+                              : '<span class="muted">' + escapeHtml(a.url) + '</span>'}</dd>
+          </dl>
+          ${a.error ? '<div class="error-banner">' + escapeHtml(a.error) + '</div>' : ''}
+          <div class="app-card__actions">
+            ${a.enabled
+              ? '<button class="btn btn--ghost" data-action="disable" data-slug="' + escapeHtml(a.slug) + '">Disable</button>'
+              : '<button class="btn"             data-action="enable"  data-slug="' + escapeHtml(a.slug) + '">Enable</button>'}
+          </div>
+          <pre class="app-card__output" hidden></pre>
+        </article>
+      `).join('');
+
+      list.querySelectorAll('button[data-action]').forEach(btn => {
+        btn.addEventListener('click', () => toggle(btn));
+      });
     }
 
-    load();
-    setInterval(load, 15000);
+    async function toggle(btn) {
+      const slug   = btn.dataset.slug;
+      const action = btn.dataset.action;
+      btn.disabled = true;
+      btn.textContent = action === 'enable' ? 'Enabling…' : 'Disabling…';
+
+      const card = document.getElementById('app-' + slug);
+      const out = card.querySelector('.app-card__output');
+      out.hidden = true;
+      out.textContent = '';
+
+      try {
+        const r = await fetch('/api/v1/' + action + '/' + encodeURIComponent(slug), {
+          method: 'POST',
+          credentials: 'same-origin',
+        });
+        const data = await r.json();
+        if (!r.ok) {
+          out.hidden = false;
+          out.textContent =
+            'exit=' + data.exit_code + '\n\n' +
+            (data.stderr || data.error || '') + '\n' + (data.stdout || '');
+        } else if (data.stderr || data.stdout) {
+          out.hidden = false;
+          out.textContent =
+            (data.stderr || '') + '\n' + (data.stdout || '');
+        }
+      } catch (err) {
+        out.hidden = false;
+        out.textContent = 'request failed: ' + err.message;
+      } finally {
+        await refresh();
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 15000);
   </script>
 </body>
 </html>

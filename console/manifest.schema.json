@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/KisaesDevLab/Vibe-Appliance/console/manifest.schema.json",
+  "title": "Vibe-Appliance per-app manifest",
+  "description": "Schema for .appliance/manifest.json shipped by each Vibe app. See docs/MANIFEST_SCHEMA.md.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "slug",
+    "displayName",
+    "description",
+    "image",
+    "subdomain",
+    "ports",
+    "routing",
+    "env",
+    "health"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]+$",
+      "minLength": 3,
+      "maxLength": 40
+    },
+    "displayName": { "type": "string", "minLength": 1, "maxLength": 80 },
+    "description": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "logo":        { "type": "string", "maxLength": 80 },
+
+    "image": {
+      "type": "object",
+      "required": ["server", "defaultTag"],
+      "additionalProperties": false,
+      "properties": {
+        "server":     { "type": "string", "minLength": 1 },
+        "client":     { "type": "string", "minLength": 1 },
+        "defaultTag": { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "subdomain": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "minLength": 1,
+      "maxLength": 40
+    },
+
+    "ports": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "server": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "client": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+
+    "routing": {
+      "type": "object",
+      "required": ["default_upstream"],
+      "additionalProperties": false,
+      "properties": {
+        "default_upstream": {
+          "type": "string",
+          "pattern": "^[a-z0-9.-]+:[0-9]+$"
+        },
+        "matchers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "path", "upstream"],
+            "additionalProperties": false,
+            "properties": {
+              "name":      { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+              "path":      { "type": "string", "minLength": 1 },
+              "upstream":  { "type": "string", "pattern": "^[a-z0-9.-]+:[0-9]+$" },
+              "streaming": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+
+    "depends": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["postgres", "redis"] },
+      "uniqueItems": true
+    },
+    "optionalDepends": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+
+    "env": {
+      "type": "object",
+      "required": ["required"],
+      "additionalProperties": false,
+      "properties": {
+        "required": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/envEntry" }
+        },
+        "optional": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/envEntry" }
+        }
+      }
+    },
+
+    "database": {
+      "type": "object",
+      "required": ["name", "user"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$", "minLength": 1, "maxLength": 60 },
+        "user": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$", "minLength": 1, "maxLength": 60 }
+      }
+    },
+
+    "firstLogin": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type":     { "enum": ["default-credentials-forced-reset", "default-credentials-passive", "none"] },
+        "username": { "type": "string" },
+        "password": { "type": "string" },
+        "url":      { "type": "string" }
+      }
+    },
+
+    "health": {
+      "type": "string",
+      "pattern": "^/.*$",
+      "minLength": 1
+    },
+
+    "migrations": {
+      "type": "object",
+      "required": ["command"],
+      "additionalProperties": false,
+      "properties": {
+        "command":    { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "autoEnvVar": { "type": "string" }
+      }
+    }
+  },
+
+  "$defs": {
+    "envEntry": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name":   { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+        "from":   {
+          "type": "string",
+          "description": "Source for the value. See docs/MANIFEST_SCHEMA.md.",
+          "anyOf": [
+            { "pattern": "^shared:[A-Z][A-Z0-9_]*$" },
+            { "const": "generated:hex32" },
+            { "const": "subdomain-url" },
+            { "const": "database-url" },
+            { "const": "redis-url" },
+            { "pattern": "^static:.*$" }
+          ]
+        },
+        "value":  { "type": "string" },
+        "secret": { "type": "boolean" },
+        "doc":    { "type": "string" }
+      }
+    }
+  }
+}

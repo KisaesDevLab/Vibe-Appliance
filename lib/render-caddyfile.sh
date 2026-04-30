@@ -1,26 +1,27 @@
 # lib/render-caddyfile.sh — atomically render /opt/vibe/data/caddy/Caddyfile.
 #
 # Idempotency: rendering the same state produces byte-identical output.
-#   The atomic-replace pattern guarantees a partially-written file never
-#   lands at the live path, so a Ctrl-C mid-render is safe.
-# Reverse: rm /opt/vibe/data/caddy/Caddyfile and re-run. The previous
-#   .bak.<timestamp> file (kept on every successful render) can be
-#   restored manually if a render goes bad.
+#   The atomic write-tmp + rename pattern means a Ctrl-C mid-render is
+#   safe and the live file is never half-written.
+# Reverse: rm /opt/vibe/data/caddy/Caddyfile and re-run, or restore one
+#   of the .bak.<timestamp> copies kept on every successful render.
 #
 # Inputs:
-#   state.json         — for mode, domain, email (and Phase 3+ enabled apps)
+#   /opt/vibe/state.json         — mode, domain, email, enabled apps list
 #   caddy/Caddyfile.tmpl
 #   caddy/snippets/<mode>.conf
+#   console/manifests/<slug>.json — for each enabled app
+#   /opt/vibe/env/shared.env     — to detect a non-empty CLOUDFLARE_API_TOKEN
 #
 # Output:
 #   /opt/vibe/data/caddy/Caddyfile
 #   /opt/vibe/data/caddy/Caddyfile.bak.<timestamp>   (previous version)
 #
-# Validation: if Caddy is reachable via `docker compose run`, the rendered
-# file is validated before installation. A validation failure aborts and
-# leaves the live Caddyfile untouched. This is the safety net the
-# "corrupt template doesn't break a running Caddy" success criterion in
-# PHASES.md Phase 2 calls out.
+# Validation: when the caddy image is locally available, the rendered
+# file is validated before installation. Validation failure aborts the
+# render with the live file untouched. This is the safety net behind
+# PHASES.md Phase 2's "corrupt template doesn't break a running Caddy"
+# criterion and the Phase 3 atomic-render-with-app-vhosts story.
 
 # shellcheck shell=bash
 # Depends on: log_info, log_step, log_warn, die (lib/log.sh)
@@ -28,56 +29,195 @@
 VIBE_DIR="${VIBE_DIR:-/opt/vibe}"
 VIBE_CADDY_DIR="${VIBE_CADDY_DIR:-${VIBE_DIR}/data/caddy}"
 VIBE_CADDYFILE="${VIBE_CADDYFILE:-${VIBE_CADDY_DIR}/Caddyfile}"
+VIBE_ENV_SHARED="${VIBE_ENV_SHARED:-${VIBE_DIR}/env/shared.env}"
 
-# Render the Caddyfile. APPLIANCE_DIR must be set (bootstrap.sh exports
-# it). Reads mode/domain/email from state.json.
+# Custom-built Caddy image (caddy/Dockerfile) with the cloudflare DNS
+# plugin baked in. Falls back to the upstream image if the custom build
+# isn't available (e.g. very early in bootstrap before Phase 5 runs).
+VIBE_CADDY_IMAGE="${VIBE_CADDY_IMAGE:-vibe-appliance/caddy:cloudflare}"
+VIBE_CADDY_IMAGE_FALLBACK="${VIBE_CADDY_IMAGE_FALLBACK:-caddy:2.8-alpine}"
+
 render_caddyfile() {
   local tmpl="${APPLIANCE_DIR}/caddy/Caddyfile.tmpl"
   local snippets_dir="${APPLIANCE_DIR}/caddy/snippets"
+  local manifests_dir="${APPLIANCE_DIR}/console/manifests"
 
   [[ -f "$tmpl" ]] || die "Caddyfile template missing: $tmpl"
 
   mkdir -p "$VIBE_CADDY_DIR" "${VIBE_CADDY_DIR}/data" "${VIBE_CADDY_DIR}/config"
 
-  # Pull config out of state.json. python3 is already required by state.sh
-  # so we know it's present.
-  local mode domain email
-  mode="$(_caddy_state_get mode)"
-  mode="${mode:-lan}"
-  domain="$(_caddy_state_get domain)"
-  email="$(_caddy_state_get email)"
+  log_step "rendering Caddyfile"
 
-  local snippet="${snippets_dir}/${mode}.conf"
-  [[ -f "$snippet" ]] || die "no snippet for mode '$mode': $snippet"
-
-  log_step "rendering Caddyfile" mode="$mode" domain="${domain:-<unset>}"
-
-  # Substitute markers using a here-doc-with-shell-eval pattern would be
-  # tempting but risks injection via a malicious domain string. Use
-  # python3 with literal substitution instead.
   local tmp
   tmp="$(mktemp "${VIBE_CADDYFILE}.XXXXXX")"
 
-  python3 - "$tmpl" "$snippet" "$tmp" "${domain:-}" "${email:-admin@example.com}" <<'PYEOF'
-import sys
-tmpl_path, snippet_path, out_path, domain, email = sys.argv[1:6]
-with open(tmpl_path) as f:
-    body = f.read()
-with open(snippet_path) as f:
-    snippet = f.read().rstrip() + "\n"
-# Placeholder substitution. Phase 3+ will add @VIBE_VHOSTS@ rendering;
-# for Phase 2 it stays empty.
-body = body.replace("@VIBE_GLOBAL_SNIPPET@", snippet.rstrip("\n"))
-body = body.replace("@VIBE_VHOSTS@", "# (no apps enabled yet)\n")
-body = body.replace("@VIBE_ACME_EMAIL@", email)
-body = body.replace("@VIBE_DOMAIN@", domain)
-with open(out_path, "w") as f:
-    f.write(body)
+  python3 - \
+      "$tmpl" "$snippets_dir" "$manifests_dir" \
+      "$VIBE_STATE_FILE" "$VIBE_ENV_SHARED" "$tmp" <<'PYEOF'
+import json, os, re, sys
+
+(tmpl_path, snippets_dir, manifests_dir,
+ state_path, shared_env_path, out_path) = sys.argv[1:7]
+
+
+def load_json(p, default):
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return default
+
+
+def env_value(path, key):
+    """Return the value of `key` in an env file, or '' if missing/empty."""
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k == key:
+                    return v
+    except FileNotFoundError:
+        pass
+    return ""
+
+
+def list_enabled_apps(state, manifests_dir):
+    out = []
+    for slug, entry in (state.get("apps", {}) or {}).items():
+        if not entry.get("enabled"):
+            continue
+        man_path = os.path.join(manifests_dir, slug + ".json")
+        man = load_json(man_path, None)
+        if man is None:
+            print(
+                f"# WARNING: manifest missing for enabled app '{slug}' — vhost skipped",
+                file=sys.stderr,
+            )
+            continue
+        out.append((slug, man))
+    return out
+
+
+def render_vhost(slug, manifest, mode, domain, has_cloudflare):
+    """
+    Emit a single Caddy site block for the app. In domain mode the host
+    is `<subdomain>.<domain>`. In LAN/Tailscale mode for Phase 3 we
+    skip routing entirely — those modes are wired in build phase 6.
+    """
+    if mode != "domain" or not domain:
+        return ""
+
+    subdomain = manifest["subdomain"]
+    host = f"{subdomain}.{domain}"
+
+    routing = manifest.get("routing", {})
+    matchers = routing.get("matchers", []) or []
+    default_upstream = routing["default_upstream"]
+
+    lines = [f"{host} {{"]
+    lines.append("    encode gzip zstd")
+    lines.append("    log {")
+    lines.append("        output stdout")
+    lines.append("        format console")
+    lines.append("    }")
+    lines.append("")
+
+    # Matcher declarations.
+    for m in matchers:
+        lines.append(f"    @{m['name']} path {m['path']}")
+    if matchers:
+        lines.append("")
+
+    # Per-matcher handles.
+    for m in matchers:
+        lines.append(f"    handle @{m['name']} {{")
+        if m.get("streaming"):
+            lines.append(f"        reverse_proxy {m['upstream']} {{")
+            lines.append("            flush_interval -1")
+            lines.append("            transport http {")
+            lines.append("                read_timeout 3600s")
+            lines.append("            }")
+            lines.append("        }")
+        else:
+            lines.append(f"        reverse_proxy {m['upstream']}")
+        lines.append("    }")
+    if matchers:
+        lines.append("")
+
+    # Default handler.
+    lines.append("    handle {")
+    lines.append(f"        reverse_proxy {default_upstream}")
+    lines.append("    }")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def render_global_snippet(snippets_dir, mode, email, has_cloudflare):
+    """Build the contents of @VIBE_GLOBAL_SNIPPET@."""
+    snippet_path = os.path.join(snippets_dir, f"{mode}.conf")
+    if os.path.exists(snippet_path):
+        with open(snippet_path) as f:
+            base = f.read()
+    else:
+        base = ""
+
+    base = base.replace("@VIBE_ACME_EMAIL@", email or "admin@example.com")
+
+    extras = []
+    if mode == "domain" and has_cloudflare:
+        # Caddy reads CLOUDFLARE_API_TOKEN from its env at request time.
+        # The token never appears in the rendered file.
+        extras.append("    acme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}")
+
+    if extras:
+        base = base.rstrip() + "\n" + "\n".join(extras) + "\n"
+
+    return base
+
+
+def main():
+    state = load_json(state_path, {"config": {}, "apps": {}})
+    config = state.get("config", {}) or {}
+    mode = config.get("mode", "lan")
+    domain = config.get("domain", "")
+    email = config.get("email", "")
+    has_cloudflare = bool(env_value(shared_env_path, "CLOUDFLARE_API_TOKEN"))
+
+    with open(tmpl_path) as f:
+        body = f.read()
+
+    global_snippet = render_global_snippet(snippets_dir, mode, email, has_cloudflare)
+
+    enabled = list_enabled_apps(state, manifests_dir)
+    if enabled:
+        vhost_blocks = "\n".join(
+            render_vhost(slug, m, mode, domain, has_cloudflare)
+            for slug, m in enabled
+        )
+        if not vhost_blocks.strip():
+            vhost_blocks = (
+                "# (apps are enabled but Caddy routing for this mode lands in "
+                "build phase 6)\n"
+            )
+    else:
+        vhost_blocks = "# (no apps enabled yet)\n"
+
+    body = body.replace("@VIBE_GLOBAL_SNIPPET@", global_snippet.rstrip("\n"))
+    body = body.replace("@VIBE_VHOSTS@", vhost_blocks.rstrip("\n"))
+    body = body.replace("@VIBE_ACME_EMAIL@", email or "admin@example.com")
+    body = body.replace("@VIBE_DOMAIN@", domain)
+
+    with open(out_path, "w") as f:
+        f.write(body)
+
+main()
 PYEOF
 
-  # Validate the rendered file before swapping it in. If Caddy isn't
-  # available yet (first bootstrap, before phase 5 pull), skip validation
-  # — the catch-all template is hand-checked.
+  # Validate before installing. Skip when no caddy image is yet present
+  # (very first bootstrap, before phase 5 has built our custom image).
   if _caddy_can_validate; then
     if ! _caddy_validate "$tmp"; then
       log_warn "rendered Caddyfile failed validation; aborting install" tmp="$tmp"
@@ -89,8 +229,6 @@ PYEOF
     log_info "skipping validation — caddy image not yet available"
   fi
 
-  # Keep a backup of the previous version (helpful when a Phase 3 app
-  # toggle goes wrong).
   if [[ -f "$VIBE_CADDYFILE" ]]; then
     cp -p "$VIBE_CADDYFILE" "${VIBE_CADDYFILE}.bak.$(date -u +%Y%m%d%H%M%S)"
   fi
@@ -100,10 +238,9 @@ PYEOF
   log_info "Caddyfile written" path="$VIBE_CADDYFILE"
 }
 
-# Reload running Caddy. No-op if Caddy isn't running yet (first bootstrap
-# brings up the stack with the rendered file already in place).
+# Reload running Caddy. No-op if Caddy isn't up yet (initial bootstrap).
 reload_caddyfile() {
-  if ! docker ps --filter name=vibe-caddy --filter status=running -q | grep -q .; then
+  if ! docker ps --filter name=^vibe-caddy$ --filter status=running -q | grep -q .; then
     log_info "caddy is not running yet; reload skipped"
     return 0
   fi
@@ -117,34 +254,28 @@ reload_caddyfile() {
 
 # --- helpers ------------------------------------------------------------
 
-_caddy_state_get() {
-  local key="$1"
-  python3 - "$VIBE_STATE_FILE" "$key" <<'PYEOF'
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        s = json.load(f)
-except (FileNotFoundError, ValueError):
-    sys.exit(0)
-v = s.get("config", {}).get(sys.argv[2], "")
-if v:
-    print(v)
-PYEOF
+_caddy_image_for_validation() {
+  if docker image inspect "$VIBE_CADDY_IMAGE" >/dev/null 2>&1; then
+    printf '%s' "$VIBE_CADDY_IMAGE"
+    return 0
+  fi
+  if docker image inspect "$VIBE_CADDY_IMAGE_FALLBACK" >/dev/null 2>&1; then
+    printf '%s' "$VIBE_CADDY_IMAGE_FALLBACK"
+    return 0
+  fi
+  return 1
 }
 
-# True iff the caddy image is locally available — meaning we can shell
-# into it for `caddy validate`.
 _caddy_can_validate() {
   command -v docker >/dev/null 2>&1 || return 1
-  docker image inspect caddy:2.8-alpine >/dev/null 2>&1
+  _caddy_image_for_validation >/dev/null
 }
 
-# Run `caddy validate` against a candidate file using a one-shot caddy
-# container. Output goes to the bootstrap log.
 _caddy_validate() {
-  local file="$1"
+  local file="$1" image
+  image="$(_caddy_image_for_validation)" || return 1
   docker run --rm \
     -v "${file}:/etc/caddy/Caddyfile:ro" \
-    caddy:2.8-alpine \
+    "$image" \
     caddy validate --config /etc/caddy/Caddyfile >>"$VIBE_LOG_FILE" 2>&1
 }

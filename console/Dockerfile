@@ -23,9 +23,27 @@ WORKDIR /app
 
 # Same /opt/vibe layout as the host so paths in env vars (VIBE_DIR,
 # state.json, etc.) resolve identically inside the container.
-RUN mkdir -p /opt/vibe \
- && groupmod -g 1000 node \
- && usermod  -u 1000 -g 1000 node 2>/dev/null || true
+RUN mkdir -p /opt/vibe
+
+# The console shells out to /opt/vibe/appliance/lib/enable-app.sh and
+# disable-app.sh. Those scripts use:
+#   - bash  (already present)
+#   - openssl (already present, comes with node:20-bookworm-slim)
+#   - python3 (NOT present — install)
+#   - docker CLI + compose plugin (NOT present — install from docker.com)
+RUN apt-get update -qq \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates curl gnupg python3 \
+ && install -m 0755 -d /etc/apt/keyrings \
+ && curl -fsSL https://download.docker.com/linux/debian/gpg \
+      -o /etc/apt/keyrings/docker.asc \
+ && chmod a+r /etc/apt/keyrings/docker.asc \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+      > /etc/apt/sources.list.d/docker.list \
+ && apt-get update -qq \
+ && apt-get install -y --no-install-recommends \
+      docker-ce-cli docker-compose-plugin \
+ && rm -rf /var/lib/apt/lists/*
 
 COPY --from=deps /app/node_modules /app/node_modules
 COPY package.json server.js ./

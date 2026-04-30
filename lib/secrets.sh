@@ -124,6 +124,37 @@ secrets_get() {
   _existing_value "$key" "$VIBE_ENV_SHARED"
 }
 
+# Set or replace a single key=value pair in shared.env. Used by
+# bootstrap.sh to persist operator-supplied values like
+# CLOUDFLARE_API_TOKEN that aren't auto-generated. Pass val="" to clear.
+# Atomic via tmp + rename.
+secrets_set_kv() {
+  local key="$1" val="$2"
+  [[ -f "$VIBE_ENV_SHARED" ]] || die "shared.env missing; run secrets_render first"
+  python3 - "$VIBE_ENV_SHARED" "$key" "$val" <<'PYEOF'
+import os, sys
+path, key, val = sys.argv[1:4]
+prefix = key + "="
+out = []
+found = False
+with open(path) as f:
+    for line in f:
+        s = line.rstrip("\n")
+        if s.startswith(prefix):
+            out.append(f"{key}={val}")
+            found = True
+        else:
+            out.append(s)
+if not found:
+    out.append(f"{key}={val}")
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    f.write("\n".join(out) + "\n")
+os.chmod(tmp, 0o600)
+os.rename(tmp, path)
+PYEOF
+}
+
 # Write /opt/vibe/CREDENTIALS.txt with the human-readable subset of
 # secrets. This is the file the customer reads on first login. Crypto
 # secrets (JWT_SECRET, ENCRYPTION_KEY, DB_PASSWORD) are deliberately NOT

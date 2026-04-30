@@ -19,18 +19,28 @@ const fs          = require('fs');
 const path        = require('path');
 const crypto      = require('crypto');
 const http        = require('http');
+const { spawn }   = require('child_process');
 const Docker      = require('dockerode');
 const Database    = require('better-sqlite3');
 
 // ----- config -----------------------------------------------------------
 
-const VIBE_DIR    = process.env.VIBE_DIR || '/opt/vibe';
-const PORT        = parseInt(process.env.CONSOLE_PORT || '3000', 10);
-const ADMIN_USER  = process.env.CONSOLE_ADMIN_USER || 'admin';
-const ADMIN_PASS  = process.env.CONSOLE_ADMIN_PASSWORD || '';
-const STATE_PATH  = path.join(VIBE_DIR, 'state.json');
-const SQLITE_DIR  = path.join(VIBE_DIR, 'data', 'console');
-const SQLITE_PATH = path.join(SQLITE_DIR, 'console.sqlite');
+const VIBE_DIR       = process.env.VIBE_DIR || '/opt/vibe';
+const APPLIANCE_DIR  = process.env.APPLIANCE_DIR || path.join(VIBE_DIR, 'appliance');
+const PORT           = parseInt(process.env.CONSOLE_PORT || '3000', 10);
+const ADMIN_USER     = process.env.CONSOLE_ADMIN_USER || 'admin';
+const ADMIN_PASS     = process.env.CONSOLE_ADMIN_PASSWORD || '';
+const STATE_PATH     = path.join(VIBE_DIR, 'state.json');
+const SQLITE_DIR     = path.join(VIBE_DIR, 'data', 'console');
+const SQLITE_PATH    = path.join(SQLITE_DIR, 'console.sqlite');
+const MANIFESTS_DIR  = path.join(__dirname, 'manifests');
+const ENABLE_SCRIPT  = path.join(APPLIANCE_DIR, 'lib', 'enable-app.sh');
+const DISABLE_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'disable-app.sh');
+
+// Slug pattern: must match manifest.schema.json's slug constraint. Used
+// to gatekeep enable/disable endpoints — prevents path traversal via
+// /api/v1/enable/../../etc/passwd-style URLs.
+const SLUG_RE = /^[a-z][a-z0-9-]+$/;
 
 if (!ADMIN_PASS) {
   // Fail fast and loud — silent password = open admin endpoint.
@@ -87,6 +97,37 @@ function readState() {
     return { phases: {}, apps: {}, config: {}, _error: err.code || err.message };
   }
 }
+
+// Load every manifest under console/manifests/*.json. Manifests that
+// fail to parse are logged and skipped — the rest of the registry stays
+// usable.
+function loadManifests() {
+  const out = {};
+  let files = [];
+  try {
+    files = fs.readdirSync(MANIFESTS_DIR).filter((f) => f.endsWith('.json'));
+  } catch (err) {
+    log('warn', 'manifests directory unreadable', { dir: MANIFESTS_DIR, err: err.code });
+    return out;
+  }
+  for (const f of files) {
+    const full = path.join(MANIFESTS_DIR, f);
+    try {
+      const m = JSON.parse(fs.readFileSync(full, 'utf8'));
+      if (!m.slug || !SLUG_RE.test(m.slug)) {
+        log('warn', 'manifest has invalid slug; skipped', { file: f });
+        continue;
+      }
+      out[m.slug] = m;
+    } catch (err) {
+      log('warn', 'manifest failed to parse; skipped', { file: f, err: err.message });
+    }
+  }
+  return out;
+}
+
+const MANIFESTS = loadManifests();
+log('info', 'manifests loaded', { count: Object.keys(MANIFESTS).length, slugs: Object.keys(MANIFESTS) });
 
 function constantTimeStringEquals(a, b) {
   const ba = Buffer.from(a, 'utf8');
@@ -170,6 +211,99 @@ app.get('/api/v1/admin/status', requireAdmin, async (_req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// --- Apps registry & toggle endpoints ---------------------------------
+
+app.get('/api/v1/apps', requireAdmin, (_req, res) => {
+  const state = readState();
+  const stateApps = state.apps || {};
+  const items = Object.values(MANIFESTS)
+    .map((m) => {
+      const s = stateApps[m.slug] || {};
+      return {
+        slug: m.slug,
+        displayName: m.displayName,
+        description: m.description,
+        subdomain: m.subdomain,
+        defaultTag: m.image && m.image.defaultTag,
+        url: appPublicUrl(m, state.config || {}),
+        enabled: !!s.enabled,
+        status: s.status || 'not-installed',
+        image_tag: s.image_tag || null,
+        last_at: s.at || null,
+        error: s.error || null,
+        firstLogin: m.firstLogin || null,
+      };
+    })
+    .sort((a, b) => a.displayName.localeCompare(b.displayName));
+  res.json({ apps: items });
+});
+
+app.post('/api/v1/enable/:slug', requireAdmin, async (req, res) => {
+  await runToggle(req, res, ENABLE_SCRIPT, 'enable');
+});
+
+app.post('/api/v1/disable/:slug', requireAdmin, async (req, res) => {
+  await runToggle(req, res, DISABLE_SCRIPT, 'disable');
+});
+
+async function runToggle(req, res, script, action) {
+  const slug = req.params.slug;
+  if (!SLUG_RE.test(slug)) {
+    return res.status(400).json({ error: 'invalid slug' });
+  }
+  if (!MANIFESTS[slug]) {
+    return res.status(404).json({ error: 'unknown app' });
+  }
+
+  log('info', 'spawn toggle', { action, slug, script });
+
+  let stdout = '';
+  let stderr = '';
+  const child = spawn('/bin/bash', [script, slug], {
+    env: {
+      ...process.env,
+      APPLIANCE_DIR,
+      VIBE_DIR,
+      // Inherit DOCKER_HOST etc. from compose; the socket is mounted.
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  child.stdout.on('data', (d) => { stdout += d.toString(); });
+  child.stderr.on('data', (d) => { stderr += d.toString(); });
+
+  child.on('error', (err) => {
+    log('error', 'spawn failed', { action, slug, err: err.message });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'spawn failed', detail: err.message });
+    }
+  });
+
+  child.on('exit', (code) => {
+    log('info', 'toggle finished', { action, slug, code });
+    res.status(code === 0 ? 200 : 500).json({
+      action,
+      slug,
+      exit_code: code,
+      stdout: trim(stdout),
+      stderr: trim(stderr),
+    });
+  });
+}
+
+function trim(s, max = 16 * 1024) {
+  if (s.length <= max) return s;
+  return s.slice(0, max) + `\n…(${s.length - max} bytes truncated)`;
+}
+
+function appPublicUrl(manifest, config) {
+  if (config.mode === 'domain' && config.domain) {
+    return `https://${manifest.subdomain}.${config.domain}/`;
+  }
+  // LAN / Tailscale public URL is Phase 6 territory — return a hint
+  // string so the UI can render something useful.
+  return `(only routed in domain mode for Phase 3)`;
+}
 
 // Catch-all 404 with friendly text rather than express's default HTML.
 app.use((_req, res) => {

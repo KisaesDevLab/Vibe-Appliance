@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "slug": "vibe-tb",
+  "displayName": "Vibe Trial Balance",
+  "description": "Tax preparation and trial balance workpaper application.",
+  "logo": "vibe-tb.svg",
+
+  "image": {
+    "server":     "ghcr.io/kisaesdevlab/vibe-tb-server",
+    "client":     "ghcr.io/kisaesdevlab/vibe-tb-client",
+    "defaultTag": "latest"
+  },
+
+  "subdomain": "tb",
+  "ports":     { "server": 3001, "client": 80 },
+
+  "routing": {
+    "default_upstream": "vibe-tb-client:80",
+    "matchers": [
+      { "name": "api", "path": "/api/*", "upstream": "vibe-tb-server:3001" },
+      { "name": "mcp", "path": "/mcp/*", "upstream": "vibe-tb-server:3001", "streaming": true }
+    ]
+  },
+
+  "depends": ["postgres", "redis"],
+  "optionalDepends": ["vibe-glm-ocr"],
+
+  "env": {
+    "required": [
+      { "name": "JWT_SECRET",      "from": "shared:JWT_SECRET" },
+      { "name": "ENCRYPTION_KEY",  "from": "shared:ENCRYPTION_KEY" },
+      { "name": "ALLOWED_ORIGIN",  "from": "subdomain-url" },
+      { "name": "DATABASE_URL",    "from": "database-url" },
+      { "name": "REDIS_URL",       "from": "redis-url" },
+      { "name": "MIGRATIONS_AUTO", "from": "static:false" }
+    ],
+    "optional": [
+      {
+        "name": "ANTHROPIC_API_KEY",
+        "secret": true,
+        "doc": "Claude API key for AI features. Set via 'sudo nano /opt/vibe/env/vibe-tb.env'."
+      }
+    ]
+  },
+
+  "database": { "name": "vibe_tb_db", "user": "vibetb" },
+
+  "firstLogin": {
+    "type":     "default-credentials-forced-reset",
+    "username": "admin",
+    "password": "admin",
+    "url":      "/login"
+  },
+
+  "health": "/api/v1/health",
+
+  "migrations": {
+    "command":    ["node", "dist/migrate.js"],
+    "autoEnvVar": "MIGRATIONS_AUTO"
+  }
+}

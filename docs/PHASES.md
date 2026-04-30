@@ -74,7 +74,7 @@ For each phase: list deliverables, success criteria, what's out of scope, and an
 
 ## Phase 3 — Manifest schema + Vibe-TB integration
 
-**Status:** Not started.
+**Status:** Implemented; awaiting fresh-droplet verification (see completion log).
 
 **Goal.** Console admin shows a Vibe-TB toggle. Toggling on installs and serves Vibe-TB at `tb.<domain>`. Default login works.
 
@@ -399,3 +399,120 @@ Append to this list as phases complete. Format:
 
   Once those bullets are confirmed on a real droplet, append a line
   "Phase 2 verified YYYY-MM-DD on DO droplet" and Phase 3 may begin.
+
+- Phase 3 implemented 2026-04-29 by Claude (Opus 4.7) on Windows dev host.
+  Deviations from PLAN/PHASES.md:
+  1. Manifest schema extended from PLAN.md §5.2 with a `routing` block
+     (default_upstream + matchers) and a `redis.db` field. Reason: the
+     PLAN example hardcoded /api/* and /mcp/* in the *appliance code*
+     for Vibe-TB, which would force the very `if (slug === ...)`
+     anti-pattern CLAUDE.md forbids. Routing now lives in the manifest;
+     render-caddyfile.sh is the only consumer.
+  2. Custom Caddy image (`caddy/Dockerfile`) is built unconditionally
+     via `xcaddy build … --with github.com/caddy-dns/cloudflare`.
+     PHASES.md said "if CLOUDFLARE_API_TOKEN env present"; building
+     conditionally would have meant a compose-file fork. The cloudflare
+     module adds ~5 MB and is a no-op when the token is empty, so the
+     simpler path is to always include it. Phase 6 will add other DNS
+     providers the same way.
+  3. Console image grew docker-ce-cli + docker-compose-plugin + python3
+     so it can shell out to `lib/enable-app.sh` and
+     `lib/disable-app.sh`. The alternative (reimplementing compose via
+     dockerode) was much more code and harder to keep idempotent. Image
+     size lands ~250 MB.
+  4. enable-app.sh / disable-app.sh are dual-mode: source them from
+     bootstrap.sh as a library, OR invoke as a script with `bash
+     enable-app.sh <slug>` from the console subprocess. The
+     `if [[ "${BASH_SOURCE[0]}" == "${0}" ]]` guard at the top sources
+     siblings only when run as a script.
+  5. Per-app Postgres password is stored embedded in DATABASE_URL
+     inside `/opt/vibe/env/<slug>.env`. On re-runs `_render_app_env`
+     extracts the existing password via regex and re-uses it, so the
+     env render is idempotent. The merge step also preserves any
+     operator-edited keys (e.g. ANTHROPIC_API_KEY) that aren't in the
+     template.
+  6. App image tags are passed to compose via the parse-time env var
+     `APP_TAG`, exported by enable-app.sh before invoking docker
+     compose. Apps' compose overlays use `${APP_TAG:-latest}` so a
+     missing env still resolves to the upstream :latest.
+  7. New `phase_apps` between core_up and credentials. Spec lists 8
+     phases; this is a sub-step of phase 7 in spirit but logged with
+     its own phase tag (`apps`). Failures during phase_apps log a
+     warning rather than aborting bootstrap, so the operator still
+     gets the credentials banner and can troubleshoot via the admin UI.
+  8. LAN-mode app routing is **not** wired in this phase. PHASES.md
+     Phase 3's success criterion is domain-mode-specific (`https://
+     tb.<domain>`); LAN routing is an explicit Phase 6 deliverable.
+     enable-app.sh in LAN mode still pulls images and starts the
+     containers; render-caddyfile.sh just doesn't emit a vhost block.
+     The console UI shows a "(only routed in domain mode for Phase 3)"
+     hint instead of a public URL.
+  9. HTTP-01 fallback (no Cloudflare token in domain mode) is not yet
+     wired — PHASES.md Phase 3 explicitly defers it to Phase 6. With
+     no Cloudflare token in domain mode today, Caddy will fall back to
+     ACME's HTTP-01 challenge automatically, but this hasn't been
+     tested end-to-end and may interact poorly with the catch-all `:80`
+     site for the console.
+
+  Tested locally on Windows dev host:
+  - `bash -n` passes on all nine lib/*.sh + bootstrap.sh.
+  - `node -c console/server.js` passes.
+  - JSON syntax of vibe-tb manifest + manifest.schema.json validates.
+  - Not runtime-tested: no Docker daemon here, no real Vibe-TB image
+     to pull from GHCR, no domain to issue a cert against.
+
+  **Owed before Phase 4 starts.** This is the heaviest verification
+  list of any phase so far because Phase 3 is the first end-to-end
+  user-facing feature.
+
+  Setup the operator does once before the test run:
+  - Domain that Cloudflare is the authoritative nameserver for. Add
+    A records: `vibe.<domain>` and `*.vibe.<domain>` (or replace
+    `vibe.<domain>` with the bare apex if preferred) → droplet IP.
+    Or use a Cloudflare API token + DNS-01 wildcard (recommended).
+  - Cloudflare API token with `Zone:DNS:Edit` permission on that zone.
+  - **Vibe-TB images published to GHCR** at
+    `ghcr.io/kisaesdevlab/vibe-tb-server:latest` and
+    `ghcr.io/kisaesdevlab/vibe-tb-client:latest`. Without these the
+    pull step will fail. PHASES.md Phase 3 calls out the Vibe-TB repo
+    PR (ALLOWED_ORIGIN list, MIGRATIONS_AUTO, manifest copy) as
+    parallel work — that PR plus a fresh build is a prerequisite for
+    *this verification*, not for the appliance code itself.
+
+  Verify on a fresh DO `s-1vcpu-2gb` Ubuntu 24.04 droplet:
+  - `curl … | sudo bash -s -- --mode domain --domain firm.com --email
+    me@firm.com --cloudflare-api-token TOKEN` → all eight phases
+    succeed; landing page reachable at `https://firm.com/` (or
+    `http://<ip>/` while DNS settles).
+  - In `/admin` → Apps tab, click Enable on Vibe Trial Balance.
+    Within 2 minutes:
+      - `https://tb.firm.com/` serves Vibe-TB.
+      - The container list shows `vibe-tb-server` and `vibe-tb-client`
+        as healthy.
+      - Default `admin` / `admin` login works; the forced-reset flow
+        (handled by Vibe-TB itself) prompts for a new password.
+  - Click Disable. Within 30s:
+      - `https://tb.firm.com/` returns 502 (Caddy has dropped the
+        vhost; nothing answers).
+      - `/opt/vibe/data/postgres` still contains `vibe_tb_db` (data
+        preserved). Verify via `sudo docker exec vibe-postgres psql
+        -U postgres -l`.
+  - Click Enable again — the same data and admin password should
+    survive. (Idempotent restore.)
+  - **Atomic Caddyfile re-render test.** While Vibe-TB is enabled,
+    edit `caddy/Caddyfile.tmpl` to inject a syntax error, then
+    `sudo /opt/vibe/appliance/bootstrap.sh`. Phase 6 should fail at
+    validation; the live Caddyfile must be unchanged; existing
+    sessions on `tb.firm.com` must keep working.
+  - **DB bootstrap idempotency.** Run `sudo docker exec vibe-postgres
+    psql -U postgres -c '\du'` and `\l` before and after a re-run.
+    No duplicate roles, no errors, ownership unchanged.
+  - **Cloudflare cert path.** First request to `https://tb.firm.com/`
+    after enable should produce a Caddy log line like `obtaining
+    certificate ... using ACME-DNS-01 with cloudflare`. Verify the
+    issued cert is wildcard-or-named for `tb.firm.com` via
+    `openssl s_client -connect tb.firm.com:443 -servername tb.firm.com
+    < /dev/null | openssl x509 -noout -subject -issuer -dates`.
+
+  Once those bullets are confirmed, append a line "Phase 3 verified
+  YYYY-MM-DD on DO droplet" and Phase 4 may begin.
