@@ -288,13 +288,32 @@
       summary.textContent = apps.length + ' app(s) registered, ' +
         apps.filter(a => a.enabled && a.status === 'running').length + ' running';
 
-      list.innerHTML = apps.map(a => `
+      list.innerHTML = apps.map(a => {
+        const notPublished = a.image_published === false;
+        const enableDisabled = !a.enabled && notPublished;
+
+        // Build the "image source" hint surfaced when a build is missing.
+        let imageHint = '';
+        if (notPublished) {
+          const tiers = [];
+          if (a.image_server_published === false) tiers.push(escapeHtml(a.image_server));
+          if (a.image_client_published === false) tiers.push(escapeHtml(a.image_client));
+          imageHint =
+            '<div class="error-banner">' +
+              'Image not published to GHCR yet: <span class="mono">' +
+              tiers.join('</span>, <span class="mono">') + '</span>. ' +
+              'The upstream Vibe-* repository owes a tagged GHCR build before this can enable.' +
+            '</div>';
+        }
+
+        return `
         <article class="app-card" id="app-${escapeHtml(a.slug)}">
           <header class="app-card__head">
             <h3 class="app-card__title">${escapeHtml(a.displayName)}</h3>
             <div class="app-card__badges">
               ${appBadge(a.status)}
               ${a.update_available ? '<span class="badge badge--warn">update available</span>' : ''}
+              ${notPublished ? '<span class="badge badge--bad">image not published</span>' : ''}
             </div>
           </header>
           <p class="muted app-card__desc">${escapeHtml(a.description)}</p>
@@ -306,12 +325,14 @@
                               ? '<a href="' + escapeHtml(a.url) + '">' + escapeHtml(a.url) + '</a>'
                               : '<span class="muted">' + escapeHtml(a.url) + '</span>'}</dd>
           </dl>
+          ${imageHint}
           ${a.error ? '<div class="error-banner">' + escapeHtml(a.error) + '</div>' : ''}
           ${a.update_error ? '<div class="error-banner">last update error: ' + escapeHtml(a.update_error) + '</div>' : ''}
           <div class="app-card__actions">
             ${a.enabled
               ? '<button class="btn btn--ghost" data-action="disable" data-slug="' + escapeHtml(a.slug) + '">Disable</button>'
-              : '<button class="btn"             data-action="enable"  data-slug="' + escapeHtml(a.slug) + '">Enable</button>'}
+              : '<button class="btn"             data-action="enable"  data-slug="' + escapeHtml(a.slug) + '"' +
+                  (enableDisabled ? ' disabled title="Image not published to GHCR yet"' : '') + '>Enable</button>'}
             ${a.enabled
               ? '<button class="btn btn--ghost" data-action="update"   data-slug="' + escapeHtml(a.slug) + '"' + (a.update_available ? '' : ' disabled') + '>Update</button>'
               : ''}
@@ -335,7 +356,8 @@
             </details>` : ''}
           <pre class="app-card__output" hidden></pre>
         </article>
-      `).join('');
+      `;
+      }).join('');
 
       list.querySelectorAll('button[data-action]').forEach(btn => {
         btn.addEventListener('click', () => toggle(btn));

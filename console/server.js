@@ -143,6 +143,78 @@ function loadManifests() {
 const MANIFESTS = loadManifests();
 log('info', 'manifests loaded', { count: Object.keys(MANIFESTS).length, slugs: Object.keys(MANIFESTS) });
 
+// ----- GHCR availability cache -----------------------------------------
+//
+// Many operators will see app cards for upstream Vibe images that
+// haven't been built and pushed to GHCR yet. Clicking Enable on those
+// fails at the docker pull step with a generic "Image pull failed"
+// message. Pre-checking saves the round trip and lets the UI disable
+// the button with a clear "image not published" badge.
+//
+// Approach: anonymous GHCR token endpoint returns a token if the repo
+// is publicly pullable, errors with code:DENIED otherwise (covers both
+// "doesn't exist" and "private" — for the appliance's purposes both
+// mean "operator can't pull anonymously, so toggle will fail").
+//
+// 10-minute TTL. Pre-warmed on console startup + refreshed in
+// background. /api/v1/apps reads the cached value (zero added latency
+// on the request path).
+
+const GHCR_TTL_MS = 10 * 60 * 1000;
+const ghcrCache = new Map();   // image (string) → { published: bool, checkedAt: ms } | { error: string, checkedAt: ms }
+
+async function checkGhcrPublished(image) {
+  if (!image) return null;
+  if (!image.startsWith('ghcr.io/')) return null;          // unknown registry — leave UX alone
+
+  const cached = ghcrCache.get(image);
+  if (cached && Date.now() - cached.checkedAt < GHCR_TTL_MS) {
+    return cached.published;
+  }
+
+  const repo = image.replace(/^ghcr\.io\//, '');
+  const tokenUrl = `https://ghcr.io/token?scope=repository:${encodeURIComponent(repo)}:pull`;
+
+  try {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 5000);
+    const resp = await fetch(tokenUrl, { signal: ac.signal });
+    clearTimeout(timer);
+    let published = false;
+    if (resp.ok) {
+      const data = await resp.json();
+      published = !!data.token && !data.errors;
+    }
+    ghcrCache.set(image, { published, checkedAt: Date.now() });
+    return published;
+  } catch (err) {
+    log('warn', 'GHCR check failed', { image, err: err.message || String(err) });
+    ghcrCache.set(image, { published: null, error: err.message || 'fetch failed', checkedAt: Date.now() });
+    return null;
+  }
+}
+
+async function prewarmGhcrCache() {
+  const images = new Set();
+  for (const m of Object.values(MANIFESTS)) {
+    if (m.image && m.image.server) images.add(m.image.server);
+    if (m.image && m.image.client) images.add(m.image.client);
+  }
+  if (!images.size) return;
+  log('info', 'pre-warming GHCR availability cache', { count: images.size });
+  await Promise.all([...images].map(img => checkGhcrPublished(img)));
+  let pubCount = 0;
+  for (const img of images) {
+    if (ghcrCache.get(img)?.published === true) pubCount++;
+  }
+  log('info', 'GHCR cache ready', { total: images.size, published: pubCount });
+}
+
+// First check 10s after boot (give the stack time to settle), then
+// every 10 minutes.
+setTimeout(prewarmGhcrCache, 10_000);
+setInterval(prewarmGhcrCache, GHCR_TTL_MS);
+
 function constantTimeStringEquals(a, b) {
   const ba = Buffer.from(a, 'utf8');
   const bb = Buffer.from(b, 'utf8');
@@ -234,6 +306,29 @@ app.get('/api/v1/apps', requireAdmin, (_req, res) => {
   const items = Object.values(MANIFESTS)
     .map((m) => {
       const s = stateApps[m.slug] || {};
+
+      // Look up GHCR cache (populated by prewarmGhcrCache). If the
+      // server image isn't published, the app can't enable. Client
+      // image is optional in the schema, so absence of a cached entry
+      // for client (when manifest declares one) is treated as
+      // "unknown" rather than failure.
+      const serverImg = m.image && m.image.server;
+      const clientImg = m.image && m.image.client;
+      const serverPub = serverImg ? (ghcrCache.get(serverImg)?.published ?? null) : null;
+      const clientPub = clientImg ? (ghcrCache.get(clientImg)?.published ?? null) : null;
+
+      // image_published is true when every required tier we know about
+      // is confirmed published. null when we couldn't determine. false
+      // when at least one tier is confirmed not pullable.
+      let image_published;
+      if (serverPub === false || clientPub === false) {
+        image_published = false;
+      } else if (serverPub === true && (clientImg ? clientPub === true : true)) {
+        image_published = true;
+      } else {
+        image_published = null;
+      }
+
       return {
         slug: m.slug,
         displayName: m.displayName,
@@ -250,6 +345,11 @@ app.get('/api/v1/apps', requireAdmin, (_req, res) => {
         update_available: !!s.update_available,
         update_error: s.update_error || null,
         update_history: (s.update_history || []).slice(-5),
+        image_published,
+        image_server: serverImg || null,
+        image_client: clientImg || null,
+        image_server_published: serverPub,
+        image_client_published: clientPub,
       };
     })
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
