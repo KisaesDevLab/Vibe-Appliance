@@ -69,19 +69,28 @@ enable_app() {
   # shellcheck source=/dev/null
   set -a; . "${VIBE_ENV_DIR}/shared.env"; set +a
 
+  # Compute the service names declared by this app's overlay so
+  # `compose pull/up` only touches them — bare `compose up` would
+  # touch every core service too, including duplicati/portainer
+  # the operator may have intentionally stopped.
+  local services
+  services="$(_app_services "$manifest")"
+  [[ -n "$services" ]] || die "could not derive service names from manifest routing for $slug"
+
   # 1. Render per-app env file (idempotent, preserves existing secrets).
   log_step "rendering ${slug}.env"
   _render_app_env "$slug" "$manifest" "$env_tmpl" "$env_out" \
     || { _state_app_set "$slug" status failed error "env render failed"; \
          die "Could not render $env_out"; }
 
-  # 2. Pull images for the overlay.
-  log_step "pulling images for $slug"
+  # 2. Pull images for the overlay (only the app's services).
+  log_step "pulling images for $slug" services="$services"
   local default_tag
   default_tag="$(_manifest_field "$manifest" 'data["image"]["defaultTag"]')"
   export APP_TAG="$default_tag"
+  # shellcheck disable=SC2086
   if ! ( cd "$APPLIANCE_DIR" && \
-         docker compose -f docker-compose.yml -f "apps/${slug}.yml" pull ) >>"$VIBE_LOG_FILE" 2>&1; then
+         docker compose -f docker-compose.yml -f "apps/${slug}.yml" pull $services ) >>"$VIBE_LOG_FILE" 2>&1; then
     _state_app_set "$slug" status failed error "image pull failed"
     die "Image pull failed for $slug. See $VIBE_LOG_FILE; common cause is a registry rate limit."
   fi
@@ -100,29 +109,46 @@ enable_app() {
     log_info "no database section in manifest; skipping DB bootstrap" slug="$slug"
   fi
 
-  # 4. Bring up the app's services.
-  log_step "starting containers for $slug"
+  # 4. Run migrations (if declared) BEFORE bringing the app up. The
+  # appliance's MIGRATIONS_AUTO=false convention means the app server
+  # won't migrate on its own boot — health-check would 5xx forever
+  # waiting on schema. Run the migration command from the new image
+  # and only proceed to `up` once migrations exit 0.
+  if _manifest_has_migrations "$manifest"; then
+    log_step "running migrations for $slug"
+    if ! _run_migrations "$slug" "$manifest" "$default_tag"; then
+      _state_app_set "$slug" status failed error "migrations failed"
+      die "Migrations failed for $slug. See $VIBE_LOG_FILE."
+    fi
+  fi
+
+  # 5. Bring up the app's services (only theirs — bare `up -d` would
+  # un-stop core services the operator may have manually stopped).
+  log_step "starting containers for $slug" services="$services"
+  # shellcheck disable=SC2086
   if ! ( cd "$APPLIANCE_DIR" && \
-         docker compose -f docker-compose.yml -f "apps/${slug}.yml" up -d ) >>"$VIBE_LOG_FILE" 2>&1; then
+         docker compose -f docker-compose.yml -f "apps/${slug}.yml" up -d $services ) >>"$VIBE_LOG_FILE" 2>&1; then
     _state_app_set "$slug" status failed error "compose up failed"
     log_step "last 50 lines of $slug logs"
-    ( cd "$APPLIANCE_DIR" && docker compose -f docker-compose.yml -f "apps/${slug}.yml" logs --tail=50 ) \
+    # shellcheck disable=SC2086
+    ( cd "$APPLIANCE_DIR" && docker compose -f docker-compose.yml -f "apps/${slug}.yml" logs --tail=50 $services ) \
       2>&1 | tee -a "$VIBE_LOG_FILE" >&2 || true
     die "Could not bring up $slug. Inspect logs above and re-run."
   fi
 
-  # 5. Wait for the app's /health (manifest.health). We use Caddy's
+  # 6. Wait for the app's /health (manifest.health). We use Caddy's
   # internal address rather than the public URL so we don't depend on
   # DNS being healthy yet.
   if ! _wait_for_app_health "$slug" "$manifest"; then
     _state_app_set "$slug" status failed error "health check timeout"
     log_step "last 50 lines of $slug logs"
-    ( cd "$APPLIANCE_DIR" && docker compose -f docker-compose.yml -f "apps/${slug}.yml" logs --tail=50 ) \
+    # shellcheck disable=SC2086
+    ( cd "$APPLIANCE_DIR" && docker compose -f docker-compose.yml -f "apps/${slug}.yml" logs --tail=50 $services ) \
       2>&1 | tee -a "$VIBE_LOG_FILE" >&2 || true
     die "App $slug did not become healthy within 120s. See logs above."
   fi
 
-  # 6. Re-render Caddyfile and reload Caddy so the new vhost goes live.
+  # 7. Re-render Caddyfile and reload Caddy so the new vhost goes live.
   log_step "re-rendering Caddyfile to include $slug"
   render_caddyfile \
     || { _state_app_set "$slug" status failed error "caddy render failed"; \
@@ -133,6 +159,58 @@ enable_app() {
 
   _state_app_set "$slug" enabled true status running image_tag "$default_tag"
   log_ok "$slug is up"
+}
+
+# Service names this app declares — same shape as update.sh's
+# _app_services. Extracts service:port pairs from manifest routing
+# so the convention isn't tied to slug suffix patterns.
+_app_services() {
+  local manifest="$1"
+  python3 - "$manifest" <<'PYEOF'
+import json, re, sys
+with open(sys.argv[1]) as f:
+    m = json.load(f)
+upstream_re = re.compile(r"^([a-z0-9.-]+):\d+$")
+seen = []
+def add(spec):
+    if not spec: return
+    mm = upstream_re.match(spec)
+    if mm and mm.group(1) not in seen:
+        seen.append(mm.group(1))
+routing = m.get("routing", {})
+add(routing.get("default_upstream", ""))
+for matcher in routing.get("matchers", []) or []:
+    add(matcher.get("upstream", ""))
+print(" ".join(seen))
+PYEOF
+}
+
+_manifest_has_migrations() {
+  local manifest="$1"
+  python3 -c "
+import json, sys
+m = json.load(open('${manifest}'))
+sys.exit(0 if m.get('migrations',{}).get('command') else 1)
+"
+}
+
+# Run the manifest's migration command from the new image, with the
+# appliance env files mounted. Used by enable-app and update.sh both;
+# behaviour is identical so an enable on a fresh DB lands the same
+# schema an update would.
+_run_migrations() {
+  local slug="$1" manifest="$2" tag="$3"
+  local server_image migration_cmd
+  server_image="$(_manifest_field "$manifest" 'data["image"]["server"]')"
+  migration_cmd="$(_manifest_field "$manifest" '" ".join(data["migrations"]["command"])')"
+
+  # shellcheck disable=SC2086
+  docker run --rm \
+    --network vibe_net \
+    --env-file "${VIBE_ENV_DIR}/shared.env" \
+    --env-file "${VIBE_ENV_DIR}/${slug}.env" \
+    "${server_image}:${tag}" \
+    $migration_cmd >>"$VIBE_LOG_FILE" 2>&1
 }
 
 # --- helpers -----------------------------------------------------------

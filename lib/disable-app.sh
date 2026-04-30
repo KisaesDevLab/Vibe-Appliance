@@ -36,15 +36,31 @@ disable_app() {
   [[ -n "$slug" ]] || die "disable_app: slug required"
   [[ -n "${APPLIANCE_DIR:-}" ]] || die "disable_app: APPLIANCE_DIR not set"
 
+  local manifest="${APPLIANCE_DIR}/console/manifests/${slug}.json"
   local overlay="${APPLIANCE_DIR}/apps/${slug}.yml"
-  [[ -f "$overlay" ]] || die "compose overlay not found: $overlay"
+  [[ -f "$overlay" ]]  || die "compose overlay not found: $overlay"
+  [[ -f "$manifest" ]] || die "manifest not found: $manifest"
 
-  log_step "disabling app" slug="$slug"
-  _state_app_set "$slug" status stopping
+  # Compute service names BEFORE flipping enabled=false so the
+  # manifest-driven extraction is unambiguous. These are the only
+  # containers we touch — bare `compose stop` would take down every
+  # service in the merged file, which includes Caddy, Postgres,
+  # Redis, the console, Duplicati, Portainer. That'd be catastrophic.
+  local services
+  services="$(_app_services "$manifest")"
+  [[ -n "$services" ]] || die "could not derive service names from manifest routing for $slug"
 
-  # 1. Drop the vhost first so external traffic stops landing on a
-  # container that's about to be killed. (Caddy returns 502 for the
-  # hostname after this point, which is the documented behaviour.)
+  log_step "disabling app" slug="$slug" services="$services"
+
+  # 1. Flip enabled=false BEFORE re-rendering Caddyfile. The renderer
+  # reads state.json's enabled-apps list; if we re-rendered while
+  # enabled=true, the disabled app's vhost would still be in the
+  # rendered config and Caddy would still try to route there.
+  _state_app_set "$slug" enabled false status stopping
+
+  # 2. Drop the vhost so external traffic stops landing on a container
+  # that's about to be killed. Caddy now returns 502 for the
+  # hostname (the documented behaviour).
   log_step "re-rendering Caddyfile without $slug"
   if ! render_caddyfile; then
     log_warn "Caddyfile re-render failed; proceeding with stop anyway"
@@ -52,24 +68,63 @@ disable_app() {
     reload_caddyfile || log_warn "Caddy reload failed; proceeding with stop"
   fi
 
-  # 2. Stop and remove the app's containers. `down` here scopes to the
-  # services declared in the overlay because the core compose file
-  # doesn't list them — compose computes the union.
-  log_step "stopping containers for $slug"
+  # 3. Stop and remove ONLY the app's containers — explicit service
+  # list. Data volumes preserved.
+  log_step "stopping containers for $slug" services="$services"
+  # shellcheck disable=SC2086
   if ! ( cd "$APPLIANCE_DIR" && \
-         docker compose -f docker-compose.yml -f "apps/${slug}.yml" stop ) >>"$VIBE_LOG_FILE" 2>&1; then
+         docker compose -f docker-compose.yml -f "apps/${slug}.yml" stop $services ) >>"$VIBE_LOG_FILE" 2>&1; then
     _state_app_set "$slug" status failed error "compose stop failed"
     die "Could not stop containers for $slug. Inspect 'docker compose ... ps' and re-run."
   fi
 
+  # shellcheck disable=SC2086
   if ! ( cd "$APPLIANCE_DIR" && \
-         docker compose -f docker-compose.yml -f "apps/${slug}.yml" rm -f ) >>"$VIBE_LOG_FILE" 2>&1; then
+         docker compose -f docker-compose.yml -f "apps/${slug}.yml" rm -f $services ) >>"$VIBE_LOG_FILE" 2>&1; then
     log_warn "compose rm reported errors; containers may already be gone"
   fi
 
-  _state_app_set "$slug" enabled false status stopped
+  _state_app_set "$slug" status stopped
 
   log_ok "$slug stopped (data preserved under /opt/vibe/data)"
+}
+
+# Manifest field reader (Python eval over `data`).
+_manifest_field() {
+  local file="$1" expr="$2"
+  python3 - "$file" "$expr" <<'PYEOF'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+v = eval(sys.argv[2], {"data": data})
+if v is None:
+    sys.exit(0)
+print(v)
+PYEOF
+}
+
+# Same shape as enable-app.sh's _app_services. Duplicated rather than
+# sourced because both scripts run as standalone /bin/bash entries
+# from the console's spawn paths.
+_app_services() {
+  local manifest="$1"
+  python3 - "$manifest" <<'PYEOF'
+import json, re, sys
+with open(sys.argv[1]) as f:
+    m = json.load(f)
+upstream_re = re.compile(r"^([a-z0-9.-]+):\d+$")
+seen = []
+def add(spec):
+    if not spec: return
+    mm = upstream_re.match(spec)
+    if mm and mm.group(1) not in seen:
+        seen.append(mm.group(1))
+routing = m.get("routing", {})
+add(routing.get("default_upstream", ""))
+for matcher in routing.get("matchers", []) or []:
+    add(matcher.get("upstream", ""))
+print(" ".join(seen))
+PYEOF
 }
 
 # Same helper as in enable-app.sh — duplicated rather than sourced both
