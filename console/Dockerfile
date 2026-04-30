@@ -46,8 +46,15 @@ RUN apt-get update -qq \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=deps /app/node_modules /app/node_modules
-COPY package.json server.js ./
+COPY package.json server.js manifest.schema.json ./
 COPY ui/ ./ui/
+
+# Per-app manifests. server.js loads /app/manifests/*.json at startup
+# and exposes them via /api/v1/apps; without this COPY the admin
+# panel shows zero apps even when the repo has them. Files under
+# manifests/_pending/ stay un-loaded because the loader scans the
+# top-level only.
+COPY manifests/ ./manifests/
 
 EXPOSE 3000
 
