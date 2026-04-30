@@ -1,0 +1,18 @@
+# Force LF line endings for everything that ships to or runs on the host.
+# Without this, Windows clones convert LF→CRLF and the bash scripts break
+# on Linux (shebang lookup fails: "/usr/bin/env bash\r" not found).
+*.sh        text eol=lf
+*.bash      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.tmpl      text eol=lf
+*.conf      text eol=lf
+LICENSE     text eol=lf
+.gitignore  text eol=lf
+.gitattributes text eol=lf
+
+# Anything with no extension under bin/ or scripts/ — also LF.
+bin/*       text eol=lf
+scripts/*   text eol=lf

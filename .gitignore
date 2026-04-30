@@ -1,0 +1,33 @@
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
+
+# Local environment overrides — never commit
+.env
+.env.local
+*.local
+
+# Per-host runtime artifacts that should never be committed
+# (these live under /opt/vibe on the host; if a developer ever drops a
+# symlink or copy into the repo, ignore it)
+state.json
+CREDENTIALS.txt
+logs/
+data/
+env/
+
+# Console build artefacts (filled in Phase 2+)
+console/node_modules/
+console/dist/
+console/*.sqlite
+console/*.sqlite-journal
+
+# Backup / scratch files Claude or shell may leave behind
+*.bak
+*.bak.*
+*.orig
+*.tmp
