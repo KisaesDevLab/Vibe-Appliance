@@ -1,0 +1,54 @@
+{
+  "_template_note": "Drop this file at .appliance/manifest.json in the upstream Vibe app repo. Replace every UPPERCASE_PLACEHOLDER below. Schema reference: https://github.com/KisaesDevLab/Vibe-Appliance/blob/main/console/manifest.schema.json. Worked example: https://github.com/KisaesDevLab/Vibe-Appliance/blob/main/console/manifests/vibe-tb.json.",
+
+  "schemaVersion": 1,
+  "slug": "vibe-EXAMPLE",
+  "displayName": "Example Vibe App",
+  "description": "One-line description of what this app does for an accounting practice.",
+
+  "image": {
+    "server":     "ghcr.io/kisaesdevlab/vibe-EXAMPLE-server",
+    "client":     "ghcr.io/kisaesdevlab/vibe-EXAMPLE-client",
+    "defaultTag": "latest"
+  },
+
+  "subdomain": "EXAMPLE",
+  "ports":     { "server": 3001, "client": 80 },
+
+  "routing": {
+    "default_upstream": "vibe-EXAMPLE-client:80",
+    "matchers": [
+      { "name": "api", "path": "/api/*", "upstream": "vibe-EXAMPLE-server:3001" }
+    ]
+  },
+
+  "depends": ["postgres", "redis"],
+
+  "env": {
+    "required": [
+      { "name": "JWT_SECRET",      "from": "shared:JWT_SECRET" },
+      { "name": "ENCRYPTION_KEY",  "from": "shared:ENCRYPTION_KEY" },
+      { "name": "ALLOWED_ORIGIN",  "from": "subdomain-url" },
+      { "name": "DATABASE_URL",    "from": "database-url" },
+      { "name": "REDIS_URL",       "from": "redis-url" },
+      { "name": "MIGRATIONS_AUTO", "from": "static:false" }
+    ]
+  },
+
+  "database": { "name": "vibe_EXAMPLE_db", "user": "vibeEXAMPLE" },
+  "redis":    { "db": 0 },
+
+  "firstLogin": {
+    "type":     "default-credentials-forced-reset",
+    "username": "admin",
+    "password": "admin",
+    "url":      "/login"
+  },
+
+  "health": "/api/v1/health",
+
+  "migrations": {
+    "command":    ["node", "dist/migrate.js"],
+    "autoEnvVar": "MIGRATIONS_AUTO"
+  }
+}

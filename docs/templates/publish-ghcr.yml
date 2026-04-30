@@ -1,0 +1,95 @@
+# .github/workflows/publish-ghcr.yml — drop into each Vibe app's repo.
+#
+# Template lives in KisaesDevLab/Vibe-Appliance at
+# docs/templates/publish-ghcr.yml. Copy this file into the upstream
+# repo at .github/workflows/publish-ghcr.yml and change:
+#
+#   1. The IMAGE_BASE env var on line ~25 to match the app's image slug.
+#      e.g. for Vibe-MyBooks: vibe-mybooks  (NOT the repo name).
+#
+#   2. The two `target:` lines under build below if your repo has a
+#      different layout — they assume server tier at ./server and
+#      client tier at ./client.
+#
+#   3. Remove the client-tier matrix entries entirely if the app is
+#      server-only (e.g. Vibe-GLM-OCR).
+#
+# What this workflow does:
+# - Triggers on push to main, push of a `v*.*.*` tag, and manual dispatch.
+# - Builds linux/amd64 + linux/arm64 multi-arch images for each tier.
+# - Publishes to ghcr.io/<org>/<image>-<tier> with three tags:
+#     latest                — points at the most recent main build
+#     vN.M.K                — pulled from the git tag (only on tag pushes)
+#     sha-<short-sha>       — every build (immutable)
+# - Uses GITHUB_TOKEN; no PAT required.
+#
+# After merging this file the appliance's GHCR pre-check will turn
+# green for this app within ~10 minutes (console caches GHCR results
+# for that long).
+
+name: Publish to GHCR
+
+on:
+  push:
+    branches: [ main ]
+    tags:     [ 'v*.*.*' ]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # ⬇️ CHANGE THIS to match the app's image slug (lowercase, dashed).
+  #    Used as the prefix for both -server and -client image names.
+  IMAGE_BASE: vibe-CHANGE-ME
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # ⬇️ Drop the `client` entry if this app is server-only.
+        tier: [ server, client ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (for arm64 emulation)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_BASE }}-${{ matrix.tier }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          # ⬇️ Adjust if the app's tier directory structure differs.
+          context: ./${{ matrix.tier }}
+          # If the app's Dockerfile lives elsewhere, set explicitly:
+          # file: ./${{ matrix.tier }}/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags:   ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
