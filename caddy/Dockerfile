@@ -10,18 +10,23 @@
 # links). Image size lands ~50 MB.
 
 # ---- builder stage -----------------------------------------------------
-FROM caddy:2.8-builder-alpine AS builder
+# Use `caddy:builder-alpine` — that's the canonical builder tag on
+# Docker Hub. There is no `caddy:<minor>-builder-alpine` (only
+# `caddy:builder`, `caddy:builder-alpine`, and per-patch tags like
+# `caddy:2.8.4-builder-alpine`). Pinning to the unversioned builder
+# is fine because xcaddy below pins the Caddy *binary* version.
+FROM caddy:builder-alpine AS builder
 
-# Pin xcaddy to a known-good Caddy version so the runtime stage's
-# `FROM caddy:2.8-alpine` resolves to the same minor. xcaddy lets us
-# pass the version inline.
+# Build a static Caddy 2.x binary with the cloudflare DNS plugin.
+# Pinning Caddy to 2.x major guards against breaking 3.x changes; the
+# cloudflare plugin's `@latest` resolves at build time.
 RUN xcaddy build v2.8.4 \
-    --with github.com/caddy-dns/cloudflare
+    --with github.com/caddy-dns/cloudflare@latest
 
 # ---- runtime stage -----------------------------------------------------
+# `caddy:2.8.4-alpine` is a real tag on Docker Hub. We replace the
+# pre-baked /usr/bin/caddy with our xcaddy-built binary; the rest of
+# the image (entrypoint, config defaults, healthcheck) is unchanged.
 FROM caddy:2.8.4-alpine
 
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
-
-# Caddy's default entrypoint and config paths are unchanged; replacing
-# the binary in /usr/bin/caddy is enough.
