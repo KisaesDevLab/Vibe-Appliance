@@ -250,7 +250,9 @@ _render_app_env() {
   fi
 
   # DB password — preserve from existing env file if present, else generate.
-  local db_pass
+  # `local db_pass=""` (not bare `local db_pass`) so the [[ -z ]] read
+  # below doesn't fail under `set -u` when the if-branch is skipped.
+  local db_pass=""
   if [[ -f "$out" ]]; then
     db_pass="$(_extract_db_password "$out")"
   fi
