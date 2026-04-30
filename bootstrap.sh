@@ -527,7 +527,11 @@ PYEOF
   local slug
   while IFS= read -r slug; do
     [[ -z "$slug" ]] && continue
-    if enable_app "$slug"; then
+    # Subshell isolation: `enable_app` calls `die` (which `exit 1`s the
+    # process) on every error path. Without this subshell, a failed
+    # re-enable would terminate the bootstrap entirely rather than
+    # falling through to the warn-and-continue branch below.
+    if ( enable_app "$slug" ); then
       log_ok "app re-enabled" slug="$slug"
     else
       log_warn "app re-enable failed; leaving in failed state" slug="$slug"

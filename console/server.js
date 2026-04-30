@@ -435,12 +435,40 @@ function trim(s, max = 16 * 1024) {
 }
 
 function appPublicUrl(manifest, config) {
+  // Domain mode → real per-app subdomain.
   if (config.mode === 'domain' && config.domain) {
     return `https://${manifest.subdomain}.${config.domain}/`;
   }
-  // LAN / Tailscale public URL is Phase 6 territory — return a hint
-  // string so the UI can render something useful.
-  return `(only routed in domain mode for Phase 3)`;
+
+  // LAN mode → http://<hostname>.local/<slug>/ via mDNS + Caddy
+  // path-prefix routing (Phase 6). state.config.hostname isn't set,
+  // so we fall back to whatever os.hostname() reports inside this
+  // container. That's the host's hostname because we set
+  // extra_hosts: host-gateway, and node:bookworm-slim inherits the
+  // container's hostname which compose sets to the service name. So
+  // we read the host hostname from /etc/hostname (the host bind-
+  // mounts /opt/vibe but not /etc, so we approximate via the
+  // VIBE_HOST_HOSTNAME env var the operator can set, or the
+  // container's hostname which is wrong but at least non-empty).
+  if (config.mode === 'lan') {
+    const host = process.env.VIBE_HOST_HOSTNAME || 'vibe';
+    return `http://${host}.local/${manifest.slug}/`;
+  }
+
+  // Tailscale mode → https://<tailnet-host>/<slug>/. The tailnet
+  // hostname isn't recorded in state today (Phase 6 deferral); we
+  // surface a placeholder the operator can complete by hand. Worth
+  // upgrading once `tailscale status` is shelled out from the
+  // console to capture the actual DNS name.
+  if (config.mode === 'tailscale') {
+    return `https://<tailnet-host>/${manifest.slug}/`;
+  }
+
+  // Combo or unknown mode — best effort.
+  if (config.mode === 'domain' && !config.domain) {
+    return `(domain mode without a --domain flag — re-bootstrap with --domain)`;
+  }
+  return `(mode "${config.mode || 'unknown'}" — see admin host info)`;
 }
 
 // --- Doctor endpoint --------------------------------------------------

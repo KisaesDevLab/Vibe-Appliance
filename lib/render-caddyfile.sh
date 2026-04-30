@@ -230,6 +230,15 @@ def render_infra_path_handler(svc):
     return "\n".join(lines) + "\n"
 
 
+def _matcher_id(slug, name):
+    """
+    Caddy named matchers (`@name`) are happiest with [a-z0-9_]. Slugs
+    contain hyphens (e.g. `vibe-glm-ocr`); converting to underscores
+    avoids any parser ambiguity inside the Caddyfile.
+    """
+    return f"{slug.replace('-', '_')}_{name}"
+
+
 def render_path_handler(slug, manifest):
     """
     Emit a `handle /<slug>/*` block (with internal `uri strip_prefix`)
@@ -247,15 +256,18 @@ def render_path_handler(slug, manifest):
     lines = []
     lines.append(f"\t# {slug}")
     # Bare-prefix redirect.
-    lines.append(f"\t@{slug}_bare path /{slug}")
-    lines.append(f"\tredir @{slug}_bare /{slug}/ permanent")
+    bare_id = _matcher_id(slug, "bare")
+    lines.append(f"\t@{bare_id} path /{slug}")
+    lines.append(f"\tredir @{bare_id} /{slug}/ permanent")
     # Main route — strip_prefix happens inside so upstream sees /api etc.
     lines.append(f"\thandle /{slug}/* {{")
     lines.append(f"\t\turi strip_prefix /{slug}")
     for m in matchers:
-        lines.append(f"\t\t@{slug}_{m['name']} path {m['path']}")
+        mid = _matcher_id(slug, m['name'])
+        lines.append(f"\t\t@{mid} path {m['path']}")
     for m in matchers:
-        lines.append(f"\t\thandle @{slug}_{m['name']} {{")
+        mid = _matcher_id(slug, m['name'])
+        lines.append(f"\t\thandle @{mid} {{")
         if m.get("streaming"):
             lines.append(f"\t\t\treverse_proxy {m['upstream']} {{")
             lines.append("\t\t\t\tflush_interval -1")

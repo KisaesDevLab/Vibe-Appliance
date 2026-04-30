@@ -54,6 +54,14 @@ services:
     depends_on:
       console:
         condition: service_healthy
+    extra_hosts:
+      # Cockpit lives on the host (apt install — see infra/cockpit-
+      # install.sh). render-caddyfile.sh emits a reverse_proxy to
+      # `host.docker.internal:9090` for the cockpit.<domain> vhost in
+      # domain mode. Without this entry Caddy can't resolve the
+      # hostname inside the container and the cockpit subdomain
+      # returns 502.
+      - "host.docker.internal:host-gateway"
     healthcheck:
       # `caddy version` exits 0 when the binary is intact; useful as a
       # liveness probe without depending on the config being valid.
