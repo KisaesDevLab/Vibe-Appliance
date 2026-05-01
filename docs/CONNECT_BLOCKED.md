@@ -1,13 +1,34 @@
 # Vibe-Connect — held back from Phase 5
 
 Per `docs/PHASES.md` Phase 5 ("Vibe-Connect license blocker"), the
-appliance does not ship an active Vibe-Connect manifest until the
-upstream `KisaesDevLab/Vibe-Connect` repo is ELv2-licensed. The other
-five Vibe apps are MIT-or-ELv2; Connect's README currently reads
-"Proprietary, internal use" and there's no `LICENSE` file. Including
-it in the appliance under that wording would make the appliance
-distribute proprietary code under an open license, which is the kind
-of mistake that's expensive to walk back.
+appliance held back the active Vibe-Connect manifest while the upstream
+`KisaesDevLab/Vibe-Connect` repo carried "Proprietary, internal use"
+wording with no `LICENSE` file. Including it under that wording would
+have made the appliance distribute proprietary code under an open
+license, which is the kind of mistake that's expensive to walk back.
+
+**Status (2026-05-01):** Resolved upstream. Vibe-Connect now ships
+under the Elastic License 2.0 (ELv2) — same as Vibe-Appliance itself.
+See `KisaesDevLab/Vibe-Connect@81658ac`. The move-out-of-_pending steps
+below are now safe to run.
+
+**Family license inventory** (recorded here so future readers don't
+have to re-audit):
+
+| Repo                    | License                          |
+| ----------------------- | -------------------------------- |
+| Vibe-Appliance          | Elastic License 2.0              |
+| Vibe-Connect            | Elastic License 2.0              |
+| Vibe-MyBooks            | PolyForm Internal Use 1.0.0      |
+| Vibe-Payroll-Time       | PolyForm Internal Use 1.0.0      |
+| trial-balance-app       | PolyForm Internal Use 1.0.0      |
+| Vibe-Tax-Research-Chat  | Business Source License 1.1      |
+| Vibe-GLM-OCR            | MIT                              |
+
+All seven licenses are source-available and compatible with the
+appliance's redistribution model (we ship images, not source); the
+constraint we were enforcing was "no `Proprietary` wording in any
+bundled component."
 
 ## What's staged, where, and how to unblock
 
