@@ -48,7 +48,11 @@ bundled component."
 | `console/manifests/vibe-connect.json`               | Loaded                            |
 | `apps/vibe-connect.yml`                             | Loaded                            |
 | `env-templates/per-app/vibe-connect.env.tmpl`       | Loaded                            |
-| `console/ui/logos/vibe-connect.svg`                 | TODO if not present yet           |
+
+(The `logo` field in the manifest references `vibe-connect.svg`. No
+app in this repo currently ships a logo SVG — the field is referenced
+in the schema but not yet rendered anywhere in the console UI, so this
+is a no-op cross-cutting deferred feature, not Connect-specific.)
 
 ## What was needed upstream (resolved)
 
