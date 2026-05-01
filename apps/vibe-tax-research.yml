@@ -20,6 +20,14 @@ services:
     env_file:
       - /opt/vibe/env/shared.env
       - /opt/vibe/env/vibe-tax-research.env
+    volumes:
+      # Persistent storage matching upstream prod compose. /app/workspaces
+      # holds the cloned skills repo + per-research-session scratch.
+      # /app/attachments is user-uploaded source documents (court rulings,
+      # firm memos). /app/backups is the rolling research-session backup.
+      - /opt/vibe/data/apps/vibe-tax-research/attachments:/app/attachments
+      - /opt/vibe/data/apps/vibe-tax-research/workspaces:/app/workspaces
+      - /opt/vibe/data/apps/vibe-tax-research/backups:/app/backups
     networks:
       vibe_net: {}
       vibe-tax-research-internal:

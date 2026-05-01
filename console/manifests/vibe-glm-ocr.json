@@ -39,5 +39,6 @@
     "url":      "/"
   },
 
-  "health": "/health"
+  "health": "/health",
+  "health_timeout_s": 300
 }

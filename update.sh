@@ -474,16 +474,18 @@ _run_migrations() {
 
 _wait_for_health() {
   local slug="$1" manifest="$2"
-  local upstream health
+  local upstream health timeout_s
   # Single-line python expression — multi-line parses as two
   # statements and the second's leading whitespace yields
   # IndentationError. Same fix as enable-app.sh's _wait_for_app_health.
   upstream="$(_manifest_field "$manifest" 'data["routing"]["matchers"][0]["upstream"] if data["routing"].get("matchers") else data["routing"]["default_upstream"]')"
   health="$(_manifest_field "$manifest" 'data["health"]')"
+  timeout_s="$(_manifest_field "$manifest" 'data.get("health_timeout_s", 90)')"
+  timeout_s="${timeout_s:-90}"
 
   # Probe via `docker exec vibe-console curl` — same path enable-app.sh
   # uses now. Avoids spinning up a curlimages/curl container per probe.
-  local deadline=$(( $(date +%s) + 90 ))
+  local deadline=$(( $(date +%s) + timeout_s ))
   while (( $(date +%s) < deadline )); do
     if docker exec vibe-console curl -fsS -o /dev/null --max-time 5 \
          "http://${upstream}${health}" >>"$VIBE_LOG_FILE" 2>&1; then

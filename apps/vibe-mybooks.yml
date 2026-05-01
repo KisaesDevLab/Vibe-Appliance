@@ -16,6 +16,13 @@ services:
     env_file:
       - /opt/vibe/env/shared.env
       - /opt/vibe/env/vibe-mybooks.env
+    volumes:
+      # Persistent storage — survives container recreate (update flow,
+      # `compose down/up`, etc.). Without these, the api's UPLOAD_DIR
+      # (/data/uploads) and per-app backups live in the container's
+      # ephemeral fs and disappear on every update.
+      - /opt/vibe/data/apps/vibe-mybooks/uploads:/data/uploads
+      - /opt/vibe/data/apps/vibe-mybooks/backups:/data/backups
     networks:
       vibe_net: {}
       vibe-mybooks-internal:

@@ -17,6 +17,11 @@ services:
     env_file:
       - /opt/vibe/env/shared.env
       - /opt/vibe/env/vibe-payroll.env
+    volumes:
+      # Payroll exports — CSV files reference rows by relative path; if
+      # not persisted, every container recreate orphans past exports
+      # and breaks re-download from the export-history UI.
+      - /opt/vibe/data/apps/vibe-payroll/exports:/app/exports
     networks:
       - vibe_net
     depends_on:

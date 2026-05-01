@@ -146,6 +146,13 @@
       "minLength": 1
     },
 
+    "health_timeout_s": {
+      "type": "integer",
+      "minimum": 30,
+      "maximum": 900,
+      "description": "How long to wait for the app's /health endpoint to respond 200 during enable / update before declaring failure. Default 120. Apps that load large models (e.g. Vibe-GLM-OCR's vision model) may need 300+."
+    },
+
     "migrations": {
       "type": "object",
       "required": ["command"],

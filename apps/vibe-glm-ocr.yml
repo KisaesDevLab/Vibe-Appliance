@@ -30,6 +30,7 @@ services:
       retries: 12
       start_period: 30s
     volumes:
-      # OCR cache — model weights / temp scan artefacts. Persists across
-      # container recreations.
-      - /opt/vibe/data/vibe-glm-ocr/cache:/app/cache
+      # OCR cache — model weights / temp scan artefacts. Standardized
+      # under /opt/vibe/data/apps/<slug>/ so the appliance's data tree
+      # is uniform per app (matches vibe-mybooks/vibe-payroll/etc.).
+      - /opt/vibe/data/apps/vibe-glm-ocr/cache:/app/cache

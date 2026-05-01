@@ -36,6 +36,15 @@ services:
     env_file:
       - /opt/vibe/env/shared.env
       - /opt/vibe/env/vibe-tb.env
+    volumes:
+      # Persistent storage matching upstream prod compose: trial-balance
+      # workpaper uploads, per-app DB-export backups, and the OCR cache
+      # the api shares with the (optional) GLM-OCR sidecar. Without
+      # these, every container recreate (update flow, host reboot,
+      # `compose down/up`) wipes the operator's uploaded PDFs.
+      - /opt/vibe/data/apps/vibe-tb/uploads:/data/uploads
+      - /opt/vibe/data/apps/vibe-tb/backups:/data/backups
+      - /opt/vibe/data/apps/vibe-tb/ocr-cache:/data/ocr-cache
     networks:
       vibe_net: {}
       vibe-tb-internal:

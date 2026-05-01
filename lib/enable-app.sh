@@ -529,19 +529,23 @@ PYEOF
 # costs ~50 ms instead of 1-2 s of container spawn.
 _wait_for_app_health() {
   local slug="$1" manifest="$2"
-  local upstream health
+  local upstream health timeout_s
   # The python expression runs through `eval()`. Multi-line expressions
   # outside brackets parse as two statements with the second
   # erroneously indented — that yields an IndentationError at eval
   # time and `upstream` becomes empty. Then curl probes
-  # `http:///health` and every probe fails until the 120s timeout.
+  # `http:///health` and every probe fails until the timeout.
   # Keep this on a single line.
   upstream="$(_manifest_field "$manifest" 'data["routing"]["matchers"][0]["upstream"] if data["routing"].get("matchers") else data["routing"]["default_upstream"]')"
   health="$(_manifest_field "$manifest" 'data["health"]')"
+  # health_timeout_s is optional; default 120s. Vibe-GLM-OCR sets it
+  # higher because it loads a 461 MiB vision model on startup.
+  timeout_s="$(_manifest_field "$manifest" 'data.get("health_timeout_s", 120)')"
+  timeout_s="${timeout_s:-120}"
 
-  log_step "waiting for $slug health" upstream="$upstream" path="$health"
+  log_step "waiting for $slug health" upstream="$upstream" path="$health" timeout_s="$timeout_s"
 
-  local deadline=$(( $(date +%s) + 120 ))
+  local deadline=$(( $(date +%s) + timeout_s ))
   while (( $(date +%s) < deadline )); do
     if docker exec vibe-console curl -fsS -o /dev/null --max-time 5 \
          "http://${upstream}${health}" >>"$VIBE_LOG_FILE" 2>&1; then
