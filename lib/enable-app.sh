@@ -237,16 +237,24 @@ PYEOF
 _render_app_env() {
   local slug="$1" manifest="$2" tmpl="$3" out="$4"
 
-  local subdomain mode domain ip allowed_origin
+  local subdomain mode domain ip allowed_origin vite_base_path
   subdomain="$(_manifest_field "$manifest" 'data["subdomain"]')"
   mode="$(python3 -c "import json;print(json.load(open('${VIBE_STATE_FILE}')).get('config',{}).get('mode','lan'))")"
   domain="$(python3 -c "import json;print(json.load(open('${VIBE_STATE_FILE}')).get('config',{}).get('domain',''))")"
 
   if [[ "$mode" == "domain" && -n "$domain" ]]; then
     allowed_origin="https://${subdomain}.${domain}"
+    # Domain mode → app lives at its own subdomain, served from root.
+    vite_base_path="/"
   else
     ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
     allowed_origin="http://${ip:-localhost}"
+    # LAN / Tailscale → Caddy path-prefix /<slug>/. The web image's
+    # /docker-entrypoint.d/40-base-path.sh reads VITE_BASE_PATH and
+    # sed-substitutes the bundle's `/__VIBE_BASE_PATH__/` sentinel
+    # before nginx starts. Without this, asset URLs are absolute `/`
+    # and Caddy 404s every <host>/assets/... request.
+    vite_base_path="/${slug}/"
   fi
 
   # DB password — preserve from existing env file if present, else generate.
@@ -290,10 +298,12 @@ _render_app_env() {
   python3 - "$tmpl" "$tmp" \
       "$allowed_origin" "$database_url" "$redis_url" \
       "${ENCRYPTION_KEY:-}" "${JWT_SECRET:-}" \
-      "$db_name" "$db_user" "$db_pass" <<'PYEOF'
+      "$db_name" "$db_user" "$db_pass" \
+      "$vite_base_path" <<'PYEOF'
 import sys
 src, dst, allowed_origin, database_url, redis_url, \
-    encryption_key, jwt_secret, db_name, db_user, db_pass = sys.argv[1:11]
+    encryption_key, jwt_secret, db_name, db_user, db_pass, \
+    vite_base_path = sys.argv[1:12]
 with open(src) as f:
     body = f.read()
 body = body.replace("@ALLOWED_ORIGIN@",  allowed_origin)
@@ -306,6 +316,7 @@ body = body.replace("@DB_USER@",         db_user)
 body = body.replace("@DB_PASSWORD@",     db_pass)
 body = body.replace("@DB_HOST@",         "postgres")
 body = body.replace("@DB_PORT@",         "5432")
+body = body.replace("@VITE_BASE_PATH@",  vite_base_path)
 with open(dst, "w") as f:
     f.write(body)
 PYEOF
