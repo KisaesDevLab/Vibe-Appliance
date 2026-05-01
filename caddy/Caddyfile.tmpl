@@ -9,11 +9,14 @@
 #   selection (caddy/snippets/{domain,lan,tailscale}.conf).
 
 {
-	# Disable the admin endpoint. We don't need runtime API access from
-	# anywhere — the appliance manages config by re-rendering and
-	# `caddy reload`. Closing the admin endpoint shrinks the attack
-	# surface; re-enable in a snippet if you ever need it.
-	admin off
+	# Admin API stays on the default localhost:2019 binding (inside the
+	# container only — port 2019 is NOT published in docker-compose.yml,
+	# so nothing outside the container can reach it). DO NOT add
+	# `admin off` here: `caddy reload` (which the appliance runs via
+	# `docker exec` after every render) POSTs the new config to this
+	# endpoint, and Caddy v2 has no signal-based reload fallback.
+	# Disabling the admin endpoint silently breaks every enable/disable
+	# /update flow.
 
 	# Logging to stdout so `docker logs caddy` captures it. Format
 	# 'console' is human-readable; switch to 'json' if you want to feed
