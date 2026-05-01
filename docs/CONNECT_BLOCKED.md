@@ -7,10 +7,21 @@ wording with no `LICENSE` file. Including it under that wording would
 have made the appliance distribute proprietary code under an open
 license, which is the kind of mistake that's expensive to walk back.
 
-**Status (2026-05-01):** Resolved upstream. Vibe-Connect now ships
-under the Elastic License 2.0 (ELv2) — same as Vibe-Appliance itself.
-See `KisaesDevLab/Vibe-Connect@81658ac`. The move-out-of-_pending steps
-below are now safe to run.
+**Status (2026-05-01):** Fully resolved. Vibe-Connect now ships under
+the Elastic License 2.0 (ELv2) — same as Vibe-Appliance itself
+(`KisaesDevLab/Vibe-Connect@81658ac`). The GHCR images were renamed
+from `vibe-connect-app`/`-nginx` to `vibe-connect-server`/`-client` to
+match the family pattern (`Vibe-Connect@bd7067e`, published as v0.1.1)
+and verified publicly pullable. Staged files were rewritten to match
+Connect's actual contract (port 4000, `/health` endpoint, no Redis
+dep, SESSION_SECRET aliased from JWT_SECRET, BASE_PATH wiring for
+LAN/Tailscale modes, per-app internal network with `app` alias) and
+moved out of `_pending/` into the loaded paths. The console picks
+Connect up automatically on next bootstrap.
+
+This file is preserved as a historical record of why the integration
+was held back and how it was unblocked. New blockers should not be
+filed here.
 
 **Family license inventory** (recorded here so future readers don't
 have to re-audit):
@@ -30,32 +41,26 @@ appliance's redistribution model (we ship images, not source); the
 constraint we were enforcing was "no `Proprietary` wording in any
 bundled component."
 
-## What's staged, where, and how to unblock
+## Where the integration files live (post-unblock)
 
-The Connect integration files are written and ready, parked outside
-the loaded paths so the console and `enable-app.sh` can't see them:
+| File                                                | Status                            |
+| --------------------------------------------------- | --------------------------------- |
+| `console/manifests/vibe-connect.json`               | Loaded                            |
+| `apps/vibe-connect.yml`                             | Loaded                            |
+| `env-templates/per-app/vibe-connect.env.tmpl`       | Loaded                            |
+| `console/ui/logos/vibe-connect.svg`                 | TODO if not present yet           |
 
-| File                                                       | Move to (when unblocked)                            |
-| ---------------------------------------------------------- | --------------------------------------------------- |
-| `console/manifests/_pending/vibe-connect.json`             | `console/manifests/vibe-connect.json`               |
-| `apps/_pending/vibe-connect.yml`                           | `apps/vibe-connect.yml`                             |
-| `env-templates/per-app/_pending/vibe-connect.env.tmpl`     | `env-templates/per-app/vibe-connect.env.tmpl`       |
+## What was needed upstream (resolved)
 
-After moving, restart the console (`docker compose restart console`)
-so the manifest loader picks up the new file, and Vibe-Connect appears
-in the admin Apps tab.
+A one-PR change to `KisaesDevLab/Vibe-Connect`, executed 2026-05-01:
 
-## What needs to happen upstream
-
-A one-PR change to `KisaesDevLab/Vibe-Connect`:
-
-1. Replace the README line "License: Proprietary, internal use" with
-   "License: Elastic License 2.0 (ELv2)".
-2. Add a `LICENSE` file at the repo root with the ELv2 text (copy
-   verbatim from this repo's `LICENSE` file).
-3. Audit the package metadata for the same string (e.g.,
-   `package.json` `"license"` field).
-
-Once that PR merges and a new GHCR build is published as
-`ghcr.io/kisaesdevlab/vibe-connect-{server,client}:latest`, the move
-above is the only change needed in this repo.
+1. Replaced the README line "License: Proprietary. Internal use." with
+   "License: Elastic License 2.0 (ELv2)" (commit `81658ac`).
+2. Added a `LICENSE` file at the repo root with the ELv2 text
+   (verbatim from this repo's `LICENSE`).
+3. Updated the root `package.json` `"license"` field from `"UNLICENSED"`
+   to `"SEE LICENSE IN LICENSE"`.
+4. Renamed GHCR image targets in `.github/workflows/release.yml`:
+   `vibe-connect-app` → `vibe-connect-server`,
+   `vibe-connect-nginx` → `vibe-connect-client` (commit `bd7067e`).
+   Tag `v0.1.1` triggered the publish; both images came up public.
