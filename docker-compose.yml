@@ -46,7 +46,19 @@ services:
       # at runtime. The default image ignores it.
       - /opt/vibe/env/shared.env
     volumes:
-      - /opt/vibe/data/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Mount the PARENT directory, not the Caddyfile itself. Caddyfile
+      # is rewritten via atomic rename (lib/render-caddyfile.sh) on
+      # every app enable/disable, which changes its inode. A file-level
+      # bind mount would freeze the container on the original inode and
+      # `caddy reload` would silently re-read the stale file — every
+      # newly-enabled app would 404 with the catch-all serving from the
+      # console. A directory mount re-resolves on every open() so
+      # reload always sees the latest Caddyfile. The .bak.* files and
+      # data/config subdirs that also live under /opt/vibe/data/caddy
+      # show up at /etc/caddy/{Caddyfile.bak.*, data, config}; Caddy
+      # doesn't read them and the actual writable Caddy dirs are
+      # mounted separately at /data and /config below.
+      - /opt/vibe/data/caddy:/etc/caddy:ro
       - /opt/vibe/data/caddy/data:/data
       - /opt/vibe/data/caddy/config:/config
     networks:
