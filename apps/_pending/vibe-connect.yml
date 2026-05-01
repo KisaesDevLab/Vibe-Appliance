@@ -1,11 +1,15 @@
-# apps/_pending/vibe-connect.yml — staged, not active.
+# apps/_pending/vibe-connect.yml — staged.
 #
-# enable-app.sh looks for apps/<slug>.yml at the top level, so this
-# file is parked here until the upstream Vibe-Connect license PR
-# merges. Move it up one directory once Connect is ELv2-licensed and
-# the appliance picks it up automatically.
+# enable-app.sh looks for apps/<slug>.yml at the top level, so this file
+# is parked here until the GHCR rename + visibility flip lands. Move it
+# up one directory once vibe-connect-{server,client}:latest is publicly
+# pullable.
 #
-# Same shape as apps/vibe-mybooks.yml.
+# Vibe-Connect's vibe-connect-client (nginx) hardcodes its upstream as
+# `http://app:4000` (see infra/docker/nginx/nginx.conf.template upstream).
+# We satisfy that via a per-app internal network (vibe-connect-internal)
+# where vibe-connect-server carries the `app` alias — same pattern used
+# by vibe-tb / vibe-mybooks (where the alias is `api`).
 
 name: vibe
 
@@ -19,14 +23,22 @@ services:
       - /opt/vibe/env/shared.env
       - /opt/vibe/env/vibe-connect.env
     networks:
-      - vibe_net
+      vibe_net: {}
+      vibe-connect-internal:
+        aliases: [app]
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
-        condition: service_healthy
+    volumes:
+      # Per-firm uploaded attachments + portal/staff files. Persist across
+      # container recreates.
+      - /opt/vibe/data/apps/vibe-connect/uploads:/var/lib/vibe/connect/uploads
+      # In-app ACME ticker writes here when TLS_MODE=internal. We use
+      # TLS_MODE=external (Caddy in front) so this stays empty, but the
+      # path must exist or the writer panics on boot.
+      - /opt/vibe/data/apps/vibe-connect/tls:/var/lib/vibe/connect/tls
     healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3001/api/v1/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4000/health >/dev/null 2>&1"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -40,7 +52,13 @@ services:
       - /opt/vibe/env/shared.env
       - /opt/vibe/env/vibe-connect.env
     networks:
-      - vibe_net
+      vibe_net: {}
+      vibe-connect-internal: {}
     depends_on:
       vibe-connect-server:
         condition: service_healthy
+
+networks:
+  vibe-connect-internal:
+    name: vibe-connect-internal
+    driver: bridge
