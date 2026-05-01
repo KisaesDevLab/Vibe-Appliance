@@ -298,6 +298,31 @@ app.get('/api/v1/admin/status', requireAdmin, async (_req, res) => {
   }
 });
 
+// --- Public apps endpoint (used by the landing page) ------------------
+//
+// Returns ONLY enabled apps with minimal metadata: slug, displayName,
+// description, url. Deliberately excludes status/error messages,
+// internal config, image refs, and first-login credentials — those
+// are admin-only. Every field returned here is information a visitor
+// can already infer from being able to load the app's public URL.
+//
+// No auth required.
+
+app.get('/api/v1/public/apps', (_req, res) => {
+  const state = readState();
+  const stateApps = state.apps || {};
+  const items = Object.values(MANIFESTS)
+    .filter((m) => !!(stateApps[m.slug] || {}).enabled)
+    .map((m) => ({
+      slug:        m.slug,
+      displayName: m.displayName,
+      description: m.description,
+      url:         appPublicUrl(m, state.config || {}),
+    }))
+    .sort((a, b) => a.displayName.localeCompare(b.displayName));
+  res.json({ apps: items });
+});
+
 // --- Apps registry & toggle endpoints ---------------------------------
 
 app.get('/api/v1/apps', requireAdmin, (_req, res) => {

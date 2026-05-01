@@ -16,14 +16,8 @@
       </p>
     </header>
 
-    <section class="empty-state">
-      <h2>No apps enabled yet.</h2>
-      <p class="muted">
-        The administrator hasn't switched any apps on. Once they do, each enabled app will appear here as a card with an Open button.
-      </p>
-      <div class="cta-row">
-        <a class="btn" href="/admin">Go to admin console</a>
-      </div>
+    <section id="apps-section" aria-busy="true">
+      <div class="card"><h3>Loading…</h3><p class="muted">fetching enabled apps…</p></div>
     </section>
 
     <footer class="footer">
@@ -32,7 +26,78 @@
         per-app first-login info. The admin password was printed during
         installation and is also in <span class="mono">/opt/vibe/CREDENTIALS.txt</span> on the server.
       </p>
+      <div class="cta-row" style="margin-top: 1rem;">
+        <a class="btn btn--ghost" href="/admin">Admin console</a>
+      </div>
     </footer>
   </main>
+
+  <script>
+    // Render enabled apps from /api/v1/public/apps. The endpoint exposes
+    // only slug/displayName/description/url for ENABLED apps; nothing
+    // sensitive ever lands in the public DOM.
+
+    function escapeHtml(s) {
+      return String(s ?? '').replace(/[&<>"']/g, (c) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+      }[c]));
+    }
+
+    function renderEmpty() {
+      return `
+        <div class="empty-state">
+          <h2>No apps enabled yet.</h2>
+          <p class="muted">
+            The administrator hasn't switched any apps on. Once they do,
+            each enabled app will appear here as a card with an Open button.
+          </p>
+          <div class="cta-row">
+            <a class="btn" href="/admin">Go to admin console</a>
+          </div>
+        </div>`;
+    }
+
+    function renderError(msg) {
+      return `
+        <div class="empty-state">
+          <h2>Couldn't load apps.</h2>
+          <p class="muted">${escapeHtml(msg)}</p>
+          <div class="cta-row">
+            <a class="btn btn--ghost" href="/admin">Go to admin console</a>
+          </div>
+        </div>`;
+    }
+
+    function renderApps(apps) {
+      const cards = apps.map((a) => `
+        <article class="app-card">
+          <header class="app-card__head">
+            <h3 class="app-card__title">${escapeHtml(a.displayName)}</h3>
+          </header>
+          <p class="app-card__desc">${escapeHtml(a.description)}</p>
+          <div class="app-card__actions">
+            <a class="btn" href="${escapeHtml(a.url)}">Open</a>
+          </div>
+        </article>`).join('');
+      return `<div class="admin-grid">${cards}</div>`;
+    }
+
+    async function loadApps() {
+      const section = document.getElementById('apps-section');
+      try {
+        const r = await fetch('/api/v1/public/apps', { credentials: 'omit' });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        const apps = Array.isArray(data.apps) ? data.apps : [];
+        section.innerHTML = apps.length ? renderApps(apps) : renderEmpty();
+      } catch (err) {
+        section.innerHTML = renderError(err.message || String(err));
+      } finally {
+        section.removeAttribute('aria-busy');
+      }
+    }
+
+    loadApps();
+  </script>
 </body>
 </html>
