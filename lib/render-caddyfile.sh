@@ -11,7 +11,6 @@
 #   caddy/Caddyfile.tmpl
 #   caddy/snippets/<mode>.conf
 #   console/manifests/<slug>.json — for each enabled app
-#   /opt/vibe/env/shared.env     — to detect a non-empty CLOUDFLARE_API_TOKEN
 #
 # Output:
 #   /opt/vibe/data/caddy/Caddyfile
@@ -29,13 +28,12 @@
 VIBE_DIR="${VIBE_DIR:-/opt/vibe}"
 VIBE_CADDY_DIR="${VIBE_CADDY_DIR:-${VIBE_DIR}/data/caddy}"
 VIBE_CADDYFILE="${VIBE_CADDYFILE:-${VIBE_CADDY_DIR}/Caddyfile}"
-VIBE_ENV_SHARED="${VIBE_ENV_SHARED:-${VIBE_DIR}/env/shared.env}"
 
-# Custom-built Caddy image (caddy/Dockerfile) with the cloudflare DNS
-# plugin baked in. Falls back to the upstream image if the custom build
-# isn't available (e.g. very early in bootstrap before Phase 5 runs).
-VIBE_CADDY_IMAGE="${VIBE_CADDY_IMAGE:-vibe-appliance/caddy:cloudflare}"
-VIBE_CADDY_IMAGE_FALLBACK="${VIBE_CADDY_IMAGE_FALLBACK:-caddy:2-alpine}"
+# Official upstream Caddy image. The default install pulls this in
+# Phase 5; no custom build is required. Operators who opt into the
+# Cloudflare DNS-01 path (caddy/Dockerfile.cloudflare) can override
+# this via the VIBE_CADDY_IMAGE env var.
+VIBE_CADDY_IMAGE="${VIBE_CADDY_IMAGE:-caddy:2-alpine}"
 
 render_caddyfile() {
   local tmpl="${APPLIANCE_DIR}/caddy/Caddyfile.tmpl"
@@ -53,11 +51,11 @@ render_caddyfile() {
 
   python3 - \
       "$tmpl" "$snippets_dir" "$manifests_dir" \
-      "$VIBE_STATE_FILE" "$VIBE_ENV_SHARED" "$tmp" <<'PYEOF'
+      "$VIBE_STATE_FILE" "$tmp" <<'PYEOF'
 import json, os, re, sys
 
 (tmpl_path, snippets_dir, manifests_dir,
- state_path, shared_env_path, out_path) = sys.argv[1:7]
+ state_path, out_path) = sys.argv[1:6]
 
 
 def load_json(p, default):
@@ -66,22 +64,6 @@ def load_json(p, default):
             return json.load(f)
     except (FileNotFoundError, ValueError):
         return default
-
-
-def env_value(path, key):
-    """Return the value of `key` in an env file, or '' if missing/empty."""
-    try:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                if k == key:
-                    return v
-    except FileNotFoundError:
-        pass
-    return ""
 
 
 def list_enabled_apps(state, manifests_dir):
@@ -101,7 +83,7 @@ def list_enabled_apps(state, manifests_dir):
     return out
 
 
-def render_vhost(slug, manifest, mode, domain, has_cloudflare):
+def render_vhost(slug, manifest, mode, domain):
     """
     Emit a single Caddy site block for the app under domain mode at
     `<subdomain>.<domain>`. Returns empty for non-domain modes — those
@@ -285,8 +267,16 @@ def render_path_handler(slug, manifest):
     return "\n".join(lines) + "\n"
 
 
-def render_global_snippet(snippets_dir, mode, email, has_cloudflare):
-    """Build the contents of @VIBE_GLOBAL_SNIPPET@."""
+def render_global_snippet(snippets_dir, mode, email):
+    """Build the contents of @VIBE_GLOBAL_SNIPPET@.
+
+    Domain mode emits the ACME contact email; Caddy then issues per-
+    subdomain certs via HTTP-01 automatically (port 80 must be inbound-
+    reachable from the internet during issuance/renewal). Operators who
+    need DNS-01 wildcard certs opt into a custom build via
+    caddy/Dockerfile.cloudflare and add the `acme_dns cloudflare ...`
+    directive to their snippet manually.
+    """
     snippet_path = os.path.join(snippets_dir, f"{mode}.conf")
     if os.path.exists(snippet_path):
         with open(snippet_path) as f:
@@ -295,16 +285,6 @@ def render_global_snippet(snippets_dir, mode, email, has_cloudflare):
         base = ""
 
     base = base.replace("@VIBE_ACME_EMAIL@", email or "admin@example.com")
-
-    extras = []
-    if mode == "domain" and has_cloudflare:
-        # Caddy reads CLOUDFLARE_API_TOKEN from its env at request time.
-        # The token never appears in the rendered file.
-        extras.append("    acme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}")
-
-    if extras:
-        base = base.rstrip() + "\n" + "\n".join(extras) + "\n"
-
     return base
 
 
@@ -314,12 +294,11 @@ def main():
     mode = config.get("mode", "lan")
     domain = config.get("domain", "")
     email = config.get("email", "")
-    has_cloudflare = bool(env_value(shared_env_path, "CLOUDFLARE_API_TOKEN"))
 
     with open(tmpl_path) as f:
         body = f.read()
 
-    global_snippet = render_global_snippet(snippets_dir, mode, email, has_cloudflare)
+    global_snippet = render_global_snippet(snippets_dir, mode, email)
 
     enabled = list_enabled_apps(state, manifests_dir)
 
@@ -327,7 +306,7 @@ def main():
         # Per-app vhosts (only when there are enabled apps).
         if enabled:
             vhost_blocks = "\n".join(
-                render_vhost(slug, m, mode, domain, has_cloudflare)
+                render_vhost(slug, m, mode, domain)
                 for slug, m in enabled
             )
         else:
@@ -382,8 +361,10 @@ def main():
 main()
 PYEOF
 
-  # Validate before installing. Skip when no caddy image is yet present
-  # (very first bootstrap, before phase 5 has built our custom image).
+  # Validate before installing. Skip when the caddy image isn't yet
+  # locally present — that happens on the very first bootstrap before
+  # Phase 5 pulls caddy:2-alpine, where there's nothing to validate
+  # against yet anyway.
   if _caddy_can_validate; then
     if ! _caddy_validate "$tmp"; then
       log_warn "rendered Caddyfile failed validation; aborting install" tmp="$tmp"
@@ -420,28 +401,15 @@ reload_caddyfile() {
 
 # --- helpers ------------------------------------------------------------
 
-_caddy_image_for_validation() {
-  if docker image inspect "$VIBE_CADDY_IMAGE" >/dev/null 2>&1; then
-    printf '%s' "$VIBE_CADDY_IMAGE"
-    return 0
-  fi
-  if docker image inspect "$VIBE_CADDY_IMAGE_FALLBACK" >/dev/null 2>&1; then
-    printf '%s' "$VIBE_CADDY_IMAGE_FALLBACK"
-    return 0
-  fi
-  return 1
-}
-
 _caddy_can_validate() {
   command -v docker >/dev/null 2>&1 || return 1
-  _caddy_image_for_validation >/dev/null
+  docker image inspect "$VIBE_CADDY_IMAGE" >/dev/null 2>&1
 }
 
 _caddy_validate() {
-  local file="$1" image
-  image="$(_caddy_image_for_validation)" || return 1
+  local file="$1"
   docker run --rm \
     -v "${file}:/etc/caddy/Caddyfile:ro" \
-    "$image" \
+    "$VIBE_CADDY_IMAGE" \
     caddy validate --config /etc/caddy/Caddyfile >>"$VIBE_LOG_FILE" 2>&1
 }

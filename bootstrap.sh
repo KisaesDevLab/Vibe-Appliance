@@ -63,10 +63,12 @@ CONFIG_FORCE="false"
 # off via --no-cockpit on hosts that already have their own admin
 # tooling or that don't need a host-OS UI.
 CONFIG_COCKPIT="true"
-# Cloudflare DNS-01 token (required for wildcard certs in domain mode).
-# Read from --cloudflare-api-token flag or the CLOUDFLARE_API_TOKEN env
-# var; persisted to /opt/vibe/env/shared.env after secrets phase. Caddy
-# then reads it via env_file at runtime.
+# Cloudflare DNS-01 token — OPT-IN, used only with the custom Caddy
+# build (caddy/Dockerfile.cloudflare). Default install uses HTTP-01 and
+# ignores this. Read from --cloudflare-api-token flag or the
+# CLOUDFLARE_API_TOKEN env var; persisted to /opt/vibe/env/shared.env
+# after secrets phase. Caddy reads it via env_file at runtime IF the
+# operator has switched to the custom image.
 CONFIG_CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
 
 # ----------------------------------------------------------------------
@@ -99,10 +101,13 @@ FLAGS
   --email  EMAIL                  ACME contact email for --mode domain.
   --tailscale                     Also install Tailscale (any mode).
   --tailscale-authkey KEY         Pre-shared authkey for unattended Tailscale up.
-  --cloudflare-api-token TOKEN    Cloudflare API token with Zone:DNS:Edit on the
-                                  target zone. Enables DNS-01 wildcard certs in
-                                  domain mode. Also reads CLOUDFLARE_API_TOKEN
-                                  from the environment.
+  --cloudflare-api-token TOKEN    [Advanced/opt-in] Cloudflare API token with
+                                  Zone:DNS:Edit. ONLY used by the opt-in DNS-01
+                                  wildcard cert path (caddy/Dockerfile.cloudflare).
+                                  The default install uses HTTP-01 per-subdomain
+                                  certs and ignores this. Persisted to
+                                  /opt/vibe/env/shared.env. Also reads
+                                  CLOUDFLARE_API_TOKEN from the environment.
   --reset-env                     Regenerate /opt/vibe/env/*.env from templates
                                   (data preserved; secrets rotated).
   --force                         Continue past WARN-level pre-flight findings.
@@ -451,32 +456,23 @@ HELP
 
 # --- Phase 5 — pull registry images and build local images -----------
 # Two distinct sets:
-#   - REGISTRY_SERVICES: pulled from upstream registries (postgres, redis,
-#                        duplicati, portainer).
+#   - REGISTRY_SERVICES: pulled from upstream registries (caddy, postgres,
+#                        redis, duplicati, portainer). Caddy uses the
+#                        official `caddy:2-alpine` — no custom build.
+#                        Operators who want DNS-01 wildcard certs opt
+#                        into caddy/Dockerfile.cloudflare manually
+#                        (out-of-band; not part of bootstrap).
 #   - BUILD_SERVICES:    built locally from Dockerfiles in this repo
-#                        (caddy with the cloudflare DNS plugin baked in;
-#                        console — Node 20 + Express + better-sqlite3).
-# Caddy's compose service has BOTH `build:` and `image:`. Listing it in
-# `docker compose pull` causes compose to attempt a pull of the
-# `vibe-appliance/caddy:cloudflare` tag — which exists nowhere — and
-# fail with "manifest unknown" / "pull access denied". Phase 5 must
-# build it locally, not pull.
+#                        (console — Node 20 + Express + better-sqlite3).
 phase_pull() {
   log_phase_banner 5 "Pull and build images" "pull"
   state_set_phase pull running
 
-  log_step "pulling registry images (postgres, redis, duplicati, portainer)"
+  log_step "pulling registry images (caddy, postgres, redis, duplicati, portainer)"
   if ! ( cd "$APPLIANCE_DIR" && \
-         docker compose pull postgres redis duplicati portainer ) >>"$VIBE_LOG_FILE" 2>&1; then
+         docker compose pull caddy postgres redis duplicati portainer ) >>"$VIBE_LOG_FILE" 2>&1; then
     state_set_phase pull failed "registry pull failed"
     die "Registry pull failed. See $VIBE_LOG_FILE — common cause is a transient ghcr.io / docker.io rate limit; retry in 60s."
-  fi
-
-  log_step "building caddy (xcaddy + cloudflare DNS plugin)"
-  if ! ( cd "$APPLIANCE_DIR" && \
-         docker compose build caddy ) >>"$VIBE_LOG_FILE" 2>&1; then
-    state_set_phase pull failed "caddy build failed"
-    die "Caddy image build failed. See $VIBE_LOG_FILE; the xcaddy stage needs network access to fetch Go modules."
   fi
 
   log_step "building console image"

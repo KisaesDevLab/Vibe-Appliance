@@ -150,14 +150,11 @@ Three deployment modes, set by `CONFIG_MODE` at install. Subdomain-per-app is pr
 
 ### 4.1 Domain mode (`CONFIG_MODE=domain`)
 
-**Required:** A real domain that the customer owns, A/AAAA records pointing at the server.
+**Required:** A real domain the customer owns, an A/AAAA record per app subdomain pointing at the server, and **inbound TCP/80 reachable from the internet** (Caddy uses HTTP-01 challenges to issue and renew certs every ~60 days).
 
-**Two sub-paths for certs:**
+**Default path: HTTP-01 per subdomain.** The appliance ships the official `caddy:2-alpine` image — no custom build, no DNS provider plugin to maintain. Customer creates one A record per subdomain (`tb.firm.com`, `mybooks.firm.com`, …). Caddy issues a separate Let's Encrypt cert per subdomain as each app is toggled on. For a 5–7 app appliance that's well under LE's 50-cert/week rate limit.
 
-- **DNS-01 wildcard (default).** If `CLOUDFLARE_API_TOKEN` is set, bootstrap uses a Caddy image with the Cloudflare DNS plugin baked in. One wildcard cert for `*.firm.com` + `firm.com`. Customer adds *one* DNS record (`*.firm.com → server-ip`) and pastes a token. Done. The bootstrap UI nudges customers strongly toward this path (free Cloudflare account, simplest setup, fewest moving parts).
-- **HTTP-01 per subdomain (fallback).** No DNS API, no problem. Customer creates an A record per subdomain. Caddy issues per-subdomain certs as each app is toggled on. Slower, more DNS churn, but works on any registrar.
-
-Bootstrap detects which by env presence and writes the right Caddyfile snippet.
+**Opt-in path: DNS-01 wildcard via Cloudflare.** For operators behind a firewall that can't expose :80, or who want a single `*.firm.com` cert, the repo ships `caddy/Dockerfile.cloudflare` — an xcaddy build with the Cloudflare DNS plugin baked in. See that file's header for the build-and-switch-image steps. This path is opt-in because it adds a custom-image maintenance burden (upstream Go-module drift has bitten the appliance twice), and most installs don't need wildcard certs.
 
 **Caddyfile sketch (domain mode, one app):**
 
@@ -177,12 +174,20 @@ Bootstrap detects which by env presence and writes the right Caddyfile snippet.
 }
 ```
 
-For DNS-01, the global block has:
+The global block carries the ACME contact email; HTTP-01 is the implicit default:
 
 ```
 {
     email {$ACME_EMAIL}
-    acme_dns cloudflare {$CLOUDFLARE_API_TOKEN}
+}
+```
+
+For the opt-in DNS-01 path, the operator appends one line manually after switching to the custom image:
+
+```
+{
+    email {$ACME_EMAIL}
+    acme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}
 }
 ```
 
@@ -426,7 +431,7 @@ The five forks-in-the-road from earlier, now resolved:
 
 1. **Vibe-Connect license: ELv2.** Same as Vibe-MyBooks, for consistency. Requires a one-PR change to the Vibe-Connect repo (replace "Proprietary, internal use" wording in the README, add a `LICENSE` file with the Elastic License 2.0 text). This is the only external blocker on the appliance shipping with Vibe-Connect included; the rest of the appliance work doesn't depend on it.
 
-2. **Cloudflare DNS-01 is the default path.** Bootstrap UI nudges strongly toward Cloudflare (free account, has API, gives wildcard certs with one DNS record). HTTP-01 per-subdomain remains as the fallback for anyone on Namecheap/GoDaddy/Route53/etc. who hasn't moved to Cloudflare. See §4.1.
+2. **HTTP-01 per-subdomain is the default cert path; DNS-01 is opt-in.** Reversed from an earlier draft. The DNS-01 wildcard story required maintaining a custom xcaddy build with the Cloudflare plugin baked in, and that build broke the appliance twice on upstream Go-module drift (`zapslog.HandlerOptions` rename in zap; vanished `caddy:2.8-builder-alpine` tag). The official `caddy:2-alpine` image plus HTTP-01 covers the common case (5–7 subdomains, well under LE rate limits) with zero custom-image maintenance. Operators who genuinely need wildcard certs (firewalled :80, many subdomains) opt into `caddy/Dockerfile.cloudflare` — preserved but not bootstrapped. See §4.1.
 
 3. **Console branding: warm editorial.** Reuses the typography/color/spacing tokens from the existing Vibe-TB landing page so the appliance reads as part of the same product family. See §5.1.
 

@@ -1066,3 +1066,35 @@ Append to this list as phases complete. Format:
   When all three lines are present plus a "CPA walkthrough verified
   YYYY-MM-DD" line, v1 ships. Tag `v1.0.0`, attach
   `docs/RELEASE_v1.md` as the release notes, announce.
+
+- Phase 5 simplification 2026-04-29 by Claude (Opus 4.7) on Windows dev host.
+  Dropped the custom xcaddy build (`caddy/Dockerfile` → renamed to
+  `caddy/Dockerfile.cloudflare`, kept as opt-in only). The default
+  install now pulls the official `caddy:2-alpine` image. Domain mode
+  cert issuance moves from DNS-01 wildcard (Cloudflare) to HTTP-01
+  per-subdomain as the default; DNS-01 stays available for operators
+  who manually opt into the custom build.
+
+  Why: the custom build broke twice on upstream Go-module drift
+  (`zapslog.HandlerOptions` rename in go.uber.org/zap; vanished
+  `caddy:2.8-builder-alpine` tag) — pain that LAN and Tailscale modes
+  never used. For 5–7 apps the per-subdomain HTTP-01 path is well
+  under LE rate limits and adds no maintenance burden.
+
+  Files touched: `bootstrap.sh` (phase_pull now `docker compose pull
+  caddy …` instead of `docker compose build caddy`),
+  `docker-compose.yml` (`image: caddy:2-alpine`, no `build:` block),
+  `lib/render-caddyfile.sh` (no longer reads CLOUDFLARE_API_TOKEN;
+  validation helper simplified), `caddy/snippets/domain.conf`
+  (rewritten — email only, plus DNS-01 instructions in header
+  comment), `env-templates/shared.env.tmpl` (CLOUDFLARE_API_TOKEN
+  documented as optional/commented), `docs/PLAN.md` §4.1 + §10.2
+  (default flipped, opt-in path documented).
+
+  Owed before declaring this verified: re-bootstrap on a fresh DO
+  droplet in LAN mode (the prior failing path) and a separate domain-
+  mode droplet to confirm HTTP-01 issuance works end-to-end. The 502
+  the operator was hitting in LAN mode is a backend-wiring issue
+  (per-app `api` alias / VITE_BASE_PATH / wrong upstream port),
+  unrelated to this change — triage steps live in
+  `~/.claude/plans/the-caddy-still-appears-frolicking-sketch.md`.

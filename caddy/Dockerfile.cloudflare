@@ -1,10 +1,24 @@
-# caddy/Dockerfile — custom Caddy build with the cloudflare DNS plugin.
+# caddy/Dockerfile.cloudflare — OPT-IN custom Caddy build with the
+# cloudflare DNS plugin. NOT used by the default install.
 #
-# Why custom: Caddy's official Alpine image doesn't carry DNS-providers.
-# DNS-01 wildcard certs require a Caddy binary linked against the
-# corresponding caddy-dns/<provider> module. Phase 3 ships Cloudflare
-# only (the recommended path per docs/PLAN.md §4.1); other providers
-# are an additive change to this Dockerfile.
+# The default install uses the official `caddy:2-alpine` image and
+# issues per-subdomain certs via HTTP-01 (port 80 must be inbound-
+# reachable from the internet during issuance/renewal). That handles
+# the common case without any custom build, eliminating the upstream-
+# Go-module-drift class of failure (see PLAN.md §4.1).
+#
+# Use this Dockerfile only if you specifically need DNS-01 wildcard
+# certs — e.g. inbound :80 isn't reachable, you have many subdomains,
+# or you want a single `*.firm.com` cert. To opt in:
+#
+#   1. sudo docker build -f /opt/vibe/appliance/caddy/Dockerfile.cloudflare \
+#        -t vibe-appliance/caddy:cloudflare /opt/vibe/appliance/caddy
+#   2. Edit /opt/vibe/appliance/docker-compose.yml and change the caddy
+#      service `image:` to `vibe-appliance/caddy:cloudflare`.
+#   3. Add CLOUDFLARE_API_TOKEN=<token> to /opt/vibe/env/shared.env.
+#   4. Add `acme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}` inside the
+#      global block (caddy/snippets/domain.conf or directly in the
+#      rendered Caddyfile) and reload caddy.
 #
 # Build is fast (xcaddy fetches the listed modules and statically
 # links). Image size lands ~50 MB.
