@@ -51,11 +51,12 @@
 @VIBE_PATH_HANDLERS@
 
 	# Default — everything not matched above proxies to the console.
+	# Caddy auto-sends X-Forwarded-For + X-Forwarded-Proto on every
+	# reverse_proxy since v2; we only need to add X-Real-IP because
+	# that's not in Caddy's default set.
 	handle {
 		reverse_proxy console:3000 {
 			header_up X-Real-IP {remote_host}
-			header_up X-Forwarded-For {remote_host}
-			header_up X-Forwarded-Proto {scheme}
 		}
 	}
 }

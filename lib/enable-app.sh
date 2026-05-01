@@ -61,13 +61,34 @@ enable_app() {
   [[ -f "$env_tmpl" ]] || die "env template not found: $env_tmpl"
   [[ -f "$overlay" ]]  || die "compose overlay not found: $overlay"
 
-  log_step "enabling app" slug="$slug"
-  _state_app_set "$slug" enabled true status enabling
-
-  # Source shared.env so POSTGRES_USER / POSTGRES_PASSWORD / REDIS_PASSWORD
-  # are available to db-bootstrap.sh and to the env renderer.
+  # Source shared.env BEFORE pre-flight so POSTGRES_USER /
+  # POSTGRES_PASSWORD / REDIS_PASSWORD / ENCRYPTION_KEY / JWT_SECRET
+  # are available to the env renderer dry-run check.
   # shellcheck source=/dev/null
   set -a; . "${VIBE_ENV_DIR}/shared.env"; set +a
+
+  # Pre-flight every check we can do without mutating state. If
+  # anything fails — manifest invalid, core container down, postgres
+  # unreachable, env template would render with unfilled @MARKER@'s,
+  # required app-specific env not satisfied — REFUSE to proceed.
+  # Pre-flight runs before any _state_app_set call so a failed check
+  # leaves state untouched and the operator can fix the underlying
+  # cause and retry.
+  log_step "pre-flight check for $slug"
+  if ! _preflight_enable "$slug" "$manifest" "$env_tmpl" "$overlay"; then
+    die "pre-flight failed for $slug. Fix the errors above and re-run; state was NOT modified."
+  fi
+  log_ok "pre-flight passed"
+
+  # --dry-run short-circuits here — caller wanted to know "would this
+  # work?" not "make it so." No state mutation, no containers touched.
+  if [[ "${ENABLE_DRY_RUN:-0}" == "1" ]]; then
+    log_ok "dry-run: would proceed to enable. No changes made to state, env files, or containers."
+    return 0
+  fi
+
+  log_step "enabling app" slug="$slug"
+  _state_app_set "$slug" enabled true status enabling
 
   # Compute the service names declared by this app's overlay so
   # `compose pull/up` only touches them — bare `compose up` would
@@ -153,6 +174,126 @@ enable_app() {
 
   _state_app_set "$slug" enabled true status running image_tag "$default_tag"
   log_ok "$slug is up"
+}
+
+# Pre-flight enable validator. Returns 0 if every check passes; non-
+# zero with detailed log messages if any fail. NEVER mutates state —
+# the caller is the only one allowed to flip status=enabling, and
+# only after pre-flight returns 0.
+#
+# Catches the failure modes the appliance has historically leaked into
+# half-mutated state:
+#
+#   - manifest invalid JSON / missing required fields
+#   - env template that references markers the renderer can't fill
+#     (e.g. operator added a custom @SOMETHING@ that's not wired in)
+#   - core stack not running (operator manually stopped postgres etc.)
+#   - postgres / redis not accepting connections
+#   - vibe_net network removed
+#
+# After a failed pre-flight the operator sees the specific list of
+# what's wrong, fixes it, retries — no state cleanup needed.
+_preflight_enable() {
+  local slug="$1" manifest="$2" env_tmpl="$3" overlay="$4"
+  local errors=0
+
+  # 1. Manifest is valid JSON + has the schema-required fields.
+  if ! python3 -c "import json; json.load(open('$manifest'))" >/dev/null 2>&1; then
+    log_error "preflight FAIL: manifest is not valid JSON" file="$manifest"
+    ((errors++)) || true
+  else
+    local missing
+    missing="$(python3 - "$manifest" <<'PYEOF'
+import json, sys
+m = json.load(open(sys.argv[1]))
+required = ['schemaVersion','slug','displayName','description',
+            'image','subdomain','ports','routing','env','health']
+print(','.join([k for k in required if k not in m]))
+PYEOF
+)"
+    if [[ -n "$missing" ]]; then
+      log_error "preflight FAIL: manifest missing required fields" missing="$missing"
+      ((errors++)) || true
+    fi
+  fi
+
+  # 2. Compose overlay + env template files exist (already checked
+  # before pre-flight runs, but redundant defense is cheap here).
+  [[ -f "$overlay" ]]  || { log_error "preflight FAIL: overlay missing" file="$overlay"; ((errors++)) || true; }
+  [[ -f "$env_tmpl" ]] || { log_error "preflight FAIL: env template missing" file="$env_tmpl"; ((errors++)) || true; }
+
+  # 3. Core containers required for the enable flow are running.
+  # docker-bootstrap, network discovery, env file mount all assume
+  # these. Pre-flight is faster than discovering it 30 seconds in.
+  local c missing_containers=""
+  for c in vibe-postgres vibe-redis vibe-console vibe-caddy; do
+    if ! docker ps --filter "name=^${c}$" --filter status=running -q 2>/dev/null | grep -q .; then
+      missing_containers+=" $c"
+    fi
+  done
+  if [[ -n "$missing_containers" ]]; then
+    log_error "preflight FAIL: core container(s) not running:$missing_containers"
+    log_error "         fix: cd /opt/vibe/appliance && sudo docker compose up -d"
+    ((errors++)) || true
+  fi
+
+  # 4. Postgres accepts connections (catches "container is up but
+  # the daemon is still starting" — bootstrap usually waits, but a
+  # console-spawned enable might race).
+  if [[ "$missing_containers" != *vibe-postgres* ]]; then
+    if ! docker exec vibe-postgres pg_isready -U "${POSTGRES_USER:-postgres}" >/dev/null 2>&1; then
+      log_error "preflight FAIL: postgres is not yet accepting connections"
+      log_error "         fix: wait 10 seconds and retry, or restart the container"
+      ((errors++)) || true
+    fi
+  fi
+
+  # 5. Redis is reachable with our password (catches a half-rotated
+  # REDIS_PASSWORD where the redis container has the old value but
+  # shared.env has the new one).
+  if [[ "$missing_containers" != *vibe-redis* && -n "${REDIS_PASSWORD:-}" ]]; then
+    if ! docker exec -e RP="$REDIS_PASSWORD" vibe-redis sh -c \
+         'redis-cli -a "$RP" ping 2>/dev/null' 2>/dev/null | grep -q PONG; then
+      log_error "preflight FAIL: redis ping with shared.env's password failed"
+      log_error "         fix: check that REDIS_PASSWORD in /opt/vibe/env/shared.env"
+      log_error "              matches what the redis container booted with."
+      ((errors++)) || true
+    fi
+  fi
+
+  # 6. vibe_net network exists.
+  if ! docker network inspect vibe_net >/dev/null 2>&1; then
+    log_error "preflight FAIL: vibe_net network missing"
+    log_error "         fix: cd /opt/vibe/appliance && sudo docker compose up -d"
+    ((errors++)) || true
+  fi
+
+  # 7. Env render dry-run — does the template have any @MARKER@s the
+  # renderer doesn't fill? This is the bug class that historically
+  # bit Vibe-Payroll (SECRETS_ENCRYPTION_KEY), Vibe-MyBooks
+  # (PLAID_ENCRYPTION_KEY), Vibe-Tax-Research (MASTER_KEY +
+  # JWT_REFRESH_SECRET), Vibe-TB (DB_HOST/PORT/NAME/USER/PASSWORD),
+  # and the SPA assets (VITE_BASE_PATH). Pre-flight catches them
+  # before the app boots and crashes.
+  local check_path
+  check_path="$(mktemp -t "vibe-preflight-${slug}.XXXXXX")"
+  if _render_app_env "$slug" "$manifest" "$env_tmpl" "$check_path" >/dev/null 2>&1; then
+    local unfilled
+    unfilled="$(grep -oE '@[A-Z_][A-Z_0-9]*@' "$check_path" 2>/dev/null | sort -u | tr '\n' ' ')"
+    if [[ -n "$unfilled" ]]; then
+      log_error "preflight FAIL: env template has unsubstituted markers: $unfilled"
+      log_error "         the renderer (lib/enable-app.sh _render_app_env) doesn't"
+      log_error "         know how to fill these. Either add the substitution to the"
+      log_error "         renderer, or remove the marker from the template."
+      ((errors++)) || true
+    fi
+  else
+    log_error "preflight FAIL: env template render produced no output"
+    ((errors++)) || true
+  fi
+  rm -f "$check_path"
+
+  return "$errors"
 }
 
 # Service names this app declares — same shape as update.sh's
@@ -450,8 +591,29 @@ os.rename(tmp, path)
 PYEOF
 }
 
-# Standalone entry: when invoked as `bash enable-app.sh <slug>`, run the
-# function with the first argument as the slug.
+# Standalone entry. Supports:
+#   bash enable-app.sh <slug>             actually enable the app
+#   bash enable-app.sh --dry-run <slug>   pre-flight only; no state mutation
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  enable_app "${1:?slug required}"
+  case "${1:-}" in
+    --dry-run)
+      shift
+      ENABLE_DRY_RUN=1 enable_app "${1:?slug required}"
+      ;;
+    -h|--help)
+      cat <<EOF
+Usage:
+  bash enable-app.sh <slug>            Enable the app (the real thing).
+  bash enable-app.sh --dry-run <slug>  Pre-flight check only — validates
+                                       manifest, core stack, env render.
+                                       No state mutation, no containers
+                                       touched. Useful for "would this
+                                       work?" before committing.
+EOF
+      exit 0
+      ;;
+    *)
+      enable_app "${1:?slug required}"
+      ;;
+  esac
 fi

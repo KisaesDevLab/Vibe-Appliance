@@ -571,6 +571,12 @@ phase_infra() {
 phase_apps() {
   log_set_phase "apps"
 
+  # Re-enable apps the operator marked enabled. Skip ones with
+  # status=failed: those failed before, would fail again on the same
+  # bug, and would just waste 2 minutes of health-check timeout per
+  # bootstrap. Operator must click Enable in admin (or run
+  # `vibe enable <slug>`) to retry — that path resets status to
+  # `enabling` and runs a fresh attempt with up-to-date manifests.
   local slugs
   slugs="$(python3 - "$VIBE_STATE_FILE" <<'PYEOF' || true
 import json, sys
@@ -580,8 +586,12 @@ try:
 except Exception:
     sys.exit(0)
 for slug, e in (s.get("apps", {}) or {}).items():
-    if e.get("enabled"):
-        print(slug)
+    if not e.get("enabled"):
+        continue
+    # Skip apps whose last attempt failed — operator decides when to retry.
+    if e.get("status") == "failed":
+        continue
+    print(slug)
 PYEOF
 )"
 
@@ -633,6 +643,55 @@ phase_credentials() {
     printf '\n  %s exists but is mode 600 root-owned; cat it with sudo to view.\n' \
       "$VIBE_CREDS_FILE" >&2
   fi
+}
+
+# Reconcile state.apps entries stuck at `status=enabling` from a
+# previous interrupted bootstrap. Anything older than 5 minutes is
+# treated as abandoned (a real in-flight enable would have updated
+# the `at` timestamp by now). Demoted to status=failed so the admin
+# badge stops showing in-progress work that isn't running.
+_state_reconcile_abandoned() {
+  python3 - "$VIBE_STATE_FILE" <<'PYEOF'
+import json, sys, os, datetime, fcntl
+path = sys.argv[1]
+if not os.path.exists(path):
+    sys.exit(0)
+_lk = open(path + ".lock", "w")
+fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
+try:
+    with open(path) as f:
+        s = json.load(f)
+except (FileNotFoundError, ValueError):
+    sys.exit(0)
+now = datetime.datetime.now(datetime.timezone.utc)
+threshold = datetime.timedelta(minutes=5)
+changed = False
+demoted = []
+for slug, entry in (s.get("apps", {}) or {}).items():
+    if entry.get("status") not in ("enabling", "stopping", "updating"):
+        continue
+    at = entry.get("at")
+    if not at:
+        continue
+    try:
+        at_dt = datetime.datetime.fromisoformat(at.replace("Z", "+00:00"))
+    except Exception:
+        continue
+    if (now - at_dt) > threshold:
+        prior = entry.get("status")
+        entry["status"] = "failed"
+        entry["error"] = f"abandoned (interrupted {prior!r} from prior run)"
+        entry["at"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        demoted.append(slug)
+        changed = True
+if changed:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(s, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.rename(tmp, path)
+    print(f"reconciled {len(demoted)} abandoned app(s): {', '.join(demoted)}", file=sys.stderr)
+PYEOF
 }
 
 # Install /usr/local/bin/vibe → APPLIANCE_DIR/bin/vibe. Idempotent.
@@ -734,6 +793,13 @@ main() {
   # failures land in the JSONL log.
   log_init
   state_init
+
+  # Reconcile abandoned 'enabling' state from a prior interrupted run.
+  # If the operator hit Ctrl-C during phase_apps mid-enable, the state
+  # entry is stuck at status=enabling with a stale `at` timestamp.
+  # Demote it to status=failed so the admin badge stops lying about
+  # in-progress work.
+  _state_reconcile_abandoned
 
   # Install the `vibe` CLI shim into /usr/local/bin (idempotent). Doing
   # this every bootstrap run keeps the symlink fresh if APPLIANCE_DIR

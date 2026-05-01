@@ -206,9 +206,9 @@ def render_infra_vhost(svc, mode, domain):
         lines.append("        transport http {")
         lines.append("            tls_insecure_skip_verify")
         lines.append("        }")
+    # Caddy auto-sends X-Forwarded-For + X-Forwarded-Proto since v2 —
+    # only X-Real-IP needs an explicit header_up.
     lines.append("        header_up X-Real-IP {remote_host}")
-    lines.append("        header_up X-Forwarded-For {remote_host}")
-    lines.append("        header_up X-Forwarded-Proto {scheme}")
     lines.append("    }")
     lines.append("}")
     return "\n".join(lines) + "\n"
