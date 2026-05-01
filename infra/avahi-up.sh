@@ -45,7 +45,31 @@ avahi_install() {
 avahi_enable() {
   log_step "ensuring avahi-daemon is enabled and running"
   if ! systemctl enable --now avahi-daemon >>"$VIBE_LOG_FILE" 2>&1; then
-    die "Could not enable/start avahi-daemon. Check 'systemctl status avahi-daemon'."
+    # Most common cause: systemd-resolved is already on port 5353 with
+    # MulticastDNS=yes (Ubuntu default), so avahi can't bind. The
+    # appliance works fine without avahi — operators reach it via the
+    # server's IP — so this is a WARN, not a hard fail.
+    log_warn "avahi-daemon failed to start; continuing without mDNS advertising"
+    cat >&2 <<'HINT'
+
+           Likely cause: systemd-resolved already owns port 5353 with
+           MulticastDNS=yes (Ubuntu's default).
+
+           Diagnose:
+             sudo systemctl status avahi-daemon --no-pager
+             sudo journalctl -u avahi-daemon -n 30 --no-pager
+
+           Fix (turn off mDNS in resolved, retry avahi):
+             sudo sed -i 's/^#\?MulticastDNS=.*/MulticastDNS=no/' /etc/systemd/resolved.conf
+             sudo systemctl restart systemd-resolved
+             sudo systemctl restart avahi-daemon
+
+           If you don't need <hostname>.local resolution from other LAN
+           machines (you'll just type the server's IP), it's safe to
+           leave avahi off. The rest of the appliance is unaffected.
+
+HINT
+    return 0
   fi
   log_ok "avahi-daemon: $(systemctl is-active avahi-daemon)"
 

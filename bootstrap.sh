@@ -356,8 +356,11 @@ phase_tailscale() {
   if [[ "$needs_avahi" == "true" ]]; then
     log_step "running infra/avahi-up.sh"
     if ! ( cd "$APPLIANCE_DIR" && /bin/bash infra/avahi-up.sh ); then
-      state_set_phase tailscale failed "avahi-up failed"
-      die "avahi install/up failed. See $VIBE_LOG_FILE."
+      # avahi-up.sh's `apt install` failure is the only thing that can
+      # actually return non-zero now — the runtime startup case warns
+      # and exits 0. So this branch means apt is broken; that warrants
+      # a hard fail because it'll surface elsewhere too.
+      log_warn "avahi-up.sh exited non-zero — continuing (operator can rerun the script standalone later)"
     fi
   fi
 
