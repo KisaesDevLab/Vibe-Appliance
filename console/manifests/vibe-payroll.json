@@ -12,10 +12,10 @@
   },
 
   "subdomain": "payroll",
-  "ports":     { "server": 4000, "client": 80 },
+  "ports":     { "server": 4000, "client": 8080 },
 
   "routing": {
-    "default_upstream": "vibe-payroll-web:80",
+    "default_upstream": "vibe-payroll-web:8080",
     "matchers": [
       { "name": "api", "path": "/api/*", "upstream": "vibe-payroll-api:4000" }
     ]

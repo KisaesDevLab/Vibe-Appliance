@@ -7,18 +7,29 @@
 #   docker compose -f docker-compose.yml -f apps/vibe-tb.yml stop
 #
 # Reads /opt/vibe/env/vibe-tb.env (rendered from
-# env-templates/per-app/vibe-tb.env.tmpl). Joins vibe_net so Caddy can
-# reverse-proxy by service name.
+# env-templates/per-app/vibe-tb.env.tmpl).
 #
-# Image tags are pinned via VIBE_TB_TAG (default 'latest', set in
-# /opt/vibe/env/vibe-tb.env). Change the tag and re-run enable-app.sh
-# to upgrade — Phase 7 will add the proper rolling-update flow.
+# Network topology: each Vibe app sits on TWO networks.
+#
+#   - vibe_net (shared)         — Caddy reaches every app's services by
+#                                  their slug-prefixed names. Postgres
+#                                  and Redis live here too.
+#   - vibe-tb-internal (private) — the web tier's baked-in nginx config
+#                                  has `proxy_pass http://api:<port>`
+#                                  literally; nginx refuses to start
+#                                  if `api` doesn't resolve. We give
+#                                  the server tier an `api` network
+#                                  alias on this private network so
+#                                  the lookup succeeds without
+#                                  colliding with other apps' webs
+#                                  that ALSO expect `api` to mean
+#                                  THEIR own backend.
 
 name: vibe
 
 services:
   vibe-tb-server:
-    image: ghcr.io/kisaesdevlab/vibe-tb-server:${VIBE_TB_TAG:-latest}
+    image: ghcr.io/kisaesdevlab/vibe-tb-server:${APP_TAG:-latest}
     container_name: vibe-tb-server
     restart: unless-stopped
     init: true
@@ -26,14 +37,15 @@ services:
       - /opt/vibe/env/shared.env
       - /opt/vibe/env/vibe-tb.env
     networks:
-      - vibe_net
+      vibe_net: {}
+      vibe-tb-internal:
+        aliases: [api]
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
-      # Vibe-TB health endpoint per the manifest (manifest.health).
       test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3001/api/v1/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
       interval: 10s
       timeout: 5s
@@ -41,17 +53,20 @@ services:
       start_period: 30s
 
   vibe-tb-client:
-    image: ghcr.io/kisaesdevlab/vibe-tb-client:${VIBE_TB_TAG:-latest}
+    image: ghcr.io/kisaesdevlab/vibe-tb-client:${APP_TAG:-latest}
     container_name: vibe-tb-client
     restart: unless-stopped
     env_file:
       - /opt/vibe/env/shared.env
       - /opt/vibe/env/vibe-tb.env
     networks:
-      - vibe_net
+      vibe_net: {}
+      vibe-tb-internal: {}
     depends_on:
       vibe-tb-server:
         condition: service_healthy
-    # Client tier is a static-asset web server (nginx-style). No
-    # explicit healthcheck — the image's own readiness is verified by
-    # the upstream Caddy probe to /.
+
+networks:
+  vibe-tb-internal:
+    name: vibe-tb-internal
+    driver: bridge

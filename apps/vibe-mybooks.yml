@@ -1,8 +1,9 @@
 # apps/vibe-mybooks.yml — Vibe MyBooks overlay.
 #
-# Image refs and ports lifted from KisaesDevLab/Vibe-MyBooks's prod
-# compose. Service names use upstream's `api` / `web` suffix to keep
-# this overlay readable next to the published images.
+# Same per-app-network pattern as vibe-tb: the web tier's baked-in
+# nginx config has `proxy_pass http://api:3001` and refuses to start
+# if `api` doesn't resolve. Per-app private network gives the api
+# tier an `api` alias without collision.
 
 name: vibe
 
@@ -16,7 +17,9 @@ services:
       - /opt/vibe/env/shared.env
       - /opt/vibe/env/vibe-mybooks.env
     networks:
-      - vibe_net
+      vibe_net: {}
+      vibe-mybooks-internal:
+        aliases: [api]
     depends_on:
       postgres:
         condition: service_healthy
@@ -38,7 +41,13 @@ services:
       - /opt/vibe/env/shared.env
       - /opt/vibe/env/vibe-mybooks.env
     networks:
-      - vibe_net
+      vibe_net: {}
+      vibe-mybooks-internal: {}
     depends_on:
       vibe-mybooks-api:
         condition: service_healthy
+
+networks:
+  vibe-mybooks-internal:
+    name: vibe-mybooks-internal
+    driver: bridge

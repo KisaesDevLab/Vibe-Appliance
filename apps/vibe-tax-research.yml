@@ -1,10 +1,13 @@
 # apps/vibe-tax-research.yml — Vibe Tax Research Chat overlay.
 #
-# Image refs and ports lifted from KisaesDevLab/Vibe-Tax-Research-Chat's
-# prod compose. api listens on 4000 with health at /api/health; web is
-# nginx serving the SPA on :80. The /chat/* matcher in the manifest is
-# streaming (SSE) — Caddy emits flush_interval -1 + 3600s read_timeout
-# for that path.
+# api listens on 4000 with health at /api/health; web is nginx serving
+# the SPA on :80. Same per-app-internal-network pattern as vibe-tb /
+# vibe-mybooks: the web tier's baked-in nginx has
+# `proxy_pass http://api:4000` and refuses to start without `api`
+# resolution.
+#
+# The /chat/* matcher in the manifest is streaming (SSE) — Caddy emits
+# flush_interval -1 + 3600s read_timeout for that path.
 
 name: vibe
 
@@ -18,7 +21,9 @@ services:
       - /opt/vibe/env/shared.env
       - /opt/vibe/env/vibe-tax-research.env
     networks:
-      - vibe_net
+      vibe_net: {}
+      vibe-tax-research-internal:
+        aliases: [api]
     depends_on:
       postgres:
         condition: service_healthy
@@ -39,7 +44,13 @@ services:
       - /opt/vibe/env/shared.env
       - /opt/vibe/env/vibe-tax-research.env
     networks:
-      - vibe_net
+      vibe_net: {}
+      vibe-tax-research-internal: {}
     depends_on:
       vibe-tax-research-api:
         condition: service_healthy
+
+networks:
+  vibe-tax-research-internal:
+    name: vibe-tax-research-internal
+    driver: bridge
