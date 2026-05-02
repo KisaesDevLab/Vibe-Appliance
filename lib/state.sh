@@ -98,6 +98,42 @@ state_phase_is_ok() {
   [[ "$(state_get_phase "$slug")" == "ok" ]]
 }
 
+# state_set_host_service <slug> <status> [detail]
+#   Records host-side service status under state.host_services[slug].
+#   Used by infra/avahi-up.sh and lib/ufw-rules.sh so the console can
+#   surface the same status the operator saw on bootstrap stdout — and
+#   show the canonical recovery sequence when broken. status is a free-
+#   form string; conventions per writer:
+#     avahi:  active | unit-missing | inactive | port-conflict
+#     ufw:    active | inactive | not-installed | active-missing-rules
+state_set_host_service() {
+  local slug="$1" status="$2" detail="${3:-}"
+  python3 - "$VIBE_STATE_FILE" "$slug" "$status" "$detail" "$VIBE_STATE_SCHEMA_VERSION" <<'PYEOF'
+import json, sys, os, datetime, fcntl
+path, slug, status, detail, schema_version = sys.argv[1:6]
+_lk = open(path + ".lock", "w")
+fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
+try:
+    with open(path) as f:
+        s = json.load(f)
+except (FileNotFoundError, ValueError):
+    s = {"schemaVersion": int(schema_version), "config": {}, "phases": {}, "apps": {}}
+host = s.setdefault("host_services", {})
+entry = {
+    "status": status,
+    "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+}
+if detail:
+    entry["detail"] = detail
+host[slug] = entry
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(s, f, indent=2, sort_keys=True)
+    f.write("\n")
+os.rename(tmp, path)
+PYEOF
+}
+
 # state_set_config_kv <key> <value>
 #   Sets state.config[key] = value (string). Pass "" to clear.
 state_set_config_kv() {

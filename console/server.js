@@ -674,6 +674,89 @@ app.get('/api/v1/infra', requireAdmin, async (_req, res) => {
   res.json({ infra: out });
 });
 
+// --- Host services (Phase 8.5 v1.2) -----------------------------------
+//
+// avahi-daemon and ufw status, written into state.json by infra/avahi-up.sh
+// and lib/ufw-rules.sh during bootstrap. The console can't probe the host
+// directly (it's containerized and lacks systemd/ufw access), so the source
+// of truth is "what the last bootstrap recorded." Each broken state has a
+// canonical recovery sequence baked in here so the UI can show a "Copy
+// fix" button without the operator hunting through docs.
+//
+// `at` is bootstrap-relative — UI surfaces "as of <when>" so a stale
+// status doesn't masquerade as live truth. To refresh, the operator
+// re-runs `sudo bash /opt/vibe/appliance/bootstrap.sh` (idempotent).
+
+const HOST_SERVICE_FIXES = {
+  avahi: {
+    'unit-missing': {
+      summary: 'avahi-daemon is installed but systemd has no service unit',
+      command:
+        'sudo apt-get install --reinstall -y avahi-daemon && \\\n' +
+        '  sudo systemctl daemon-reload && \\\n' +
+        '  sudo systemctl enable --now avahi-daemon',
+    },
+    'inactive': {
+      summary: 'avahi-daemon failed to start (likely systemd-resolved port 5353 conflict)',
+      command:
+        "sudo sed -i 's/^#\\?MulticastDNS=.*/MulticastDNS=no/' /etc/systemd/resolved.conf && \\\n" +
+        '  sudo find /etc/systemd/resolved.conf.d -type f -exec \\\n' +
+        "    sed -i 's/^#\\?MulticastDNS=.*/MulticastDNS=no/' {} + 2>/dev/null; \\\n" +
+        '  sudo systemctl restart systemd-resolved && \\\n' +
+        '  sudo systemctl restart avahi-daemon',
+    },
+  },
+  ufw: {
+    'inactive': {
+      summary: 'ufw is installed but inactive — emergency ports 5171:5198 are unprotected',
+      // Order is critical: SSH allow MUST land before `ufw enable` so the
+      // operator doesn't lock themselves out. Step 4 re-applies our app
+      // rules so the dormant emergency-port allows go live.
+      command:
+        'sudo ufw allow OpenSSH && \\\n' +
+        '  sudo ufw allow 80,443/tcp && \\\n' +
+        '  sudo ufw --force enable && \\\n' +
+        '  sudo bash /opt/vibe/appliance/lib/ufw-rules.sh',
+    },
+    'not-installed': {
+      summary: 'ufw is not installed — emergency ports 5171:5198 are unprotected',
+      command:
+        'sudo apt-get install -y ufw && \\\n' +
+        '  sudo ufw allow OpenSSH && \\\n' +
+        '  sudo ufw allow 80,443/tcp && \\\n' +
+        '  sudo ufw --force enable && \\\n' +
+        '  sudo bash /opt/vibe/appliance/lib/ufw-rules.sh',
+    },
+  },
+};
+
+const HOST_SERVICE_LABELS = {
+  avahi: 'Avahi (mDNS — <hostname>.local resolution)',
+  ufw:   'UFW firewall (gates emergency ports 5171:5198)',
+};
+
+app.get('/api/v1/host-services', requireAdmin, (_req, res) => {
+  const state = readState();
+  const recorded = state.host_services || {};
+  const out = [];
+  for (const slug of ['avahi', 'ufw']) {
+    const entry = recorded[slug] || {};
+    const status = entry.status || 'unknown';
+    const ok = (status === 'active');
+    const fix = (HOST_SERVICE_FIXES[slug] || {})[status] || null;
+    out.push({
+      slug,
+      label:  HOST_SERVICE_LABELS[slug] || slug,
+      status,
+      ok,
+      detail: entry.detail || '',
+      at:     entry.at || null,
+      fix,
+    });
+  }
+  res.json({ host_services: out });
+});
+
 // --- Settings registry & endpoints (Phase 8.5 Workstream C) -----------
 //
 // The "settings registry" walks every loaded manifest, picks out env

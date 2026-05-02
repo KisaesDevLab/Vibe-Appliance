@@ -90,6 +90,12 @@
     </section>
 
     <section>
+      <h2>Host services</h2>
+      <p class="muted">Avahi (mDNS) and UFW (firewall) status. Recorded by bootstrap on the host — re-run <span class="mono">sudo bash /opt/vibe/appliance/bootstrap.sh</span> to refresh after applying a fix.</p>
+      <div id="host-services-list"></div>
+    </section>
+
+    <section>
       <h2>Containers</h2>
       <p class="muted" id="container-summary">—</p>
       <table class="containers" id="containers">
@@ -166,7 +172,7 @@
 
     async function refresh() {
       try {
-        const [status, apps, infra, firstLogin, settingsValues] = await Promise.all([
+        const [status, apps, infra, firstLogin, settingsValues, hostServices] = await Promise.all([
           loadStatus(),
           loadApps(),
           fetch('/api/v1/infra',       { credentials: 'same-origin' }).then(r => r.json()),
@@ -177,12 +183,17 @@
           fetch('/api/v1/settings/values', { credentials: 'same-origin' })
             .then(r => r.ok ? r.json() : null)
             .catch(() => null),
+          // Phase 8.5 v1.2 — Avahi/UFW status from the last bootstrap run.
+          fetch('/api/v1/host-services', { credentials: 'same-origin' })
+            .then(r => r.ok ? r.json() : null)
+            .catch(() => null),
         ]);
         renderStatus(status);
         renderApps(apps.apps || []);
         renderInfra((infra && infra.infra) || []);
         renderFirstLogin((firstLogin && firstLogin.first_login) || []);
         renderSetupBanners(settingsValues, status.state && status.state.config || {});
+        renderHostServices((hostServices && hostServices.host_services) || []);
         renderEmergency(
           apps.apps || [],
           (infra && infra.infra) || [],
@@ -331,6 +342,79 @@
             ${note}
           </article>`;
       }).join('');
+    }
+
+    // Phase 8.5 v1.2 — Avahi/UFW host status. Source-of-truth is
+    // state.json's host_services block, written by infra/avahi-up.sh and
+    // lib/ufw-rules.sh during bootstrap. Console can't probe host
+    // systemd/ufw from the container, so the data is "as of last
+    // bootstrap." Each broken status maps to a canned recovery sequence
+    // that the Copy-fix button writes to the clipboard.
+    function renderHostServices(items) {
+      const list = document.getElementById('host-services-list');
+      if (!items.length) {
+        list.innerHTML = '<p class="muted">No host service status recorded yet — re-run bootstrap to populate.</p>';
+        return;
+      }
+      list.innerHTML = items.map((s, idx) => {
+        const badge = s.ok
+          ? '<span class="badge badge--good">' + escapeHtml(s.status) + '</span>'
+          : (s.status === 'unknown'
+              ? '<span class="badge badge--muted">not yet recorded</span>'
+              : '<span class="badge badge--bad">' + escapeHtml(s.status) + '</span>');
+        const at = s.at
+          ? '<span class="muted" style="font-size:0.9em">as of ' + escapeHtml(s.at) + '</span>'
+          : '';
+        const detail = s.detail
+          ? '<p class="muted" style="margin:0.4rem 0 0;font-size:0.9em">' + escapeHtml(s.detail) + '</p>'
+          : '';
+        const fixBlock = s.fix ? `
+          <div style="margin-top:0.6rem;background:#0f172a0a;border:1px solid #0f172a1a;border-radius:6px;padding:0.6rem 0.8rem;">
+            <p class="muted" style="margin:0 0 0.4rem;font-size:0.9em;">${escapeHtml(s.fix.summary)}</p>
+            <pre class="app-card__output" id="host-fix-${escapeHtml(s.slug)}" style="max-height:none;margin:0 0 0.5rem;font-size:0.85em;">${escapeHtml(s.fix.command)}</pre>
+            <button class="btn btn--ghost" data-host-fix="${escapeHtml(s.slug)}" type="button">Copy fix command</button>
+            <span class="muted" style="font-size:0.85em;margin-left:0.6rem;">Run via Cockpit Terminal or SSH, then re-run bootstrap to refresh status.</span>
+          </div>` : '';
+        return `
+          <article class="app-card">
+            <header class="app-card__head">
+              <h3 class="app-card__title">${escapeHtml(s.label)}</h3>
+              ${badge}
+            </header>
+            ${at ? '<p class="app-card__desc">' + at + '</p>' : ''}
+            ${detail}
+            ${fixBlock}
+          </article>`;
+      }).join('');
+
+      // Wire the Copy-fix buttons. Same fallback ladder as the log Copy
+      // button (Clipboard API → execCommand → leave selected for Ctrl-C).
+      list.querySelectorAll('button[data-host-fix]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const slug = btn.getAttribute('data-host-fix');
+          const pre  = document.getElementById('host-fix-' + slug);
+          const text = pre ? pre.textContent : '';
+          const sel  = window.getSelection();
+          const range = document.createRange();
+          if (pre) {
+            range.selectNodeContents(pre);
+            sel.removeAllRanges();
+            sel.addRange(range);
+          }
+          let ok = false;
+          try {
+            if (navigator.clipboard && window.isSecureContext) {
+              await navigator.clipboard.writeText(text);
+              ok = true;
+            } else {
+              ok = document.execCommand('copy');
+            }
+          } catch (_) { ok = false; }
+          const orig = btn.textContent;
+          btn.textContent = ok ? 'Copied!' : 'Press Ctrl-C';
+          setTimeout(() => { btn.textContent = orig; }, 1500);
+        });
+      });
     }
 
     function renderInfra(items) {

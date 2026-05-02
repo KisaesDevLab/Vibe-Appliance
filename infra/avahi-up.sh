@@ -23,6 +23,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   export APPLIANCE_DIR
   # shellcheck source=/dev/null
   . "${APPLIANCE_DIR}/lib/log.sh"
+  # shellcheck source=/dev/null
+  . "${APPLIANCE_DIR}/lib/state.sh"
   log_init
   log_set_phase "avahi"
 fi
@@ -108,6 +110,7 @@ avahi_enable() {
   # recovery loop and emitting the same cryptic "Unit file ... does
   # not exist" twice.
   if ! _avahi_unit_known; then
+    state_set_host_service avahi "unit-missing" "dpkg installed but systemd has no avahi-daemon.service unit" 2>/dev/null || true
     log_warn "avahi-daemon package reports installed but systemd has no avahi-daemon.service unit; skipping mDNS setup"
     cat >&2 <<'HINT'
 
@@ -156,6 +159,7 @@ HINT
   fi
 
   if systemctl enable --now avahi-daemon >>"$VIBE_LOG_FILE" 2>&1; then
+    state_set_host_service avahi "active" "" 2>/dev/null || true
     log_ok "avahi-daemon: $(systemctl is-active avahi-daemon)"
     local hn; hn="$(hostname)"
     log_info "advertising as ${hn}.local on the LAN" hostname="$hn"
@@ -170,6 +174,7 @@ HINT
   _disable_resolved_mdns
   systemctl reset-failed avahi-daemon >>"$VIBE_LOG_FILE" 2>&1 || true
   if systemctl enable --now avahi-daemon >>"$VIBE_LOG_FILE" 2>&1; then
+    state_set_host_service avahi "active" "recovered after resolved-conflict fix" 2>/dev/null || true
     log_ok "avahi-daemon recovered after resolved-conflict fix"
     local hn; hn="$(hostname)"
     log_info "advertising as ${hn}.local on the LAN" hostname="$hn"
@@ -180,6 +185,7 @@ HINT
   # MulticastDNS=yes (Ubuntu default), so avahi can't bind. The
   # appliance works fine without avahi — operators reach it via the
   # server's IP — so this is a WARN, not a hard fail.
+  state_set_host_service avahi "inactive" "failed to start; likely systemd-resolved port 5353 conflict" 2>/dev/null || true
   log_warn "avahi-daemon failed to start; continuing without mDNS advertising"
   cat >&2 <<'HINT'
 

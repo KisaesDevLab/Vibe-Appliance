@@ -36,6 +36,7 @@ _EMERGENCY_PORT_RANGE="5171:5198"
 
 apply_ufw_rules() {
   if ! command -v ufw >/dev/null 2>&1; then
+    state_set_host_service ufw "not-installed" "" 2>/dev/null || true
     log_info "ufw not installed; skipping firewall rules"
     return 0
   fi
@@ -47,6 +48,7 @@ apply_ufw_rules() {
   local ufw_status
   ufw_status="$(ufw status 2>/dev/null | awk '/^Status:/ {print $2; exit}')"
   if [[ "$ufw_status" != "active" ]]; then
+    state_set_host_service ufw "inactive" "ufw installed but not enabled" 2>/dev/null || true
     # Detect whether the operator is currently on SSH so we can be
     # extra-loud about the lock-out risk. SSH_CONNECTION is set on
     # interactive sessions; SUDO_USER catches the `sudo bootstrap.sh`
@@ -146,6 +148,7 @@ except Exception:
     _ufw_allow_silent "192.168.0.0/16" "9090" "tcp" "cockpit RFC1918 (LAN mode)"
   fi
 
+  state_set_host_service ufw "active" "rules applied" 2>/dev/null || true
   log_ok "ufw rules applied"
 }
 
@@ -181,6 +184,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   export APPLIANCE_DIR
   # shellcheck source=/dev/null
   . "${APPLIANCE_DIR}/lib/log.sh"
+  # shellcheck source=/dev/null
+  . "${APPLIANCE_DIR}/lib/state.sh"
   log_init
   log_set_phase "ufw"
   apply_ufw_rules
