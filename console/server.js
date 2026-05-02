@@ -107,6 +107,12 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_audit_ts      ON settings_audit(ts);
   CREATE INDEX IF NOT EXISTS idx_audit_setting ON settings_audit(setting);
+  -- Composite for the paginated category-filter query in /api/v1/audit.
+  -- Without this, "WHERE category = ? ORDER BY ts DESC LIMIT ? OFFSET ?"
+  -- does a full scan + sort once the table grows past a few thousand
+  -- rows (1-year retention × 100 saves/day → ~36k rows). The composite
+  -- lets SQLite walk the index in (category, ts DESC) order.
+  CREATE INDEX IF NOT EXISTS idx_audit_category_ts ON settings_audit(category, ts DESC);
 `);
 db.prepare(
   `INSERT INTO meta (key, value) VALUES ('schema_version', '2')
@@ -453,24 +459,29 @@ app.get('/api/v1/apps', requireAdmin, (_req, res) => {
   res.json({ apps: items });
 });
 
-app.post('/api/v1/enable/:slug', requireAdmin, async (req, res) => {
+// Phase 8.5 hardening — rate-limit the toggle and update endpoints.
+// Each call spawns a docker compose pull / restart that hits GHCR or
+// dockerhub; without a limit, a hostile or runaway client can burn
+// bandwidth and trigger registry rate-limits. Same 10-req/min/IP
+// budget as the test endpoints, keyed separately by req.path.
+app.post('/api/v1/enable/:slug', requireAdmin, testRateLimit, async (req, res) => {
   await runToggle(req, res, ENABLE_SCRIPT, 'enable');
 });
 
-app.post('/api/v1/disable/:slug', requireAdmin, async (req, res) => {
+app.post('/api/v1/disable/:slug', requireAdmin, testRateLimit, async (req, res) => {
   await runToggle(req, res, DISABLE_SCRIPT, 'disable');
 });
 
 // --- Update endpoints --------------------------------------------------
 
-app.post('/api/v1/update/:slug', requireAdmin, async (req, res) => {
+app.post('/api/v1/update/:slug', requireAdmin, testRateLimit, async (req, res) => {
   const slug = req.params.slug;
   if (!SLUG_RE.test(slug)) return res.status(400).json({ error: 'invalid slug' });
   if (!MANIFESTS[slug])    return res.status(404).json({ error: 'unknown app' });
   await runShell(res, [UPDATE_SCRIPT, slug], 'update', { slug });
 });
 
-app.post('/api/v1/update/:slug/rollback', requireAdmin, async (req, res) => {
+app.post('/api/v1/update/:slug/rollback', requireAdmin, testRateLimit, async (req, res) => {
   const slug = req.params.slug;
   if (!SLUG_RE.test(slug)) return res.status(400).json({ error: 'invalid slug' });
   if (!MANIFESTS[slug])    return res.status(404).json({ error: 'unknown app' });
@@ -478,7 +489,7 @@ app.post('/api/v1/update/:slug/rollback', requireAdmin, async (req, res) => {
 });
 
 // One-off update check that the operator can fire by hand.
-app.post('/api/v1/update/check', requireAdmin, async (_req, res) => {
+app.post('/api/v1/update/check', requireAdmin, testRateLimit, async (_req, res) => {
   await runShell(res, [UPDATE_SCRIPT, '--check'], 'update-check');
 });
 
@@ -1097,6 +1108,12 @@ async function _testFetch(url, opts, timeoutMs) {
     clearTimeout(timer);
     let body = '';
     try { body = await r.text(); } catch { /* ignore */ }
+    // Strip non-printable / non-utf8-safe bytes from the body before
+    // returning. Provider error responses are meant to be JSON / plain
+    // text but a misbehaving upstream (or a partial response on
+    // network error) can include null bytes or escape sequences that
+    // mangle the JSON we send back to the browser.
+    body = body.replace(/[^\x20-\x7E\n\r\t]/g, '?');
     return { ok: r.ok, status: r.status, body };
   } catch (err) {
     clearTimeout(timer);

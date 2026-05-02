@@ -167,6 +167,14 @@ settings_save_apply() {
 
   log_info "settings save begin" payload="$payload_file" lock="$lock_file"
 
+  # Trap closes the lock fd on every exit path — function returns AND
+  # uncaught failures (set -e). Without this, a function called from a
+  # long-lived sourced shell would leak fds across saves and eventually
+  # exhaust the per-process limit. The trap fires on RETURN even from
+  # inside `if !` chains. Cleared on function exit so it doesn't fire
+  # for unrelated returns higher up the stack.
+  trap "exec {_save_lock_fd}>&-; trap - RETURN" RETURN
+
   # 1. Snapshot env first — without it there's no rollback path.
   local snap_dir
   snap_dir="$(settings_snapshot_env)"
