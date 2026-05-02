@@ -42,25 +42,104 @@ avahi_install() {
   fi
 }
 
+# Detect whether systemd-resolved is the one holding port 5353. On
+# Ubuntu 24.04, MulticastDNS=yes is the default in /etc/systemd/resolved.conf,
+# which binds *:5353 and prevents avahi-daemon from starting. Returns 0
+# if conflict detected, 1 otherwise.
+_resolved_owns_5353() {
+  # systemd-resolved must be active AND MulticastDNS in its effective
+  # config must be "yes" (or default-yes, which means the line is
+  # commented or absent on Ubuntu's distro config).
+  systemctl is-active systemd-resolved >/dev/null 2>&1 || return 1
+  # ss -ltnup is most reliable: shows owner of UDP listeners.
+  if ! command -v ss >/dev/null 2>&1; then
+    return 1
+  fi
+  ss -lnup 'sport = :5353' 2>/dev/null | grep -qi 'systemd-resolved'
+}
+
+# Apply the fix per Ubuntu's documented avahi-vs-resolved conflict:
+# turn off MulticastDNS in resolved, restart it. Idempotent — if
+# MulticastDNS=no is already set, the sed is a no-op and the restart
+# is harmless.
+_disable_resolved_mdns() {
+  local cfg=/etc/systemd/resolved.conf
+  [[ -f "$cfg" ]] || return 0
+  log_step "setting MulticastDNS=no in $cfg (avahi conflict resolution)"
+  # Match a line that begins with MulticastDNS= (commented or not) and
+  # replace with MulticastDNS=no. If no such line exists (some custom
+  # configs), append one to the [Resolve] section.
+  if grep -qE '^[[:space:]]*#?[[:space:]]*MulticastDNS[[:space:]]*=' "$cfg"; then
+    sed -i -E 's|^[[:space:]]*#?[[:space:]]*MulticastDNS[[:space:]]*=.*|MulticastDNS=no|' "$cfg"
+  else
+    # No MulticastDNS line at all — append under [Resolve] (or at end if
+    # the section header is missing too).
+    if grep -q '^\[Resolve\]' "$cfg"; then
+      sed -i -E '/^\[Resolve\]/a MulticastDNS=no' "$cfg"
+    else
+      printf '\n[Resolve]\nMulticastDNS=no\n' >> "$cfg"
+    fi
+  fi
+  log_step "restarting systemd-resolved to release :5353"
+  systemctl restart systemd-resolved >>"$VIBE_LOG_FILE" 2>&1 || \
+    log_warn "systemd-resolved restart returned non-zero; continuing"
+}
+
 avahi_enable() {
   log_step "ensuring avahi-daemon is enabled and running"
-  if ! systemctl enable --now avahi-daemon >>"$VIBE_LOG_FILE" 2>&1; then
-    # Most common cause: systemd-resolved is already on port 5353 with
-    # MulticastDNS=yes (Ubuntu default), so avahi can't bind. The
-    # appliance works fine without avahi — operators reach it via the
-    # server's IP — so this is a WARN, not a hard fail.
-    log_warn "avahi-daemon failed to start; continuing without mDNS advertising"
-    cat >&2 <<'HINT'
 
-           Likely cause: systemd-resolved already owns port 5353 with
-           MulticastDNS=yes (Ubuntu's default).
+  # Pre-flight: if systemd-resolved is already squatting on :5353,
+  # avahi will fail to start. Apply the canonical fix BEFORE the first
+  # start attempt rather than after — saves one restart cycle and
+  # produces cleaner logs. Bootstrap only invokes this script when the
+  # operator chose --mode lan, so they've explicitly opted into mDNS;
+  # mutating resolved is the right call.
+  if _resolved_owns_5353; then
+    log_info "systemd-resolved owns :5353 with MulticastDNS=yes — applying conflict fix"
+    _disable_resolved_mdns
+  fi
+
+  if systemctl enable --now avahi-daemon >>"$VIBE_LOG_FILE" 2>&1; then
+    log_ok "avahi-daemon: $(systemctl is-active avahi-daemon)"
+    local hn; hn="$(hostname)"
+    log_info "advertising as ${hn}.local on the LAN" hostname="$hn"
+    return 0
+  fi
+
+  # Start failed even after pre-flight (or pre-flight skipped because
+  # ss/systemctl unavailable). Try one recovery cycle: re-apply the
+  # resolved fix and retry avahi. If that also fails, fall back to the
+  # operator-facing hint.
+  log_warn "avahi-daemon failed to start on first try; attempting recovery"
+  _disable_resolved_mdns
+  systemctl reset-failed avahi-daemon >>"$VIBE_LOG_FILE" 2>&1 || true
+  if systemctl enable --now avahi-daemon >>"$VIBE_LOG_FILE" 2>&1; then
+    log_ok "avahi-daemon recovered after resolved-conflict fix"
+    local hn; hn="$(hostname)"
+    log_info "advertising as ${hn}.local on the LAN" hostname="$hn"
+    return 0
+  fi
+
+  # Most common cause: systemd-resolved is already on port 5353 with
+  # MulticastDNS=yes (Ubuntu default), so avahi can't bind. The
+  # appliance works fine without avahi — operators reach it via the
+  # server's IP — so this is a WARN, not a hard fail.
+  log_warn "avahi-daemon failed to start; continuing without mDNS advertising"
+  cat >&2 <<'HINT'
+
+           Likely cause: systemd-resolved still owns port 5353 even
+           after the auto-fix attempt — possibly because resolved.conf
+           is overridden by /etc/systemd/resolved.conf.d/*.conf snippets.
 
            Diagnose:
              sudo systemctl status avahi-daemon --no-pager
              sudo journalctl -u avahi-daemon -n 30 --no-pager
+             sudo ss -lnup 'sport = :5353'
+             sudo systemd-resolve --status | grep -i mDNS
 
-           Fix (turn off mDNS in resolved, retry avahi):
+           Fix (turn off mDNS in resolved everywhere, retry avahi):
              sudo sed -i 's/^#\?MulticastDNS=.*/MulticastDNS=no/' /etc/systemd/resolved.conf
+             sudo find /etc/systemd/resolved.conf.d -type f -exec sed -i 's/^#\?MulticastDNS=.*/MulticastDNS=no/' {} +
              sudo systemctl restart systemd-resolved
              sudo systemctl restart avahi-daemon
 
@@ -69,13 +148,7 @@ avahi_enable() {
            leave avahi off. The rest of the appliance is unaffected.
 
 HINT
-    return 0
-  fi
-  log_ok "avahi-daemon: $(systemctl is-active avahi-daemon)"
-
-  local hn
-  hn="$(hostname)"
-  log_info "advertising as ${hn}.local on the LAN" hostname="$hn"
+  return 0
 }
 
 avahi_install
