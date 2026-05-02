@@ -112,6 +112,177 @@
       </table>
     </section>
 
+    <section>
+      <h2>Help &amp; setup guides</h2>
+      <p class="muted">Reference for connecting this appliance to the internet via different paths. Pick the one that matches your network situation. Click a title to expand.</p>
+
+      <details style="margin-top:0.8rem;border:1px solid #0f172a1a;border-radius:6px;padding:0.6rem 0.8rem;">
+        <summary style="cursor:pointer;font-weight:600;">Custom DNS — own domain via public DNS</summary>
+        <div style="margin-top:0.8rem;line-height:1.55;">
+          <p><strong>When to use:</strong> Your appliance has a public IP, and you own a domain. Standard public-internet HTTPS via Let&rsquo;s Encrypt; Caddy auto-issues and renews certs.</p>
+
+          <p><strong>Prerequisites</strong></p>
+          <ul>
+            <li>Domain registered (any registrar)</li>
+            <li>Public-facing host with ports 80 and 443 reachable from the internet</li>
+            <li>An email address for Let&rsquo;s Encrypt expiry notifications</li>
+          </ul>
+
+          <p><strong>Steps</strong></p>
+          <ol>
+            <li>At your DNS provider, create A records:
+              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">yourdomain.com       A   &lt;your-public-ip&gt;
+*.yourdomain.com     A   &lt;your-public-ip&gt;</pre>
+            </li>
+            <li>Verify propagation from a different machine:
+              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">dig +short tb.yourdomain.com
+# should return your public IP</pre>
+            </li>
+            <li>Open ports 80 and 443:
+              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">sudo ufw allow 80,443/tcp</pre>
+              In the DigitalOcean control panel, also confirm any cloud-firewall rules allow 80/443 from <span class="mono">0.0.0.0/0</span>.
+            </li>
+            <li>Switch the appliance to domain mode:
+              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">sudo /opt/vibe/appliance/bootstrap.sh \
+  --mode domain \
+  --domain yourdomain.com \
+  --email you@yourdomain.com</pre>
+            </li>
+          </ol>
+
+          <p><strong>Verification</strong></p>
+          <ul>
+            <li><span class="mono">https://yourdomain.com/admin</span> loads with a green padlock</li>
+            <li>First request to each new subdomain takes 10&ndash;30s while Caddy issues its cert &mdash; subsequent requests are instant</li>
+          </ul>
+
+          <p><strong>Gotchas</strong></p>
+          <ul>
+            <li>Port 80 must be reachable from the public internet for ACME HTTP-01. If port 80 is blocked, certs never issue and every subdomain returns broken &mdash; use Cloudflare Tunnel or DNS-01 wildcard certs instead.</li>
+            <li>DNS propagation can take minutes to hours. Don&rsquo;t switch to domain mode until <span class="mono">dig</span> returns the right IP from a fresh machine, or you&rsquo;ll waste cert-issuance attempts (Let&rsquo;s Encrypt rate-limits at 5 failures per hostname per hour).</li>
+            <li>Switching from LAN/Tailscale mode rewrites your URLs &mdash; update bookmarks and any app callback URLs.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details style="margin-top:0.8rem;border:1px solid #0f172a1a;border-radius:6px;padding:0.6rem 0.8rem;">
+        <summary style="cursor:pointer;font-weight:600;">Tailscale &mdash; private mesh, no public IP needed</summary>
+        <div style="margin-top:0.8rem;line-height:1.55;">
+          <p><strong>When to use:</strong> Private deployment &mdash; only your team accesses the appliance, no public exposure needed. Or your host has no public IP at all.</p>
+
+          <p><strong>Prerequisites</strong></p>
+          <ul>
+            <li>Tailscale account (free for up to 100 devices)</li>
+            <li>Auth key from your Tailscale admin console</li>
+          </ul>
+
+          <p><strong>Steps</strong></p>
+          <ol>
+            <li>Generate an auth key at <span class="mono">https://login.tailscale.com/admin/settings/keys</span>. Recommended: reusable, no expiry &mdash; otherwise the appliance will go offline silently when the key expires.</li>
+            <li>Switch the appliance to Tailscale mode:
+              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">sudo /opt/vibe/appliance/bootstrap.sh \
+  --mode tailscale \
+  --tailscale-authkey tskey-auth-...</pre>
+            </li>
+            <li>Wait a minute or two for the tailnet hostname to propagate. Verify on the host:
+              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">tailscale status</pre>
+            </li>
+          </ol>
+
+          <p><strong>Verification</strong></p>
+          <ul>
+            <li>From any tailnet member: <span class="mono">https://&lt;hostname&gt;.&lt;your-tailnet&gt;.ts.net/admin</span> loads with a valid Tailscale-CA cert</li>
+            <li>Cockpit: <span class="mono">https://&lt;hostname&gt;.&lt;your-tailnet&gt;.ts.net:9090</span></li>
+          </ul>
+
+          <p><strong>Gotchas</strong></p>
+          <ul>
+            <li>Every user accessing the appliance needs Tailscale on their own device.</li>
+            <li>Tailscale&rsquo;s MagicDNS auto-issues certs from Tailscale&rsquo;s own CA &mdash; no Let&rsquo;s Encrypt, no port 80 requirement.</li>
+            <li>Vibe-Connect&rsquo;s client-portal magic-links won&rsquo;t work if your CLIENTS aren&rsquo;t on Tailscale (they almost certainly aren&rsquo;t). For external client traffic, you need Custom DNS or Cloudflare Tunnel; Tailscale is staff-only.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details style="margin-top:0.8rem;border:1px solid #0f172a1a;border-radius:6px;padding:0.6rem 0.8rem;">
+        <summary style="cursor:pointer;font-weight:600;">Cloudflare Tunnel &mdash; no port forwarding, no public IP</summary>
+        <div style="margin-top:0.8rem;line-height:1.55;">
+          <p><strong>When to use:</strong> Public clients need to reach the appliance, but you can&rsquo;t (or won&rsquo;t) open ports 80/443. Common cases: home installs behind double-NAT or carrier-grade NAT, datacenter VMs on internal networks, or adding Cloudflare&rsquo;s DDoS protection without changing infrastructure.</p>
+
+          <p><strong>Prerequisites</strong></p>
+          <ul>
+            <li>Cloudflare account (free)</li>
+            <li>Your domain hosted at Cloudflare (transfer nameservers if not already there)</li>
+            <li>Outbound HTTPS allowed from the host</li>
+          </ul>
+
+          <p><strong>Steps</strong> &mdash; manual; the appliance doesn&rsquo;t yet automate this</p>
+          <ol>
+            <li>Install cloudflared on the host:
+              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | \
+  sudo tee /usr/share/keyrings/cloudflare-main.gpg &gt;/dev/null
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] \
+  https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | \
+  sudo tee /etc/apt/sources.list.d/cloudflared.list
+sudo apt-get update && sudo apt-get install -y cloudflared</pre>
+            </li>
+            <li>Authenticate (opens a browser at Cloudflare):
+              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">sudo cloudflared tunnel login</pre>
+            </li>
+            <li>Create the tunnel and note its UUID:
+              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">sudo cloudflared tunnel create vibe-appliance</pre>
+              Credentials are written to <span class="mono">/root/.cloudflared/&lt;UUID&gt;.json</span>.
+            </li>
+            <li>Create <span class="mono">/etc/cloudflared/config.yml</span> (replace <span class="mono">&lt;UUID&gt;</span> and <span class="mono">yourdomain.com</span>):
+              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">tunnel: &lt;UUID&gt;
+credentials-file: /root/.cloudflared/&lt;UUID&gt;.json
+ingress:
+  - hostname: yourdomain.com
+    service: http://localhost:80
+  - hostname: "*.yourdomain.com"
+    service: http://localhost:80
+  - service: http_status:404</pre>
+              Cloudflare terminates TLS at its edge with its own cert; local Caddy serves HTTP-only inside the tunnel. Faster, and removes the cert-renewal dependency.
+            </li>
+            <li>Route the DNS records at Cloudflare:
+              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">sudo cloudflared tunnel route dns vibe-appliance yourdomain.com
+sudo cloudflared tunnel route dns vibe-appliance "*.yourdomain.com"</pre>
+            </li>
+            <li>Run as a systemd service:
+              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">sudo cloudflared service install
+sudo systemctl start cloudflared</pre>
+            </li>
+            <li>Bootstrap the appliance in domain mode &mdash; Caddy serves HTTP locally, Cloudflare provides HTTPS:
+              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">sudo /opt/vibe/appliance/bootstrap.sh \
+  --mode domain \
+  --domain yourdomain.com \
+  --email noreply@yourdomain.com</pre>
+              The email isn&rsquo;t used (no Let&rsquo;s Encrypt) but bootstrap requires the flag.
+            </li>
+            <li>Tighten the host firewall &mdash; ports 80/443 no longer need to be open to the public internet:
+              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">sudo ufw delete allow 80,443/tcp
+# only outbound to Cloudflare needs to work; inbound is gone</pre>
+            </li>
+          </ol>
+
+          <p><strong>Verification</strong></p>
+          <ul>
+            <li><span class="mono">sudo cloudflared tunnel info vibe-appliance</span> shows status <span class="mono">HEALTHY</span> with at least one active connection</li>
+            <li><span class="mono">https://yourdomain.com/admin</span> loads from anywhere on the internet, served by Cloudflare&rsquo;s cert</li>
+            <li>The Cloudflare Zero Trust dashboard shows the tunnel as <em>Active</em></li>
+          </ul>
+
+          <p><strong>Gotchas</strong></p>
+          <ul>
+            <li>Tunnel adds ~50&ndash;100ms latency vs direct connection. Fine for normal browser use; may be noticeable for real-time features.</li>
+            <li>Some apps&rsquo; OAuth callback URLs need to be set to the public Cloudflare-served domain.</li>
+            <li>Free tier has no daily/monthly limits for single-app use; rate limits kick in at high traffic. The Cloudflare docs at <span class="mono">developers.cloudflare.com/cloudflare-one</span> have the current numbers.</li>
+            <li>If you also want the Vibe emergency fallback ports (5171&ndash;5198) public-internet-reachable, you&rsquo;ll need to add per-port ingress rules to <span class="mono">config.yml</span> and route subdomains for them. Most setups leave the fallback ports LAN-only and use Tunnel for the primary domain only &mdash; that&rsquo;s safer.</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
     <footer class="footer">
       <p>
         Source:
