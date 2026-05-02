@@ -590,6 +590,12 @@
   }
 
   function onPerAppFieldChange(slug, field, input) {
+    // Disabled inputs may still emit change events under odd
+    // conditions (screen readers, JS console, browser autofill on a
+    // disabled field). Ignore them — disabled means the field is in
+    // an inherited or reverted state and shouldn't accept edits.
+    if (input.disabled) return;
+
     const newVal = readInputValue(input);
     const v = (state.values.perApp[slug] || {})[field.key];
     const dKey = dirtyKey('per-app:' + slug, field.key);

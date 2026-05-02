@@ -320,9 +320,18 @@ _post_save_tailscale_toggle() {
 
   if [[ "$enabled" == "true" ]]; then
     if ! command -v tailscale >/dev/null 2>&1; then
-      log_warn "TAILSCALE_ENABLED=true but tailscale CLI not installed" \
-        "fix:Install: sudo apt-get install -y tailscale" \
-        "fix:Then: sudo tailscale up --authkey <key>"
+      # The settings ALREADY wrote TAILSCALE_ENABLED=true to appliance.env
+      # at this point — but Tailscale itself isn't installed, so the
+      # toggle is effectively a no-op for now. Surface a loud warning
+      # with concrete recovery steps, but don't try to apt-install
+      # inline (the install path needs `infra/tailscale-up.sh` which
+      # also handles the apt repo + signing key). Operator runs that
+      # script (or re-runs bootstrap --tailscale) and re-saves.
+      log_warn "TAILSCALE_ENABLED=true but Tailscale CLI is not installed on this host" \
+        "diagnose:command -v tailscale; ls /etc/apt/sources.list.d/tailscale.list" \
+        "fix:Install via the canonical path: sudo bash /opt/vibe/appliance/infra/tailscale-up.sh" \
+        "fix:Or run: sudo /opt/vibe/appliance/bootstrap.sh --tailscale --tailscale-authkey <key>" \
+        "fix:After installing, re-save in Settings to trigger 'tailscale up'. Your TAILSCALE_ENABLED flag is preserved."
       return 1
     fi
     if [[ -z "$authkey" ]]; then

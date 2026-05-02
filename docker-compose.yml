@@ -47,9 +47,22 @@ services:
       - /opt/vibe/env/shared.env
       # Phase 8.5 v1.2 — appliance.env also mounted so the Settings
       # page's CLOUDFLARE_API_TOKEN write (admin Settings → Network)
-      # reaches Caddy without needing a re-bootstrap. Compose merges
-      # in declaration order, so appliance.env values OVERRIDE shared.env
-      # for the same key — Settings wins over the legacy bootstrap path.
+      # reaches Caddy without needing a re-bootstrap.
+      #
+      # Override semantics: docker-compose merges env_file entries in
+      # declaration order. For the same key in both files, the LATER
+      # file (appliance.env, declared second) wins. So Settings-page
+      # writes consistently override values from `bootstrap.sh
+      # --cloudflare-api-token` (which targets shared.env).
+      #
+      # File-existence: bootstrap's phase_secrets renders appliance.env
+      # before phase_core_up brings up Caddy, so the file always
+      # exists by container-start time. On a re-bootstrap that fails
+      # mid-secrets (rare), the file might be missing and compose
+      # would error "env file not found". Recovery: re-run
+      # `sudo /opt/vibe/appliance/bootstrap.sh` (idempotent — picks
+      # up at the failed phase) which calls secrets_render_appliance
+      # and creates the file.
       - /opt/vibe/env/appliance.env
     volumes:
       # Mount the PARENT directory, not the Caddyfile itself. Caddyfile

@@ -722,13 +722,19 @@ function buildSettingsRegistry() {
     if (!e.ui || e.ui.tier !== 1) {
       // Tier 2 settings (read-only with rotation hint) are also
       // surfaced — admin's password-change-flow lives at tier 2.
+      // CRITICAL: Tier 2 entries do NOT go into allKeys, so the
+      // /api/v1/settings/save endpoint's strict-scope-match check
+      // refuses any attempt to save them. Tier 2 is read-only by
+      // contract; the UI surfaces them but offers no input element.
+      // sharedSeen still records them so an app manifest can't
+      // accidentally re-declare the same key as Tier 1.
       if (e.ui && e.ui.tier === 2) {
         const f = _fieldDescriptor(e, '_appliance');
         const cat = e.ui.category;
         if (cat) {
           (appliance[cat] = appliance[cat] || []).push(f);
-          allKeys.set(f.key, f);
           sharedSeen.add(f.key);
+          // Deliberately NOT: allKeys.set(f.key, f) — see comment above.
         }
       }
       continue;
