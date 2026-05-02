@@ -312,6 +312,68 @@ secrets_set_kv_per_app() {
   _secrets_set_kv_in "$file" "$key" "$val"
 }
 
+# Pre-seed Portainer's admin password. Portainer doesn't accept a plain
+# password via env — it expects a bcrypt-hashed value in a file passed
+# via the `--admin-password-file` startup flag. This function hashes
+# the plain password from shared.env using a one-shot httpd:2.4-alpine
+# container (htpasswd is the most portable bcrypt tool we can rely on
+# without installing anything on the host) and writes the result to
+# /opt/vibe/data/portainer/.admin-pw, mode 600.
+#
+# Idempotency: preserves existing hash file unless force=true (passed
+# from --reset-env). On force, regenerates from the (likely rotated)
+# plain password.
+#
+# Note: Portainer applies --admin-password-file ONLY if the admin user
+# doesn't already exist in its database. If the operator already
+# created an admin manually before this code shipped, the seeded hash
+# is ignored (Portainer logs a notice). To force-apply: stop portainer,
+# delete /opt/vibe/data/portainer (loses all Portainer state), bootstrap.
+secrets_seed_portainer_password() {
+  local force="${1:-false}"
+  local pw_dir="${VIBE_DIR}/data/portainer"
+  local pw_file="${pw_dir}/.admin-pw"
+  local plain
+  plain="$(secrets_get PORTAINER_ADMIN_PASSWORD)"
+
+  if [[ -z "$plain" ]]; then
+    log_warn "PORTAINER_ADMIN_PASSWORD not set in shared.env — skipping Portainer password seed (Portainer will prompt on first visit)"
+    return 0
+  fi
+
+  if [[ -f "$pw_file" && "$force" != "true" ]]; then
+    log_info "portainer admin password file already present (preserving)" path="$pw_file"
+    return 0
+  fi
+
+  if ! command -v docker >/dev/null 2>&1; then
+    log_warn "docker not available; skipping Portainer password hash (will retry next bootstrap)"
+    return 0
+  fi
+
+  mkdir -p "$pw_dir"
+
+  log_step "computing portainer admin password hash via httpd:2.4-alpine"
+  local hash
+  hash="$(docker run --rm httpd:2.4-alpine \
+            htpasswd -bnB admin "$plain" 2>/dev/null \
+            | awk -F: '{print $2}' | tr -d '\r\n')"
+
+  if [[ -z "$hash" || "$hash" != \$2y\$* ]]; then
+    log_warn "failed to compute Portainer password hash (got: ${hash:-empty}); skipping seed"
+    return 0
+  fi
+
+  # Write atomically. mode 600 + root-owned so non-privileged users
+  # can't read the hash from the bind-mount source.
+  local tmp
+  tmp="$(mktemp "${pw_file}.XXXXXX")"
+  printf '%s' "$hash" > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$pw_file"
+  log_info "portainer admin password seeded" path="$pw_file"
+}
+
 # Write /opt/vibe/CREDENTIALS.txt with the human-readable subset of
 # secrets. This is the file the customer reads on first login. Crypto
 # secrets (JWT_SECRET, ENCRYPTION_KEY, DB_PASSWORD) are deliberately NOT
@@ -333,9 +395,15 @@ secrets_write_credentials() {
   # has lost this key, Duplicati can't decrypt its own settings DB and
   # all configured backup jobs are unrecoverable. Surface it in
   # CREDENTIALS.txt so it gets archived alongside other login secrets.
-  local dup_key
+  local dup_key dup_pass dup_web_pw portainer_pw
   dup_key="$(secrets_get SETTINGS_ENCRYPTION_KEY)"
   [[ -z "$dup_key" ]] && dup_key="(not yet generated — re-run bootstrap)"
+  dup_pass="$(secrets_get DUPLICATI_PASSPHRASE)"
+  [[ -z "$dup_pass" ]] && dup_pass="(not yet generated — re-run bootstrap)"
+  dup_web_pw="$(secrets_get DUPLICATI__WEBSERVICE_PASSWORD)"
+  [[ -z "$dup_web_pw" ]] && dup_web_pw="(not yet generated — re-run bootstrap)"
+  portainer_pw="$(secrets_get PORTAINER_ADMIN_PASSWORD)"
+  [[ -z "$portainer_pw" ]] && portainer_pw="(not yet generated — re-run bootstrap)"
 
   if [[ -z "$user" || -z "$pass" ]]; then
     die "console admin credentials missing from $VIBE_ENV_SHARED — re-run bootstrap"
@@ -410,24 +478,49 @@ For live per-app status, open the admin console "Emergency Access"
 panel at ${server_url}/admin.
 
 ================================================================
- DUPLICATI — settings DB encryption key
+ DUPLICATI (backup configuration UI)
 ================================================================
-Required since Duplicati 2.1. Encrypts the container's internal
-settings database (job configs, schedules, destination credentials).
-The container reads this from \$SETTINGS_ENCRYPTION_KEY at startup.
+URL:           ${server_url}/backup/  (also: http://${lan_ip}:5198/ fallback)
+Web username:  admin
+Web password:  ${dup_web_pw}
+
+Backup-job AES-256 passphrase — type this into the destination form
+when creating a backup job. Same passphrase for every backup; rotating
+it invalidates existing archives.
+
+  DUPLICATI_PASSPHRASE: ${dup_pass}
+
+Settings-DB encryption key — required since Duplicati 2.1, encrypts
+the container's internal settings database. The container reads it
+from \$SETTINGS_ENCRYPTION_KEY at startup.
 
   SETTINGS_ENCRYPTION_KEY: ${dup_key}
 
-⚠ KEEP THIS VALUE OFF-MACHINE.
+⚠ KEEP THESE VALUES OFF-MACHINE.
   If the host is destroyed and you restore /opt/vibe/data/duplicati
-  from an off-host backup but have lost this key, the settings DB
-  cannot be decrypted and every configured backup job is gone. The
-  key lives in /opt/vibe/env/shared.env (mode 600) — losing the host
-  loses the key with it.
+  from an off-host backup but have lost the encryption key, the
+  settings DB cannot be decrypted and every configured backup job
+  is gone. The passphrase is needed to read the actual archive
+  contents. Both live in /opt/vibe/env/shared.env (mode 600) —
+  losing the host loses them with it.
 
   This file is the canonical record. Print it, save it to a password
   manager, or store it in a sealed envelope alongside any other
   recovery credentials.
+
+================================================================
+ PORTAINER (container management UI)
+================================================================
+URL:       ${server_url}/portainer/  (also: http://${lan_ip}:5197/ fallback)
+Username:  admin
+Password:  ${portainer_pw}
+
+Pre-seeded by lib/secrets.sh into /opt/vibe/data/portainer/.admin-pw
+as a bcrypt hash. If you've already created an admin manually before
+this seed shipped, this value is unused (Portainer ignores
+--admin-password-file once an admin user exists). To force-apply:
+stop portainer, remove /opt/vibe/data/portainer (loses all Portainer
+state including stack registrations), and re-bootstrap.
 ================================================================
 EOF
   mv "$tmp" "$VIBE_CREDS_FILE"

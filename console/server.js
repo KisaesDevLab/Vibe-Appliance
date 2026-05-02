@@ -1638,7 +1638,7 @@ app.post('/api/v1/admin/test/llm', requireAdmin, testRateLimit, async (req, res)
 
 // --- First-login info (Phase 8) ----------------------------------------
 
-app.get('/api/v1/first-login', requireAdmin, (_req, res) => {
+app.get('/api/v1/first-login', requireAdmin, async (_req, res) => {
   const state = readState();
   const stateApps = state.apps || {};
   const items = Object.values(MANIFESTS)
@@ -1665,8 +1665,87 @@ app.get('/api/v1/first-login', requireAdmin, (_req, res) => {
       };
     })
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
-  res.json({ first_login: items });
+
+  // Infra services (Duplicati, Portainer) — passwords pre-seeded by
+  // bootstrap and surfaced from process.env (which the console
+  // container reads via env_file: shared.env). The container ALWAYS
+  // has these even when the infra service is stopped, so we report
+  // status from a docker inspect. Same shape as app items so the UI
+  // renderer doesn't need a second code path.
+  const config = state.config || {};
+  const infraDomainBase = (config.mode === 'domain' && config.domain)
+    ? `https://${config.domain}` : null;
+  const infraLanBase = config.host_ip ? `http://${config.host_ip}` : null;
+  const infraExtras = [];
+
+  const dupWebPw = process.env.DUPLICATI__WEBSERVICE_PASSWORD || '';
+  const dupPass  = process.env.DUPLICATI_PASSPHRASE || '';
+  if (dupWebPw) {
+    const dupRunning = await containerRunning('vibe-duplicati');
+    infraExtras.push({
+      slug: '_infra_duplicati_web',
+      displayName: 'Duplicati (web UI)',
+      type:     'default-credentials-passive',
+      username: 'admin',
+      password: dupWebPw,
+      login_url: infraDomainBase ? `${infraDomainBase}/backup/`
+               : infraLanBase ? `${infraLanBase}:5198/`
+               : '/backup/',
+      enabled:  true,
+      status:   dupRunning ? 'running' : 'stopped',
+      changed:  false,
+      note:     'Pre-seeded via DUPLICATI__WEBSERVICE_PASSWORD env. Change in Duplicati UI under Settings.',
+    });
+  }
+  if (dupPass) {
+    infraExtras.push({
+      slug: '_infra_duplicati_passphrase',
+      displayName: 'Duplicati (backup-job AES passphrase)',
+      type:     'default-credentials-passive',
+      username: '(no username — paste passphrase into the destination form)',
+      password: dupPass,
+      login_url: 'Type into Settings → Encryption when creating a backup job.',
+      enabled:  true,
+      status:   'running',
+      changed:  false,
+      note:     'Same passphrase for every backup job. Rotating it invalidates existing archives — do not change after first backup.',
+    });
+  }
+
+  const portainerPw = process.env.PORTAINER_ADMIN_PASSWORD || '';
+  if (portainerPw) {
+    const portRunning = await containerRunning('vibe-portainer');
+    infraExtras.push({
+      slug: '_infra_portainer',
+      displayName: 'Portainer (containers UI)',
+      type:     'default-credentials-passive',
+      username: 'admin',
+      password: portainerPw,
+      login_url: infraDomainBase ? `${infraDomainBase}/portainer/`
+               : infraLanBase ? `${infraLanBase}:5197/`
+               : '/portainer/',
+      enabled:  true,
+      status:   portRunning ? 'running' : 'stopped',
+      changed:  false,
+      note:     'Pre-seeded via lib/secrets.sh. Only takes effect on first install — if you already created an admin manually, your existing password is unchanged.',
+    });
+  }
+
+  res.json({ first_login: items.concat(infraExtras) });
 });
+
+// Helper: is a container running? Used by the first-login endpoint
+// for infra service status. Returns false on any error so a missing
+// container doesn't crash the response.
+async function containerRunning(name) {
+  try {
+    const c = docker.getContainer(name);
+    const info = await c.inspect();
+    return !!(info.State && info.State.Running);
+  } catch {
+    return false;
+  }
+}
 
 async function runShell(res, args, action, extra = {}) {
   log('info', 'spawn shell', { action, ...extra });

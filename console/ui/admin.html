@@ -638,12 +638,17 @@ sudo systemctl start cloudflared</pre>
       }
       list.innerHTML = '<div class="apps-list">' + items.map(item => {
         const enabled = item.enabled && item.status === 'running';
-        const note =
-          item.type === 'default-credentials-forced-reset'
-            ? 'app forces a password reset at first login'
-            : item.type === 'default-credentials-passive'
-              ? 'app does NOT force reset; rotate manually'
-              : '';
+        // Server-supplied note (per-item, e.g. "Pre-seeded via env...")
+        // wins over the type-derived generic note. Apps without a custom
+        // note still get the original "forces reset" / "rotate manually"
+        // hint based on type.
+        const note = item.note
+          ? item.note
+          : (item.type === 'default-credentials-forced-reset'
+              ? 'app forces a password reset at first login'
+              : item.type === 'default-credentials-passive'
+                ? 'app does NOT force reset; rotate manually'
+                : '');
         const stillDefault = item.changed
           ? '<span class="badge badge--good">changed</span>'
           : '<span class="badge badge--warn">still default</span>';

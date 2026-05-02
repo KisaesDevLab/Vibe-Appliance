@@ -515,6 +515,13 @@ HELP
     state_set_config_kv anthropic_key_present "true"
   fi
 
+  # Pre-seed Portainer's bcrypt-hashed admin password file. Runs after
+  # secrets_render so PORTAINER_ADMIN_PASSWORD is in shared.env. Pulls
+  # httpd:2.4-alpine on demand for htpasswd; idempotent across re-runs.
+  # The hash file is read by Portainer at startup via
+  # --admin-password-file (set in docker-compose.yml).
+  secrets_seed_portainer_password "$CONFIG_RESET_ENV"
+
   state_set_phase secrets ok
   log_ok "shared.env populated at $VIBE_ENV_SHARED"
 }
