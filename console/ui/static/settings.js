@@ -386,11 +386,38 @@
 
     saveBtn.disabled = true;
     discBtn.disabled = true;
+    // Long-running save (90s+ when restart-with-rollback fires) needs a
+    // visible heartbeat so the operator doesn't think the page hung.
+    // Toggle a dot every 800ms.
+    let elapsed = 0;
+    const tickStart = Date.now();
+    const tick = setInterval(() => {
+      elapsed = Math.floor((Date.now() - tickStart) / 1000);
+      const dots = '.'.repeat((elapsed % 3) + 1);
+      saveStat.textContent = `Saving${dots} (${elapsed}s — restart + health-check can take up to 90s per app)`;
+    }, 800);
     saveStat.textContent = 'Saving…';
     resultEl.hidden = true;
 
+    // Hidden showIf fields shouldn't be saved — their values are stale
+    // (e.g. RESEND_API_KEY left in dirty state after the operator
+    // switched EMAIL_PROVIDER to postmark). Filter the dirty map to
+    // currently-visible fields only.
+    const visibleKeys = new Set();
+    for (const wrap of panelEl.querySelectorAll('.settings-field')) {
+      if (wrap.style.display !== 'none') {
+        visibleKeys.add(wrap.dataset.key);
+      }
+    }
+    // For showIf'd fields not in active tab (different category dirty
+    // values), keep them — only filter against the active tab's fields.
+    const activeFields = new Set(
+      (state.schema.appliance[state.activeTab] || []).map(f => f.key)
+    );
+
     const changes = [];
-    for (const [, d] of state.dirty) {
+    for (const [key, d] of state.dirty) {
+      if (activeFields.has(key) && !visibleKeys.has(key)) continue;
       changes.push({
         scope:    d.scope,
         key:      d.field.key,
@@ -408,13 +435,23 @@
         body: JSON.stringify({ changes }),
       });
       const data = await r.json();
+      clearInterval(tick);
       renderResult(data);
-      if (r.ok && data.result === 'saved') {
+      // Reset dirty + reload values on BOTH saved and rolled-back.
+      // - saved: persisted, refresh to show the new state.
+      // - rolled-back: server restored env from snapshot, so the form
+      //   should also reset to that pre-save state. Leaving the dirty
+      //   values in place would let the operator click Save again and
+      //   trigger the same rollback in a loop.
+      // Degraded leaves dirty alone — operator may want to inspect /
+      // adjust what they tried before manual recovery.
+      if (r.ok && (data.result === 'saved' || data.result === 'rolled-back')) {
         state.dirty.clear();
-        await loadValues();           // refresh post-save
+        await loadValues();
         selectTab(state.activeTab);
       }
     } catch (err) {
+      clearInterval(tick);
       renderResult({ result: 'error', reason: err.message });
     } finally {
       updateSaveBar();

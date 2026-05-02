@@ -150,7 +150,22 @@ settings_save_apply() {
   local payload_file="${1:?settings_save_apply: payload file required}"
   [[ -f "$payload_file" ]] || die "settings_save_apply: payload file missing: $payload_file"
 
-  log_info "settings save begin" payload="$payload_file"
+  # Serialize concurrent saves. Two simultaneous POST /api/v1/settings/save
+  # requests would otherwise race on /opt/vibe/env/* writes — second
+  # snapshot, partial overlap, rollback path restores the wrong baseline.
+  # `flock --nonblock` returns immediately if held, so a concurrent save
+  # gets a clear error rather than a silent stall. The lock fd is closed
+  # automatically when the function returns (subshell exits).
+  local lock_file="${VIBE_DIR}/data/.settings-save.lock"
+  mkdir -p "$(dirname "$lock_file")"
+  exec {_save_lock_fd}>>"$lock_file"
+  if ! flock --nonblock "$_save_lock_fd"; then
+    _settings_emit_result "rolled-back" "another-save-in-progress" "" ""
+    exec {_save_lock_fd}>&-
+    return 1
+  fi
+
+  log_info "settings save begin" payload="$payload_file" lock="$lock_file"
 
   # 1. Snapshot env first — without it there's no rollback path.
   local snap_dir
@@ -375,6 +390,16 @@ print(json.load(open(sys.argv[1])).get('health_timeout_s', 90))
 PYEOF
 )"
   timeout_s="${timeout_s:-90}"
+
+  # Empty upstream/health means manifest fields were missing or the
+  # python parse failed silently. Probing http:/// would just stall
+  # the loop for the full timeout, then trigger a spurious rollback.
+  # Bail loudly instead.
+  if [[ -z "$upstream" || -z "$health" ]]; then
+    log_warn "$slug manifest missing routing.default_upstream or health" \
+      "diagnose:python3 -c \"import json; print(json.load(open('${manifest}')))\""
+    return 1
+  fi
 
   log_step "waiting for $slug health" upstream="$upstream" path="$health" timeout_s="$timeout_s"
 

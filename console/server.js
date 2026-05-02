@@ -798,7 +798,13 @@ const SETTINGS_SAVE_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'settings-save.sh')
 const KEY_RE   = /^[A-Z][A-Z0-9_]*$/;
 const SCOPE_RE = /^(appliance|per-app:[a-z][a-z0-9-]+)$/;
 
-app.post('/api/v1/settings/save', requireAdmin, (req, res) => {
+// Rate-limit settings/save so a runaway client (or hostile admin) can't
+// queue thousands of restart-with-rollback cycles per minute. Each save
+// can take 30-180s of compute (restart + health-check + maybe rollback)
+// so the limit is intentionally low. Reuses the per-IP testRateLimit
+// middleware — which is keyed by req.path, so save and test endpoints
+// have separate buckets.
+app.post('/api/v1/settings/save', requireAdmin, testRateLimit, (req, res) => {
   const body = req.body || {};
   if (!Array.isArray(body.changes) || body.changes.length === 0) {
     return res.status(400).json({ error: 'changes array required and non-empty' });
@@ -823,15 +829,21 @@ app.post('/api/v1/settings/save', requireAdmin, (req, res) => {
       }
     }
     // Reject keys that aren't declared in any manifest's Tier-1 ui block.
-    // This prevents the Settings UI from being used to set arbitrary
-    // env vars that bypass the schema. Per-app keys must match the
-    // declaring slug.
-    const allKey = c.scope === 'appliance'
+    // STRICT match: the scope sent by the client must match the
+    // manifest's declared scope. Registry stores appliance-shared keys
+    // under the bare key and per-app keys under "<slug>::<KEY>". A key
+    // declared as `appliance: "shared"` may be POSTed only with
+    // scope=appliance; a per-app-only key only with scope=per-app:slug;
+    // an `appliance: "both"` key with either (registry has both rows).
+    // Falling back to bare-key matching for per-app POSTs would let
+    // EMAIL_PROVIDER (declared appliance-shared) be written to a
+    // per-app env file by an attacker, where it would silently override
+    // the appliance value on container start.
+    const lookupKey = c.scope === 'appliance'
       ? c.key
       : (c.scope.split(':')[1] + '::' + c.key);
-    if (!SETTINGS_REGISTRY.allKeys.has(allKey)
-        && !SETTINGS_REGISTRY.allKeys.has(c.key)) {
-      return res.status(400).json({ error: 'unknown setting: ' + c.scope + '/' + c.key });
+    if (!SETTINGS_REGISTRY.allKeys.has(lookupKey)) {
+      return res.status(400).json({ error: 'unknown setting at this scope: ' + c.scope + '/' + c.key });
     }
   }
 
@@ -936,9 +948,18 @@ const AUDIT_COUNT_STMT_ALL    = db.prepare('SELECT COUNT(*) AS n FROM settings_a
 const AUDIT_COUNT_STMT_BY_CAT = db.prepare('SELECT COUNT(*) AS n FROM settings_audit WHERE category = ?');
 
 // CSV escape — wraps in quotes if needed, doubles internal quotes.
+// Phase 8.5 hardening: prepend a single-quote to cells starting with
+// formula chars (=, +, -, @, |, %) so Excel/Sheets/LibreOffice don't
+// auto-evaluate them as formulas. Without this, an attacker who
+// somehow lands a value like `=cmd|'/c calc'!A0` in the audit log can
+// achieve RCE on the operator's machine when they open the export.
+// Standard mitigation per OWASP CSV-injection guidance.
 function _csvCell(v) {
   if (v == null) return '';
-  const s = String(v);
+  let s = String(v);
+  if (s.length > 0 && '=+-@|%\t\r'.includes(s[0])) {
+    s = "'" + s;
+  }
   if (s.includes(',') || s.includes('"') || s.includes('\n') || s.includes('\r')) {
     return '"' + s.replace(/"/g, '""') + '"';
   }
@@ -1157,7 +1178,7 @@ app.post('/api/v1/admin/test/email', requireAdmin, testRateLimit, async (req, re
       try { id = (JSON.parse(result.body) || {}).id || ''; } catch { /* ignore */ }
       return res.json({ ok: true, message: `Test email sent via Resend to ${from}.`, message_id: id });
     }
-    return res.json({ ok: false, message: 'Resend rejected: ' + (result.error || `HTTP ${result.status}: ${result.body.slice(0, 200)}`) });
+    return res.json({ ok: false, message: 'Resend rejected: ' + (result.error || `HTTP ${result.status}: ${result.body.slice(0, 200) + (result.body.length > 200 ? '…' : '')}`) });
   }
 
   if (provider === 'postmark') {
@@ -1177,7 +1198,7 @@ app.post('/api/v1/admin/test/email', requireAdmin, testRateLimit, async (req, re
       try { id = (JSON.parse(result.body) || {}).MessageID || ''; } catch { /* ignore */ }
       return res.json({ ok: true, message: `Test email sent via Postmark to ${from}.`, message_id: id });
     }
-    return res.json({ ok: false, message: 'Postmark rejected: ' + (result.error || `HTTP ${result.status}: ${result.body.slice(0, 200)}`) });
+    return res.json({ ok: false, message: 'Postmark rejected: ' + (result.error || `HTTP ${result.status}: ${result.body.slice(0, 200) + (result.body.length > 200 ? '…' : '')}`) });
   }
 
   if (provider === 'smtp') {
@@ -1226,7 +1247,7 @@ app.post('/api/v1/admin/test/sms', requireAdmin, testRateLimit, async (req, res)
       try { sidOut = (JSON.parse(result.body) || {}).sid || ''; } catch { /* ignore */ }
       return res.json({ ok: true, message: `Test SMS dispatched via Twilio to ${to}.`, sid: sidOut });
     }
-    return res.json({ ok: false, message: 'Twilio rejected: ' + (result.error || `HTTP ${result.status}: ${result.body.slice(0, 200)}`) });
+    return res.json({ ok: false, message: 'Twilio rejected: ' + (result.error || `HTTP ${result.status}: ${result.body.slice(0, 200) + (result.body.length > 200 ? '…' : '')}`) });
   }
 
   if (provider === 'textlink') {
@@ -1269,7 +1290,7 @@ app.post('/api/v1/admin/test/llm', requireAdmin, testRateLimit, async (req, res)
   }
   return res.json({
     ok: false,
-    message: 'LLM endpoint rejected: ' + (result.error || `HTTP ${result.status}: ${result.body.slice(0, 200)}`),
+    message: 'LLM endpoint rejected: ' + (result.error || `HTTP ${result.status}: ${result.body.slice(0, 200) + (result.body.length > 200 ? '…' : '')}`),
   });
 });
 

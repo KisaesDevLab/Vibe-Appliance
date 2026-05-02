@@ -274,7 +274,18 @@ table.containers td.col-name { font-family: var(--mono); }
   margin-bottom: 0.85rem;
 }
 .app-card__kv dd {
+  /* Phase 8.5 — emergency URLs and long tailnet hostnames overflow the
+     grid cell on narrow viewports without these. overflow-wrap is the
+     modern equivalent of word-wrap; word-break is the fallback. The
+     anchor inside the dd inherits this since min-width: 0 lets the
+     dd shrink past its content's natural width. */
   word-break: break-all;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.app-card__kv dd a {
+  word-break: break-all;
+  overflow-wrap: anywhere;
 }
 .app-card__actions {
   margin-top: auto;

@@ -65,7 +65,8 @@
       <h2>Logs</h2>
       <p class="muted">Tail the structured logs under /opt/vibe/logs.</p>
       <div class="cta-row">
-        <select id="log-picker" class="btn btn--ghost"></select>
+        <label for="log-picker" class="visually-hidden" style="position:absolute;clip:rect(0 0 0 0);width:1px;height:1px;overflow:hidden;">Log file to tail</label>
+        <select id="log-picker" class="btn btn--ghost" aria-label="Log file to tail"></select>
         <button class="btn btn--ghost" id="log-refresh">Refresh</button>
         <span id="log-meta" class="muted"></span>
       </div>
