@@ -195,6 +195,15 @@ _self_clone_and_exec() {
     _pre_die "must run as root. Pipe through sudo: curl -fsSL ... | sudo bash"
   fi
 
+  # Move to a directory that's guaranteed to exist after we mutate
+  # /opt/vibe/appliance below. If the operator was *inside* that
+  # directory when running curl|bash, the mv-aside on line ~213
+  # deletes their shell's CWD; subsequent git/exec calls then die
+  # with "Unable to read current working directory" before we even
+  # reach phase 1. Cheap, safe, no observable side effect when the
+  # operator is already somewhere else.
+  cd / || _pre_die "cannot cd to / (filesystem in unusable state)"
+
   _pre_log "running via 'curl | bash' — installing git and cloning repo to ${VIBE_APPLIANCE_DIR_DEFAULT}"
 
   export DEBIAN_FRONTEND=noninteractive

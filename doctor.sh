@@ -150,6 +150,25 @@ print(v)
 PYEOF
 }
 
+# Detect whether doctor.sh is running inside a container vs on the host.
+# /.dockerenv is created by Docker for every container at runtime — the
+# canonical sentinel that's been in place since Docker 1.0. The console
+# spawns this script via `/bin/bash doctor.sh --json` from inside its
+# container; in that namespace `dpkg -s avahi-daemon`, `command -v ufw`,
+# and `systemctl is-active foo` give wrong answers (the console's
+# Debian-bookworm base doesn't ship those tools, while the host's Ubuntu
+# 24.04 does). Affected checks branch on this and read the host's
+# state.host_services entries (written by infra/avahi-up.sh and
+# lib/ufw-rules.sh during bootstrap) instead of probing in-container.
+_in_container() {
+  [[ -f /.dockerenv ]]
+}
+
+# Read state.host_services.<slug>.status. Empty string if missing.
+_host_service_status() { _state_get "host_services.$1.status"; }
+_host_service_at()     { _state_get "host_services.$1.at"; }
+_host_service_detail() { _state_get "host_services.$1.detail"; }
+
 _enabled_slugs() {
   python3 - "$VIBE_STATE_FILE" <<'PYEOF'
 import json, sys
@@ -204,6 +223,16 @@ _resolve_server_ip() {
 
 check_host_os() {
   _check_begin "Host OS"
+  # When running inside the console container this would report the
+  # console image's base OS (Debian bookworm) rather than the actual
+  # host. Be honest about it instead — the operator who ran doctor from
+  # the admin button shouldn't think they're running on Debian.
+  if _in_container; then
+    _check_warn "running inside console container — host OS not directly visible from here" \
+      "Run from the host shell to see the real host OS:
+  sudo /opt/vibe/appliance/doctor.sh"
+    return
+  fi
   if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
     . /etc/os-release
@@ -459,6 +488,29 @@ check_tailscale_serve() {
 
 check_avahi_status() {
   _check_begin "Avahi daemon"
+
+  # In-container path — defer to state.host_services written by
+  # infra/avahi-up.sh on the host. Without this branch, the check probes
+  # the console container (no avahi installed, no systemd) and produces
+  # a false WARN.
+  if _in_container; then
+    local s ts
+    s="$(_host_service_status avahi)"
+    ts="$(_host_service_at avahi)"
+    case "$s" in
+      active)        _check_pass "active (per state.host_services as of ${ts:-unknown})" ;;
+      inactive)      _check_fail "inactive — likely systemd-resolved port-5353 conflict" \
+                       "Fix: open the admin Host services panel and copy the Avahi fix command" ;;
+      unit-missing)  _check_warn "package installed but systemd has no avahi-daemon.service unit" \
+                       "Fix: sudo apt-get install --reinstall -y avahi-daemon && sudo systemctl daemon-reload && sudo systemctl enable --now avahi-daemon" ;;
+      "")            _check_warn "no host_services entry — re-run bootstrap on the host to populate" \
+                       "Fix: sudo /opt/vibe/appliance/bootstrap.sh" ;;
+      *)             _check_warn "unexpected status: $s" ;;
+    esac
+    return
+  fi
+
+  # Host path — direct systemd / dpkg probes work.
   if ! systemctl is-active avahi-daemon >/dev/null 2>&1; then
     if dpkg -s avahi-daemon >/dev/null 2>&1; then
       _check_fail "avahi-daemon is installed but not running" \
@@ -505,6 +557,26 @@ check_recent_errors() {
 check_cockpit_reachability() {
   _check_begin "Cockpit reachability"
 
+  # In-container path — neither `dpkg -s cockpit` nor `systemctl is-active
+  # cockpit.socket` works from the console namespace. But the console
+  # container has `host.docker.internal:host-gateway` in its extra_hosts
+  # (docker-compose.yml), so we can curl Cockpit's host port via that
+  # hostname. This is the same channel server.js's probeCockpit() uses.
+  if _in_container; then
+    local code
+    code="$(curl -ks -o /dev/null -w '%{http_code}' --max-time 3 \
+              https://host.docker.internal:9090/ 2>/dev/null || echo 000)"
+    case "$code" in
+      2*|3*) _check_pass "https://host.docker.internal:9090/ responds (HTTP $code)" ;;
+      000)   _check_warn "Cockpit not reachable from console container — may be down on the host, or --no-cockpit was passed" \
+               "Diagnose: from host shell, sudo systemctl status cockpit.socket
+Fix:      sudo bash /opt/vibe/appliance/infra/cockpit-install.sh" ;;
+      *)     _check_warn "Cockpit responded with unexpected HTTP $code" ;;
+    esac
+    return
+  fi
+
+  # Host path — full dpkg + systemctl + curl chain.
   if ! dpkg -s cockpit >/dev/null 2>&1; then
     _check_warn "cockpit not installed (--no-cockpit was passed, or install failed)" \
       "Fix: sudo bash /opt/vibe/appliance/infra/cockpit-install.sh"
@@ -642,6 +714,28 @@ check_emergency_proxy() {
 
 check_ufw_rules() {
   _check_begin "UFW emergency-port rules"
+
+  # In-container path — `ufw` binary isn't in the console image and even
+  # if it were, it can't read host iptables/nftables state. Defer to
+  # state.host_services.ufw written by lib/ufw-rules.sh on the host.
+  if _in_container; then
+    local s ts
+    s="$(_host_service_status ufw)"
+    ts="$(_host_service_at ufw)"
+    case "$s" in
+      active)        _check_pass "active with rules applied (per state.host_services as of ${ts:-unknown})" ;;
+      inactive)      _check_warn "ufw installed but inactive — emergency ports 5171:5198 unprotected" \
+                       "Fix: open the admin Host services panel and copy the UFW fix command" ;;
+      not-installed) _check_warn "ufw not installed; emergency ports are not firewalled" \
+                       "Fix: open the admin Host services panel and copy the UFW fix command" ;;
+      "")            _check_warn "no host_services entry — re-run bootstrap on the host to populate" \
+                       "Fix: sudo /opt/vibe/appliance/bootstrap.sh" ;;
+      *)             _check_warn "unexpected status: $s" ;;
+    esac
+    return
+  fi
+
+  # Host path — direct ufw probes work.
   if ! command -v ufw >/dev/null 2>&1; then
     _check_warn "ufw not installed; emergency ports are not firewalled" \
       "Fix: sudo apt-get install -y ufw && sudo ufw enable && sudo bash /opt/vibe/appliance/lib/ufw-rules.sh"
