@@ -34,15 +34,29 @@ VIBE_DIR="${VIBE_DIR:-/opt/vibe}"
 cockpit_install() {
   if dpkg -s cockpit >/dev/null 2>&1; then
     log_info "cockpit already installed"
-    return 0
+  else
+    log_step "installing cockpit via apt"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq >>"$VIBE_LOG_FILE" 2>&1
+    apt-get install -y -qq --no-install-recommends \
+      cockpit cockpit-system cockpit-bridge \
+      >>"$VIBE_LOG_FILE" 2>&1
+    log_ok "cockpit installed"
   fi
-  log_step "installing cockpit via apt"
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq >>"$VIBE_LOG_FILE" 2>&1
-  apt-get install -y -qq --no-install-recommends \
-    cockpit cockpit-system cockpit-bridge \
-    >>"$VIBE_LOG_FILE" 2>&1
-  log_ok "cockpit installed"
+
+  # `sscg` (Simple Self-Signed Certificate Generator) is Cockpit's
+  # preferred cert backend — it produces certs with proper SAN entries
+  # so browsers stop complaining about CN/IP mismatch once the CA is
+  # trusted. Without it, cockpit-certificate-helper falls back to
+  # openssl and emits "sscg: command not found" on first start. Cheap
+  # to install (universe repo, ~50 KB).
+  if ! dpkg -s sscg >/dev/null 2>&1; then
+    log_step "installing sscg (better self-signed certs for cockpit-ws)"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y -qq --no-install-recommends sscg \
+      >>"$VIBE_LOG_FILE" 2>&1 || \
+      log_warn "sscg install failed; cockpit will use openssl fallback (still functional, just less polished)"
+  fi
 }
 
 # Configure Cockpit to accept reverse-proxy headers so Caddy can front
@@ -60,10 +74,21 @@ cockpit_install() {
 cockpit_configure() {
   local cfg="/etc/cockpit/cockpit.conf"
   local domain="${1:-}"
+  local host_ip="${2:-}"
 
   local origins=""
   if [[ -n "$domain" ]]; then
     origins="https://cockpit.${domain} https://${domain}"
+  fi
+
+  # In LAN mode (no domain) operators reach Cockpit via the host's
+  # LAN IP at https://<host_ip>:9090/. Without that origin in the
+  # allowlist, Cockpit's WebSocket upgrade is rejected after TLS
+  # handshake completes — operator sees a blank page or terminal-
+  # never-loads. Include the cached IP whenever it's known so this
+  # works regardless of mode (harmless to allow even in domain mode).
+  if [[ -n "$host_ip" ]]; then
+    origins="${origins} https://${host_ip}:9090"
   fi
 
   # Detect tailnet hostname when Tailscale is up and add it to Origins.
@@ -146,12 +171,23 @@ cockpit_health_check() {
   return 0
 }
 
-# domain comes from state.config or first argument.
+# Read domain + host_ip from state.config (cached at bootstrap startup
+# in bootstrap.sh's main flow). Both are best-effort — empty values are
+# tolerated downstream, just produce a tighter Origins allowlist.
 if [[ -z "${COCKPIT_DOMAIN:-}" && -r "${VIBE_DIR}/state.json" ]]; then
   COCKPIT_DOMAIN="$(python3 -c "
 import json
 try:
     print(json.load(open('${VIBE_DIR}/state.json')).get('config',{}).get('domain',''))
+except Exception:
+    pass
+" 2>/dev/null || true)"
+fi
+if [[ -z "${COCKPIT_HOST_IP:-}" && -r "${VIBE_DIR}/state.json" ]]; then
+  COCKPIT_HOST_IP="$(python3 -c "
+import json
+try:
+    print(json.load(open('${VIBE_DIR}/state.json')).get('config',{}).get('host_ip',''))
 except Exception:
     pass
 " 2>/dev/null || true)"
@@ -192,7 +228,7 @@ except Exception:
 }
 
 cockpit_install
-cockpit_configure "${COCKPIT_DOMAIN:-}"
+cockpit_configure "${COCKPIT_DOMAIN:-}" "${COCKPIT_HOST_IP:-}"
 cockpit_enable
 cockpit_health_check
 cockpit_add_tailscale_serve

@@ -620,6 +620,11 @@ phase_infra() {
 
   log_step "installing cockpit on host"
   export COCKPIT_DOMAIN="$CONFIG_DOMAIN"
+  # LAN-mode operators reach Cockpit at https://<host_ip>:9090; pass
+  # the cached IP through so cockpit_configure adds it to Origins
+  # (without it, Cockpit's WebSocket upgrade is rejected after TLS
+  # handshake completes — operator gets a blank page).
+  export COCKPIT_HOST_IP="${_host_ip:-}"
   if ! ( cd "$APPLIANCE_DIR" && /bin/bash infra/cockpit-install.sh ); then
     log_warn "cockpit install failed; continuing without it"
     return 0
