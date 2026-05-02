@@ -1,0 +1,35 @@
+HTTP/1.0 503 Service Unavailable
+Cache-Control: no-cache
+Connection: close
+Content-Type: text/html; charset=utf-8
+
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>App not running — Vibe Appliance emergency access</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         max-width: 36rem; margin: 4rem auto; padding: 0 1.5rem; color: #2a2520;
+         background: #faf7f2; }
+  h1 { font-size: 1.4rem; margin-bottom: 0.5rem; color: #6b4423; }
+  p { line-height: 1.55; }
+  code { background: #efe9df; padding: 0.1rem 0.4rem; border-radius: 3px; font-size: 0.95em; }
+  .note { color: #8a7860; font-size: 0.9em; margin-top: 2rem; border-top: 1px solid #e0d8c8;
+          padding-top: 1rem; }
+</style>
+</head>
+<body>
+<h1>App not running</h1>
+<p>You reached the Vibe Appliance <strong>emergency access</strong> port for an app
+that isn't currently enabled (or its container is down).</p>
+<p>Open the admin console at <code>https://admin.&lt;your-server&gt;/admin</code> to
+enable the app or check its status. The admin URL was printed during
+installation — see <code>/opt/vibe/CREDENTIALS.txt</code> on the host if
+you've forgotten it.</p>
+<p class="note">This is plain HTTP on a non-standard port. Browsers may flag
+it as insecure — that's expected. Emergency access is gated to your LAN
+or Tailscale network and exists only for staff use when the primary
+HTTPS routing is broken.</p>
+</body>
+</html>

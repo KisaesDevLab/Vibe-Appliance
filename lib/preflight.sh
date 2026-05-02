@@ -237,6 +237,7 @@ _preflight_port_check() {
 
 preflight_port() {
   local port="$1"
+  local owner_container="${2:-vibe-caddy}"
   local title="Port ${port} is free"
   local listener
   listener="$(_preflight_port_check "$port")"
@@ -248,36 +249,54 @@ preflight_port() {
       who="$(ss -Hltnp "sport = :${port}" 2>/dev/null | head -n1)"
     fi
 
-    # Idempotency: if our own Caddy is already running, port 80/443
+    # Idempotency: if our own container is already running, the port
     # being held by docker-proxy is the EXPECTED state on a re-run,
     # not a conflict. Bootstrap must converge on a healthy install.
     # The check requires both signals — listener is docker-proxy AND
-    # a vibe-caddy container is up — to avoid passing on a port held
+    # the named container is up — to avoid passing on a port held
     # by some unrelated docker container.
     if [[ "$who" == *docker-proxy* ]] \
        && command -v docker >/dev/null 2>&1 \
-       && docker ps --filter name=^vibe-caddy$ --filter status=running --format '{{.Names}}' 2>/dev/null \
-            | grep -q '^vibe-caddy$'; then
-      log_check_pass "$title (held by vibe-caddy from prior bootstrap)"
+       && docker ps --filter "name=^${owner_container}$" --filter status=running --format '{{.Names}}' 2>/dev/null \
+            | grep -q "^${owner_container}\$"; then
+      log_check_pass "$title (held by ${owner_container} from prior bootstrap)"
       return 0
     fi
 
     log_check_fail "$title" \
       "Something is already listening on port ${port}." \
-      "cause:An existing web server (Apache, Nginx, Plesk) is bound to ${port}." \
-      "cause:A previous Vibe install left Caddy running and bootstrap state was wiped." \
+      "cause:An existing service (Apache, Nginx, Plesk, dev server) is bound to ${port}." \
+      "cause:A previous Vibe install left a container running and bootstrap state was wiped." \
       "cause:A test process (e.g. \`nc -l ${port}\`) was left running." \
       "diagnose:sudo ss -ltnp 'sport = :${port}'" \
       "diagnose:sudo lsof -iTCP:${port} -sTCP:LISTEN" \
-      "fix:Stop the conflicting service: sudo systemctl stop apache2 (or nginx, or whatever owns it)." \
-      "fix:Disable on boot: sudo systemctl disable apache2" \
-      "fix:If it's a leftover Caddy from us: sudo docker stop caddy 2>/dev/null; sudo docker rm caddy 2>/dev/null"
+      "fix:Stop the conflicting service: sudo systemctl stop <service-name>." \
+      "fix:Disable on boot: sudo systemctl disable <service-name>." \
+      "fix:If it's a leftover Vibe container: sudo docker stop ${owner_container} 2>/dev/null; sudo docker rm ${owner_container} 2>/dev/null"
 
     [[ -n "$who" ]] && printf '        Listener: %s\n\n' "$who" >&2 || true
     return 1
   fi
 
   log_check_pass "$title"
+}
+
+# Phase 8.5 Workstream D — emergency-access port range (5171:5198).
+# The HAProxy sidecar binds 5171, 5172, 5181, 5182, 5191, 5192 on the
+# host and 5199 on loopback. Each can be held by `vibe-emergency-proxy`
+# on a re-bootstrap (idempotent) or by an unrelated process (conflict).
+# The check is a soft loop — if any single port has a non-our-proxy
+# listener, log it but do NOT fail the whole bootstrap (the operator
+# may want to opt out of one port; emergency access is a fallback).
+preflight_emergency_ports() {
+  local errors=0
+  local p
+  for p in 5171 5172 5181 5182 5191 5192 5199; do
+    if ! preflight_port "$p" vibe-emergency-proxy; then
+      ((errors++)) || true
+    fi
+  done
+  return "$errors"
 }
 
 # ---- outbound HTTPS check ----------------------------------------------
@@ -322,6 +341,62 @@ preflight_https() {
   log_check_pass "$title"
 }
 
+# Phase 8.5 Workstream D — DigitalOcean cloud-firewall detection.
+# When this droplet runs behind DO's metadata-aware cloud firewall, the
+# emergency-access ports (5171-5198) are blocked at the cloud edge —
+# UFW rules on the host alone don't help because traffic never reaches
+# the host. Detect the metadata service and surface an actionable NOTE.
+#
+# WARN-not-FAIL: a DO droplet without an attached firewall has no rule
+# to set, so this check is informational. Operators get a copy-paste
+# instruction for adding the right exception when applicable.
+preflight_do_firewall() {
+  local title="DigitalOcean cloud-firewall detection"
+
+  # The DO metadata service is reachable from inside the droplet only.
+  # Short --max-time so this never blocks bootstrap on non-DO hosts.
+  if ! curl -fsS --max-time 2 \
+        http://169.254.169.254/metadata/v1/id >/dev/null 2>&1; then
+    # Not on a DO droplet — silently skip. No PASS line either; this
+    # check is only informational when DO is actually detected.
+    return 0
+  fi
+
+  log_check_warn "$title" \
+    "This droplet is behind DigitalOcean. If you've attached a cloud firewall, the emergency-access ports (5171-5198/TCP) are blocked at the DO edge — UFW alone won't help." \
+    "cause:DO cloud firewalls deny all inbound by default unless an explicit allow rule exists." \
+    "fix:If you want emergency access via Tailscale on this droplet, add a DO firewall rule:" \
+    "fix:  Source: Tag, value 'tailscale-access' (or specific Tailscale node IPs)" \
+    "fix:  Ports:  TCP 5171-5198" \
+    "fix:Without this rule, emergency access is unavailable on this droplet."
+  return 0
+}
+
+# Soft variant: log WARN, not FAIL. Used for opt-in egress checks
+# (Claude Code) where the appliance core works fine without the target.
+# Returns 0 always so the aggregator doesn't count it.
+preflight_https_soft() {
+  local host="$1"
+  local url="${2:-https://${host}/}"
+  local title="Outbound HTTPS to ${host} (optional)"
+
+  local http_code
+  if ! http_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$url" 2>/dev/null)"; then
+    http_code="000"
+  fi
+
+  if [[ "$http_code" == "000" ]]; then
+    log_check_warn "$title" \
+      "${host} is unreachable. The feature using this endpoint will not work, but the appliance core can still be installed." \
+      "diagnose:curl -v https://${host}/ 2>&1 | head -20" \
+      "fix:Open outbound 443 to ${host} or set HTTPS_PROXY in /etc/environment."
+    return 0
+  fi
+
+  log_check_pass "$title"
+  return 0
+}
+
 # ---- aggregator --------------------------------------------------------
 # Run every check. Return 0 if all PASSED (including WARN), non-zero with
 # the count of FAILED checks otherwise. Bootstrap exits on a non-zero
@@ -337,9 +412,27 @@ preflight_run_all() {
   if ! preflight_dns;      then ((errors++)) || true; fi
   if ! preflight_port 80;  then ((errors++)) || true; fi
   if ! preflight_port 443; then ((errors++)) || true; fi
+  # Phase 8.5 Workstream D — emergency-access ports. Loops 7 ports,
+  # each with vibe-emergency-proxy as the expected idempotent owner.
+  preflight_emergency_ports
+  local _eperr=$?
+  if (( _eperr > 0 )); then ((errors+=_eperr)) || true; fi
   if ! preflight_https ghcr.io;                                    then ((errors++)) || true; fi
   if ! preflight_https acme-v02.api.letsencrypt.org \
         https://acme-v02.api.letsencrypt.org/directory;            then ((errors++)) || true; fi
+
+  # Phase 8.5 Workstream D — DO cloud-firewall detection. Soft check;
+  # only emits a WARN when a DO metadata service is reachable AND
+  # operator chose to keep emergency-proxy enabled (it's always on).
+  preflight_do_firewall
+
+  # Phase 8.5 Workstream B — Claude Code egress checks. Gated on
+  # --with-claude-code, soft (WARN-not-FAIL) so a blocked Anthropic
+  # endpoint doesn't abort the appliance install.
+  if [[ "${CONFIG_CLAUDE_CODE:-false}" == "true" ]]; then
+    preflight_https_soft api.anthropic.com  https://api.anthropic.com/
+    preflight_https_soft deb.nodesource.com https://deb.nodesource.com/
+  fi
 
   return "$errors"
 }

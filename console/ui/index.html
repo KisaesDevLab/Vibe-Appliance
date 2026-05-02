@@ -69,16 +69,43 @@
     }
 
     function renderApps(apps) {
-      const cards = apps.map((a) => `
+      const cards = apps.map((a) => {
+        // Primary URL row — always present, clickable when http(s).
+        const primaryUrl = a.url && a.url.startsWith('http')
+          ? `<a href="${escapeHtml(a.url)}">${escapeHtml(a.url)}</a>`
+          : `<span class="muted">${escapeHtml(a.url || '—')}</span>`;
+
+        // Emergency / backup URL row — shown only when the appliance
+        // has both a manifest emergencyPort AND a cached host_ip. Plain
+        // HTTP on the LAN; the proxy is UFW-gated to RFC1918 + tailnet.
+        const emergencyRow = a.emergencyUrl ? `
+          <dt>backup</dt>
+          <dd><a href="${escapeHtml(a.emergencyUrl)}">${escapeHtml(a.emergencyUrl)}</a>
+            <span class="muted">(LAN/Tailscale only)</span></dd>` : '';
+
+        // Default admin username — surfaced so end users see what
+        // account to log in with. Password is deliberately NOT shown
+        // here; operators get it via /admin only.
+        const userRow = a.username ? `
+          <dt>username</dt>
+          <dd><span class="mono">${escapeHtml(a.username)}</span></dd>` : '';
+
+        return `
         <article class="app-card">
           <header class="app-card__head">
             <h3 class="app-card__title">${escapeHtml(a.displayName)}</h3>
           </header>
           <p class="app-card__desc">${escapeHtml(a.description)}</p>
+          <dl class="kv app-card__kv">
+            <dt>primary</dt><dd>${primaryUrl}</dd>
+            ${emergencyRow}
+            ${userRow}
+          </dl>
           <div class="app-card__actions">
             <a class="btn" href="${escapeHtml(a.url)}">Open</a>
           </div>
-        </article>`).join('');
+        </article>`;
+      }).join('');
       return `<div class="admin-grid">${cards}</div>`;
     }
 

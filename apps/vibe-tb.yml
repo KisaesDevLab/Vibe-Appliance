@@ -35,6 +35,11 @@ services:
     init: true
     env_file:
       - /opt/vibe/env/shared.env
+      # Phase 8.5 Workstream C — Tier 1 inline-editable settings managed
+      # via the admin Settings page. Loaded between shared.env and the
+      # per-app env so per-app overrides win (Docker compose merges in
+      # declared order; later files override earlier).
+      - /opt/vibe/env/appliance.env
       - /opt/vibe/env/vibe-tb.env
     volumes:
       # Persistent storage matching upstream prod compose: trial-balance
@@ -67,6 +72,11 @@ services:
     restart: unless-stopped
     env_file:
       - /opt/vibe/env/shared.env
+      # Phase 8.5 Workstream C — Tier 1 inline-editable settings managed
+      # via the admin Settings page. Loaded between shared.env and the
+      # per-app env so per-app overrides win (Docker compose merges in
+      # declared order; later files override earlier).
+      - /opt/vibe/env/appliance.env
       - /opt/vibe/env/vibe-tb.env
     networks:
       vibe_net: {}

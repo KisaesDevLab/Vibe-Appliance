@@ -31,6 +31,62 @@
       { "name": "DATABASE_URL",    "from": "database-url" },
       { "name": "REDIS_URL",       "from": "redis-url" },
       { "name": "MIGRATIONS_AUTO", "from": "static:false" }
+    ],
+    "optional": [
+      {
+        "name":   "ANTHROPIC_API_KEY",
+        "from":   "appliance:ANTHROPIC_API_KEY",
+        "secret": true,
+        "doc":    "Claude API key for AI-assisted bookkeeping. Inherited from appliance-wide ANTHROPIC_API_KEY (Settings → AI) unless overridden for this app.",
+        "ui": {
+          "tier":         1,
+          "category":     "AI",
+          "label":        "Anthropic API key",
+          "helpText":     "Powers Vibe-MyBooks AI features. The same key is used appliance-wide unless overridden per-app.",
+          "input":        "password",
+          "appliance":    "both",
+          "validate":     "anthropic-api-key",
+          "testEndpoint": "/api/v1/admin/test/anthropic"
+        }
+      },
+      {
+        "name":  "LICENSE_MODE",
+        "value": "online",
+        "doc":   "License validation mode. 'online' phones home periodically, 'offline' uses a pre-issued license file, 'disabled' bypasses license checks.",
+        "ui": {
+          "tier":      1,
+          "category":  "Application",
+          "label":     "License mode",
+          "helpText":  "Controls how MyBooks validates its license. 'offline' for air-gapped installs.",
+          "input":     "dropdown",
+          "appliance": "per-app",
+          "validate":  "enum",
+          "options": [
+            { "value": "online",   "label": "Online (default)" },
+            { "value": "offline",  "label": "Offline (pre-issued license file)" },
+            { "value": "disabled", "label": "Disabled (no license check)" }
+          ]
+        }
+      },
+      {
+        "name":  "LOG_LEVEL",
+        "value": "info",
+        "doc":   "Application log verbosity. Use 'debug' only when investigating an issue — high volume in production.",
+        "ui": {
+          "tier":      1,
+          "category":  "Time & Logging",
+          "label":     "Log level",
+          "input":     "dropdown",
+          "appliance": "per-app",
+          "validate":  "enum",
+          "options": [
+            { "value": "error", "label": "error" },
+            { "value": "warn",  "label": "warn"  },
+            { "value": "info",  "label": "info"  },
+            { "value": "debug", "label": "debug" }
+          ]
+        }
+      }
     ]
   },
 

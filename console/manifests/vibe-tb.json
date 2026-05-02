@@ -11,8 +11,9 @@
     "defaultTag": "latest"
   },
 
-  "subdomain": "tb",
-  "ports":     { "server": 3001, "client": 80 },
+  "subdomain":     "tb",
+  "emergencyPort": 5172,
+  "ports":         { "server": 3001, "client": 80 },
 
   "routing": {
     "default_upstream": "vibe-tb-client:80",
@@ -36,9 +37,20 @@
     ],
     "optional": [
       {
-        "name": "ANTHROPIC_API_KEY",
+        "name":   "ANTHROPIC_API_KEY",
+        "from":   "appliance:ANTHROPIC_API_KEY",
         "secret": true,
-        "doc": "Claude API key for AI features. Set via 'sudo nano /opt/vibe/env/vibe-tb.env'."
+        "doc":    "Claude API key for AI features. Set via the admin Settings page (AI category). Inherited from appliance.env unless overridden per-app.",
+        "ui": {
+          "tier":         1,
+          "category":     "AI",
+          "label":        "Anthropic API key",
+          "helpText":     "Powers Vibe-TB AI features. The same key is used appliance-wide unless overridden per-app.",
+          "input":        "password",
+          "appliance":    "both",
+          "validate":     "anthropic-api-key",
+          "testEndpoint": "/api/v1/admin/test/anthropic"
+        }
       }
     ]
   },

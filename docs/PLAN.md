@@ -68,12 +68,16 @@ Vibe-Appliance/
 │   ├── redis/
 │   ├── caddy/
 │   ├── console.sqlite
+│   ├── emergency-proxy/         # haproxy.cfg + 503.http (Phase 8.5 W-D)
+│   ├── env-history/             # timestamped env snapshots from settings saves (Phase 8.5 W-C)
 │   └── apps/<app-slug>/         # uploads, backups, app-specific volumes
 ├── env/
-│   ├── shared.env
+│   ├── shared.env               # crypto material (POSTGRES_PASSWORD, JWT, etc.)
+│   ├── appliance.env            # Tier 1 inline-editable settings (Phase 8.5 W-C)
 │   └── <app-slug>.env           # generated from templates
 ├── state.json                   # current desired/actual state
 ├── CREDENTIALS.txt              # generated on first boot, mode 600
+├── SUPPORT.md                   # operator hint, dropped by --with-claude-code (Phase 8.5 W-B)
 └── logs/                        # all bootstrap/doctor/update logs
 ```
 

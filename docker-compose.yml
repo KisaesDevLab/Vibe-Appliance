@@ -218,3 +218,44 @@ services:
     # No healthcheck: the official portainer-ce image doesn't include
     # wget/curl/etc., and Portainer's HTTP listener boots in <5 s on
     # any reasonable host. Caddy's reverse-proxy probe is sufficient.
+
+  emergency-proxy:
+    # Phase 8.5 Workstream D — second, independent reverse proxy that
+    # gives staff a working access path when the primary domain routing
+    # is broken. Plain HTTP, no ACME, deliberately decoupled from Caddy.
+    # Config is rendered by lib/render-haproxy.sh from manifest
+    # emergencyPort fields. UFW (lib/ufw-rules.sh) gates these ports to
+    # RFC1918 + Tailscale CGNAT only — they MUST NEVER be reachable from
+    # the public internet.
+    #
+    # `depends_on: []` is deliberate: emergency-proxy must come up even
+    # if Caddy or any app is broken, and must keep running if they
+    # crash. That's the whole point.
+    image: haproxy:2.9-alpine
+    container_name: vibe-emergency-proxy
+    restart: unless-stopped
+    ports:
+      - "5171:5171"
+      - "5172:5172"
+      - "5181:5181"
+      - "5182:5182"
+      - "5191:5191"
+      - "5192:5192"
+      # Stats UI on loopback only — SSH-tunnel for diagnostics, never
+      # exposed off-host. See docs/addenda/emergency-access.md §4.1.
+      - "127.0.0.1:5199:5199"
+    volumes:
+      - /opt/vibe/data/emergency-proxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - /opt/vibe/data/emergency-proxy/503.http:/usr/local/etc/haproxy/503.http:ro
+    networks:
+      - vibe_net
+    depends_on: []
+    healthcheck:
+      # `haproxy -c -f` exits 0 when the config parses; useful liveness
+      # probe without reaching out for socat or other extras. The image
+      # is busybox-ish but ships sh.
+      test: ["CMD-SHELL", "haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg >/dev/null 2>&1 || exit 1"]
+      interval: 60s
+      timeout: 5s
+      retries: 2
+      start_period: 10s

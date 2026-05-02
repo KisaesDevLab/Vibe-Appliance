@@ -21,6 +21,10 @@
 VIBE_DIR="${VIBE_DIR:-/opt/vibe}"
 VIBE_ENV_DIR="${VIBE_ENV_DIR:-${VIBE_DIR}/env}"
 VIBE_ENV_SHARED="${VIBE_ENV_SHARED:-${VIBE_ENV_DIR}/shared.env}"
+# appliance.env holds Tier 1 inline-editable settings (admin config surface,
+# Phase 8.5 Workstream C). Independent of shared.env — see
+# env-templates/appliance.env.tmpl header for the boundary rationale.
+VIBE_ENV_APPLIANCE="${VIBE_ENV_APPLIANCE:-${VIBE_ENV_DIR}/appliance.env}"
 VIBE_CREDS_FILE="${VIBE_CREDS_FILE:-${VIBE_DIR}/CREDENTIALS.txt}"
 
 # Generate a 64-character hex string (32 random bytes). openssl is in
@@ -42,19 +46,24 @@ _existing_value() {
   ' "$file"
 }
 
-# Render env-templates/shared.env.tmpl → /opt/vibe/env/shared.env.
+# Private: render any secrets template to any output path. Behaviour
+# differs by file role:
+#   preserve_static=false → static (non-{{PLACEHOLDER}}) lines emit
+#     verbatim from template. Used for shared.env, where values like
+#     CONSOLE_ADMIN_USER=admin are template-controlled and operator
+#     edits should not silently override.
+#   preserve_static=true → static lines preserve any non-empty existing
+#     value; template default applies only when the key is missing or
+#     empty. Used for appliance.env, where operator-set values via the
+#     Settings page must survive bootstrap re-runs.
 #
-# For each {{PLACEHOLDER}}:
-#   - if reset_env=true → always generate fresh.
-#   - else if shared.env already has a value for the matching KEY → keep it.
-#   - else → generate a new hex32.
-#
-# Args:
-#   $1 path to template (defaults to ${APPLIANCE_DIR}/env-templates/shared.env.tmpl)
-#   $2 reset flag (true|false; defaults to false)
-secrets_render() {
-  local tmpl="${1:-${APPLIANCE_DIR}/env-templates/shared.env.tmpl}"
-  local reset="${2:-false}"
+# {{PLACEHOLDER}} lines always preserve existing values (with --reset-env
+# regenerating). That logic is unchanged from before.
+_secrets_render_to() {
+  local tmpl="$1"
+  local out="$2"
+  local reset="${3:-false}"
+  local preserve_static="${4:-false}"
 
   [[ -f "$tmpl" ]] || die "secrets template missing: $tmpl"
 
@@ -63,16 +72,16 @@ secrets_render() {
   # If reset requested and an existing file is there, archive it so the
   # operator can compare/recover. Never silently overwrite a file with
   # secrets in it.
-  if [[ "$reset" == "true" && -f "$VIBE_ENV_SHARED" ]]; then
-    local backup="${VIBE_ENV_SHARED}.bak.$(date -u +%Y%m%d%H%M%S)"
-    cp -p "$VIBE_ENV_SHARED" "$backup"
+  if [[ "$reset" == "true" && -f "$out" ]]; then
+    local backup="${out}.bak.$(date -u +%Y%m%d%H%M%S)"
+    cp -p "$out" "$backup"
     chmod 600 "$backup"
-    log_warn "archived previous shared.env to $backup"
-    rm -f "$VIBE_ENV_SHARED"
+    log_warn "archived previous $(basename "$out") to $backup"
+    rm -f "$out"
   fi
 
   local tmp
-  tmp="$(mktemp "${VIBE_ENV_SHARED}.XXXXXX")"
+  tmp="$(mktemp "${out}.XXXXXX")"
   chmod 600 "$tmp"
 
   local generated=0 reused=0
@@ -96,7 +105,7 @@ secrets_render() {
     # Detect a {{PLACEHOLDER}} on the value side.
     if [[ "$val" =~ ^\{\{([A-Z0-9_]+)\}\}$ ]]; then
       placeholder="${BASH_REMATCH[1]}"
-      existing="$(_existing_value "$key" "$VIBE_ENV_SHARED")"
+      existing="$(_existing_value "$key" "$out")"
       if [[ -n "$existing" ]]; then
         printf '%s=%s\n' "$key" "$existing" >>"$tmp"
         ((reused++)) || true
@@ -105,15 +114,117 @@ secrets_render() {
         ((generated++)) || true
       fi
     else
-      # Static line — emit verbatim.
+      # Static line — preserve operator-set value when the file role
+      # asks for it (appliance.env), otherwise emit template verbatim.
+      if [[ "$preserve_static" == "true" ]]; then
+        existing="$(_existing_value "$key" "$out")"
+        if [[ -n "$existing" ]]; then
+          printf '%s=%s\n' "$key" "$existing" >>"$tmp"
+          ((reused++)) || true
+          continue
+        fi
+      fi
       printf '%s\n' "$line" >>"$tmp"
     fi
   done <"$tmpl"
 
-  mv "$tmp" "$VIBE_ENV_SHARED"
-  chmod 600 "$VIBE_ENV_SHARED"
+  # Phase 8.5 W-C — preserve_static mode also rescues operator-set keys
+  # that exist in the live file but are NOT declared in the template.
+  # Without this, the Settings UI writing EMAIL_PROVIDER (which isn't
+  # in appliance.env.tmpl yet) would have its value wiped on the next
+  # bootstrap re-render. Same merge pattern as lib/enable-app.sh's
+  # _render_app_env "preserved from previous render" block.
+  local appended=0
+  if [[ "$preserve_static" == "true" && -f "$out" ]]; then
+    local rescued rescue_err
+    rescue_err="$(mktemp)"
+    rescued="$(python3 - "$tmpl" "$out" 2>"$rescue_err" <<'PYEOF'
+import re, sys
+tmpl_path, live_path = sys.argv[1:3]
 
-  log_info "shared.env rendered" generated="$generated" reused="$reused" path="$VIBE_ENV_SHARED"
+def keys(path):
+    out = set()
+    try:
+        with open(path) as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                if not line or line.lstrip().startswith("#"): continue
+                if "=" not in line: continue
+                out.add(line.split("=", 1)[0])
+    except FileNotFoundError:
+        pass
+    return out
+
+tmpl_keys = keys(tmpl_path)
+emitted = []
+seen = set()
+with open(live_path) as f:
+    for raw in f:
+        line = raw.rstrip("\n")
+        if not line or line.lstrip().startswith("#"): continue
+        if "=" not in line: continue
+        k = line.split("=", 1)[0]
+        if k in tmpl_keys: continue        # already handled by template loop
+        if k in seen:       continue        # de-dup
+        seen.add(k)
+        emitted.append(line)
+print("\n".join(emitted))
+PYEOF
+)"
+    if [[ -s "$rescue_err" ]]; then
+      log_warn "python rescue step printed to stderr; operator-set keys may have been silently dropped" \
+        "diagnose:cat $rescue_err"
+      # Keep the stderr file around for the operator. Don't rm.
+    else
+      rm -f "$rescue_err"
+    fi
+    if [[ -n "$rescued" ]]; then
+      {
+        printf '\n# --- preserved from previous render (operator-set, not in template) ---\n'
+        printf '%s\n' "$rescued"
+      } >>"$tmp"
+      appended="$(printf '%s\n' "$rescued" | wc -l | tr -d ' ')"
+    fi
+  fi
+
+  mv "$tmp" "$out"
+  chmod 600 "$out"
+
+  log_info "$(basename "$out") rendered" generated="$generated" reused="$reused" preserved="$appended" path="$out"
+}
+
+# Render env-templates/shared.env.tmpl → /opt/vibe/env/shared.env.
+#
+# For each {{PLACEHOLDER}}:
+#   - if reset_env=true → always generate fresh.
+#   - else if shared.env already has a value for the matching KEY → keep it.
+#   - else → generate a new hex32.
+# Static lines are emitted verbatim from the template (operator edits to
+# shared.env are deliberately not preserved across re-runs).
+#
+# Args:
+#   $1 path to template (defaults to ${APPLIANCE_DIR}/env-templates/shared.env.tmpl)
+#   $2 reset flag (true|false; defaults to false)
+secrets_render() {
+  local tmpl="${1:-${APPLIANCE_DIR}/env-templates/shared.env.tmpl}"
+  local reset="${2:-false}"
+  _secrets_render_to "$tmpl" "$VIBE_ENV_SHARED" "$reset" "false"
+}
+
+# Render env-templates/appliance.env.tmpl → /opt/vibe/env/appliance.env.
+#
+# Same {{PLACEHOLDER}} semantics as secrets_render. Differs in that static
+# lines (e.g. ANTHROPIC_API_KEY=) preserve operator-set values across
+# re-runs — the Settings page is the source of truth, the template is
+# just a default-and-discovery surface.
+#
+# Args:
+#   $1 path to template (defaults to ${APPLIANCE_DIR}/env-templates/appliance.env.tmpl)
+#   $2 reset flag (true|false; defaults to false)
+secrets_render_appliance() {
+  local tmpl="${1:-${APPLIANCE_DIR}/env-templates/appliance.env.tmpl}"
+  local reset="${2:-false}"
+  _secrets_render_to "$tmpl" "$VIBE_ENV_APPLIANCE" "$reset" "true"
 }
 
 # Read a value from /opt/vibe/env/shared.env. Used by bootstrap.sh to
@@ -124,14 +235,19 @@ secrets_get() {
   _existing_value "$key" "$VIBE_ENV_SHARED"
 }
 
-# Set or replace a single key=value pair in shared.env. Used by
-# bootstrap.sh to persist operator-supplied values like
-# CLOUDFLARE_API_TOKEN that aren't auto-generated. Pass val="" to clear.
-# Atomic via tmp + rename.
-secrets_set_kv() {
-  local key="$1" val="$2"
-  [[ -f "$VIBE_ENV_SHARED" ]] || die "shared.env missing; run secrets_render first"
-  python3 - "$VIBE_ENV_SHARED" "$key" "$val" <<'PYEOF'
+# Read a value from /opt/vibe/env/appliance.env. Used by Claude Code's
+# install script to detect API-key auth, and by the Settings page render
+# to populate "current value" for Tier 1 fields.
+secrets_get_appliance() {
+  local key="$1"
+  _existing_value "$key" "$VIBE_ENV_APPLIANCE"
+}
+
+# Internal: atomic key=value upsert in any env file. Body shared by
+# secrets_set_kv (shared.env) and secrets_set_kv_appliance (appliance.env).
+_secrets_set_kv_in() {
+  local file="$1" key="$2" val="$3"
+  python3 - "$file" "$key" "$val" <<'PYEOF'
 import os, sys
 path, key, val = sys.argv[1:4]
 prefix = key + "="
@@ -153,6 +269,47 @@ with open(tmp, "w") as f:
 os.chmod(tmp, 0o600)
 os.rename(tmp, path)
 PYEOF
+}
+
+# Set or replace a single key=value pair in shared.env. Used by
+# bootstrap.sh to persist operator-supplied values like
+# CLOUDFLARE_API_TOKEN that aren't auto-generated. Pass val="" to clear.
+# Atomic via tmp + rename.
+secrets_set_kv() {
+  local key="$1" val="$2"
+  [[ -f "$VIBE_ENV_SHARED" ]] || die "shared.env missing; run secrets_render first"
+  _secrets_set_kv_in "$VIBE_ENV_SHARED" "$key" "$val"
+}
+
+# Set or replace a key=value pair in appliance.env. Auto-creates the file
+# (mode 600) if it doesn't exist yet — appliance.env is operator-managed
+# and may legitimately not exist on a first call (e.g. when bootstrap
+# receives --anthropic-api-key=... before phase_secrets has run, or when
+# the Settings page writes the very first value).
+secrets_set_kv_appliance() {
+  local key="$1" val="$2"
+  if [[ ! -f "$VIBE_ENV_APPLIANCE" ]]; then
+    mkdir -p "$VIBE_ENV_DIR"
+    install -m 600 /dev/null "$VIBE_ENV_APPLIANCE"
+  fi
+  _secrets_set_kv_in "$VIBE_ENV_APPLIANCE" "$key" "$val"
+}
+
+# Set or replace a key=value pair in /opt/vibe/env/<slug>.env. Used by
+# the Settings UI's per-app override path (Phase 8.5 W-C). Refuses to
+# create the file if missing — per-app env files are rendered by
+# lib/enable-app.sh's _render_app_env when the app is first enabled.
+# Calling this for an app that's never been enabled is a programming
+# error (the Settings UI should grey-out per-app fields for disabled
+# apps).
+secrets_set_kv_per_app() {
+  local slug="$1" key="$2" val="$3"
+  [[ -n "$slug" ]] || die "secrets_set_kv_per_app: slug required"
+  local file="${VIBE_ENV_DIR}/${slug}.env"
+  if [[ ! -f "$file" ]]; then
+    die "per-app env file missing: $file (enable the app first via the admin Apps panel)"
+  fi
+  _secrets_set_kv_in "$file" "$key" "$val"
 }
 
 # Write /opt/vibe/CREDENTIALS.txt with the human-readable subset of
@@ -178,6 +335,16 @@ secrets_write_credentials() {
   tmp="$(mktemp "${VIBE_CREDS_FILE}.XXXXXX")"
   chmod 600 "$tmp"
 
+  # Best-effort detection of LAN + Tailscale IPs for the emergency-access
+  # section. Both fall back to a placeholder when unavailable.
+  local lan_ip ts_ip
+  lan_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  [[ -z "$lan_ip" ]] && lan_ip="<your-server-ip>"
+  if command -v tailscale >/dev/null 2>&1; then
+    ts_ip="$(tailscale ip -4 2>/dev/null | head -1)"
+  fi
+  [[ -z "${ts_ip:-}" ]] && ts_ip="N/A (Tailscale not configured)"
+
   cat >"$tmp" <<EOF
 ================================================================
  Vibe Appliance — credentials
@@ -201,6 +368,32 @@ ROTATING SECRETS
 NEXT STEPS
   Open ${server_url}/        — public landing page
   Open ${server_url}/admin   — admin console (use credentials above)
+
+================================================================
+ EMERGENCY ACCESS (Phase 8.5 — staff fallback when primary routing fails)
+================================================================
+Plain-HTTP ports on this server, gated by UFW to LAN + Tailscale only.
+Use these when DNS, certs, or Caddy is broken and the apps themselves
+are still running. Browsers will warn that the connection is insecure —
+that's expected.
+
+  Server LAN IP:        ${lan_ip}
+  Server Tailscale IP:  ${ts_ip}
+
+Canonical port assignments (active only when the matching app is enabled):
+  http://${lan_ip}:5171   Vibe MyBooks
+  http://${lan_ip}:5172   Vibe Trial Balance
+  http://${lan_ip}:5181   Vibe Connect (staff)
+  http://${lan_ip}:5182   Vibe Connect (client portal — STAFF ONLY,
+                          magic-link flows do not work over HTTP)
+  http://${lan_ip}:5191   Vibe Tax Research Chat
+  http://${lan_ip}:5192   Vibe Payroll Time
+
+  http://127.0.0.1:5199   HAProxy stats UI (loopback only; SSH-tunnel
+                          to access for diagnostics)
+
+For live per-app status, open the admin console "Emergency Access"
+panel at ${server_url}/admin.
 ================================================================
 EOF
   mv "$tmp" "$VIBE_CREDS_FILE"

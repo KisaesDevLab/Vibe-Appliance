@@ -6,6 +6,9 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Claude Code local config (per-developer; never committed)
+.claude/
+
 # Local environment overrides — never commit
 .env
 .env.local

@@ -40,7 +40,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   APPLIANCE_DIR="${APPLIANCE_DIR:-$(cd "${_self_dir}/.." && pwd)}"
   export APPLIANCE_DIR
   # shellcheck source=/dev/null
-  for _f in log.sh state.sh secrets.sh db-bootstrap.sh render-caddyfile.sh; do
+  for _f in log.sh state.sh secrets.sh db-bootstrap.sh render-caddyfile.sh render-haproxy.sh; do
     . "${_self_dir}/${_f}"
   done
   log_init
@@ -171,6 +171,15 @@ enable_app() {
   reload_caddyfile \
     || { _state_app_set "$slug" status failed error "caddy reload failed"; \
          die "Could not reload Caddy."; }
+
+  # 8. Phase 8.5 W-D — re-render emergency-proxy haproxy.cfg so the new
+  # app's emergencyPort gets a frontend. Non-fatal: emergency access is
+  # a fallback path, not a hard requirement for app enable.
+  if declare -F render_haproxy >/dev/null; then
+    log_step "re-rendering emergency-proxy haproxy.cfg"
+    render_haproxy \
+      || log_warn "haproxy.cfg re-render failed; emergency access for $slug not yet available. Run: sudo bash /opt/vibe/appliance/lib/render-haproxy.sh"
+  fi
 
   _state_app_set "$slug" enabled true status running image_tag "$default_tag"
   log_ok "$slug is up"

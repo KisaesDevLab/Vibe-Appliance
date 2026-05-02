@@ -21,6 +21,7 @@ services:
     init: true
     env_file:
       - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
       - /opt/vibe/env/vibe-connect.env
     networks:
       vibe_net: {}
@@ -50,6 +51,7 @@ services:
     restart: unless-stopped
     env_file:
       - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
       - /opt/vibe/env/vibe-connect.env
     networks:
       vibe_net: {}

@@ -16,6 +16,7 @@ services:
     init: true
     env_file:
       - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
       - /opt/vibe/env/vibe-payroll.env
     volumes:
       # Payroll exports — CSV files reference rows by relative path; if
@@ -42,6 +43,7 @@ services:
     restart: unless-stopped
     env_file:
       - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
       - /opt/vibe/env/vibe-payroll.env
     networks:
       - vibe_net

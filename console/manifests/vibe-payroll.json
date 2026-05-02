@@ -32,6 +32,85 @@
       { "name": "DATABASE_URL",    "from": "database-url" },
       { "name": "REDIS_URL",       "from": "redis-url" },
       { "name": "MIGRATIONS_AUTO", "from": "static:false" }
+    ],
+    "optional": [
+      {
+        "name": "FIRM_NAME",
+        "doc":  "Display name for your firm. Shown in the kiosk login screen and on payroll reports.",
+        "ui": {
+          "tier":      1,
+          "category":  "Application",
+          "label":     "Firm name",
+          "helpText":  "e.g. \"Acme Tax LLC\". Shown to staff at the time-tracking kiosk.",
+          "input":     "text",
+          "appliance": "per-app",
+          "validate":  "non-empty"
+        }
+      },
+      {
+        "name":  "ENABLED_STATES",
+        "doc":   "US state codes (comma-separated) where this firm files payroll. Drives state-specific overtime, withholding, and FLSA defaults.",
+        "ui": {
+          "tier":      1,
+          "category":  "Application",
+          "label":     "Enabled states",
+          "helpText":  "Multi-select. Each state activates its own withholding tables and overtime rules.",
+          "input":     "state-codes",
+          "appliance": "per-app",
+          "validate":  "state-codes"
+        }
+      },
+      {
+        "name":  "WORKWEEK_START_DAY",
+        "value": "0",
+        "doc":   "Day the FLSA workweek starts. 0=Sunday … 6=Saturday.",
+        "ui": {
+          "tier":      1,
+          "category":  "Application",
+          "label":     "FLSA workweek start day",
+          "helpText":  "FLSA requires a fixed 7-day workweek; this sets the start day for overtime calculations.",
+          "input":     "dropdown",
+          "appliance": "per-app",
+          "validate":  "enum",
+          "options": [
+            { "value": "0", "label": "Sunday"    },
+            { "value": "1", "label": "Monday"    },
+            { "value": "2", "label": "Tuesday"   },
+            { "value": "3", "label": "Wednesday" },
+            { "value": "4", "label": "Thursday"  },
+            { "value": "5", "label": "Friday"    },
+            { "value": "6", "label": "Saturday"  }
+          ]
+        }
+      },
+      {
+        "name":  "KIOSK_AUTO_LOGOUT_MS",
+        "value": "5000",
+        "doc":   "Milliseconds the kiosk waits after a successful punch before auto-logging out, so the next staff member doesn't punch on the previous one's session.",
+        "ui": {
+          "tier":      1,
+          "category":  "Application",
+          "label":     "Kiosk auto-logout (ms)",
+          "helpText":  "3000–60000. Shorter is more secure but rushes slow staff. Default 5000 (5s).",
+          "input":     "number",
+          "appliance": "per-app",
+          "validate":  "number-range:3000:60000"
+        }
+      },
+      {
+        "name": "TZ",
+        "from": "appliance:TZ",
+        "doc":  "IANA time-zone name (e.g. America/Chicago). Inherits the appliance-wide TZ unless overridden.",
+        "ui": {
+          "tier":      1,
+          "category":  "Time & Logging",
+          "label":     "Time zone (override)",
+          "helpText":  "Inherited from appliance. Override only if this firm operates in a different zone than the host.",
+          "input":     "time-zone",
+          "appliance": "both",
+          "validate":  "iana-timezone"
+        }
+      }
     ]
   },
 

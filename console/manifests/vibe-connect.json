@@ -38,7 +38,220 @@
       { "name": "CLAMD_HOST",
         "doc": "ClamAV host for attachment scanning. Omit to skip scanning." },
       { "name": "CLAMD_PORT",
-        "doc": "ClamAV port. Default 3310." }
+        "doc": "ClamAV port. Default 3310." },
+
+      {
+        "name":  "EMAIL_PROVIDER",
+        "from":  "appliance:EMAIL_PROVIDER",
+        "value": "none",
+        "doc":   "Outbound email provider, used by Vibe-Connect for magic-link emails and notifications. The client portal is disabled until configured.",
+        "ui": {
+          "tier":            1,
+          "category":        "Email & SMS",
+          "label":           "Email provider",
+          "helpText":        "Without email, Vibe-Connect's client portal is disabled. Pick a provider, fill the credentials, click Test, then Save.",
+          "input":           "dropdown",
+          "appliance":       "shared",
+          "validate":        "enum",
+          "testEndpoint":    "/api/v1/admin/test/email",
+          "options": [
+            { "value": "none",     "label": "None (client portal disabled)" },
+            { "value": "resend",   "label": "Resend" },
+            { "value": "postmark", "label": "Postmark" },
+            { "value": "smtp",     "label": "SMTP server" }
+          ],
+          "disabledImpacts": ["client-portal-in-vibe-connect"]
+        }
+      },
+      {
+        "name": "EMAIL_FROM",
+        "from": "appliance:EMAIL_FROM",
+        "doc":  "From address used for outbound email. Must be verified with the chosen provider.",
+        "ui": {
+          "tier":             1,
+          "category":         "Email & SMS",
+          "label":            "From address",
+          "helpText":         "e.g. noreply@firm.com — must be verified with your email provider.",
+          "input":            "text",
+          "appliance":        "shared",
+          "validate":         "email",
+          "dependsOnFields":  ["EMAIL_PROVIDER"],
+          "showIf":           { "EMAIL_PROVIDER": "resend" }
+        }
+      },
+      {
+        "name":   "RESEND_API_KEY",
+        "from":   "appliance:RESEND_API_KEY",
+        "secret": true,
+        "doc":    "Resend API key. Visible at https://resend.com/api-keys.",
+        "ui": {
+          "tier":            1,
+          "category":        "Email & SMS",
+          "label":           "Resend API key",
+          "input":           "password",
+          "appliance":       "shared",
+          "validate":        "non-empty",
+          "dependsOnFields": ["EMAIL_PROVIDER"],
+          "showIf":          { "EMAIL_PROVIDER": "resend" }
+        }
+      },
+      {
+        "name":   "POSTMARK_SERVER_TOKEN",
+        "from":   "appliance:POSTMARK_SERVER_TOKEN",
+        "secret": true,
+        "doc":    "Postmark server token. Visible at https://account.postmarkapp.com under Servers → Credentials.",
+        "ui": {
+          "tier":            1,
+          "category":        "Email & SMS",
+          "label":           "Postmark server token",
+          "input":           "password",
+          "appliance":       "shared",
+          "validate":        "non-empty",
+          "dependsOnFields": ["EMAIL_PROVIDER"],
+          "showIf":          { "EMAIL_PROVIDER": "postmark" }
+        }
+      },
+      {
+        "name": "SMTP_HOST",
+        "from": "appliance:SMTP_HOST",
+        "doc":  "SMTP server hostname (e.g. smtp.example.com).",
+        "ui": {
+          "tier":            1,
+          "category":        "Email & SMS",
+          "label":           "SMTP host",
+          "input":           "text",
+          "appliance":       "shared",
+          "validate":        "non-empty",
+          "dependsOnFields": ["EMAIL_PROVIDER"],
+          "showIf":          { "EMAIL_PROVIDER": "smtp" }
+        }
+      },
+      {
+        "name":  "SMTP_PORT",
+        "from":  "appliance:SMTP_PORT",
+        "value": "587",
+        "doc":   "SMTP port. 587 (STARTTLS) is most common; 465 for implicit TLS.",
+        "ui": {
+          "tier":            1,
+          "category":        "Email & SMS",
+          "label":           "SMTP port",
+          "input":           "number",
+          "appliance":       "shared",
+          "validate":        "number-range:1:65535",
+          "dependsOnFields": ["EMAIL_PROVIDER"],
+          "showIf":          { "EMAIL_PROVIDER": "smtp" }
+        }
+      },
+      {
+        "name": "SMTP_USER",
+        "from": "appliance:SMTP_USER",
+        "doc":  "SMTP authentication username.",
+        "ui": {
+          "tier":            1,
+          "category":        "Email & SMS",
+          "label":           "SMTP username",
+          "input":           "text",
+          "appliance":       "shared",
+          "dependsOnFields": ["EMAIL_PROVIDER"],
+          "showIf":          { "EMAIL_PROVIDER": "smtp" }
+        }
+      },
+      {
+        "name":   "SMTP_PASSWORD",
+        "from":   "appliance:SMTP_PASSWORD",
+        "secret": true,
+        "doc":    "SMTP authentication password.",
+        "ui": {
+          "tier":            1,
+          "category":        "Email & SMS",
+          "label":           "SMTP password",
+          "input":           "password",
+          "appliance":       "shared",
+          "dependsOnFields": ["EMAIL_PROVIDER"],
+          "showIf":          { "EMAIL_PROVIDER": "smtp" }
+        }
+      },
+
+      {
+        "name":  "SMS_PROVIDER",
+        "from":  "appliance:SMS_PROVIDER",
+        "value": "none",
+        "doc":   "Outbound SMS provider for two-factor codes. Optional; magic-link email is the primary delivery path.",
+        "ui": {
+          "tier":         1,
+          "category":     "Email & SMS",
+          "label":        "SMS provider",
+          "input":        "dropdown",
+          "appliance":    "shared",
+          "validate":     "enum",
+          "testEndpoint": "/api/v1/admin/test/sms",
+          "options": [
+            { "value": "none",     "label": "None (SMS 2FA disabled)" },
+            { "value": "twilio",   "label": "Twilio" },
+            { "value": "textlink", "label": "TextLink (LAN appliance)" }
+          ]
+        }
+      },
+      {
+        "name":   "TWILIO_AUTH_TOKEN",
+        "from":   "appliance:TWILIO_AUTH_TOKEN",
+        "secret": true,
+        "doc":    "Twilio auth token, paired with TWILIO_ACCOUNT_SID below.",
+        "ui": {
+          "tier":            1,
+          "category":        "Email & SMS",
+          "label":           "Twilio auth token",
+          "input":           "password",
+          "appliance":       "shared",
+          "validate":        "non-empty",
+          "dependsOnFields": ["SMS_PROVIDER"],
+          "showIf":          { "SMS_PROVIDER": "twilio" }
+        }
+      },
+      {
+        "name": "TWILIO_ACCOUNT_SID",
+        "from": "appliance:TWILIO_ACCOUNT_SID",
+        "doc":  "Twilio Account SID (starts with AC...).",
+        "ui": {
+          "tier":            1,
+          "category":        "Email & SMS",
+          "label":           "Twilio account SID",
+          "input":           "text",
+          "appliance":       "shared",
+          "validate":        "non-empty",
+          "dependsOnFields": ["SMS_PROVIDER"],
+          "showIf":          { "SMS_PROVIDER": "twilio" }
+        }
+      },
+
+      {
+        "name":  "PRESIDIO_CONFIDENCE_THRESHOLD",
+        "value": "0.85",
+        "doc":   "Microsoft Presidio confidence threshold for PII redaction. Lower = more aggressive redaction; higher = fewer false positives.",
+        "ui": {
+          "tier":      1,
+          "category":  "Compliance",
+          "label":     "PII redaction confidence threshold",
+          "helpText":  "0.5–0.95. Tighter values redact less; loose values may redact non-PII text.",
+          "input":     "number",
+          "appliance": "per-app",
+          "validate":  "number-range:0.5:0.95"
+        }
+      },
+      {
+        "name":  "STEP_UP_CODE_TTL_SECONDS",
+        "value": "300",
+        "doc":   "How long step-up auth codes (SMS/email 2FA) remain valid, in seconds.",
+        "ui": {
+          "tier":      1,
+          "category":  "Compliance",
+          "label":     "Step-up code TTL (seconds)",
+          "helpText":  "60–3600. Shorter is more secure; longer is more forgiving for slow inboxes.",
+          "input":     "number",
+          "appliance": "per-app",
+          "validate":  "number-range:60:3600"
+        }
+      }
     ]
   },
 

@@ -24,7 +24,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   APPLIANCE_DIR="${APPLIANCE_DIR:-$(cd "${_self_dir}/.." && pwd)}"
   export APPLIANCE_DIR
   # shellcheck source=/dev/null
-  for _f in log.sh state.sh render-caddyfile.sh; do
+  for _f in log.sh state.sh render-caddyfile.sh render-haproxy.sh; do
     . "${_self_dir}/${_f}"
   done
   log_init
@@ -66,6 +66,15 @@ disable_app() {
     log_warn "Caddyfile re-render failed; proceeding with stop anyway"
   else
     reload_caddyfile || log_warn "Caddy reload failed; proceeding with stop"
+  fi
+
+  # 2b. Phase 8.5 W-D — re-render emergency-proxy haproxy.cfg so the
+  # disabled app's frontend goes away. Non-fatal: a stale frontend just
+  # serves the custom 503 page from the proxy; not a security issue.
+  if declare -F render_haproxy >/dev/null; then
+    log_step "re-rendering emergency-proxy haproxy.cfg"
+    render_haproxy \
+      || log_warn "haproxy.cfg re-render failed; emergency-proxy still has a stale frontend for $slug. Run: sudo bash /opt/vibe/appliance/lib/render-haproxy.sh"
   fi
 
   # 3. Stop and remove ONLY the app's containers — explicit service

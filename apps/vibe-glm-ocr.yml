@@ -17,6 +17,7 @@ services:
     init: true
     env_file:
       - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
       - /opt/vibe/env/vibe-glm-ocr.env
     networks:
       - vibe_net

@@ -241,6 +241,110 @@ If any audit item fails, open a PR against the app repo before integrating.
 
 ---
 
+## Phase 8.5 — v1.1 coordinated update
+
+**Status:** Substrate landed 2026-05-02 (Steps 1–7 of the implementation plan). Settings UI + 7 test endpoints + special-case save flows still owed; tracked under "Deferred to a follow-up session" below. See `docs/addenda/admin-config-surface.md` and `docs/addenda/emergency-access.md` for the design specs.
+
+**Goal.** Ship four bundled changes on top of v1: (A) Cockpit reachability fix across all three deployment modes; (B) opt-in Claude Code install on the host for support/troubleshooting; (C) full admin configuration surface — Tier 1 inline-editable settings with atomic save/rollback, audit log, test endpoints; (D) emergency-access HAProxy sidecar with UFW gating.
+
+**Why bundled.** All four share substrate (the new `appliance.env` storage layer, the doctor.sh check surface, the UFW management script). Bundling avoids three rounds of manifest schema migration and two rounds of bootstrap-flag plumbing.
+
+**Workstream summary.**
+- **A — Cockpit fix.** Doctor reachability check, mode-aware admin link, `tailscale serve --https=9090` for tailnet access, LAN-mode UFW allowance for `:9090`. Symmetric `tailscale serve` rule in both `infra/tailscale-up.sh` and `infra/cockpit-install.sh` so the rule lands regardless of install order.
+- **B — Claude Code.** `infra/claude-code-install.sh` (Node 20 from NodeSource + `npm i -g @anthropic-ai/claude-code`), `--with-claude-code` flag, both API-key and `claude login` auth modes supported. Per CLAUDE.md anti-pattern #4, no console UI surface — operators reach Claude Code via Cockpit Terminal or SSH only. Drops `/opt/vibe/SUPPORT.md` once on first install with the operator hint.
+- **C — Admin config surface.** `/opt/vibe/env/appliance.env` storage layer with operator-value preservation, manifest `ui` block schema (12 fields covering tier, category, input, validation, test endpoint, inheritance, conditional render), `lib/settings-save.sh` substrate (snapshot, restore, audit-log helpers), SQLite `settings_audit` table, per-app overlay `env_file:` inheritance for all 6 apps. **UI page + 7 test endpoints + restart-with-rollback machinery deferred to a follow-up session** (TODO markers in `lib/settings-save.sh`).
+- **D — Emergency access.** `haproxy:2.9-alpine` sidecar on ports `5171–5198`, UFW-gated to RFC1918 + Tailscale CGNAT (idempotent via `lib/ufw-rules.sh`), custom 503 page (`haproxy/503.http`), per-IP rate limit 30 req/sec via stick-table. `lib/render-haproxy.sh` generates `haproxy.cfg` from manifest emergencyPort fields with atomic write + Docker-validate + SIGHUP reload.
+
+**Decisions locked at plan time** (from each addendum's §14):
+- Audit log retention 1 year; auto-snapshot env-history 90 days; restart timeout default 90s with per-manifest override.
+- Provider test buttons real-send with confirmation dialog.
+- Downstream-impact warning system: generic `disabledImpacts` array.
+- HAProxy 2.9 LTS; stats UI on (loopback-only); custom 503 on disabled-app port; per-IP rate limit 30 req/sec.
+- Vibe-GLM-OCR (`userFacing:false`) gets no emergency port — deferred.
+
+**Deliverables landed (substrate, Steps 1–7).**
+- New files:
+  - `env-templates/appliance.env.tmpl`
+  - `lib/render-haproxy.sh`, `lib/ufw-rules.sh`, `lib/settings-save.sh`
+  - `infra/claude-code-install.sh`
+  - `haproxy/503.http`
+  - `docs/addenda/admin-config-surface.md`, `docs/addenda/emergency-access.md` (relocated from repo root)
+- Modified:
+  - `bootstrap.sh` (flags `--with-claude-code`, `--anthropic-api-key`; `phase_claude_code`; appliance.env render in `phase_secrets`; haproxy + UFW in `phase_caddy`; haproxy in `phase_pull`; host-IP + tailnet hostname caching in state.config)
+  - `lib/secrets.sh` (private `_secrets_render_to`; `secrets_render_appliance`, `secrets_get_appliance`, `secrets_set_kv_appliance`; emergency-access section in `secrets_write_credentials`)
+  - `lib/preflight.sh` (`preflight_https_soft` for opt-in egress checks)
+  - `infra/cockpit-install.sh` (post-install reachability poll, tailnet hostname in `Origins`, symmetric tailscale serve rule)
+  - `infra/tailscale-up.sh` (`tailscale serve --https=9090` for Cockpit)
+  - `console/server.js` (mode-aware Cockpit URL, TCP reachability probe via `host.docker.internal:9090`, `settings_audit` SQLite table init)
+  - `console/manifest.schema.json` (`emergencyPort`, `userFacing`, `emergencyNote` top-level fields; `ui` block with 12 properties on env entries; new `from: "appliance:..."` source pattern)
+  - `console/manifests/vibe-tb.json`, `console/manifests/vibe-tax-research.json` (`emergencyPort` + ANTHROPIC_API_KEY ui blocks as proof-of-concept)
+  - `docker-compose.yml` (`emergency-proxy` service)
+  - `apps/{vibe-tb,vibe-mybooks,vibe-connect,vibe-payroll,vibe-tax-research,vibe-glm-ocr}.yml` (env_file inherits appliance.env)
+  - `doctor.sh` (5 new checks: cockpit_reachability, claude_code, settings_audit_db, emergency_proxy, ufw_rules)
+  - `uninstall.sh` (`remove_claude_code()`)
+  - `docs/MANIFEST_SCHEMA.md` (ui block reference)
+
+**Deferred to v1.2.**
+- Per-app override UX ("Override for this app" / "Revert to appliance" buttons) — substrate honors `appliance: "both"` in the registry, but the per-app tab + override toggles aren't rendered yet.
+- Special-case save flow dispatchers — `postSaveJob` declarative hook is in the schema; the bash dispatcher in `settings-save.sh` is stubbed with TODO notes. Specifically: corpus-sync (Tax-Research ENABLED_STATES), Tailscale enable/disable, console admin password change (currently shared.env-managed), DNS provider switch.
+- Backup-destination + Tailscale + DNS-provider Tier-1 settings (no manifest declares them today; addendum §2.1 lists them but Connect's manifest currently owns only EMAIL_*/SMS_*/Compliance).
+- ui blocks on `vibe-glm-ocr` manifest — pending the GLM-OCR addendum being written.
+- SMTP + TextLink test endpoints — stubbed 501 in v1.1 since they need npm deps (nodemailer) or LAN-side hardware respectively.
+- Real Backup destination test (write/read/delete on S3/B2/etc) — needs AWS SDK or comparable.
+- DNS-01 staging cert test — needs acme-client npm dep.
+
+**Landed in Session 1 (2026-05-02).** Previously deferred items now substrate-ready:
+- ui blocks on `vibe-mybooks`, `vibe-connect`, `vibe-payroll` manifests per addendum §10 (3 / 13 / 5 Tier-1 settings respectively, plus 1-each on vibe-tb and vibe-tax-research from the original substrate work — total **23 Tier-1 settings** declared across 5 manifests).
+- `lib/enable-app.sh` / `lib/disable-app.sh` calls to `render_haproxy` after Caddy reload (already landed in the QA pass — emergency-proxy stays in sync with toggle state).
+- DO firewall detection in `lib/preflight.sh` (`preflight_do_firewall` — soft check, only emits WARN when DO metadata service is reachable).
+- Pre-flight port-availability check on 5171:5198 (`preflight_emergency_ports` — loops 7 ports with `vibe-emergency-proxy` as expected idempotent owner).
+- Audit log retention (`pruneAuditLog` `setInterval` in `console/server.js` — daily, 1-year retention per addendum §14.1, runs once 30s after boot to catch up).
+- Schema fix: `validate: number-range:<min>:<max>` now accepts decimals (was integer-only — caught when adding `PRESIDIO_CONFIDENCE_THRESHOLD: number-range:0.5:0.95`).
+
+**Landed in Session 2 (2026-05-02).** Settings UI substrate + page:
+- `GET /api/v1/settings/schema` — manifest-aggregated form schema; categorizes Tier-1 fields by `ui.category`, dedupes shared keys, sorts within category.
+- `GET /api/v1/settings/values` — current values from `appliance.env` + per-app envs, with `(inherited)` / `(overridden)` / `per-app` source markers, secrets redacted to `(set)` / `(empty)` server-side.
+- `POST /api/v1/settings/save` — atomic write + restart + rollback; spawns `lib/settings-save.sh apply <tempfile>`, payload-via-tempfile so secrets never reach the process command line. Rejects unknown keys + unknown slugs server-side.
+- `GET /api/v1/audit` — paginated read of `settings_audit` table.
+- `lib/settings-save.sh::settings_save_apply` body: `_settings_apply_changes` (python, atomic per-file), `_settings_validate_compose` (`docker compose config`), `_settings_dependent_apps` (manifest scan for keys), `_settings_restart_app` (`docker compose restart`), `_settings_wait_health` (manifest-driven health-check via `docker exec vibe-console curl`, default 90s, manifest `health_timeout_s` override), `_settings_emit_result` (one-line JSON result on stdout). Rollback path: restore env from snapshot, restart with old config, poll. Rollback-of-rollback failure → DEGRADED state surfaced to UI.
+- `lib/secrets.sh::secrets_set_kv_per_app` — symmetric with `secrets_set_kv_appliance`; refuses if per-app env file missing.
+- `console/ui/settings.html` + `console/ui/static/settings.js` — manifest-driven form renderer with category tabs, dirty-state tracking, `showIf` conditional rendering, save with `disabledImpacts` confirmation dialog, save-result display (saved / rolled-back / DEGRADED).
+- `/admin/settings` route in `console/server.js`.
+- First-run banners on `/admin` (EMAIL_PROVIDER + Tailscale).
+
+**Landed in Session 3 (2026-05-02).** Provider test endpoints + audit export:
+- `POST /api/v1/admin/test/anthropic` — 1-token ping to `api.anthropic.com/v1/messages` (haiku-4-5; cheapest functional probe). Validates the API key without burning meaningful credit.
+- `POST /api/v1/admin/test/email` — real send via Resend or Postmark HTTP API, dispatched by `EMAIL_PROVIDER`. SMTP path stubbed 501.
+- `POST /api/v1/admin/test/sms` — Twilio HTTP API. TextLink path stubbed 501.
+- `POST /api/v1/admin/test/llm` — OpenAI-compatible POST (forward-compat for local LLM servers; Tax-Research-Chat's Tier-2 LLM_ENDPOINT in v1.2).
+- In-process rate limiter — 10 req/min/endpoint per source IP; sliding 60s window via Map; periodic stale-bucket cleanup. No npm dep.
+- `console/ui/static/settings.js` Test buttons + confirmation dialog (window.confirm with cost warning). SMS modal prompts for `TO_NUMBER` and `FROM_NUMBER` when not in form.
+- `GET /api/v1/audit?format=csv` — streamed CSV export with `Content-Disposition: attachment`, capped at 10000 rows. Reuses redacted secret values from the table.
+- Special-case save flow stubs: TODO markers in `lib/settings-save.sh` for postSaveJob dispatcher (corpus-sync), password-change-flow, Tailscale toggle, DNS provider switch — all noted as v1.2 work with explicit reasoning.
+
+**Landed in Session 1 (2026-05-02).** Previously deferred items now substrate-ready:
+- ui blocks on `vibe-mybooks`, `vibe-connect`, `vibe-payroll` manifests per addendum §10 (3 / 5 / 13 Tier-1 settings respectively, plus the 1-each on vibe-tb and vibe-tax-research from the original substrate work — total **23 Tier-1 settings** now declared across 5 manifests).
+- `lib/enable-app.sh` / `lib/disable-app.sh` calls to `render_haproxy` after Caddy reload (already landed in the QA pass — emergency-proxy stays in sync with toggle state).
+- DO firewall detection in `lib/preflight.sh` (`preflight_do_firewall` — soft check, only emits WARN when DO metadata service is reachable).
+- Pre-flight port-availability check on 5171:5198 (`preflight_emergency_ports` — loops 7 ports with `vibe-emergency-proxy` as expected idempotent owner).
+- Audit log retention (`pruneAuditLog` `setInterval` in `console/server.js` — daily, 1-year retention per addendum §14.1, runs once 30s after boot to catch up).
+- Schema fix: `validate: number-range:<min>:<max>` now accepts decimals (was integer-only — caught when adding `PRESIDIO_CONFIDENCE_THRESHOLD: number-range:0.5:0.95`).
+
+**Success criteria — substrate (achievable now).**
+- Fresh DO droplet bootstrap with `--with-claude-code --anthropic-api-key=sk-ant-...` completes phases 1–9 without errors. `claude --version` works on host. `appliance.env` mode 600 contains the key.
+- `vibe doctor` runs end-to-end and surfaces all 5 new checks (Cockpit, Claude Code, audit DB, emergency proxy, UFW). Stop `cockpit.socket` → doctor FAILs with the canonical recovery hint.
+- `vibe-emergency-proxy` container is up; `curl -kfsS http://127.0.0.1:5172/api/v1/ping` reaches Vibe-TB when toggled on.
+- `sudo ufw status` shows the 4 RFC1918 + (if Tailscale) 1 CGNAT allow + 1 deny rule for `5171:5198`.
+- Cockpit reachable in domain mode at `cockpit.<domain>`, in Tailscale mode at `<host>.<tailnet>.ts.net:9090`, in LAN mode at `<host-ip>:9090` (self-signed warning OK).
+- Re-run bootstrap: zero destructive operations; secrets preserved; appliance.env operator values preserved.
+
+**Success criteria — full release (after follow-up session lands the UI).**
+Cover the full verification matrix from the original design plan: settings save happy path + automatic rollback on health failure; per-app override UX; 7 test endpoints functional; audit log writes per save; emergency proxy survives `docker kill vibe-caddy`; magic-link emergency-mode test confirms Vibe-Connect client portal disables flows correctly.
+
+**Out of scope (deferred to v1.2).** Per-tenant settings; settings-sync across hosts; customer-defined custom env vars; first-run wizard (banners suffice for v1.1); multi-admin RBAC; settings rollback-via-button; `userFacing:false` services on emergency ports.
+
+---
+
 ## Phase 9 — End-to-end test on three fresh hosts
 
 **Status:** Doc artifacts shipped; three-host verification still owed.
@@ -1098,3 +1202,104 @@ Append to this list as phases complete. Format:
   (per-app `api` alias / VITE_BASE_PATH / wrong upstream port),
   unrelated to this change — triage steps live in
   `~/.claude/plans/the-caddy-still-appears-frolicking-sketch.md`.
+
+- Phase 8.5 substrate landed 2026-05-02 by Claude (Opus 4.7, 1M context)
+  on Windows dev host. Substrate covers Steps 1–7 of the implementation
+  plan at `~/.claude/plans/craft-plan-to-install-modular-abelson.md`.
+
+  What landed (substrate):
+  1. Housekeeping: addenda relocated repo-root → `docs/addenda/` with
+     implementation-status banner pointing back at PHASES.md. Phase 8.5
+     stub inserted between Phase 8 and Phase 9.
+  2. Workstream C substrate: `appliance.env` storage layer with
+     operator-value preservation across re-runs; `ui` block schema in
+     `console/manifest.schema.json` (12 fields covering tier, category,
+     input, validation, inheritance, conditional render); `from:
+     "appliance:..."` source pattern in env entries; `ui` block proof-
+     of-concept on `vibe-tb.json` and `vibe-tax-research.json` (both for
+     ANTHROPIC_API_KEY).
+  3. Workstream D: `emergency-proxy` HAProxy 2.9-alpine sidecar in
+     `docker-compose.yml`; `lib/render-haproxy.sh` generates the cfg
+     from manifest emergencyPorts with atomic write + Docker-validate +
+     SIGHUP reload; `lib/ufw-rules.sh` applies RFC1918 + CGNAT allow /
+     public deny rules idempotently; `haproxy/503.http` static error
+     page; wired through `phase_pull` (image) and `phase_caddy` (config
+     + UFW); CREDENTIALS.txt extended with emergency-access section.
+  4. Workstream A: `infra/cockpit-install.sh` post-install reachability
+     poll + tailnet hostname in `Origins`; symmetric `tailscale serve
+     --bg --https=9090 https+insecure://localhost:9090` rule in both
+     `infra/tailscale-up.sh` and `infra/cockpit-install.sh` (handles
+     either install order); `console/server.js` mode-aware Cockpit URL
+     builder + TCP probe via `host.docker.internal:9090`; LAN-mode
+     `:9090` UFW allowance; bootstrap caches `host_ip` and
+     `tailscale_hostname` in state.config so the console can render
+     concrete clickable URLs.
+  5. Workstream B: `infra/claude-code-install.sh` (Node 20 from
+     NodeSource + `npm i -g @anthropic-ai/claude-code`); bootstrap
+     flags `--with-claude-code` and `--anthropic-api-key=...`;
+     `phase_claude_code` opt-in phase; soft preflight check for
+     `api.anthropic.com` and `deb.nodesource.com` (WARN-not-FAIL
+     because the appliance core works without CC); `remove_claude_code()`
+     in `uninstall.sh` (preserves Node.js); `/opt/vibe/SUPPORT.md`
+     operator hint dropped once on first install.
+  6. Workstream C MVP: all 6 `apps/*.yml` overlays inherit
+     `appliance.env` between `shared.env` and per-app envs (so per-app
+     overrides win); `lib/settings-save.sh` substrate (snapshot,
+     restore, audit-log helpers, redaction by name pattern); SQLite
+     `settings_audit` table init in `console/server.js` with `ts` and
+     `setting` indices.
+  7. Doctor: 5 new checks (cockpit_reachability, claude_code,
+     settings_audit_db, emergency_proxy, ufw_rules), each with the
+     canonical recovery-hint format.
+
+  Deferred to a follow-up session (TODO markers in `lib/settings-save.sh`
+  and `bootstrap.sh`, plus enumerated in the Phase 8.5 section above):
+  Settings UI page, 7 provider test endpoints, restart-with-rollback
+  machinery, audit-log read API + CSV export, first-run banners,
+  special-case save flows (corpus-sync, Tailscale enable/disable,
+  password change, DNS provider switch), per-app override UX, `ui`
+  blocks on the remaining 4 manifests, the on-toggle dynamic
+  `render_haproxy` call from `enable-app.sh` / `disable-app.sh`, DO
+  firewall detection, port-availability preflight on 5171:5198.
+
+  Tested locally on Windows (no Docker daemon, no Linux runtime — same
+  caveat as Phase 1 / Phase 2 entries):
+  - `bash -n` passes on every modified `.sh` file.
+  - `node -c` passes on `console/server.js`.
+  - JSON Schema parses; `vibe-tb.json` and `vibe-tax-research.json`
+    parse and contain the expected `ui` blocks.
+  - `lib/render-haproxy.sh`'s manifest-walking logic was simulated in
+    JS against `vibe-tb.json`; output is one frontend with port 5172 →
+    `vibe-tb-client:80` upstream.
+  - `cockpitUrl()` exercised against all five mode/cache combinations;
+    each returns a sensible URL or instructional fallback.
+  - All 6 `apps/*.yml` confirmed to inherit `appliance.env`.
+
+  Owed before declaring Phase 8.5 substrate verified — fresh DO droplet
+  `s-1vcpu-2gb` Ubuntu 24.04 LTS x64, no extras. Run:
+  ```
+  curl -fsSL https://install.kisaes.com/vibe.sh | sudo bash -s -- \
+    --mode domain --domain <test.example> --email admin@example.com \
+    --with-claude-code --anthropic-api-key sk-ant-... \
+    --cloudflare-api-token <token>
+  ```
+  Verify:
+  - All eight phases complete clean. State.json contains
+    `config.host_ip`, `config.tailscale_hostname` (if Tailscale opted),
+    `config.claude_code: "true"`.
+  - `claude --version` works on host; `cat /opt/vibe/env/appliance.env`
+    shows mode 600 with `ANTHROPIC_API_KEY=sk-ant-...`.
+  - `vibe doctor` runs end-to-end. All 5 new checks PASS or expected
+    WARN. Stop `cockpit.socket` → re-run doctor → cockpit_reachability
+    FAIL with recovery hint.
+  - `docker ps` shows `vibe-emergency-proxy` running; `curl -fsS
+    http://<lan-ip>:5172/api/v1/ping` succeeds when Vibe-TB is enabled.
+  - `sudo ufw status numbered` shows 5 allow + 1 deny rules covering
+    5171:5198 (and one extra 9090 allow if mode=lan).
+  - Re-run bootstrap unchanged: phases run idempotently; appliance.env
+    operator values preserved.
+
+  Once those bullets are confirmed on a real droplet, append a line
+  "Phase 8.5 substrate verified YYYY-MM-DD on DO droplet" and the
+  follow-up session may begin (Settings UI + test endpoints + rollback
+  machinery).

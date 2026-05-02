@@ -140,6 +140,7 @@ Apps with a single tier use just `default_upstream` and omit `matchers`.
 | Value                         | Meaning                                                  |
 |-------------------------------|----------------------------------------------------------|
 | `shared:<KEY>`                | Pull the value from `/opt/vibe/env/shared.env`           |
+| `appliance:<KEY>`             | Pull the value from `/opt/vibe/env/appliance.env` (Tier 1 inline-editable settings; see `ui` below) |
 | `generated:hex32`             | Generate a fresh 64-char hex value once, then preserve   |
 | `subdomain-url`               | `https://<slug-subdomain>.<domain>` (or LAN equivalent)  |
 | `database-url`                | `postgresql://<user>:<pass>@postgres:5432/<dbname>`      |
@@ -148,6 +149,49 @@ Apps with a single tier use just `default_upstream` and omit `matchers`.
 
 Optional entries are exposed in the admin "Env files" panel so the
 operator knows what they can set, without surfacing them as required.
+
+---
+
+## `env[].ui` — Settings page surface (Phase 8.5)
+
+Each env entry can declare a `ui` block that promotes it onto the admin
+Settings page as an inline-editable form field. Absence of `ui` means
+the env var is **Tier 3** — appliance-internal, not surfaced. See
+`docs/addenda/admin-config-surface.md` for the full design.
+
+```jsonc
+"ui": {
+  "tier":        1,                                  // 1 = inline-editable; 2 = read-only with rotation hint; 3 = not surfaced (default)
+  "category":    "AI",                               // Settings page tab. Required for tier 1.
+  "label":       "Anthropic API key",
+  "helpText":    "Powers AI features across enabled apps.",
+  "input":       "password",                         // form widget; see schema for full enum
+  "appliance":   "both",                             // shared = lives in appliance.env; per-app = vibe-<slug>.env (default); both = appliance default + per-app override
+  "restartRequired": true,                           // default true; false = SIGHUP-only (forward-compat)
+  "validate":    "anthropic-api-key",                // server-side validator
+  "testEndpoint": "/api/v1/admin/test/anthropic",    // POSTs current form values; never persists
+  "dependsOnFields": ["EMAIL_PROVIDER"],             // optional, for client-side conditional render
+  "showIf":      { "EMAIL_PROVIDER": "resend" },     // hide field unless predicate matches
+  "postSaveJob": "corpus-sync",                      // optional background job after save
+  "healthCheckTimeout": 180,                         // override the default 90s post-restart window
+  "disabledImpacts": ["client-portal-in-vibe-connect"]  // strings naming features that break if this setting is disabled; surface as confirm dialog
+}
+```
+
+`category` values: `Network`, `Email & SMS`, `Backup`, `AI`,
+`Time & Logging`, `System`, `Application`, `Compliance`.
+
+`input` values: `text`, `password`, `textarea`, `number`, `toggle`,
+`dropdown`, `multi-select`, `time-zone`, `state-codes`, `password-change-flow`.
+
+`appliance` values:
+- `shared` — value lives in `/opt/vibe/env/appliance.env`. Cascades to every app whose manifest references this key (via `from: "appliance:<KEY>"`). One source of truth, no per-app override.
+- `per-app` — value lives in `/opt/vibe/env/vibe-<slug>.env`. Default for fields without `appliance` set.
+- `both` — declared at appliance level (default) AND per-app (override). Settings page renders "(inherited)" / "(overridden)" badges per addendum §4.4.
+
+The Settings page reads/writes through `lib/settings-save.sh` with atomic
+write + restart + rollback (Phase 8.5 Workstream C). Test buttons are
+gated behind admin basic auth and rate-limited 10 req/min/endpoint.
 
 ---
 

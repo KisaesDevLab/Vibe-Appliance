@@ -120,6 +120,24 @@ tailscale_configure_serve() {
   fi
   log_ok "tailscale serve configured"
 
+  # Phase 8.5 Workstream A — Cockpit access via tailnet on :9090.
+  # Tailscale's CA issues a valid HTTPS cert for the tailnet hostname on
+  # any port, so https://<host>.<tailnet>.ts.net:9090 just works. Only
+  # add the rule when Cockpit is actually installed; a stranded serve
+  # config pointing at a non-existent localhost:9090 is harmless but
+  # noisy in `tailscale serve status`.
+  if dpkg -s cockpit >/dev/null 2>&1; then
+    log_step "adding tailscale serve rule for cockpit (:9090)"
+    if ! tailscale serve --bg --https=9090 https+insecure://localhost:9090 \
+         >>"$VIBE_LOG_FILE" 2>&1; then
+      log_warn "tailscale serve rule for :9090 failed; cockpit will not be reachable on the tailnet" \
+        "diagnose:tailscale serve status" \
+        "fix:tailscale serve --bg --https=9090 https+insecure://localhost:9090"
+    else
+      log_ok "tailscale :9090 → cockpit configured"
+    fi
+  fi
+
   local ts_url
   ts_url="$(tailscale status --json 2>/dev/null | python3 -c 'import json,sys
 d=json.load(sys.stdin)

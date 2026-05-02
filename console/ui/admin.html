@@ -18,6 +18,13 @@
 
     <div id="error" class="error-banner" hidden></div>
 
+    <!-- Phase 8.5 W-C — first-run banners. Surface critical settings
+         that haven't been configured yet. Each banner links to the
+         relevant Settings page tab. Hidden by default; the JS shows
+         banners only when /api/v1/settings/values reports an unset
+         value for a known-critical key. -->
+    <div id="setup-banners" hidden></div>
+
     <section class="admin-grid" id="status-grid" aria-busy="true">
       <div class="card"><h3>Loading…</h3><p class="muted">fetching status…</p></div>
     </section>
@@ -142,16 +149,23 @@
 
     async function refresh() {
       try {
-        const [status, apps, infra, firstLogin] = await Promise.all([
+        const [status, apps, infra, firstLogin, settingsValues] = await Promise.all([
           loadStatus(),
           loadApps(),
           fetch('/api/v1/infra',       { credentials: 'same-origin' }).then(r => r.json()),
           fetch('/api/v1/first-login', { credentials: 'same-origin' }).then(r => r.json()),
+          // Phase 8.5 W-C — settings values, used by renderSetupBanners
+          // to decide which first-run banners to show. Tolerates 404 /
+          // 500 silently (banners just stay hidden).
+          fetch('/api/v1/settings/values', { credentials: 'same-origin' })
+            .then(r => r.ok ? r.json() : null)
+            .catch(() => null),
         ]);
         renderStatus(status);
         renderApps(apps.apps || []);
         renderInfra((infra && infra.infra) || []);
         renderFirstLogin((firstLogin && firstLogin.first_login) || []);
+        renderSetupBanners(settingsValues, status.state && status.state.config || {});
         document.getElementById('now').textContent =
           'Snapshot at ' + (status.now || new Date().toISOString());
       } catch (err) {
@@ -161,15 +175,68 @@
       }
     }
 
+    // First-run banners — show until each critical setting is configured.
+    // EMAIL_PROVIDER is the only one substrate-ready today (Connect blocker).
+    // BACKUP_DESTINATION_TYPE / TAILSCALE banners surface when those
+    // settings are declared in a manifest (v1.2 / when DUPLICATI_DEST setting
+    // lands).
+    function renderSetupBanners(settings, config) {
+      const wrap = document.getElementById('setup-banners');
+      if (!settings) { wrap.hidden = true; return; }
+      const banners = [];
+      const a = settings.appliance || {};
+
+      const email = a.EMAIL_PROVIDER && a.EMAIL_PROVIDER.value;
+      if (!email || email === 'none') {
+        banners.push({
+          severity: 'critical',
+          msg: 'Email provider not configured — Vibe Connect\'s client portal is disabled.',
+          link: '/admin/settings#Email%20%26%20SMS',
+          linkText: 'Configure email →'
+        });
+      }
+
+      // Tailscale: not in settings registry today (config.tailscale lives
+      // in state.config). Surface as informational reminder when off.
+      if (config.tailscale !== 'true' && config.mode !== 'tailscale') {
+        banners.push({
+          severity: 'info',
+          msg: 'Tailscale not configured. Recommended for emergency access from outside the LAN.',
+          link: '/admin/settings#Network',
+          linkText: 'Configure Tailscale →'
+        });
+      }
+
+      if (!banners.length) { wrap.hidden = true; wrap.innerHTML = ''; return; }
+      wrap.hidden = false;
+      wrap.innerHTML = banners.map(b => `
+        <div class="${b.severity === 'critical' ? 'error-banner' : 'card'}" style="margin-bottom: 0.75rem;">
+          <strong>${b.severity === 'critical' ? '⚠ ' : '↗ '}</strong>
+          ${escapeHtml(b.msg)}
+          <a href="${b.link}" style="margin-left: 0.5rem;">${escapeHtml(b.linkText)}</a>
+        </div>`).join('');
+    }
+
     function renderInfra(items) {
       const list = document.getElementById('infra-list');
       if (!items.length) { list.innerHTML = '<p class="muted">No infra services registered.</p>'; return; }
       list.innerHTML = items.map(s => {
+        // s.url is now a clean URL (or null) and s.note is optional
+        // caveat text rendered separately — no more "URL + warning"
+        // string spliced into a broken href.
         const linkable = s.url && s.url.startsWith('http');
         const runStat =
           s.running === true  ? '<span class="badge badge--good">running</span>' :
           s.running === false ? '<span class="badge badge--bad">stopped</span>'  :
                                 '<span class="badge badge--muted">host service</span>';
+        const urlBlock = linkable
+          ? '<a href="' + escapeHtml(s.url) + '">' + escapeHtml(s.url) + '</a>'
+          : (s.note
+              ? '<span class="muted">' + escapeHtml(s.note) + '</span>'
+              : '<span class="muted">no URL available</span>');
+        const noteBlock = (linkable && s.note)
+          ? '<p class="muted" style="margin-top:0.4rem;font-size:0.9em">' + escapeHtml(s.note) + '</p>'
+          : '';
         return `
           <article class="app-card">
             <header class="app-card__head">
@@ -177,9 +244,8 @@
               ${runStat}
             </header>
             <p class="muted app-card__desc">slug: <span class="mono">${escapeHtml(s.slug)}</span></p>
-            <p>${linkable
-              ? '<a href="' + escapeHtml(s.url) + '">' + escapeHtml(s.url) + '</a>'
-              : '<span class="muted">' + escapeHtml(s.url) + '</span>'}</p>
+            <p>${urlBlock}</p>
+            ${noteBlock}
           </article>`;
       }).join('');
     }
@@ -324,6 +390,12 @@
             <dt>url</dt><dd>${a.enabled && a.status === 'running' && a.url.startsWith('http')
                               ? '<a href="' + escapeHtml(a.url) + '">' + escapeHtml(a.url) + '</a>'
                               : '<span class="muted">' + escapeHtml(a.url) + '</span>'}</dd>
+            ${a.emergencyUrl ? `
+            <dt>backup</dt><dd><a href="${escapeHtml(a.emergencyUrl)}">${escapeHtml(a.emergencyUrl)}</a>
+              <span class="muted">(LAN / Tailscale only)</span></dd>` : ''}
+            ${a.username ? `
+            <dt>username</dt><dd><span class="mono">${escapeHtml(a.username)}</span>
+              <span class="muted">(default; password in First-login info)</span></dd>` : ''}
           </dl>
           ${imageHint}
           ${a.error ? '<div class="error-banner">' + escapeHtml(a.error) + '</div>' : ''}
@@ -433,6 +505,17 @@
         const r = await fetch('/api/v1/doctor', { credentials: 'same-origin' });
         const data = await r.json();
         renderDoctor(data);
+
+        // Phase 8.5 — server appends each run to /opt/vibe/logs/doctor.log.
+        // Refresh the log picker so the file appears (it may not have
+        // existed before this first run), select doctor.log, and tail
+        // it into the log box. The operator gets the structured view
+        // above AND the persistent JSONL trail below.
+        await loadLogList();
+        if ([...logPicker.options].some(o => o.value === 'doctor.log')) {
+          logPicker.value = 'doctor.log';
+          await loadLog();
+        }
       } catch (err) {
         out.innerHTML = '<div class="error-banner">doctor failed: ' + escapeHtml(err.message) + '</div>';
       } finally {

@@ -491,6 +491,180 @@ check_recent_errors() {
   fi
 }
 
+# ====================================================================
+# Phase 8.5 checks — Cockpit fix (A), Claude Code (B), admin config
+# surface (C), emergency access (D). Each check is gated on the relevant
+# config so an installation without (e.g.) Claude Code doesn't surface
+# a confusing "claude binary missing" finding.
+# ====================================================================
+
+# Workstream A — Cockpit reachability. Pre-Phase 8.5, doctor had no
+# Cockpit check at all and silent failures were the norm. Probe both
+# from the host (curl localhost:9090) and indirectly from vibe_net via
+# host.docker.internal — the latter is what Caddy actually reaches.
+check_cockpit_reachability() {
+  _check_begin "Cockpit reachability"
+
+  if ! dpkg -s cockpit >/dev/null 2>&1; then
+    _check_warn "cockpit not installed (--no-cockpit was passed, or install failed)" \
+      "Fix: sudo bash /opt/vibe/appliance/infra/cockpit-install.sh"
+    return
+  fi
+
+  if ! systemctl is-active cockpit.socket >/dev/null 2>&1; then
+    _check_fail "cockpit.socket is not active" \
+      "Diagnose: systemctl status cockpit.socket
+Fix:      sudo systemctl restart cockpit.socket"
+    return
+  fi
+
+  # Host-local probe — fastest, doesn't require docker.
+  local code
+  code="$(curl -ks -o /dev/null -w '%{http_code}' --max-time 3 https://127.0.0.1:9090/ 2>/dev/null || echo 000)"
+  case "$code" in
+    2*|3*) _check_pass "https://127.0.0.1:9090/ responds (HTTP $code)" ;;
+    000)   _check_fail "Cockpit on :9090 not responding" \
+             "Diagnose: ss -ltnp 'sport = :9090'; journalctl -u cockpit.service --no-pager -n 50
+Fix:      sudo systemctl restart cockpit.socket cockpit.service" ;;
+    *)     _check_warn "Cockpit responded with unexpected HTTP $code" ;;
+  esac
+}
+
+# Workstream B — Claude Code on the host (opt-in via --with-claude-code).
+# Three outcomes: not installed (skipped if not opted-in; FAIL if opted-in
+# but missing); installed + authenticated; installed + unauthenticated.
+check_claude_code() {
+  local opted_in
+  opted_in="$(_state_get config.claude_code 2>/dev/null || true)"
+
+  _check_begin "Claude Code (host support tooling)"
+
+  local has_bin=false
+  command -v claude >/dev/null 2>&1 && has_bin=true
+
+  # Three opt-in states from bootstrap.sh's phase_claude_code:
+  #   ""       → operator did not pass --with-claude-code
+  #   "true"   → install succeeded
+  #   "false"  → operator passed --no... (no flag exists today, but
+  #              empty/false handled identically here)
+  #   "failed" → operator opted in, install failed; doctor should warn
+  if [[ "$opted_in" == "failed" ]]; then
+    _check_fail "claude-code install was attempted and FAILED" \
+      "Fix: sudo bash /opt/vibe/appliance/infra/claude-code-install.sh
+Diagnose: tail -50 /opt/vibe/logs/bootstrap.log | grep -i claude-code"
+    return
+  fi
+
+  if [[ "$opted_in" != "true" && "$has_bin" == "false" ]]; then
+    _check_pass "not installed (--with-claude-code not requested)"
+    return
+  fi
+
+  if [[ "$has_bin" == "false" ]]; then
+    _check_fail "--with-claude-code was set but 'claude' binary is missing" \
+      "Fix: sudo bash /opt/vibe/appliance/infra/claude-code-install.sh"
+    return
+  fi
+
+  local ver
+  ver="$(claude --version 2>/dev/null | head -1 || echo 'unknown')"
+
+  # Auth detection mirrors infra/claude-code-install.sh's logic.
+  local key=""
+  if [[ -r "${VIBE_DIR}/env/appliance.env" ]]; then
+    key="$(grep -E '^ANTHROPIC_API_KEY=' "${VIBE_DIR}/env/appliance.env" 2>/dev/null \
+            | tail -1 | sed 's/^[^=]*=//')"
+  fi
+  if [[ -n "$key" ]]; then
+    _check_pass "$ver — API-key auth (appliance.env)"
+    return
+  fi
+
+  local f
+  for f in "${HOME:-/root}/.claude/.credentials.json" \
+           "${HOME:-/root}/.claude/credentials.json" \
+           "${HOME:-/root}/.config/claude/auth.json"; do
+    if [[ -s "$f" ]]; then
+      _check_pass "$ver — subscription auth (OAuth)"
+      return
+    fi
+  done
+
+  _check_warn "$ver — installed but not authenticated" \
+    "Fix: run 'sudo -i; claude login' interactively, OR set ANTHROPIC_API_KEY in the admin Settings page"
+}
+
+# Workstream C — Tier 1 settings substrate health. Confirms console.sqlite
+# is reachable and the settings_audit table is writeable. The
+# "Tier 1 settings populated" checks (e.g. EMAIL_PROVIDER not 'none' when
+# Connect is enabled) land in the next session alongside the UI.
+check_settings_audit_db() {
+  _check_begin "Settings audit DB"
+  local db="${VIBE_DIR}/data/console/console.sqlite"
+  if [[ ! -f "$db" ]]; then
+    _check_warn "console.sqlite not yet created" \
+      "Cause: the console hasn't started yet (fresh bootstrap not yet completed)"
+    return
+  fi
+  # Test by selecting from the audit table — failure means the table
+  # wasn't initialized, which is a substrate bug not a runtime issue.
+  if python3 -c "
+import sqlite3
+db = sqlite3.connect('$db')
+db.execute('SELECT COUNT(*) FROM settings_audit').fetchone()
+db.close()
+" >/dev/null 2>&1; then
+    _check_pass "settings_audit table reachable"
+  else
+    _check_fail "settings_audit table missing or unreadable" \
+      "Fix: bounce the console — sudo docker compose -f /opt/vibe/appliance/docker-compose.yml restart console"
+  fi
+}
+
+# Workstream D — Emergency access proxy.
+check_emergency_proxy() {
+  _check_begin "Emergency proxy (HAProxy)"
+  local s
+  s="$(docker inspect --format '{{.State.Status}}/{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+        vibe-emergency-proxy 2>/dev/null || echo 'missing')"
+  case "$s" in
+    running/healthy)        _check_pass "vibe-emergency-proxy running, healthy" ;;
+    running/none|running/starting) _check_pass "vibe-emergency-proxy running" ;;
+    running/unhealthy)
+      _check_fail "vibe-emergency-proxy is UNHEALTHY" \
+        "Diagnose: docker logs vibe-emergency-proxy --tail 50; docker exec vibe-emergency-proxy haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg" ;;
+    missing|exited*|created*|dead*)
+      _check_warn "vibe-emergency-proxy is $s" \
+        "Fix: cd /opt/vibe/appliance && sudo docker compose up -d emergency-proxy" ;;
+    *) _check_warn "unexpected state: $s" ;;
+  esac
+}
+
+check_ufw_rules() {
+  _check_begin "UFW emergency-port rules"
+  if ! command -v ufw >/dev/null 2>&1; then
+    _check_warn "ufw not installed; emergency ports are not firewalled" \
+      "Fix: sudo apt-get install -y ufw && sudo ufw enable && sudo bash /opt/vibe/appliance/lib/ufw-rules.sh"
+    return
+  fi
+  # Anchored match: "Status: active" only — `grep -q active` would
+  # also match "Status: inactive" (substring). Use awk for an exact
+  # second-field comparison instead.
+  local ufw_status
+  ufw_status="$(ufw status 2>/dev/null | awk '/^Status:/ {print $2; exit}')"
+  if [[ "$ufw_status" != "active" ]]; then
+    _check_warn "ufw is installed but inactive (status: ${ufw_status:-unknown})" \
+      "Fix: sudo ufw enable && sudo bash /opt/vibe/appliance/lib/ufw-rules.sh"
+    return
+  fi
+  if ufw status 2>/dev/null | grep -q '5171:5198'; then
+    _check_pass "ufw allow + deny rules for 5171:5198 are present"
+  else
+    _check_fail "ufw is active but emergency-port rules are missing — plain HTTP on 5171:5198 is unprotected" \
+      "Fix: sudo bash /opt/vibe/appliance/lib/ufw-rules.sh"
+  fi
+}
+
 # ---- main --------------------------------------------------------------
 
 _human_out "$(printf '\n%s===== Vibe Appliance — doctor =====%s\n' "${_C_BOLD:-}" "${_C_RESET:-}")"
@@ -508,6 +682,13 @@ check_core_container vibe-console  "Console"
 check_postgres_connectivity
 check_redis_connectivity
 check_console_health
+
+# Phase 8.5 — coordinated checks across all four workstreams.
+check_cockpit_reachability      # Workstream A
+check_emergency_proxy           # Workstream D
+check_ufw_rules                 # Workstream D
+check_settings_audit_db         # Workstream C
+check_claude_code               # Workstream B
 
 # Mode-specific checks. We read state.config to know which mode this
 # install is running in; doctor only runs the relevant checks.

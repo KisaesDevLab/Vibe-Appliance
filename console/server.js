@@ -88,15 +88,67 @@ db.exec(`
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
   );
+
+  -- Phase 8.5 Workstream C — Settings audit log. Every successful save,
+  -- rollback, and DEGRADED-state event written here. Retention 1 year
+  -- (pruned by a daily cron added when the Settings UI lands). Secrets
+  -- are redacted to "(set)" / "(changed)" / "(rolled back)" — never
+  -- their actual values.
+  CREATE TABLE IF NOT EXISTS settings_audit (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         TEXT NOT NULL,                 -- ISO 8601
+    user       TEXT NOT NULL,                 -- admin username (basic auth)
+    category   TEXT NOT NULL,                 -- ui.category from manifest
+    setting    TEXT NOT NULL,                 -- env var name
+    old_value  TEXT,                          -- redacted for secrets
+    new_value  TEXT,                          -- redacted for secrets
+    result     TEXT NOT NULL,                 -- 'saved' | 'rolled-back' | 'degraded'
+    details    TEXT                           -- optional JSON: affected_apps, etc.
+  );
+  CREATE INDEX IF NOT EXISTS idx_audit_ts      ON settings_audit(ts);
+  CREATE INDEX IF NOT EXISTS idx_audit_setting ON settings_audit(setting);
 `);
 db.prepare(
-  `INSERT INTO meta (key, value) VALUES ('schema_version', '1')
-     ON CONFLICT(key) DO NOTHING`
+  `INSERT INTO meta (key, value) VALUES ('schema_version', '2')
+     ON CONFLICT(key) DO UPDATE SET value=excluded.value`
 ).run();
 db.prepare(
   `INSERT INTO meta (key, value) VALUES ('first_started_at', ?)
      ON CONFLICT(key) DO NOTHING`
 ).run(new Date().toISOString());
+
+// ----- audit log retention --------------------------------------------
+// Phase 8.5 Workstream C — daily prune of settings_audit rows older than
+// 1 year. In-process setInterval rather than a host-level cron because
+// the console is a long-running daemon and the prune is forgiving of
+// missed runs (a daily scan re-checks everything). Run once on startup
+// to catch up after any extended downtime, then every 24h.
+//
+// 1 year retention is the addendum's locked decision (§14.1). To change
+// it, edit AUDIT_RETENTION_DAYS or expose a setting (Tier 1 System
+// category) in a future iteration.
+const AUDIT_RETENTION_DAYS    = 365;
+const AUDIT_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const _auditPruneStmt = db.prepare(
+  'DELETE FROM settings_audit WHERE ts < ?'
+);
+function pruneAuditLog() {
+  const cutoff = new Date(Date.now() - AUDIT_RETENTION_DAYS * 86_400_000).toISOString();
+  try {
+    const result = _auditPruneStmt.run(cutoff);
+    if (result.changes > 0) {
+      log('info', 'audit log pruned', {
+        rows_deleted: result.changes,
+        cutoff,
+        retention_days: AUDIT_RETENTION_DAYS,
+      });
+    }
+  } catch (err) {
+    log('warn', 'audit log prune failed', { err: err.message });
+  }
+}
+setTimeout(pruneAuditLog, 30_000);                  // catch up after boot
+setInterval(pruneAuditLog, AUDIT_PRUNE_INTERVAL_MS); // ~24h cadence
 
 // ----- docker ----------------------------------------------------------
 
@@ -284,6 +336,11 @@ app.get('/admin', requireAdmin, (_req, res) => {
   res.sendFile(path.join(__dirname, 'ui', 'admin.html'));
 });
 
+// Phase 8.5 W-C — Tier 1 settings page. Reuses requireAdmin auth.
+app.get('/admin/settings', requireAdmin, (_req, res) => {
+  res.sendFile(path.join(__dirname, 'ui', 'settings.html'));
+});
+
 app.get('/api/v1/state', requireAdmin, (_req, res) => {
   res.json(readState());
 });
@@ -310,6 +367,7 @@ app.get('/api/v1/admin/status', requireAdmin, async (_req, res) => {
 
 app.get('/api/v1/public/apps', (_req, res) => {
   const state = readState();
+  const config = state.config || {};
   const stateApps = state.apps || {};
   const items = Object.values(MANIFESTS)
     .filter((m) => !!(stateApps[m.slug] || {}).enabled)
@@ -317,7 +375,14 @@ app.get('/api/v1/public/apps', (_req, res) => {
       slug:        m.slug,
       displayName: m.displayName,
       description: m.description,
-      url:         appPublicUrl(m, state.config || {}),
+      url:         appPublicUrl(m, config),
+      // Phase 8.5 — second URL for emergency/backup access via HAProxy
+      // sidecar on the LAN. Null when host_ip or emergencyPort missing.
+      emergencyUrl: appEmergencyUrl(m, config),
+      // Default admin username from the manifest. Password is
+      // deliberately NOT exposed on the public endpoint — operators
+      // see it only behind admin auth via /api/v1/first-login.
+      username:    m.firstLogin && m.firstLogin.username || null,
     }))
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
   res.json({ apps: items });
@@ -361,6 +426,13 @@ app.get('/api/v1/apps', requireAdmin, (_req, res) => {
         subdomain: m.subdomain,
         defaultTag: m.image && m.image.defaultTag,
         url: appPublicUrl(m, state.config || {}),
+        // Phase 8.5 — second URL for emergency/backup access; null if
+        // not available on this install (no host_ip cached or app
+        // declares no emergencyPort).
+        emergencyUrl: appEmergencyUrl(m, state.config || {}),
+        // Default admin username only — password lives behind the
+        // admin-only /api/v1/first-login endpoint.
+        username: m.firstLogin && m.firstLogin.username || null,
         enabled: !!s.enabled,
         status: s.status || 'not-installed',
         image_tag: s.image_tag || null,
@@ -421,19 +493,90 @@ const INFRA_SERVICES = [
   { slug: 'cockpit',   label: 'Cockpit (host)',         container: null /* host install */, subdomain_only: true },
 ];
 
+// Phase 8.5 Workstream A — Cockpit reachability probe. The console runs
+// on vibe_net with extra_hosts mapping host.docker.internal → host-gateway,
+// so a TCP connect to host.docker.internal:9090 from inside this
+// container reaches the host's cockpit.socket.
+function probeCockpit(timeoutMs = 1500) {
+  return new Promise(resolve => {
+    const net = require('net');
+    const sock = net.createConnection({ host: 'host.docker.internal', port: 9090 });
+    const finish = (ok) => { try { sock.destroy(); } catch {} resolve(ok); };
+    sock.setTimeout(timeoutMs);
+    sock.once('connect', () => finish(true));
+    sock.once('timeout', () => finish(false));
+    sock.once('error',   () => finish(false));
+  });
+}
+
+// Mode-aware Cockpit URL — Phase 8.5 Workstream A. Three deployment modes:
+//   - domain mode: Caddy reverse-proxies cockpit.<domain> (existing).
+//   - tailscale mode: tailscale serve --https=9090 publishes the tailnet
+//     hostname on port 9090 with a Tailscale-CA cert.
+//   - lan mode: direct access on https://<host-ip>:9090 with self-signed
+//     cert (browsers will warn — that's expected on the LAN).
+//
+// Returns { url, note }. `url` is a clean URL when reachable, or null
+// when state lacks the info needed to construct one. `note` is optional
+// caveat text rendered alongside the link, never inside the href.
+function cockpitUrl(config) {
+  if (config.mode === 'domain' && config.domain) {
+    return { url: `https://cockpit.${config.domain}/`, note: null };
+  }
+  if (config.mode === 'tailscale' || config.tailscale === true || config.tailscale === 'true') {
+    const tsHost = config.tailscale_hostname;
+    if (tsHost) return { url: `https://${tsHost}:9090/`, note: null };
+    return {
+      url: null,
+      note: 'tailnet hostname not yet cached in state — run `tailscale status`, then visit https://<host>.<tailnet>.ts.net:9090',
+    };
+  }
+  if (config.mode === 'lan') {
+    const ip = config.host_ip;
+    if (ip) return {
+      url: `https://${ip}:9090/`,
+      note: 'self-signed cert — your browser will warn; click through (OK on the LAN)',
+    };
+    return {
+      url: null,
+      note: 'LAN host IP not cached in state — visit https://<your-server-lan-ip>:9090 (self-signed cert OK on LAN)',
+    };
+  }
+  return { url: null, note: 'mode unknown — Cockpit is reachable on host:9090 directly' };
+}
+
 app.get('/api/v1/infra', requireAdmin, async (_req, res) => {
   const state = readState();
   const config = state.config || {};
   const out = [];
   for (const svc of INFRA_SERVICES) {
-    let url;
-    if (config.mode === 'domain' && config.domain) {
+    let url = null;
+    let note = null;
+    if (svc.slug === 'cockpit') {
+      // Cockpit gets full mode-aware URL handling (Phase 8.5 W-A).
+      // Returns { url, note } so the UI can render a clean clickable
+      // link AND the caveat text without splicing them together.
+      ({ url, note } = cockpitUrl(config));
+    } else if (config.mode === 'domain' && config.domain) {
       url = `https://${svc.slug}.${config.domain}/`;
-    } else if (svc.subdomain_only) {
-      url = `(domain mode only)`;
     } else {
-      url = `(non-domain modes: see ${svc.slug} via path-prefix)`;
+      // Non-domain modes: Duplicati and Portainer are reachable via
+      // Caddy's path-prefix routing under the appliance hostname.
+      // The exact host depends on mode (LAN: <host>.local, Tailscale:
+      // tailnet hostname). Be honest about not knowing.
+      const host = (config.mode === 'tailscale' && config.tailscale_hostname)
+                 ? config.tailscale_hostname
+                 : (config.mode === 'lan' && config.host_ip)
+                   ? config.host_ip
+                   : null;
+      if (host) {
+        const scheme = (config.mode === 'tailscale') ? 'https' : 'http';
+        url = `${scheme}://${host}/${svc.slug}/`;
+      } else {
+        note = `non-domain mode — reach via http(s)://<your-server>/${svc.slug}/`;
+      }
     }
+
     let running = null;
     if (svc.container) {
       try {
@@ -443,14 +586,691 @@ app.get('/api/v1/infra', requireAdmin, async (_req, res) => {
       } catch {
         running = false;
       }
-    } else {
-      // Host service (Cockpit) — assume installed if domain renders
-      // its vhost. The doctor's Cockpit check is more authoritative.
-      running = null;
+    } else if (svc.slug === 'cockpit') {
+      // Real reachability probe in place of the prior hard-coded null.
+      running = await probeCockpit();
     }
-    out.push({ ...svc, url, running });
+    out.push({ ...svc, url, note, running });
   }
   res.json({ infra: out });
+});
+
+// --- Settings registry & endpoints (Phase 8.5 Workstream C) -----------
+//
+// The "settings registry" walks every loaded manifest, picks out env
+// entries with ui.tier === 1, and returns a structure the Settings UI
+// can render category tabs from. Computed once at startup; manifests
+// don't change at runtime so a static registry is safe.
+
+const ENV_DIR = path.join(VIBE_DIR, 'env');
+
+// Categories the UI renders as appliance-level tabs (see addendum §7.1).
+// Per-app-only categories ('Application', 'Compliance') get an "Apps"
+// meta-tab populated from the perApp map.
+const APPLIANCE_CATEGORIES = new Set([
+  'Network', 'Email & SMS', 'Backup', 'AI', 'Time & Logging', 'System',
+]);
+
+function _fieldDescriptor(envEntry, providingSlug) {
+  const ui = envEntry.ui || {};
+  return {
+    key:                 envEntry.name,
+    scope:               ui.appliance || 'per-app',
+    secret:              !!envEntry.secret,
+    default:             envEntry.value || '',
+    label:               ui.label || envEntry.name,
+    helpText:            ui.helpText || envEntry.doc || '',
+    input:               ui.input || 'text',
+    options:             ui.options || null,
+    validate:            ui.validate || null,
+    testEndpoint:        ui.testEndpoint || null,
+    showIf:              ui.showIf || null,
+    dependsOnFields:     ui.dependsOnFields || [],
+    disabledImpacts:     ui.disabledImpacts || [],
+    restartRequired:     ui.restartRequired !== false,
+    healthCheckTimeout:  ui.healthCheckTimeout || null,
+    providingSlug,
+  };
+}
+
+// buildSettingsRegistry — returns:
+//   {
+//     appliance: { [category]: [field, ...], ... },
+//     perApp:    { [slug]:    { [category]: [field, ...], ... }, ... },
+//     allKeys:   Map<key, field>           // flat lookup for save flow
+//   }
+function buildSettingsRegistry() {
+  const appliance = {};
+  const perApp    = {};
+  const allKeys   = new Map();
+  const sharedSeen = new Set();   // dedupe shared keys declared on multiple manifests
+
+  for (const m of Object.values(MANIFESTS)) {
+    const entries = [...(m.env.required || []), ...(m.env.optional || [])];
+    for (const e of entries) {
+      if (!e.ui || e.ui.tier !== 1) continue;
+      const f = _fieldDescriptor(e, m.slug);
+      const cat = e.ui.category;
+      if (!cat) continue;        // Tier 1 requires category — schema enforces
+
+      if (f.scope === 'shared' || f.scope === 'both') {
+        // Goes under the appliance tab. Dedupe — first declaration wins
+        // for shared keys (multiple apps may declare same EMAIL_PROVIDER).
+        if (!sharedSeen.has(f.key)) {
+          sharedSeen.add(f.key);
+          (appliance[cat] = appliance[cat] || []).push(f);
+          allKeys.set(f.key, f);
+        }
+      }
+      if (f.scope === 'per-app' || f.scope === 'both') {
+        // Per-app entry. For 'both', this gives the per-app override
+        // surface; for 'per-app' it's the only home.
+        const slugMap = perApp[m.slug] = perApp[m.slug] || {};
+        (slugMap[cat] = slugMap[cat] || []).push(f);
+        allKeys.set(`${m.slug}::${f.key}`, f);
+      }
+    }
+  }
+
+  // Stable sort fields within each category by label for predictable UI.
+  for (const cat of Object.keys(appliance)) {
+    appliance[cat].sort((a, b) => a.label.localeCompare(b.label));
+  }
+  for (const slug of Object.keys(perApp)) {
+    for (const cat of Object.keys(perApp[slug])) {
+      perApp[slug][cat].sort((a, b) => a.label.localeCompare(b.label));
+    }
+  }
+
+  return { appliance, perApp, allKeys };
+}
+
+const SETTINGS_REGISTRY = buildSettingsRegistry();
+log('info', 'settings registry built', {
+  appliance_categories: Object.keys(SETTINGS_REGISTRY.appliance).length,
+  per_app_slugs:        Object.keys(SETTINGS_REGISTRY.perApp).length,
+  total_keys:           SETTINGS_REGISTRY.allKeys.size,
+});
+
+// parseEnvFile — read an env file as { KEY: VALUE } map.
+// Skips comments, blank lines, malformed lines. Mode 600 enforced via
+// fs read; if permissions deny, returns {} silently (caller logs).
+function parseEnvFile(filePath) {
+  const out = {};
+  try {
+    const text = fs.readFileSync(filePath, 'utf8');
+    for (const raw of text.split('\n')) {
+      const line = raw.trim();
+      if (!line || line.startsWith('#')) continue;
+      const eq = line.indexOf('=');
+      if (eq < 0) continue;
+      const k = line.slice(0, eq).trim();
+      const v = line.slice(eq + 1);
+      if (k) out[k] = v;
+    }
+  } catch (err) {
+    // ENOENT is normal for un-rendered files; permission errors logged.
+    if (err.code && err.code !== 'ENOENT') {
+      log('warn', 'parseEnvFile failed', { path: filePath, err: err.code });
+    }
+  }
+  return out;
+}
+
+// Settings schema — what fields exist, where they live, what input
+// widgets to render. No values, no secrets.
+app.get('/api/v1/settings/schema', requireAdmin, (_req, res) => {
+  res.json({
+    appliance: SETTINGS_REGISTRY.appliance,
+    perApp:    SETTINGS_REGISTRY.perApp,
+  });
+});
+
+// Settings values — current values from appliance.env + per-app envs.
+// Secrets are redacted to '(set)' / '(empty)' before they leave the
+// server. Shape mirrors the schema so the UI can zip them client-side.
+app.get('/api/v1/settings/values', requireAdmin, (_req, res) => {
+  const applianceEnv = parseEnvFile(path.join(ENV_DIR, 'appliance.env'));
+  const perAppEnvs   = {};
+  for (const slug of Object.keys(MANIFESTS)) {
+    perAppEnvs[slug] = parseEnvFile(path.join(ENV_DIR, slug + '.env'));
+  }
+
+  function redact(field, raw) {
+    if (raw === undefined || raw === null) return null;
+    if (field.secret) return raw === '' ? '(empty)' : '(set)';
+    return raw;
+  }
+
+  // Appliance-level values.
+  const applianceVals = {};
+  for (const cat of Object.keys(SETTINGS_REGISTRY.appliance)) {
+    for (const f of SETTINGS_REGISTRY.appliance[cat]) {
+      const raw = applianceEnv[f.key];
+      applianceVals[f.key] = {
+        value:  redact(f, raw),
+        source: 'appliance',
+      };
+    }
+  }
+
+  // Per-app values, with inheritance markers for `appliance: "both"`
+  // fields (declared at appliance level AND surfaced per-app).
+  const perAppVals = {};
+  for (const slug of Object.keys(SETTINGS_REGISTRY.perApp)) {
+    perAppVals[slug] = {};
+    for (const cat of Object.keys(SETTINGS_REGISTRY.perApp[slug])) {
+      for (const f of SETTINGS_REGISTRY.perApp[slug][cat]) {
+        const perAppRaw = perAppEnvs[slug][f.key];
+        const applianceRaw = applianceEnv[f.key];
+        if (f.scope === 'both') {
+          if (perAppRaw !== undefined) {
+            perAppVals[slug][f.key] = {
+              value:  redact(f, perAppRaw),
+              source: 'overridden',
+              applianceValue: redact(f, applianceRaw),
+            };
+          } else {
+            perAppVals[slug][f.key] = {
+              value:  redact(f, applianceRaw),
+              source: 'inherited',
+            };
+          }
+        } else {
+          perAppVals[slug][f.key] = {
+            value:  redact(f, perAppRaw),
+            source: 'per-app',
+          };
+        }
+      }
+    }
+  }
+
+  res.json({ appliance: applianceVals, perApp: perAppVals });
+});
+
+// Settings save — atomic write + restart + rollback per addendum §6.1.
+// Body: { changes: [{ scope, key, value, category, secret }, ...] }.
+// Server writes payload to a tempfile (mode 600) so secrets never
+// appear in process listings, spawns lib/settings-save.sh apply, and
+// audit-logs each change after the script completes.
+const SETTINGS_SAVE_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'settings-save.sh');
+const KEY_RE   = /^[A-Z][A-Z0-9_]*$/;
+const SCOPE_RE = /^(appliance|per-app:[a-z][a-z0-9-]+)$/;
+
+app.post('/api/v1/settings/save', requireAdmin, (req, res) => {
+  const body = req.body || {};
+  if (!Array.isArray(body.changes) || body.changes.length === 0) {
+    return res.status(400).json({ error: 'changes array required and non-empty' });
+  }
+  for (const c of body.changes) {
+    if (!c || !c.scope || !c.key) {
+      return res.status(400).json({ error: 'each change requires scope + key' });
+    }
+    if (!SCOPE_RE.test(c.scope)) {
+      return res.status(400).json({ error: 'bad scope: ' + c.scope });
+    }
+    if (!KEY_RE.test(c.key)) {
+      return res.status(400).json({ error: 'bad key: ' + c.key });
+    }
+    // For per-app scope, also verify the slug actually has a loaded
+    // manifest. Catches typos and stale state references that the
+    // regex alone wouldn't (regex matches any [a-z][a-z0-9-]+).
+    if (c.scope.startsWith('per-app:')) {
+      const slug = c.scope.slice('per-app:'.length);
+      if (!MANIFESTS[slug]) {
+        return res.status(400).json({ error: 'unknown app slug: ' + slug });
+      }
+    }
+    // Reject keys that aren't declared in any manifest's Tier-1 ui block.
+    // This prevents the Settings UI from being used to set arbitrary
+    // env vars that bypass the schema. Per-app keys must match the
+    // declaring slug.
+    const allKey = c.scope === 'appliance'
+      ? c.key
+      : (c.scope.split(':')[1] + '::' + c.key);
+    if (!SETTINGS_REGISTRY.allKeys.has(allKey)
+        && !SETTINGS_REGISTRY.allKeys.has(c.key)) {
+      return res.status(400).json({ error: 'unknown setting: ' + c.scope + '/' + c.key });
+    }
+  }
+
+  // Tag with the authenticated admin user — used for audit-log row.
+  body.user = ADMIN_USER;
+
+  // Stash payload in a tempfile so secrets never reach the process
+  // command-line. Mode 600 + opt-in unlink in the spawn finally block.
+  const tmpDir = path.join(VIBE_DIR, 'data');
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const tempPath = path.join(tmpDir,
+    `.settings-save-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.json`);
+  fs.writeFileSync(tempPath, JSON.stringify(body), { mode: 0o600 });
+
+  log('info', 'settings save invoked', {
+    user: ADMIN_USER,
+    change_count: body.changes.length,
+  });
+
+  const child = spawn('/bin/bash', [SETTINGS_SAVE_SCRIPT, 'apply', tempPath], {
+    env: { ...process.env, APPLIANCE_DIR, VIBE_DIR, NO_COLOR: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', d => { stdout += d.toString(); });
+  child.stderr.on('data', d => { stderr += d.toString(); });
+
+  child.on('error', err => {
+    try { fs.unlinkSync(tempPath); } catch {}
+    log('error', 'settings save spawn failed', { err: err.message });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'spawn failed', detail: err.message });
+    }
+  });
+
+  child.on('exit', code => {
+    try { fs.unlinkSync(tempPath); } catch {}
+
+    let result;
+    try {
+      // The script may emit log lines via JSONL stderr/stdout earlier.
+      // The result is a single JSON line written by _settings_emit_result
+      // — take the last non-empty stdout line.
+      const lines = stdout.trim().split('\n').filter(Boolean);
+      result = JSON.parse(lines[lines.length - 1]);
+    } catch {
+      result = { result: 'error', reason: 'unparsable-output', snapshot: null, affected_apps: [] };
+    }
+
+    // Audit-log every change with redaction. Done here (in JS, with
+    // direct DB access) rather than in bash so the row IDs auto-
+    // increment cleanly and we never write secret values.
+    const auditStmt = db.prepare(
+      'INSERT INTO settings_audit (ts, user, category, setting, old_value, new_value, result, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    );
+    const ts = new Date().toISOString();
+    const detailsBase = {
+      snapshot:      result.snapshot || null,
+      affected_apps: result.affected_apps || [],
+      exit_code:     code,
+    };
+    for (const c of body.changes) {
+      const newVal = c.secret
+        ? (c.value ? '(set)' : '(empty)')
+        : (c.value === undefined ? '' : String(c.value));
+      try {
+        auditStmt.run(
+          ts, ADMIN_USER,
+          c.category || 'unknown',
+          c.key,
+          null,                                       // old_value — would need pre-write read; v1.2
+          newVal,
+          result.result || 'unknown',
+          JSON.stringify({ ...detailsBase, scope: c.scope })
+        );
+      } catch (err) {
+        log('warn', 'audit-log insert failed', { err: err.message, key: c.key });
+      }
+    }
+
+    res.json({ ...result, exit_code: code, stderr: trim(stderr) });
+  });
+});
+
+// Settings audit log — paginated read. Use ?category=X to filter,
+// ?page=N&pageSize=N to page (default page 0, pageSize 50, max 500).
+// Sorted ts DESC. Secrets are already redacted at write-time so this
+// returns rows verbatim.
+//
+// CSV export is deferred to Session 3 (?format=csv).
+const AUDIT_LIST_STMT_ALL = db.prepare(
+  'SELECT id, ts, user, category, setting, old_value, new_value, result, details ' +
+  'FROM settings_audit ORDER BY ts DESC LIMIT ? OFFSET ?'
+);
+const AUDIT_LIST_STMT_BY_CAT = db.prepare(
+  'SELECT id, ts, user, category, setting, old_value, new_value, result, details ' +
+  'FROM settings_audit WHERE category = ? ORDER BY ts DESC LIMIT ? OFFSET ?'
+);
+const AUDIT_COUNT_STMT_ALL    = db.prepare('SELECT COUNT(*) AS n FROM settings_audit');
+const AUDIT_COUNT_STMT_BY_CAT = db.prepare('SELECT COUNT(*) AS n FROM settings_audit WHERE category = ?');
+
+// CSV escape — wraps in quotes if needed, doubles internal quotes.
+function _csvCell(v) {
+  if (v == null) return '';
+  const s = String(v);
+  if (s.includes(',') || s.includes('"') || s.includes('\n') || s.includes('\r')) {
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+  return s;
+}
+
+app.get('/api/v1/audit', requireAdmin, (req, res) => {
+  const category = typeof req.query.category === 'string' ? req.query.category : '';
+  const isCsv    = req.query.format === 'csv';
+
+  // CSV pulls a larger window in one go (capped at 10000 rows per
+  // addendum recommendation). JSON keeps the lighter pagination
+  // contract.
+  let page     = parseInt(req.query.page || '0', 10);
+  let pageSize = parseInt(req.query.pageSize || (isCsv ? '10000' : '50'), 10);
+  if (!Number.isFinite(page) || page < 0)        page = 0;
+  if (!Number.isFinite(pageSize) || pageSize <= 0) pageSize = 50;
+  const cap = isCsv ? 10000 : 500;
+  if (pageSize > cap) pageSize = cap;
+  const offset = page * pageSize;
+
+  let rows, total;
+  try {
+    if (category) {
+      rows  = AUDIT_LIST_STMT_BY_CAT.all(category, pageSize, offset);
+      total = AUDIT_COUNT_STMT_BY_CAT.get(category).n;
+    } else {
+      rows  = AUDIT_LIST_STMT_ALL.all(pageSize, offset);
+      total = AUDIT_COUNT_STMT_ALL.get().n;
+    }
+  } catch (err) {
+    log('warn', 'audit list query failed', { err: err.message });
+    return res.status(500).json({ error: 'query-failed' });
+  }
+
+  // CSV path — stream as text/csv with a Content-Disposition header so
+  // browsers offer a download. Secrets are already redacted at write
+  // time so rows go out verbatim. UTF-8 BOM prepended so Excel-on-
+  // Windows correctly identifies the encoding (without BOM, it
+  // misinterprets as ANSI and mojibakes non-ASCII operator names).
+  if (isCsv) {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const fname = `vibe-audit-${category || 'all'}-${ts}.csv`;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
+    const headers = ['ts', 'user', 'category', 'setting', 'old_value', 'new_value', 'result'];
+    const lines = [headers.join(',')];
+    for (const r of rows) {
+      lines.push([
+        _csvCell(r.ts),
+        _csvCell(r.user),
+        _csvCell(r.category),
+        _csvCell(r.setting),
+        _csvCell(r.old_value),
+        _csvCell(r.new_value),
+        _csvCell(r.result),
+      ].join(','));
+    }
+    // If the export hit the 10000-row cap and there are more rows in
+    // the database, surface that to the operator with a final comment
+    // line. Without it, silent truncation makes compliance audits
+    // unreliable.
+    if (rows.length >= pageSize && total > rows.length) {
+      lines.push(`# truncated: ${total - rows.length} additional row(s) in DB; query with ?page=N&pageSize=${pageSize} to get the rest`);
+    }
+    return res.send('﻿' + lines.join('\n') + '\n');
+  }
+
+  // JSON path — parse details for each row so the client doesn't have to.
+  for (const r of rows) {
+    if (r.details) {
+      try { r.details = JSON.parse(r.details); } catch { /* leave string */ }
+    }
+  }
+  res.json({ total, page, pageSize, rows });
+});
+
+// --- Provider test endpoints (Phase 8.5 Workstream C / addendum §5) ---
+//
+// Per-provider one-shot probes. Each endpoint receives the in-flight
+// form values from the Settings UI's Test button. Values are NEVER
+// persisted by these endpoints — that's the Save flow's job. Real-send
+// for email/SMS so the customer actually validates end-to-end (the
+// addendum's locked decision §14.2). Confirmation dialog on the UI
+// side warns about cost.
+//
+// Rate limited 10 req/min per endpoint per source IP. In-process Map
+// tracks recent timestamps; no npm dep. Sliding 60s window.
+const TEST_RATE_LIMIT       = 10;
+const TEST_RATE_WINDOW_MS   = 60_000;
+const _testRateBuckets      = new Map();   // "<endpoint>::<ip>" -> [ts, ts, ...]
+
+function testRateLimit(req, res, next) {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const key = req.path + '::' + ip;
+  const now = Date.now();
+  const cutoff = now - TEST_RATE_WINDOW_MS;
+  let bucket = _testRateBuckets.get(key) || [];
+  bucket = bucket.filter(t => t > cutoff);
+  if (bucket.length >= TEST_RATE_LIMIT) {
+    res.setHeader('Retry-After', '60');
+    return res.status(429).json({
+      ok: false,
+      error: 'rate-limited',
+      message: `Test endpoint rate limit exceeded (${TEST_RATE_LIMIT}/min). Try again in a minute.`,
+    });
+  }
+  bucket.push(now);
+  _testRateBuckets.set(key, bucket);
+  next();
+}
+
+// Periodic cleanup of stale rate-limit entries — prevents the Map from
+// growing unbounded if many distinct IPs probe (e.g. behind a load
+// balancer with X-Forwarded-For). Runs every 5 minutes, drops entries
+// whose newest timestamp is older than the window.
+setInterval(() => {
+  const cutoff = Date.now() - TEST_RATE_WINDOW_MS;
+  for (const [key, ts] of _testRateBuckets) {
+    if (!ts.length || ts[ts.length - 1] < cutoff) {
+      _testRateBuckets.delete(key);
+    }
+  }
+}, 5 * 60_000);
+
+// Common HTTP-fetch wrapper for test endpoints. Returns {ok, status,
+// body, error} so each handler can inspect what came back. Default
+// 15s timeout — Twilio and Postmark can legitimately take 8-12s under
+// load, so the prior 10s ceiling was producing false failures.
+async function _testFetch(url, opts, timeoutMs) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs || 15_000);
+  try {
+    const r = await fetch(url, { ...opts, signal: ac.signal });
+    clearTimeout(timer);
+    let body = '';
+    try { body = await r.text(); } catch { /* ignore */ }
+    return { ok: r.ok, status: r.status, body };
+  } catch (err) {
+    clearTimeout(timer);
+    return { ok: false, status: 0, error: err.message || String(err) };
+  }
+}
+
+// 1-token ping to api.anthropic.com. Validates that the key is good
+// without burning meaningful credit. Body: { ANTHROPIC_API_KEY }.
+app.post('/api/v1/admin/test/anthropic', requireAdmin, testRateLimit, async (req, res) => {
+  const key = (req.body && req.body.ANTHROPIC_API_KEY) || '';
+  if (!key) {
+    return res.status(400).json({ ok: false, error: 'ANTHROPIC_API_KEY required in body' });
+  }
+  // Smallest valid request — 1 user message, max_tokens=1. Anthropic
+  // bills the input tokens (~10) but caps output at 1, so this is the
+  // cheapest functional probe. Model can be overridden by passing
+  // ANTHROPIC_MODEL in the body — handy when the default model is
+  // deprecated or the operator wants to validate a specific tier.
+  const model = (req.body && req.body.ANTHROPIC_MODEL) || 'claude-haiku-4-5-20251001';
+  const result = await _testFetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type':       'application/json',
+      'x-api-key':          key,
+      'anthropic-version':  '2023-06-01',
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: 1,
+      messages:   [{ role: 'user', content: 'ping' }],
+    }),
+  });
+  if (result.ok) {
+    return res.json({ ok: true, message: 'API key valid; Anthropic responded 200.' });
+  }
+  let detail = result.error || `HTTP ${result.status}`;
+  // Anthropic returns JSON error bodies — surface the type if parseable.
+  if (result.body) {
+    try {
+      const parsed = JSON.parse(result.body);
+      if (parsed.error && parsed.error.message) detail = parsed.error.message;
+    } catch { /* leave raw */ }
+  }
+  return res.status(200).json({
+    ok: false,
+    message: 'Anthropic rejected the request: ' + detail,
+    status: result.status,
+  });
+});
+
+// Real send via Resend or Postmark. Body: { EMAIL_PROVIDER, EMAIL_FROM,
+// RESEND_API_KEY?, POSTMARK_SERVER_TOKEN?, SMTP_*? }.
+app.post('/api/v1/admin/test/email', requireAdmin, testRateLimit, async (req, res) => {
+  const b = req.body || {};
+  // Trim before lowercasing so leading/trailing whitespace from a
+  // copy-paste doesn't break the provider dispatch.
+  const provider = (b.EMAIL_PROVIDER || '').trim().toLowerCase();
+  const from     = (b.EMAIL_FROM || '').trim();
+  if (!from) {
+    return res.status(400).json({ ok: false, error: 'EMAIL_FROM required' });
+  }
+
+  const subject = '[Vibe Appliance] Email provider test';
+  const text    = 'This is a test email from your Vibe Appliance Settings page. ' +
+                  'If you received it, your email provider is configured correctly. ' +
+                  'You can safely delete this message.';
+
+  if (provider === 'resend') {
+    const key = b.RESEND_API_KEY || '';
+    if (!key) return res.status(400).json({ ok: false, error: 'RESEND_API_KEY required' });
+    const result = await _testFetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'authorization': 'Bearer ' + key, 'content-type': 'application/json' },
+      body: JSON.stringify({ from, to: [from], subject, text }),
+    });
+    if (result.ok) {
+      let id = '';
+      try { id = (JSON.parse(result.body) || {}).id || ''; } catch { /* ignore */ }
+      return res.json({ ok: true, message: `Test email sent via Resend to ${from}.`, message_id: id });
+    }
+    return res.json({ ok: false, message: 'Resend rejected: ' + (result.error || `HTTP ${result.status}: ${result.body.slice(0, 200)}`) });
+  }
+
+  if (provider === 'postmark') {
+    const token = b.POSTMARK_SERVER_TOKEN || '';
+    if (!token) return res.status(400).json({ ok: false, error: 'POSTMARK_SERVER_TOKEN required' });
+    const result = await _testFetch('https://api.postmarkapp.com/email', {
+      method: 'POST',
+      headers: {
+        'accept':                  'application/json',
+        'content-type':            'application/json',
+        'x-postmark-server-token': token,
+      },
+      body: JSON.stringify({ From: from, To: from, Subject: subject, TextBody: text }),
+    });
+    if (result.ok) {
+      let id = '';
+      try { id = (JSON.parse(result.body) || {}).MessageID || ''; } catch { /* ignore */ }
+      return res.json({ ok: true, message: `Test email sent via Postmark to ${from}.`, message_id: id });
+    }
+    return res.json({ ok: false, message: 'Postmark rejected: ' + (result.error || `HTTP ${result.status}: ${result.body.slice(0, 200)}`) });
+  }
+
+  if (provider === 'smtp') {
+    // Real SMTP needs nodemailer (or comparable). Deferred to v1.2 when
+    // the npm dep + Dockerfile rebuild lands. Returns 501 with a clear
+    // path forward so the operator isn't left guessing.
+    return res.status(501).json({
+      ok: false,
+      message: 'SMTP test not implemented in v1.1. Add nodemailer to console/Dockerfile and POST to mail server directly. Resend/Postmark work today.',
+    });
+  }
+
+  return res.status(400).json({ ok: false, error: `unknown EMAIL_PROVIDER: ${provider || '(empty)'}` });
+});
+
+// Twilio HTTP API for SMS. Body: { SMS_PROVIDER, TWILIO_ACCOUNT_SID,
+// TWILIO_AUTH_TOKEN, FROM_NUMBER, TO_NUMBER }. UI prompts for TO via
+// modal; FROM is operator-configured.
+app.post('/api/v1/admin/test/sms', requireAdmin, testRateLimit, async (req, res) => {
+  const b = req.body || {};
+  const provider = (b.SMS_PROVIDER || '').trim().toLowerCase();
+  const to       = (b.TO_NUMBER  || '').trim();
+  const from     = (b.FROM_NUMBER || '').trim();
+  if (!to)   return res.status(400).json({ ok: false, error: 'TO_NUMBER required (entered in modal)' });
+  if (!from) return res.status(400).json({ ok: false, error: 'FROM_NUMBER required (your Twilio sender)' });
+
+  if (provider === 'twilio') {
+    const sid   = b.TWILIO_ACCOUNT_SID || '';
+    const token = b.TWILIO_AUTH_TOKEN  || '';
+    if (!sid || !token) {
+      return res.status(400).json({ ok: false, error: 'TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN required' });
+    }
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(sid)}/Messages.json`;
+    const auth = Buffer.from(`${sid}:${token}`).toString('base64');
+    const form = new URLSearchParams({ From: from, To: to, Body: 'Vibe Appliance SMS test.' }).toString();
+    const result = await _testFetch(url, {
+      method: 'POST',
+      headers: {
+        'authorization': 'Basic ' + auth,
+        'content-type':  'application/x-www-form-urlencoded',
+      },
+      body: form,
+    });
+    if (result.ok) {
+      let sidOut = '';
+      try { sidOut = (JSON.parse(result.body) || {}).sid || ''; } catch { /* ignore */ }
+      return res.json({ ok: true, message: `Test SMS dispatched via Twilio to ${to}.`, sid: sidOut });
+    }
+    return res.json({ ok: false, message: 'Twilio rejected: ' + (result.error || `HTTP ${result.status}: ${result.body.slice(0, 200)}`) });
+  }
+
+  if (provider === 'textlink') {
+    return res.status(501).json({
+      ok: false,
+      message: 'TextLink test requires the TextLink LAN appliance reachable from this host. Implement in v1.2 when the appliance discovery flow lands.',
+    });
+  }
+
+  return res.status(400).json({ ok: false, error: `unknown SMS_PROVIDER: ${provider || '(empty)'}` });
+});
+
+// Generic LLM endpoint probe. Body: { LLM_ENDPOINT, LLM_API_KEY?,
+// LLM_MODEL? }. Sends a "Hello" prompt and waits for any response.
+// Forward-compat for Tax-Research-Chat's Tier-2 LLM_ENDPOINT field.
+app.post('/api/v1/admin/test/llm', requireAdmin, testRateLimit, async (req, res) => {
+  const b = req.body || {};
+  const endpoint = b.LLM_ENDPOINT || '';
+  if (!endpoint) {
+    return res.status(400).json({ ok: false, error: 'LLM_ENDPOINT required' });
+  }
+  if (!/^https?:\/\//.test(endpoint)) {
+    return res.status(400).json({ ok: false, error: 'LLM_ENDPOINT must be a valid http(s) URL' });
+  }
+  const headers = { 'content-type': 'application/json' };
+  if (b.LLM_API_KEY) headers.authorization = 'Bearer ' + b.LLM_API_KEY;
+  // OpenAI-compatible payload — most local LLM servers (Ollama,
+  // llama.cpp, vLLM) accept this shape on /v1/chat/completions.
+  const payload = {
+    model:      b.LLM_MODEL || 'default',
+    messages:   [{ role: 'user', content: 'Hello' }],
+    max_tokens: 4,
+  };
+  const result = await _testFetch(endpoint, {
+    method: 'POST', headers, body: JSON.stringify(payload),
+  });
+  if (result.ok) {
+    let excerpt = result.body.slice(0, 120);
+    return res.json({ ok: true, message: 'LLM endpoint responded.', response_excerpt: excerpt });
+  }
+  return res.json({
+    ok: false,
+    message: 'LLM endpoint rejected: ' + (result.error || `HTTP ${result.status}: ${result.body.slice(0, 200)}`),
+  });
 });
 
 // --- First-login info (Phase 8) ----------------------------------------
@@ -559,6 +1379,19 @@ function trim(s, max = 16 * 1024) {
   return s.slice(0, max) + `\n…(${s.length - max} bytes truncated)`;
 }
 
+// Phase 8.5 Workstream D — emergency access URL.
+// Returns http://<host_ip>:<emergencyPort>/ when both ends are known.
+// Null otherwise (operator gets a card without an emergency row).
+// LAN IP comes from state.config.host_ip cached at bootstrap time. The
+// emergencyPort is the manifest's declared TCP port on the HAProxy
+// sidecar, gated by UFW to RFC1918 + Tailscale CGNAT.
+function appEmergencyUrl(manifest, config) {
+  const port = manifest.emergencyPort;
+  const ip = config.host_ip;
+  if (!port || !ip) return null;
+  return `http://${ip}:${port}/`;
+}
+
 function appPublicUrl(manifest, config) {
   // Domain mode → real per-app subdomain.
   if (config.mode === 'domain' && config.domain) {
@@ -631,12 +1464,46 @@ app.get('/api/v1/doctor', requireAdmin, async (_req, res) => {
         log('warn', 'doctor produced unparsable line', { line: s });
       }
     }
+    const now = new Date().toISOString();
+
+    // Phase 8.5 — persist this run to /opt/vibe/logs/doctor.log so the
+    // operator sees it in the admin "Logs" tab AND has a historical
+    // record. Append-mode JSONL: a header line, one line per check, and
+    // a summary line. Failure here is logged but does not affect the
+    // response (the run itself succeeded).
+    try {
+      const logPath = path.join(LOGS_DIR, 'doctor.log');
+      fs.mkdirSync(LOGS_DIR, { recursive: true });
+      const lines = [];
+      lines.push(JSON.stringify({
+        ts: now, phase: 'doctor', level: 'info',
+        msg: 'doctor run begin', source: 'console',
+      }));
+      for (const c of checks) {
+        lines.push(JSON.stringify({
+          ts: now, phase: 'doctor',
+          level: c.status === 'pass' ? 'info' : c.status,
+          msg: c.name, status: c.status,
+          message: c.message || '',
+          ...(c.hint ? { hint: c.hint } : {}),
+        }));
+      }
+      lines.push(JSON.stringify({
+        ts: now, phase: 'doctor', level: 'info',
+        msg: 'doctor run end', exit_code: code,
+        summary, source: 'console',
+      }));
+      fs.appendFileSync(logPath, lines.join('\n') + '\n');
+    } catch (err) {
+      log('warn', 'could not append doctor.log', { err: err.message });
+    }
+
     res.json({
       exit_code: code,
       summary,
       checks,
       stderr: trim(stderr),
-      now: new Date().toISOString(),
+      now,
     });
   });
 });

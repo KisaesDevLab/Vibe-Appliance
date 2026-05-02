@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Settings · Vibe Appliance</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <style>
+    /* Settings-page-specific layout. Keeps the global styles.css clean. */
+    .settings-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.25rem;
+      border-bottom: 1px solid #e0d8c8;
+      margin-bottom: 1.5rem;
+    }
+    .settings-tab {
+      padding: 0.5rem 1rem;
+      background: transparent;
+      border: 0;
+      border-bottom: 2px solid transparent;
+      font: inherit;
+      color: #6b4423;
+      cursor: pointer;
+    }
+    .settings-tab[aria-selected="true"] {
+      border-bottom-color: #b8722e;
+      font-weight: 600;
+    }
+    .settings-form {
+      display: grid;
+      gap: 1rem;
+      max-width: 36rem;
+    }
+    .settings-field {
+      display: grid;
+      gap: 0.25rem;
+    }
+    .settings-field label {
+      font-weight: 600;
+      font-size: 0.95em;
+    }
+    .settings-field input[type="text"],
+    .settings-field input[type="password"],
+    .settings-field input[type="number"],
+    .settings-field select,
+    .settings-field textarea {
+      padding: 0.4rem 0.6rem;
+      border: 1px solid #e0d8c8;
+      border-radius: 4px;
+      font: inherit;
+      background: #fff;
+    }
+    .settings-field .help {
+      font-size: 0.85em;
+      color: #8a7860;
+    }
+    .settings-field .scope-badge {
+      display: inline-block;
+      font-size: 0.75em;
+      padding: 0.1rem 0.4rem;
+      border-radius: 3px;
+      background: #efe9df;
+      color: #6b4423;
+      margin-left: 0.5rem;
+    }
+    .settings-field .scope-badge--shared    { background: #e0e8d4; color: #4a6b1f; }
+    .settings-field .scope-badge--per-app   { background: #e8d8c8; color: #6b4423; }
+    .settings-field .scope-badge--secret    { background: #fceadf; color: #8b3a1c; }
+    .settings-save-bar {
+      position: sticky;
+      bottom: 0;
+      background: #faf7f2;
+      border-top: 1px solid #e0d8c8;
+      padding: 1rem 0;
+      margin-top: 2rem;
+      display: flex;
+      gap: 0.75rem;
+      align-items: center;
+    }
+    .settings-save-bar.dirty {
+      background: #fdf6e8;
+      border-top-color: #b8722e;
+    }
+    .settings-save-status {
+      flex: 1;
+      color: #8a7860;
+      font-size: 0.9em;
+    }
+    .impact-warning {
+      background: #fdf0e0;
+      border: 1px solid #b8722e;
+      padding: 0.75rem;
+      border-radius: 4px;
+      margin-bottom: 1rem;
+      color: #6b3a1c;
+    }
+    .save-result {
+      padding: 0.75rem;
+      border-radius: 4px;
+      margin-top: 1rem;
+    }
+    .save-result--saved      { background: #e0e8d4; color: #2d4a14; }
+    .save-result--rolled-back { background: #fdf0e0; color: #6b3a1c; }
+    .save-result--degraded   { background: #fce0e0; color: #6b1c1c; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <main class="container container--admin">
+    <header class="hero">
+      <p class="eyebrow">Admin · Settings</p>
+      <h1>Configuration</h1>
+      <p class="lede">
+        Tier-1 inline-editable settings. Changes save atomically with restart-and-rollback —
+        if any dependent app fails its health-check, your env files are restored from the
+        snapshot taken at save time. <a href="/admin">Back to admin home</a>.
+      </p>
+    </header>
+
+    <div id="error" class="error-banner" hidden></div>
+
+    <nav class="settings-tabs" id="settings-tabs" role="tablist" aria-busy="true">
+      <span class="muted">loading…</span>
+    </nav>
+
+    <section id="settings-panel" aria-busy="true">
+      <p class="muted">fetching schema…</p>
+    </section>
+
+    <div id="save-result" hidden></div>
+
+    <div class="settings-save-bar" id="save-bar">
+      <span class="settings-save-status" id="save-status">No changes pending.</span>
+      <button class="btn btn--ghost" id="save-discard" disabled>Discard</button>
+      <button class="btn"           id="save-apply"   disabled>Save changes</button>
+    </div>
+
+    <footer class="footer">
+      <p class="muted">
+        Audit log: <a href="/api/v1/audit?pageSize=20">recent saves (JSON)</a>.
+        See <span class="mono">/opt/vibe/data/env-history/</span> for env snapshots.
+      </p>
+    </footer>
+  </main>
+
+  <script src="/static/settings.js"></script>
+</body>
+</html>

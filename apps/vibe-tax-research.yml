@@ -19,6 +19,7 @@ services:
     init: true
     env_file:
       - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
       - /opt/vibe/env/vibe-tax-research.env
     volumes:
       # Persistent storage matching upstream prod compose. /app/workspaces
@@ -50,6 +51,7 @@ services:
     restart: unless-stopped
     env_file:
       - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
       - /opt/vibe/env/vibe-tax-research.env
     networks:
       vibe_net: {}

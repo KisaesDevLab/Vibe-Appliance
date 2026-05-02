@@ -208,6 +208,30 @@ remove_avahi() {
   fi
 }
 
+# Phase 8.5 Workstream B. Removes the npm package, the NodeSource apt
+# repo, and the SUPPORT.md hint. Deliberately does NOT remove Node.js
+# itself — Node may be in use by other host processes the operator
+# installed independently. If the operator wants Node gone too:
+#   sudo apt-get remove -y nodejs
+remove_claude_code() {
+  step "removing claude-code"
+  if command -v claude >/dev/null 2>&1 || command -v claude-code >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive npm remove -g --silent @anthropic-ai/claude-code 2>/dev/null || true
+    ok "claude-code removed (Node.js preserved — remove via apt if you want it gone)"
+  else
+    note "claude-code not installed"
+  fi
+
+  # NodeSource apt source — safe to drop; if the operator wants Node
+  # back later they can re-run the install script.
+  rm -f /etc/apt/sources.list.d/nodesource.list
+  rm -f /usr/share/keyrings/nodesource.gpg
+
+  # SUPPORT.md drop is a hint file, not state. Remove it so a fresh
+  # install gets a clean copy.
+  rm -f "${VIBE_DIR}/SUPPORT.md"
+}
+
 remove_docker() {
   step "removing docker"
   if command -v docker >/dev/null 2>&1; then
@@ -252,7 +276,7 @@ case "$LEVEL" in
     ;;
 
   full)
-    confirm "About to perform a FULL UNINSTALL: containers, images, data, env, Docker, Cockpit, Tailscale, Avahi, the CLI symlink, and /opt/vibe." "YES"
+    confirm "About to perform a FULL UNINSTALL: containers, images, data, env, Docker, Cockpit, Tailscale, Avahi, Claude Code (npm package only — Node preserved), the CLI symlink, and /opt/vibe." "YES"
     confirm "Final confirm — this is destructive and not reversible without re-running curl|bash from scratch." "I AM SURE"
     stop_containers
     remove_images
@@ -261,6 +285,7 @@ case "$LEVEL" in
     remove_cli_symlink
     remove_cockpit
     remove_avahi
+    remove_claude_code
     remove_tailscale
     remove_docker
     remove_appliance_dir

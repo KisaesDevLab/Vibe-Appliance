@@ -70,6 +70,12 @@ CONFIG_COCKPIT="true"
 # after secrets phase. Caddy reads it via env_file at runtime IF the
 # operator has switched to the custom image.
 CONFIG_CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
+# Phase 8.5 Workstream B — opt-in Claude Code install on the host for
+# operator-driven troubleshooting. Default off; flip via
+# --with-claude-code. The optional API key is persisted to appliance.env
+# (Workstream C) by phase_secrets.
+CONFIG_CLAUDE_CODE="false"
+CONFIG_ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
 
 # ----------------------------------------------------------------------
 # Minimal output helpers (used before lib/log.sh is available)
@@ -115,6 +121,16 @@ FLAGS
   --no-cockpit                    Skip the host Cockpit install (default is to
                                   install). Useful on hosts that already have
                                   their own admin tooling.
+  --with-claude-code              [Phase 8.5] Install Claude Code on the host
+                                  for operator-driven troubleshooting (opt-in;
+                                  reachable only via SSH or Cockpit Terminal).
+                                  Pulls Node 20 from NodeSource and installs
+                                  @anthropic-ai/claude-code via npm.
+  --anthropic-api-key KEY         API key persisted to /opt/vibe/env/appliance.env.
+                                  Used by Claude Code (with --with-claude-code)
+                                  and by per-app AI features that opt into the
+                                  shared key via manifest ui blocks. Reads
+                                  ANTHROPIC_API_KEY from the environment too.
   -h | --help                     Show this help.
 
 DOCS
@@ -139,6 +155,9 @@ parse_flags() {
       --reset-env)       CONFIG_RESET_ENV="true"; shift ;;
       --force)           CONFIG_FORCE="true"; shift ;;
       --no-cockpit)      CONFIG_COCKPIT="false"; shift ;;
+      --with-claude-code) CONFIG_CLAUDE_CODE="true"; shift ;;
+      --anthropic-api-key)        CONFIG_ANTHROPIC_API_KEY="${2:?--anthropic-api-key requires a value}"; shift 2 ;;
+      --anthropic-api-key=*)      CONFIG_ANTHROPIC_API_KEY="${1#*=}"; shift ;;
       -h|--help)         usage; exit 0 ;;
       *)
         _pre_log "Unknown flag: $1"
@@ -376,6 +395,22 @@ phase_tailscale() {
       state_set_phase tailscale failed "tailscale-up failed"
       die "tailscale install/up failed. See $VIBE_LOG_FILE."
     fi
+
+    # Cache the tailnet hostname so the console can render Tailscale
+    # mode URLs (Cockpit at <host>.<tailnet>.ts.net:9090, etc.) without
+    # placeholders. Best-effort — Tailscale state may not be readable
+    # immediately after `tailscale up`. (Phase 8.5 Workstream A.)
+    local _ts_host
+    _ts_host="$(tailscale status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print(d["Self"]["DNSName"].rstrip("."))
+except Exception:
+    pass' 2>/dev/null || true)"
+    if [[ -n "${_ts_host:-}" ]]; then
+      state_set_config_kv tailscale_hostname "$_ts_host"
+    fi
   fi
 
   state_set_phase tailscale ok
@@ -440,6 +475,17 @@ HELP
     die "Could not render shared.env. See $VIBE_LOG_FILE."
   fi
 
+  # Render appliance.env — Tier 1 inline-editable settings (Phase 8.5
+  # admin config surface). Operator-set values from previous runs are
+  # preserved; only newly-added template keys take a default. Failure
+  # here is non-fatal: the substrate file just won't exist yet, and the
+  # Settings page will create it on first save.
+  if ! secrets_render_appliance \
+        "${APPLIANCE_DIR}/env-templates/appliance.env.tmpl" \
+        "$CONFIG_RESET_ENV"; then
+    log_warn "could not render appliance.env; continuing without it"
+  fi
+
   # Persist CLOUDFLARE_API_TOKEN if provided. Caddy reads it from
   # /opt/vibe/env/shared.env at runtime via env_file.
   if [[ -n "${CONFIG_CLOUDFLARE_API_TOKEN:-}" ]]; then
@@ -448,6 +494,16 @@ HELP
     state_set_config_kv cloudflare_token_present "true"
   else
     state_set_config_kv cloudflare_token_present "false"
+  fi
+
+  # Persist ANTHROPIC_API_KEY into appliance.env if provided via
+  # --anthropic-api-key flag. Read by Claude Code (host support tooling)
+  # and by per-app AI features whose manifest declares
+  # ui.appliance: "shared" on this key.
+  if [[ -n "${CONFIG_ANTHROPIC_API_KEY:-}" ]]; then
+    secrets_set_kv_appliance ANTHROPIC_API_KEY "$CONFIG_ANTHROPIC_API_KEY"
+    log_info "anthropic API key persisted to appliance.env"
+    state_set_config_kv anthropic_key_present "true"
   fi
 
   state_set_phase secrets ok
@@ -468,9 +524,9 @@ phase_pull() {
   log_phase_banner 5 "Pull and build images" "pull"
   state_set_phase pull running
 
-  log_step "pulling registry images (caddy, postgres, redis, duplicati, portainer)"
+  log_step "pulling registry images (caddy, postgres, redis, duplicati, portainer, emergency-proxy)"
   if ! ( cd "$APPLIANCE_DIR" && \
-         docker compose pull caddy postgres redis duplicati portainer ) >>"$VIBE_LOG_FILE" 2>&1; then
+         docker compose pull caddy postgres redis duplicati portainer emergency-proxy ) >>"$VIBE_LOG_FILE" 2>&1; then
     state_set_phase pull failed "registry pull failed"
     die "Registry pull failed. See $VIBE_LOG_FILE — common cause is a transient ghcr.io / docker.io rate limit; retry in 60s."
   fi
@@ -487,6 +543,10 @@ phase_pull() {
 }
 
 # --- Phase 6 — render Caddyfile from template + mode snippet ----------
+# Also renders the emergency-proxy haproxy.cfg (Phase 8.5 Workstream D)
+# and applies UFW rules. Both are non-fatal here: the HAProxy config is
+# regenerated on every app enable/disable anyway, and UFW is optional —
+# absence of either should not block bringing up the core stack.
 phase_caddy() {
   log_phase_banner 6 "Render Caddyfile" "caddy"
   state_set_phase caddy running
@@ -494,6 +554,17 @@ phase_caddy() {
     state_set_phase caddy failed "render failed"
     die "Caddyfile render failed. See $VIBE_LOG_FILE."
   fi
+
+  # Emergency-proxy haproxy.cfg + 503.http (Phase 8.5 Workstream D).
+  # Idempotent; renders a stats-only config when no apps are enabled.
+  if ! render_haproxy; then
+    log_warn "haproxy.cfg render failed; emergency proxy will not be configured. See $VIBE_LOG_FILE."
+  fi
+
+  # UFW rules for emergency-access ports + LAN-mode :9090.
+  # Gracefully no-ops when ufw is missing or inactive.
+  apply_ufw_rules || log_warn "ufw rule application returned non-zero; check $VIBE_LOG_FILE"
+
   state_set_phase caddy ok
 }
 
@@ -554,6 +625,30 @@ phase_infra() {
     return 0
   fi
   log_ok "cockpit installed"
+}
+
+# --- Phase 7+ — install Claude Code on the host (opt-in) -------------
+# Phase 8.5 Workstream B. Adds Node 20 + @anthropic-ai/claude-code for
+# operator-driven troubleshooting via SSH / Cockpit Terminal. Skipped
+# unless the operator passes --with-claude-code. Failure here is
+# non-fatal — the appliance core works without it.
+phase_claude_code() {
+  log_set_phase "claude-code"
+
+  if [[ "$CONFIG_CLAUDE_CODE" != "true" ]]; then
+    log_info "skipping claude-code install (use --with-claude-code to enable)"
+    state_set_config_kv claude_code "false"
+    return 0
+  fi
+
+  log_step "installing claude-code on host"
+  if ! ( cd "$APPLIANCE_DIR" && /bin/bash infra/claude-code-install.sh ); then
+    log_warn "claude-code install failed; continuing without it. Re-run: sudo bash infra/claude-code-install.sh"
+    state_set_config_kv claude_code "failed"
+    return 0
+  fi
+  state_set_config_kv claude_code "true"
+  log_ok "claude-code installed"
 }
 
 # --- Phase 7+ — re-enable apps from state.json -----------------------
@@ -777,6 +872,7 @@ main() {
   # Source library files. These live alongside this script.
   local lib="${APPLIANCE_DIR}/lib"
   for f in log.sh state.sh preflight.sh secrets.sh render-caddyfile.sh \
+           render-haproxy.sh ufw-rules.sh \
            db-bootstrap.sh enable-app.sh disable-app.sh; do
     if [[ ! -f "${lib}/${f}" ]]; then
       _pre_die "missing ${lib}/${f}. Is this a complete clone of the Vibe-Appliance repo?"
@@ -814,6 +910,15 @@ main() {
   # Tailscale authkey is a secret — never persist it. Only the *flag* is
   # recorded; the key is passed through the environment when phase 3 lands.
 
+  # Cache the host's primary LAN IPv4 so the console can render LAN-mode
+  # Cockpit and emergency-access URLs as concrete clickable links rather
+  # than placeholders. Best-effort — falls back gracefully if `hostname
+  # -I` returns nothing on a misconfigured host. (Phase 8.5 Workstream A.)
+  _host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  if [[ -n "${_host_ip:-}" ]]; then
+    state_set_config_kv host_ip "$_host_ip"
+  fi
+
   log_info "bootstrap starting" mode="$CONFIG_MODE" appliance_dir="$APPLIANCE_DIR"
 
   phase_preflight
@@ -824,6 +929,7 @@ main() {
   phase_caddy
   phase_core_up
   phase_infra          # cockpit on host (duplicati/portainer already up via core)
+  phase_claude_code    # opt-in: claude-code on host for support (Phase 8.5 W-B)
   phase_apps           # re-enable any apps marked enabled in state.json
   phase_credentials
 

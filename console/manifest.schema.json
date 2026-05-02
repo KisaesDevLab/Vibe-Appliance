@@ -47,6 +47,25 @@
       "maxLength": 40
     },
 
+    "emergencyPort": {
+      "type": "integer",
+      "minimum": 5171,
+      "maximum": 5198,
+      "description": "TCP port on the emergency HAProxy proxy (Phase 8.5 Workstream D). Plain HTTP, UFW-gated to RFC1918 + Tailscale CGNAT. Maps to this app's routing.default_upstream. See docs/addenda/emergency-access.md §3 for the canonical port assignments. Apps with userFacing=false MUST NOT declare an emergencyPort."
+    },
+
+    "emergencyNote": {
+      "type": "string",
+      "maxLength": 200,
+      "description": "Optional caveat displayed verbatim in CREDENTIALS.txt and the admin Emergency Access panel — e.g. for Vibe-Connect's client portal: 'Staff emergency access only. Client magic-link flows require HTTPS.'"
+    },
+
+    "userFacing": {
+      "type": "boolean",
+      "default": true,
+      "description": "If false, the app is internal-only (consumed by other Vibe apps, never directly by users). Internal apps do not get an emergency port and may be excluded from the public landing page."
+    },
+
     "ports": {
       "type": "object",
       "additionalProperties": false,
@@ -176,6 +195,7 @@
           "description": "Source for the value. See docs/MANIFEST_SCHEMA.md.",
           "anyOf": [
             { "pattern": "^shared:[A-Z][A-Z0-9_]*$" },
+            { "pattern": "^appliance:[A-Z][A-Z0-9_]*$" },
             { "const": "generated:hex32" },
             { "const": "subdomain-url" },
             { "const": "database-url" },
@@ -185,7 +205,92 @@
         },
         "value":  { "type": "string" },
         "secret": { "type": "boolean" },
-        "doc":    { "type": "string" }
+        "doc":    { "type": "string" },
+        "ui":     { "$ref": "#/$defs/uiBlock" }
+      }
+    },
+
+    "uiBlock": {
+      "type": "object",
+      "description": "Admin Settings page surface for this env var. Phase 8.5 Workstream C. Absence means tier 3 (not surfaced). See docs/addenda/admin-config-surface.md §3.",
+      "required": ["tier"],
+      "additionalProperties": false,
+      "properties": {
+        "tier": {
+          "type": "integer",
+          "enum": [1, 2, 3],
+          "description": "1 = inline-editable form field; 2 = read-only with copy-paste rotation hint; 3 = not surfaced (default)."
+        },
+        "category": {
+          "enum": ["Network", "Email & SMS", "Backup", "AI", "Time & Logging", "System", "Application", "Compliance"],
+          "description": "Settings page tab. Required for tier 1."
+        },
+        "label":     { "type": "string", "minLength": 1, "maxLength": 80 },
+        "helpText":  { "type": "string", "maxLength": 200 },
+        "input": {
+          "enum": ["text", "password", "textarea", "number", "toggle", "dropdown", "multi-select", "time-zone", "state-codes", "password-change-flow"],
+          "description": "Form input widget. Required for tier 1."
+        },
+        "options": {
+          "type": "array",
+          "description": "Choices for dropdown / multi-select inputs.",
+          "items": {
+            "type": "object",
+            "required": ["value", "label"],
+            "additionalProperties": false,
+            "properties": {
+              "value": { "type": "string" },
+              "label": { "type": "string" }
+            }
+          }
+        },
+        "appliance": {
+          "enum": ["shared", "per-app", "both"],
+          "description": "Where the value lives. shared = appliance.env (cascades to all apps); per-app = vibe-<slug>.env (default); both = declared at both levels with per-app override."
+        },
+        "restartRequired": {
+          "type": "boolean",
+          "description": "If true (default), saving this setting restarts dependent apps with rollback-on-health-failure. If false, send SIGHUP only (forward-compat — no Vibe app supports SIGHUP reload yet)."
+        },
+        "validate": {
+          "type": "string",
+          "description": "Server-side validator name. Constrained to the dispatcher's known set so a typo (e.g. 'anthropic-key') fails schema validation rather than blowing up at save time.",
+          "anyOf": [
+            { "enum": ["non-empty", "url", "email", "iana-timezone", "enum", "state-codes", "anthropic-api-key"] },
+            { "pattern": "^number-range:-?[0-9]+(\\.[0-9]+)?:-?[0-9]+(\\.[0-9]+)?$" },
+            { "pattern": "^regex:.+$" }
+          ]
+        },
+        "testEndpoint": {
+          "type": "string",
+          "pattern": "^/api/v1/admin/test/[a-z0-9_-]+$",
+          "description": "Console route the Test button POSTs current form values to (without persisting). See addendum §5."
+        },
+        "dependsOnFields": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+          "description": "Field names this field depends on, used for client-side conditional rendering."
+        },
+        "showIf": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Predicate keyed by FIELD_NAME → required value. Field hidden until predicate satisfied."
+        },
+        "postSaveJob": {
+          "type": "string",
+          "description": "Background job triggered after save. e.g. 'corpus-sync' for Tax-Research-Chat ENABLED_STATES."
+        },
+        "healthCheckTimeout": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 900,
+          "description": "Override the default 90s post-restart health-check window. Apps with slow warm-up (e.g. LLM-backed) may need 180+."
+        },
+        "disabledImpacts": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Strings naming features that break if this setting is set to a disabling value (e.g. EMAIL_PROVIDER=none disables 'client-portal-in-vibe-connect'). The Settings page surfaces these as a confirmation dialog before save."
+        }
       }
     }
   }

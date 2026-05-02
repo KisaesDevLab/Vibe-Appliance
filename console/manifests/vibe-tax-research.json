@@ -34,8 +34,22 @@
       { "name": "MIGRATIONS_AUTO", "from": "static:false" }
     ],
     "optional": [
-      { "name": "ANTHROPIC_API_KEY", "secret": true,
-        "doc":  "Claude API key. Required for the chat tier — set via 'sudo nano /opt/vibe/env/vibe-tax-research.env'." }
+      {
+        "name":   "ANTHROPIC_API_KEY",
+        "from":   "appliance:ANTHROPIC_API_KEY",
+        "secret": true,
+        "doc":    "Claude API key powering the chat tier. Inherited from the appliance-wide ANTHROPIC_API_KEY (Settings → AI) unless explicitly overridden for this app.",
+        "ui": {
+          "tier":         1,
+          "category":     "AI",
+          "label":        "Anthropic API key",
+          "helpText":     "Required for the Tax Research chat tier. Shared with other AI-using Vibe apps unless overridden.",
+          "input":        "password",
+          "appliance":    "both",
+          "validate":     "anthropic-api-key",
+          "testEndpoint": "/api/v1/admin/test/anthropic"
+        }
+      }
     ]
   },
 
