@@ -292,7 +292,15 @@ lines.append("global")
 lines.append("  daemon")
 lines.append("  maxconn 200")
 lines.append("  log stdout format raw local0")
-lines.append("  stats socket /var/run/haproxy.sock mode 600 level admin")
+# /tmp not /var/run: haproxy:2.9-alpine runs as the unprivileged
+# `haproxy` user (uid 99), which can't write to /var/run (root-owned).
+# /tmp is always writable by all users. The socket is currently only
+# referenced for ad-hoc diagnostics ("docker exec ... socat - /tmp/...");
+# reload uses `docker kill -s HUP` so the socket path being non-canonical
+# is harmless. NB: `haproxy -c -f` validates config syntax WITHOUT
+# binding any sockets, which is why /var/run mistakes pass validation
+# but kill the live container — caught only at runtime.
+lines.append("  stats socket /tmp/haproxy.sock mode 600 level admin")
 lines.append("")
 # Resolvers section — HAProxy resolves backend hostnames at config-parse
 # time by default. During phase_caddy (Phase 6) the upstream containers
