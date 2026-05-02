@@ -85,8 +85,64 @@ _disable_resolved_mdns() {
     log_warn "systemd-resolved restart returned non-zero; continuing"
 }
 
+# Detect whether systemd actually knows about avahi-daemon.service.
+# `dpkg -s` can show the package as installed while systemd has no
+# unit file — the most common case is a cloud-init image that
+# preinstalled a partial avahi (binary present, .service file missing
+# or not registered), or a prior `apt purge avahi-daemon` that left
+# dpkg metadata inconsistent. systemctl daemon-reload first so a
+# freshly-installed-but-not-yet-rescanned unit is recognized.
+_avahi_unit_known() {
+  systemctl daemon-reload >>"$VIBE_LOG_FILE" 2>&1 || true
+  systemctl list-unit-files avahi-daemon.service --no-pager 2>/dev/null \
+    | awk '$1 == "avahi-daemon.service" { found = 1 } END { exit !found }'
+}
+
 avahi_enable() {
   log_step "ensuring avahi-daemon is enabled and running"
+
+  # Pre-flight check: is systemd actually going to find the unit?
+  # If not, no amount of restart-or-resolved-fix will help — the
+  # service literally doesn't exist as far as systemd is concerned.
+  # Bail with a clear hint instead of running through the start +
+  # recovery loop and emitting the same cryptic "Unit file ... does
+  # not exist" twice.
+  if ! _avahi_unit_known; then
+    log_warn "avahi-daemon package reports installed but systemd has no avahi-daemon.service unit; skipping mDNS setup"
+    cat >&2 <<'HINT'
+
+           This is an unusual state. dpkg thinks the package is
+           installed but systemd can't find the service file. Most
+           common causes:
+
+             1. The cloud-init / image-builder preinstalled a partial
+                avahi (binary present, .service file missing or in a
+                non-standard path).
+             2. A prior `apt purge avahi-daemon` left dpkg metadata
+                inconsistent with the filesystem.
+             3. `/usr/lib/systemd/system/` was bind-mounted read-only
+                during package install and the service file silently
+                wasn't placed.
+
+           Diagnose:
+             dpkg -L avahi-daemon | grep -E '\.service$|\.socket$'
+             ls -l /usr/lib/systemd/system/avahi*.service /lib/systemd/system/avahi*.service 2>/dev/null
+             systemctl list-unit-files | grep avahi
+
+           Repair (most reliable):
+             sudo apt-get install --reinstall avahi-daemon
+             sudo systemctl daemon-reload
+             sudo systemctl enable --now avahi-daemon
+
+           Or skip — the appliance works fine without mDNS. Operators
+           reach it via the server's IP rather than <hostname>.local.
+           This warning will recur on every bootstrap until the
+           package state is fixed; nothing else in the appliance is
+           affected.
+
+HINT
+    return 0
+  fi
 
   # Pre-flight: if systemd-resolved is already squatting on :5353,
   # avahi will fail to start. Apply the canonical fix BEFORE the first
