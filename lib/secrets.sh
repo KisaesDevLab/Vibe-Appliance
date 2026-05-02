@@ -328,6 +328,15 @@ secrets_write_credentials() {
   pass="$(secrets_get CONSOLE_ADMIN_PASSWORD)"
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
+  # Duplicati settings-DB encryption key. CRITICAL for disaster recovery:
+  # if the operator restores /opt/vibe/data/duplicati from a backup but
+  # has lost this key, Duplicati can't decrypt its own settings DB and
+  # all configured backup jobs are unrecoverable. Surface it in
+  # CREDENTIALS.txt so it gets archived alongside other login secrets.
+  local dup_key
+  dup_key="$(secrets_get SETTINGS_ENCRYPTION_KEY)"
+  [[ -z "$dup_key" ]] && dup_key="(not yet generated — re-run bootstrap)"
+
   if [[ -z "$user" || -z "$pass" ]]; then
     die "console admin credentials missing from $VIBE_ENV_SHARED — re-run bootstrap"
   fi
@@ -399,6 +408,26 @@ Infra fallback ports (admin tools — always-up with the core stack):
 
 For live per-app status, open the admin console "Emergency Access"
 panel at ${server_url}/admin.
+
+================================================================
+ DUPLICATI — settings DB encryption key
+================================================================
+Required since Duplicati 2.1. Encrypts the container's internal
+settings database (job configs, schedules, destination credentials).
+The container reads this from \$SETTINGS_ENCRYPTION_KEY at startup.
+
+  SETTINGS_ENCRYPTION_KEY: ${dup_key}
+
+⚠ KEEP THIS VALUE OFF-MACHINE.
+  If the host is destroyed and you restore /opt/vibe/data/duplicati
+  from an off-host backup but have lost this key, the settings DB
+  cannot be decrypted and every configured backup job is gone. The
+  key lives in /opt/vibe/env/shared.env (mode 600) — losing the host
+  loses the key with it.
+
+  This file is the canonical record. Print it, save it to a password
+  manager, or store it in a sealed envelope alongside any other
+  recovery credentials.
 ================================================================
 EOF
   mv "$tmp" "$VIBE_CREDS_FILE"

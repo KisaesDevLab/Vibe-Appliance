@@ -200,9 +200,17 @@ services:
     # is the operator's to type into the form. The destination is
     # deliberately left blank: PLAN.md §7's "automated source, manual
     # destination" rule.
+    #
+    # SETTINGS_ENCRYPTION_KEY is required since Duplicati 2.1
+    # (linuxserver image v2.3+). Without it the container starts but
+    # refuses to bring up its web service ("Missing encryption key,
+    # unable to encrypt your settings database"). The key lives in
+    # /opt/vibe/env/shared.env and is mounted via env_file below.
     image: lscr.io/linuxserver/duplicati:latest
     container_name: vibe-duplicati
     restart: unless-stopped
+    env_file:
+      - /opt/vibe/env/shared.env
     environment:
       PUID: "0"
       PGID: "0"

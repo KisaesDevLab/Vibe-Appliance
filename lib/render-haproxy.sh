@@ -370,12 +370,13 @@ else:
         lines.append(f"  option httpchk GET {fe.get('health', '/api/v1/ping')}")
         # Apps expose /api/v1/ping as a strict 200 (codebase convention)
         # — match exactly. Infra services (Portainer/Duplicati) probe `/`
-        # which redirects to login (302). For those we just want "alive,
-        # not 5xx-ing" — `! rstatus ^5..` rejects 5xx, accepts everything
-        # else. Without this, HAProxy marks the redirect-only backend
-        # DOWN and the emergency port serves a permanent 503.
+        # which serves redirects: Portainer returns 307 to /timeout.html,
+        # Duplicati similar. Use HAProxy's range syntax to accept any
+        # non-5xx as "alive." Earlier attempt with `! rstatus ^5..` did
+        # not actually pass 307 (HAProxy logs showed "Layer7 wrong
+        # status, code: 307") — the explicit numeric range is reliable.
         if fe.get('kind') == 'infra':
-            lines.append(f"  http-check expect ! rstatus ^5..")
+            lines.append(f"  http-check expect status 100-499")
         else:
             lines.append(f"  http-check expect status 200")
         lines.append(f"  server {fe['name']} {fe['upstream']} check inter 30s fall 3 rise 1 resolvers docker init-addr last,libc,none")
