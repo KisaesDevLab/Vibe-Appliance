@@ -294,6 +294,29 @@ lines.append("  maxconn 200")
 lines.append("  log stdout format raw local0")
 lines.append("  stats socket /var/run/haproxy.sock mode 600 level admin")
 lines.append("")
+# Resolvers section — HAProxy resolves backend hostnames at config-parse
+# time by default. During phase_caddy (Phase 6) the upstream containers
+# don't exist yet (phase_core_up brings them up in Phase 7) and config
+# validation fails with "could not resolve address vibe-duplicati". The
+# resolvers block + per-server `init-addr last,libc,none` lets HAProxy
+# start with the backend marked DOWN if DNS isn't yet answering, then
+# re-resolve at runtime against Docker's embedded DNS (127.0.0.11)
+# inside the vibe_net network.
+lines.append("# Docker's embedded DNS for re-resolution at runtime. Combined with")
+lines.append("# `init-addr last,libc,none` on each server, lets HAProxy start before")
+lines.append("# upstream containers exist (Phase 6 validation, Phase 7 startup race).")
+lines.append("resolvers docker")
+lines.append("  nameserver dns 127.0.0.11:53")
+lines.append("  resolve_retries 3")
+lines.append("  timeout resolve 1s")
+lines.append("  timeout retry 1s")
+lines.append("  hold valid 10s")
+lines.append("  hold other 10s")
+lines.append("  hold refused 10s")
+lines.append("  hold nx 10s")
+lines.append("  hold timeout 10s")
+lines.append("  hold obsolete 10s")
+lines.append("")
 lines.append("defaults")
 lines.append("  mode http")
 lines.append("  log global")
@@ -338,7 +361,7 @@ else:
         lines.append(f"backend be_{fe['name']}")
         lines.append(f"  option httpchk GET {fe.get('health', '/api/v1/ping')}")
         lines.append(f"  http-check expect status 200")
-        lines.append(f"  server {fe['name']} {fe['upstream']} check inter 30s fall 3 rise 1")
+        lines.append(f"  server {fe['name']} {fe['upstream']} check inter 30s fall 3 rise 1 resolvers docker init-addr last,libc,none")
 
 with open(out_path, "w") as f:
     f.write("\n".join(lines) + "\n")
