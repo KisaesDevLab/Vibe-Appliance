@@ -10,8 +10,9 @@
     "defaultTag": "latest"
   },
 
-  "subdomain": "ocr",
-  "ports":     { "server": 8090 },
+  "subdomain":  "ocr",
+  "userFacing": false,
+  "ports":      { "server": 8090 },
 
   "routing": {
     "default_upstream": "vibe-glm-ocr:8090",

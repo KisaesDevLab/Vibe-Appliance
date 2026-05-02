@@ -11,8 +11,9 @@
     "defaultTag": "latest"
   },
 
-  "subdomain": "tax-research",
-  "ports":     { "server": 4000, "client": 80 },
+  "subdomain":     "tax-research",
+  "emergencyPort": 5191,
+  "ports":         { "server": 4000, "client": 80 },
 
   "routing": {
     "default_upstream": "vibe-tax-research-web:80",

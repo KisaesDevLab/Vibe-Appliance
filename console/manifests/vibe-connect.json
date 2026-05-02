@@ -11,8 +11,10 @@
     "defaultTag": "latest"
   },
 
-  "subdomain": "connect",
-  "ports":     { "server": 4000, "client": 80 },
+  "subdomain":     "connect",
+  "emergencyPort": 5181,
+  "emergencyNote": "Staff access only; client portal magic-link flows require HTTPS and won't work over the emergency port.",
+  "ports":         { "server": 4000, "client": 80 },
 
   "routing": {
     "default_upstream": "vibe-connect-client:80",
@@ -224,6 +226,30 @@
         }
       },
 
+      {
+        "name":  "BACKUP_DESTINATION_TYPE",
+        "from":  "appliance:BACKUP_DESTINATION_TYPE",
+        "value": "none",
+        "doc":   "Where Duplicati ships encrypted backups. Connect refuses new vault uploads after 30 days without a successful backup, so this is effectively required for production use.",
+        "ui": {
+          "tier":            1,
+          "category":        "Backup",
+          "label":           "Backup destination",
+          "helpText":        "Encrypted backups of /opt/vibe/data and /opt/vibe/env. Configure the destination here, then complete authentication inside the Duplicati UI on its own subdomain.",
+          "input":           "dropdown",
+          "appliance":       "shared",
+          "validate":        "enum",
+          "testEndpoint":    "/api/v1/admin/test/backup",
+          "options": [
+            { "value": "none", "label": "None (Vibe Connect blocks new vault uploads after 30 days)" },
+            { "value": "s3",   "label": "Amazon S3" },
+            { "value": "b2",   "label": "Backblaze B2" },
+            { "value": "sftp", "label": "SFTP / rsync.net" },
+            { "value": "local","label": "Local path (USB / mounted volume)" }
+          ],
+          "disabledImpacts": ["vault-uploads-in-vibe-connect-after-30-days"]
+        }
+      },
       {
         "name":  "PRESIDIO_CONFIDENCE_THRESHOLD",
         "value": "0.85",

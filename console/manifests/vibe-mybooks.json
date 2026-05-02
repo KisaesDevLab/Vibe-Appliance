@@ -11,8 +11,9 @@
     "defaultTag": "latest"
   },
 
-  "subdomain": "mybooks",
-  "ports":     { "server": 3001, "client": 5173 },
+  "subdomain":     "mybooks",
+  "emergencyPort": 5171,
+  "ports":         { "server": 3001, "client": 5173 },
 
   "routing": {
     "default_upstream": "vibe-mybooks-web:5173",

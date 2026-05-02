@@ -384,7 +384,8 @@ app.get('/api/v1/public/apps', (_req, res) => {
       url:         appPublicUrl(m, config),
       // Phase 8.5 — second URL for emergency/backup access via HAProxy
       // sidecar on the LAN. Null when host_ip or emergencyPort missing.
-      emergencyUrl: appEmergencyUrl(m, config),
+      emergencyUrl:  appEmergencyUrl(m, config),
+      emergencyNote: m.emergencyNote || null,
       // Default admin username from the manifest. Password is
       // deliberately NOT exposed on the public endpoint — operators
       // see it only behind admin auth via /api/v1/first-login.
@@ -435,7 +436,8 @@ app.get('/api/v1/apps', requireAdmin, (_req, res) => {
         // Phase 8.5 — second URL for emergency/backup access; null if
         // not available on this install (no host_ip cached or app
         // declares no emergencyPort).
-        emergencyUrl: appEmergencyUrl(m, state.config || {}),
+        emergencyUrl:  appEmergencyUrl(m, state.config || {}),
+        emergencyNote: m.emergencyNote || null,
         // Default admin username only — password lives behind the
         // admin-only /api/v1/first-login endpoint.
         username: m.firstLogin && m.firstLogin.username || null,
@@ -1275,6 +1277,33 @@ app.post('/api/v1/admin/test/sms', requireAdmin, testRateLimit, async (req, res)
   }
 
   return res.status(400).json({ ok: false, error: `unknown SMS_PROVIDER: ${provider || '(empty)'}` });
+});
+
+// Phase 8.5 — three stub test endpoints. Implementing them properly
+// requires npm deps the v1.1 image deliberately doesn't carry (AWS SDK
+// for backup S3/B2, acme-client for DNS-01 staging, tailscale CLI for
+// authkey validation). Returning 501 with a clear path forward so the
+// Settings UI's Test button shows a helpful message rather than a
+// generic 404. v1.2 lands the real implementations.
+app.post('/api/v1/admin/test/backup', requireAdmin, testRateLimit, (_req, res) => {
+  res.status(501).json({
+    ok: false,
+    message: 'Backup destination test not implemented in v1.1. Configure inside the Duplicati UI directly (its own subdomain) — Duplicati validates credentials at job-config time and runs a test backup.',
+  });
+});
+
+app.post('/api/v1/admin/test/dns', requireAdmin, testRateLimit, (_req, res) => {
+  res.status(501).json({
+    ok: false,
+    message: 'DNS provider test not implemented in v1.1. The default install uses HTTP-01 (port 80 reachability is the validator); Cloudflare DNS-01 is opt-in via the custom Caddy build at caddy/Dockerfile.cloudflare.',
+  });
+});
+
+app.post('/api/v1/admin/test/tailscale', requireAdmin, testRateLimit, (_req, res) => {
+  res.status(501).json({
+    ok: false,
+    message: 'Tailscale authkey test not implemented in v1.1 (would require running tailscale up against an ephemeral instance, with risk of locking out the host). Validate by running: sudo bootstrap.sh --tailscale --tailscale-authkey ...',
+  });
 });
 
 // Generic LLM endpoint probe. Body: { LLM_ENDPOINT, LLM_API_KEY?,

@@ -41,6 +41,21 @@
       <div class="apps-list" id="infra-list"></div>
     </section>
 
+    <!-- Phase 8.5 W-D — Emergency Access panel (addendum §8). Always
+         visible (when the operator hasn't passed --no-emergency-proxy);
+         shows HAProxy status + per-app emergency URLs + LAN / Tailscale
+         IPs so staff have a fallback path documented in one place. -->
+    <section id="emergency-section">
+      <h2>Emergency access</h2>
+      <p class="muted">
+        Plain-HTTP fallback when DNS, certs, or Caddy are broken. UFW-gated to
+        LAN + Tailscale only. Browsers will warn the connection isn't secure —
+        that's expected.
+      </p>
+      <p class="muted" id="emergency-meta">—</p>
+      <div class="apps-list" id="emergency-list"></div>
+    </section>
+
     <section>
       <h2>First-login info</h2>
       <p class="muted">Default credentials surfaced from each enabled app's manifest. Change the password as soon as you log in.</p>
@@ -167,6 +182,11 @@
         renderInfra((infra && infra.infra) || []);
         renderFirstLogin((firstLogin && firstLogin.first_login) || []);
         renderSetupBanners(settingsValues, status.state && status.state.config || {});
+        renderEmergency(
+          apps.apps || [],
+          status.containers || [],
+          status.state && status.state.config || {}
+        );
         document.getElementById('now').textContent =
           'Snapshot at ' + (status.now || new Date().toISOString());
       } catch (err) {
@@ -216,6 +236,72 @@
           ${escapeHtml(b.msg)}
           <a href="${b.link}" style="margin-left: 0.5rem;">${escapeHtml(b.linkText)}</a>
         </div>`).join('');
+    }
+
+    // Phase 8.5 W-D — Emergency Access panel. Composed from data the
+    // page already loads: apps[].emergencyUrl + emergencyNote (server
+    // builds these from manifest + state.host_ip), containers[] (for
+    // the HAProxy sidecar status), config.host_ip + config.tailscale_hostname.
+    // No new endpoint needed.
+    function renderEmergency(apps, containers, config) {
+      const list = document.getElementById('emergency-list');
+      const meta = document.getElementById('emergency-meta');
+
+      // HAProxy sidecar state — pull from the containers list.
+      const proxy = (containers || []).find(c => c.name === 'vibe-emergency-proxy');
+      let proxyBadge;
+      if (!proxy) {
+        proxyBadge = '<span class="badge badge--bad">missing</span>';
+      } else if (proxy.health === 'healthy' || (proxy.state === 'running' && !proxy.health)) {
+        proxyBadge = '<span class="badge badge--good">running</span>';
+      } else if (proxy.state === 'running') {
+        proxyBadge = '<span class="badge badge--warn">' + escapeHtml(proxy.health || 'starting') + '</span>';
+      } else {
+        proxyBadge = '<span class="badge badge--bad">' + escapeHtml(proxy.state || 'down') + '</span>';
+      }
+
+      const lanIp  = config.host_ip || '';
+      const tsHost = config.tailscale_hostname || '';
+      meta.innerHTML =
+        'HAProxy sidecar: ' + proxyBadge +
+        '   ·   Server LAN IP: <span class="mono">' +
+          (lanIp ? escapeHtml(lanIp) : '(not detected — check `hostname -I` on the host)') + '</span>' +
+        (tsHost
+          ? '   ·   Tailnet host: <span class="mono">' + escapeHtml(tsHost) + '</span>'
+          : '');
+
+      // Per-app emergency cards. Apps without emergencyUrl don't get a
+      // card here — render an empty-state instead so the operator knows
+      // the proxy is up but no apps are wired in (e.g. all disabled).
+      const withUrl = apps.filter(a => a.emergencyUrl);
+      if (!withUrl.length) {
+        list.innerHTML = '<p class="muted">No apps with emergency access reachable. ' +
+          'Either no apps are enabled or the host LAN IP could not be detected ' +
+          '(set <span class="mono">state.config.host_ip</span> via re-bootstrap).</p>';
+        return;
+      }
+
+      list.innerHTML = withUrl.map(a => {
+        const status = a.enabled && a.status === 'running'
+          ? '<span class="badge badge--good">app running</span>'
+          : '<span class="badge badge--muted">app ' + escapeHtml(a.status || 'idle') + '</span>';
+        const note = a.emergencyNote
+          ? '<p class="muted" style="margin:0.4rem 0 0;font-size:0.9em;">' + escapeHtml(a.emergencyNote) + '</p>'
+          : '';
+        return `
+          <article class="app-card">
+            <header class="app-card__head">
+              <h3 class="app-card__title">${escapeHtml(a.displayName)}</h3>
+              ${status}
+            </header>
+            <p class="app-card__desc">
+              <a href="${escapeHtml(a.emergencyUrl)}" target="_blank" rel="noopener">
+                ${escapeHtml(a.emergencyUrl)}
+              </a>
+            </p>
+            ${note}
+          </article>`;
+      }).join('');
     }
 
     function renderInfra(items) {

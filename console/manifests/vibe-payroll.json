@@ -11,8 +11,9 @@
     "defaultTag": "latest"
   },
 
-  "subdomain": "payroll",
-  "ports":     { "server": 4000, "client": 8080 },
+  "subdomain":     "payroll",
+  "emergencyPort": 5192,
+  "ports":         { "server": 4000, "client": 8080 },
 
   "routing": {
     "default_upstream": "vibe-payroll-web:8080",
