@@ -389,6 +389,11 @@ Canonical port assignments (active only when the matching app is enabled):
   http://${lan_ip}:5191   Vibe Tax Research Chat
   http://${lan_ip}:5192   Vibe Payroll Time
 
+Infra fallback ports (admin tools — always-up with the core stack):
+  http://${lan_ip}:5197   Portainer (container management)
+  http://${lan_ip}:5198   Duplicati (backup configuration)
+  https://${lan_ip}:9090  Cockpit (host management; self-signed cert)
+
   http://127.0.0.1:5199   HAProxy stats UI (loopback only; SSH-tunnel
                           to access for diagnostics)
 

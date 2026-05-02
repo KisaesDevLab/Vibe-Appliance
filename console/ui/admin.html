@@ -184,6 +184,7 @@
         renderSetupBanners(settingsValues, status.state && status.state.config || {});
         renderEmergency(
           apps.apps || [],
+          (infra && infra.infra) || [],
           status.containers || [],
           status.state && status.state.config || {}
         );
@@ -243,7 +244,7 @@
     // builds these from manifest + state.host_ip), containers[] (for
     // the HAProxy sidecar status), config.host_ip + config.tailscale_hostname.
     // No new endpoint needed.
-    function renderEmergency(apps, containers, config) {
+    function renderEmergency(apps, infra, containers, config) {
       const list = document.getElementById('emergency-list');
       const meta = document.getElementById('emergency-meta');
 
@@ -270,33 +271,60 @@
           ? '   ·   Tailnet host: <span class="mono">' + escapeHtml(tsHost) + '</span>'
           : '');
 
-      // Per-app emergency cards. Apps without emergencyUrl don't get a
-      // card here — render an empty-state instead so the operator knows
-      // the proxy is up but no apps are wired in (e.g. all disabled).
-      const withUrl = apps.filter(a => a.emergencyUrl);
-      if (!withUrl.length) {
-        list.innerHTML = '<p class="muted">No apps with emergency access reachable. ' +
-          'Either no apps are enabled or the host LAN IP could not be detected ' +
-          '(set <span class="mono">state.config.host_ip</span> via re-bootstrap).</p>';
-        return;
-      }
-
-      list.innerHTML = withUrl.map(a => {
+      // Build a unified list: apps with emergencyUrl, then infra
+      // services with emergencyUrl. Cockpit gets a special entry
+      // pointing at its native :9090 (still LAN/Tailnet-reachable
+      // even when Caddy is broken since it binds the host port
+      // directly — same emergency-access shape, different mechanism).
+      const items = [];
+      for (const a of apps || []) {
+        if (!a.emergencyUrl) continue;
         const status = a.enabled && a.status === 'running'
           ? '<span class="badge badge--good">app running</span>'
           : '<span class="badge badge--muted">app ' + escapeHtml(a.status || 'idle') + '</span>';
-        const note = a.emergencyNote
-          ? '<p class="muted" style="margin:0.4rem 0 0;font-size:0.9em;">' + escapeHtml(a.emergencyNote) + '</p>'
+        items.push({
+          title: a.displayName, badge: status,
+          url: a.emergencyUrl, note: a.emergencyNote || '',
+        });
+      }
+      for (const s of infra || []) {
+        if (!s.emergencyUrl && s.slug !== 'cockpit') continue;
+        // Cockpit's emergency URL is its native :9090 (which is the
+        // same as its primary URL in non-domain modes). Inline it
+        // here so operators see all three admin tools in one place.
+        let url = s.emergencyUrl;
+        let note = '';
+        if (s.slug === 'cockpit') {
+          if (!lanIp) continue;     // can't construct URL without LAN IP
+          url = `https://${lanIp}:9090/`;
+          note = 'native host port (self-signed cert; click through the warning)';
+        }
+        const stat = s.running === true
+          ? '<span class="badge badge--good">running</span>'
+          : '<span class="badge badge--bad">' + escapeHtml(s.running === false ? 'stopped' : 'unknown') + '</span>';
+        items.push({ title: s.label, badge: stat, url, note });
+      }
+
+      if (!items.length) {
+        list.innerHTML = '<p class="muted">No emergency access available. ' +
+          'Either no apps are enabled, no infra is running, or the host LAN IP ' +
+          'could not be detected (set <span class="mono">state.config.host_ip</span> via re-bootstrap).</p>';
+        return;
+      }
+
+      list.innerHTML = items.map(it => {
+        const note = it.note
+          ? '<p class="muted" style="margin:0.4rem 0 0;font-size:0.9em;">' + escapeHtml(it.note) + '</p>'
           : '';
         return `
           <article class="app-card">
             <header class="app-card__head">
-              <h3 class="app-card__title">${escapeHtml(a.displayName)}</h3>
-              ${status}
+              <h3 class="app-card__title">${escapeHtml(it.title)}</h3>
+              ${it.badge}
             </header>
             <p class="app-card__desc">
-              <a href="${escapeHtml(a.emergencyUrl)}" target="_blank" rel="noopener">
-                ${escapeHtml(a.emergencyUrl)}
+              <a href="${escapeHtml(it.url)}" target="_blank" rel="noopener">
+                ${escapeHtml(it.url)}
               </a>
             </p>
             ${note}
@@ -324,6 +352,14 @@
         const noteBlock = (linkable && s.note)
           ? '<p class="muted" style="margin-top:0.4rem;font-size:0.9em">' + escapeHtml(s.note) + '</p>'
           : '';
+        // Phase 8.5 v1.2 — fallback URL via emergency-proxy. Cockpit
+        // is omitted here because its native :9090 URL is already the
+        // primary URL in non-domain modes.
+        const fallbackBlock = s.emergencyUrl ? `
+          <p class="muted" style="margin-top:0.4rem;font-size:0.9em;">
+            Fallback (when Caddy/DNS/cert is broken):
+            <a href="${escapeHtml(s.emergencyUrl)}">${escapeHtml(s.emergencyUrl)}</a>
+          </p>` : '';
         return `
           <article class="app-card">
             <header class="app-card__head">
@@ -333,6 +369,7 @@
             <p class="muted app-card__desc">slug: <span class="mono">${escapeHtml(s.slug)}</span></p>
             <p>${urlBlock}</p>
             ${noteBlock}
+            ${fallbackBlock}
           </article>`;
       }).join('');
     }

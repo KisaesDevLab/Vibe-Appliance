@@ -552,9 +552,14 @@ app.post('/api/v1/update/check', requireAdmin, testRateLimit, async (_req, res) 
 // Keep these two in sync — when adding a new infra service, add it
 // here AND to INFRA_SERVICES in render-caddyfile.sh.
 const INFRA_SERVICES = [
-  { slug: 'backup',    label: 'Duplicati (backup)',     container: 'vibe-duplicati', subdomain_only: false },
-  { slug: 'portainer', label: 'Portainer (containers)', container: 'vibe-portainer', subdomain_only: false },
-  { slug: 'cockpit',   label: 'Cockpit (host)',         container: null /* host install */, subdomain_only: true },
+  // emergencyPort: HAProxy sidecar port for fallback access when Caddy
+  // / DNS / certs are broken. Cockpit doesn't have one because it
+  // already binds :9090 directly on the host (its "primary" port IS
+  // its emergency port). Container-based infra services get a real
+  // emergencyPort wired by lib/render-haproxy.sh's INFRA_FRONTENDS.
+  { slug: 'backup',    label: 'Duplicati (backup)',     container: 'vibe-duplicati', subdomain_only: false, emergencyPort: 5198 },
+  { slug: 'portainer', label: 'Portainer (containers)', container: 'vibe-portainer', subdomain_only: false, emergencyPort: 5197 },
+  { slug: 'cockpit',   label: 'Cockpit (host)',         container: null /* host install */, subdomain_only: true,  emergencyPort: null },
 ];
 
 // Phase 8.5 Workstream A — Cockpit reachability probe. The console runs
@@ -654,7 +659,17 @@ app.get('/api/v1/infra', requireAdmin, async (_req, res) => {
       // Real reachability probe in place of the prior hard-coded null.
       running = await probeCockpit();
     }
-    out.push({ ...svc, url, note, running });
+
+    // Phase 8.5 v1.2 — fallback URL via the emergency-proxy sidecar.
+    // Same pattern as app cards: only renders when host_ip is cached
+    // AND the service declared an emergencyPort. Cockpit gets null
+    // here because its "primary" url is already the :9090 port.
+    let emergencyUrl = null;
+    if (svc.emergencyPort && config.host_ip) {
+      emergencyUrl = `http://${config.host_ip}:${svc.emergencyPort}/`;
+    }
+
+    out.push({ ...svc, url, note, running, emergencyUrl });
   }
   res.json({ infra: out });
 });

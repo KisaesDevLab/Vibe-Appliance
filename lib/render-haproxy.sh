@@ -235,13 +235,52 @@ for slug in enabled_apps:
             continue
         seen_ports_global.add(port)
         frontends.append({
-            "slug":     slug,
-            "name":     slug.replace("-", "_") + c["name_suffix"],
-            "port":     port,
-            "upstream": upstream,
-            "label":    m.get("displayName", slug) + c["label_suffix"],
-            "note":     c["note"],
+            "slug":       slug,
+            "name":       slug.replace("-", "_") + c["name_suffix"],
+            "port":       port,
+            "upstream":   upstream,
+            "label":      m.get("displayName", slug) + c["label_suffix"],
+            "note":       c["note"],
+            "health":     "/api/v1/ping",
+            "kind":       "app",
         })
+
+# Phase 8.5 v1.2 — fallback ports for infra services. Same pattern as
+# the per-app frontends: HAProxy proxies the appliance's own admin
+# tools (Duplicati, Portainer) on a dedicated port so they're reachable
+# when Caddy / DNS / certs are broken. Cockpit is intentionally absent
+# from this list — it already binds :9090 on the host (its own port is
+# its emergency port), and it can't be path-prefix routed for use as a
+# Caddy backend either way. Health checks use `/` since these tools
+# don't expose a Vibe-style `/api/v1/ping` endpoint.
+INFRA_FRONTENDS = [
+    {
+        "name":     "duplicati",
+        "port":     5198,
+        "upstream": "vibe-duplicati:8200",
+        "label":    "Duplicati (backup)",
+        "note":     "",
+        "health":   "/",
+        "kind":     "infra",
+    },
+    {
+        "name":     "portainer",
+        "port":     5197,
+        "upstream": "vibe-portainer:9000",
+        "label":    "Portainer (containers)",
+        "note":     "",
+        "health":   "/",
+        "kind":     "infra",
+    },
+]
+for fe in INFRA_FRONTENDS:
+    if fe["port"] in seen_ports_global:
+        sys.stderr.write(
+          f"render-haproxy: emergencyPort={fe['port']} for {fe['name']} clashes "
+          f"with an app manifest's port; skipping the infra frontend\n")
+        continue
+    seen_ports_global.add(fe["port"])
+    frontends.append(fe)
 
 # ---- Emit haproxy.cfg ----------------------------------------------------
 lines = []
@@ -282,12 +321,14 @@ if not frontends:
     lines.append("# No apps with emergencyPort enabled — stats-only config. Frontends")
     lines.append("# will be appended here by lib/render-haproxy.sh as apps get toggled on.")
 else:
-    lines.append("# Per-app emergency frontends. Each frontend has a per-IP rate limit")
-    lines.append("# of 30 req/sec via stick-table to prevent accidental DoS from a")
-    lines.append("# misbehaving LAN client.")
+    lines.append("# Emergency-access frontends. Each has a per-IP rate limit of")
+    lines.append("# 30 req/sec via stick-table to prevent accidental DoS from a")
+    lines.append("# misbehaving LAN client. App backends health-check via")
+    lines.append("# /api/v1/ping; infra backends (Duplicati, Portainer) check /")
+    lines.append("# since they don't expose a Vibe-style ping endpoint.")
     for fe in frontends:
         lines.append("")
-        lines.append(f"# {fe['label']}" + (f" — {fe['note']}" if fe['note'] else ""))
+        lines.append(f"# [{fe.get('kind', 'app')}] {fe['label']}" + (f" — {fe['note']}" if fe['note'] else ""))
         lines.append(f"frontend fe_{fe['name']}")
         lines.append(f"  bind *:{fe['port']}")
         lines.append(f"  stick-table type ip size 1m expire 60s store http_req_rate(10s)")
@@ -295,7 +336,7 @@ else:
         lines.append(f"  http-request deny deny_status 429 if {{ sc_http_req_rate(0) gt 300 }}")
         lines.append(f"  default_backend be_{fe['name']}")
         lines.append(f"backend be_{fe['name']}")
-        lines.append(f"  option httpchk GET /api/v1/ping")
+        lines.append(f"  option httpchk GET {fe.get('health', '/api/v1/ping')}")
         lines.append(f"  http-check expect status 200")
         lines.append(f"  server {fe['name']} {fe['upstream']} check inter 30s fall 3 rise 1")
 
