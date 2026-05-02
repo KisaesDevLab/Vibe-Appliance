@@ -47,7 +47,58 @@ apply_ufw_rules() {
   local ufw_status
   ufw_status="$(ufw status 2>/dev/null | awk '/^Status:/ {print $2; exit}')"
   if [[ "$ufw_status" != "active" ]]; then
-    log_warn "ufw is installed but ${ufw_status:-inactive} — emergency-port deny rules NOT applied. Plain HTTP on ports ${_EMERGENCY_PORT_RANGE} is reachable from any source if no other firewall is in place. To enable: sudo ufw enable"
+    # Detect whether the operator is currently on SSH so we can be
+    # extra-loud about the lock-out risk. SSH_CONNECTION is set on
+    # interactive sessions; SUDO_USER catches the `sudo bootstrap.sh`
+    # invocation pattern. Either is a strong signal.
+    local on_ssh="false"
+    if [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_CLIENT:-}" ]]; then
+      on_ssh="true"
+    fi
+
+    log_warn "ufw is installed but ${ufw_status:-inactive} — emergency-port deny rules NOT applied. Plain HTTP on ports ${_EMERGENCY_PORT_RANGE} is reachable from any source if no other firewall is in place."
+
+    cat >&2 <<HINT
+
+           ============================================================
+           UFW SETUP (copy-paste; do NOT skip the SSH allow line)
+           ============================================================
+HINT
+    if [[ "$on_ssh" == "true" ]]; then
+      cat >&2 <<'HINT'
+           ⚠ You appear to be connected via SSH right now. If you
+             enable UFW without an SSH allow rule first, you'll lock
+             yourself out of this server immediately. The sequence
+             below allows SSH BEFORE enabling — follow it in order.
+
+HINT
+    fi
+    cat >&2 <<HINT
+           # 1. Allow SSH (so you don't lose remote access):
+             sudo ufw allow OpenSSH
+
+           # 2. Allow appliance public ports (HTTP-01 cert validation
+           #    needs :80 reachable from the internet for cert renewal):
+             sudo ufw allow 80,443/tcp
+
+           # 3. Enable the firewall (with the allow rules above
+           #    already in place):
+             sudo ufw --force enable
+
+           # 4. Add the appliance's emergency-port + Cockpit rules
+           #    (gates ports ${_EMERGENCY_PORT_RANGE} to RFC1918 + Tailscale CGNAT):
+             sudo bash ${APPLIANCE_DIR:-/opt/vibe/appliance}/lib/ufw-rules.sh
+
+           # 5. Verify:
+             sudo ufw status numbered
+
+           If you don't want UFW (e.g. you're behind a cloud-provider
+           firewall already), it's safe to leave it off — the
+           appliance core works fine. Just understand that emergency
+           ports 5171-5198 are then reachable by any source that can
+           route to this host.
+
+HINT
     return 0
   fi
 
