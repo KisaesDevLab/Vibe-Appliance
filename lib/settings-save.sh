@@ -246,8 +246,152 @@ settings_save_apply() {
     return 1
   fi
 
+  # Phase 8.5 v1.2 — post-save dispatcher. Runs special-case handlers
+  # for changes that need more than just env-write + restart (Tailscale
+  # up/down, Caddy plugin gate for DNS provider switch, etc.). Best-
+  # effort: failures are logged but don't trigger a rollback. Operator
+  # can re-run from Settings or via the standalone `vibe ts-up` etc.
+  _settings_run_post_save_jobs "$payload_file" || \
+    log_warn "post-save jobs reported failures; settings persisted but downstream actions may need manual completion"
+
   log_ok "settings saved successfully" affected_apps="$affected_slugs"
   _settings_emit_result "saved" "" "$snap_dir" "$affected_slugs"
+  return 0
+}
+
+# Internal: identify which post-save jobs the payload triggers, then
+# dispatch each. Today: tailscale-toggle (TAILSCALE_ENABLED or AUTHKEY
+# changed), dns-provider-switch (DNS_PROVIDER changed), corpus-sync
+# (Tax-Research ENABLED_STATES changed).
+_settings_run_post_save_jobs() {
+  local payload_file="$1"
+  local jobs
+  jobs="$(python3 - "$payload_file" <<'PYEOF'
+import json, sys
+with open(sys.argv[1]) as f:
+    p = json.load(f)
+keys = {c.get("key") for c in p.get("changes", [])}
+out = []
+if "TAILSCALE_ENABLED" in keys or "TAILSCALE_AUTHKEY" in keys:
+    out.append("tailscale-toggle")
+if "DNS_PROVIDER" in keys:
+    out.append("dns-provider-switch")
+for c in p.get("changes", []):
+    if c.get("key") == "ENABLED_STATES" \
+       and c.get("scope", "").endswith("vibe-tax-research"):
+        out.append("corpus-sync")
+        break
+print("\n".join(out))
+PYEOF
+)" || return 1
+
+  local rc=0
+  local job
+  while IFS= read -r job; do
+    [[ -z "$job" ]] && continue
+    log_step "post-save dispatch" job="$job"
+    case "$job" in
+      tailscale-toggle)
+        _post_save_tailscale_toggle || rc=1
+        ;;
+      dns-provider-switch)
+        _post_save_dns_provider_switch || rc=1
+        ;;
+      corpus-sync)
+        _post_save_corpus_sync || rc=1
+        ;;
+      *)
+        log_warn "unknown postSaveJob; skipping" job="$job"
+        ;;
+    esac
+  done <<<"$jobs"
+  return "$rc"
+}
+
+# Tailscale enable/disable per addendum §11.2. Reads the resulting
+# value from appliance.env (already written by the standard flow) and
+# runs `tailscale up` or `tailscale down` accordingly. Auth key is
+# cleared from appliance.env after successful auth — best practice
+# (the key is only useful once; keeping it around is needless exposure).
+_post_save_tailscale_toggle() {
+  local enabled authkey
+  enabled="$(secrets_get_appliance TAILSCALE_ENABLED)"
+  authkey="$(secrets_get_appliance TAILSCALE_AUTHKEY)"
+
+  if [[ "$enabled" == "true" ]]; then
+    if ! command -v tailscale >/dev/null 2>&1; then
+      log_warn "TAILSCALE_ENABLED=true but tailscale CLI not installed" \
+        "fix:Install: sudo apt-get install -y tailscale" \
+        "fix:Then: sudo tailscale up --authkey <key>"
+      return 1
+    fi
+    if [[ -z "$authkey" ]]; then
+      # Already authenticated? Check status.
+      local state
+      state="$(tailscale status --json 2>/dev/null | python3 -c '
+import json, sys
+try: print(json.load(sys.stdin).get("BackendState",""))
+except Exception: pass' 2>/dev/null || echo)"
+      if [[ "$state" == "Running" ]]; then
+        log_ok "tailscale already up; no authkey needed"
+        state_set_config_kv tailscale "true"
+        return 0
+      fi
+      log_warn "TAILSCALE_ENABLED=true but TAILSCALE_AUTHKEY empty and Tailscale not running" \
+        "fix:Set TAILSCALE_AUTHKEY in Settings → Network and Save again."
+      return 1
+    fi
+    log_step "running: tailscale up --authkey=<redacted>"
+    if ! tailscale up --authkey="$authkey" >>"$VIBE_LOG_FILE" 2>&1; then
+      log_warn "tailscale up failed" \
+        "diagnose:tailscale status" \
+        "fix:Generate a new auth key at https://login.tailscale.com/admin/settings/keys"
+      return 1
+    fi
+    # Best practice — burn the key after successful auth.
+    secrets_set_kv_appliance TAILSCALE_AUTHKEY ""
+    state_set_config_kv tailscale "true"
+    log_ok "tailscale enabled"
+  else
+    if command -v tailscale >/dev/null 2>&1; then
+      log_step "running: tailscale down"
+      tailscale down >>"$VIBE_LOG_FILE" 2>&1 || log_warn "tailscale down returned non-zero"
+    fi
+    state_set_config_kv tailscale "false"
+    log_ok "tailscale disabled"
+  fi
+}
+
+# DNS provider switch per addendum §11.4. The standard flow already
+# wrote DNS_PROVIDER to appliance.env; here we verify the running Caddy
+# image actually supports the chosen provider's plugin. If not, the
+# operator gets a clear instruction rather than a confusing cert-
+# issuance failure later.
+_post_save_dns_provider_switch() {
+  local provider
+  provider="$(secrets_get_appliance DNS_PROVIDER)"
+  if [[ "$provider" == "cloudflare" ]]; then
+    if ! docker exec vibe-caddy caddy list-modules 2>/dev/null \
+         | grep -q '^dns\.providers\.cloudflare$'; then
+      log_warn "DNS_PROVIDER=cloudflare but the running Caddy lacks the dns.providers.cloudflare plugin" \
+        "fix:Switch to the custom Caddy build: cd /opt/vibe/appliance && docker compose build caddy --build-arg CADDY_BUILD=cloudflare && sudo docker compose up -d caddy" \
+        "fix:Or revert DNS_PROVIDER to http-01 in Settings → Network."
+      return 1
+    fi
+    log_ok "Caddy supports DNS_PROVIDER=cloudflare"
+  else
+    log_ok "DNS_PROVIDER=$provider needs no Caddy plugin"
+  fi
+}
+
+# Corpus sync for Tax-Research-Chat per addendum §11.1. Stubbed — the
+# upstream Vibe-Tax-Research-Chat repo doesn't expose a sync endpoint
+# today. v1.3+ wires the real call when that endpoint lands. The save
+# already completed and the app restarted; on next-start the app
+# detects ENABLED_STATES and may re-index lazily.
+_post_save_corpus_sync() {
+  log_warn "Tax-Research-Chat corpus sync stub: app restarted with new ENABLED_STATES; full re-index endpoint pending v1.3 in upstream Vibe-Tax-Research-Chat" \
+    "diagnose:docker compose -f /opt/vibe/appliance/docker-compose.yml -f /opt/vibe/appliance/apps/vibe-tax-research.yml logs --tail 50"
   return 0
 }
 
@@ -260,9 +404,16 @@ import json, os, sys
 payload_path, env_dir = sys.argv[1:3]
 with open(payload_path) as f:
     payload = json.load(f)
+
+# Group changes by target file, tracking per-key op ('set' or 'revert').
+# Phase 8.5 v1.2 — 'revert' deletes the key from the per-app env file
+# so the merged compose env falls back to appliance.env (inheritance
+# restored). Only meaningful for per-app scope; appliance-scope revert
+# is treated as 'set value=""' for now.
 changes_by_file = {}
 for c in payload.get("changes", []):
     scope = c.get("scope", "")
+    op = c.get("op", "set")
     if scope == "appliance":
         target = os.path.join(env_dir, "appliance.env")
     elif scope.startswith("per-app:"):
@@ -274,7 +425,10 @@ for c in payload.get("changes", []):
     else:
         print(f"_settings_apply_changes: unknown scope {scope!r}", file=sys.stderr)
         sys.exit(2)
-    changes_by_file.setdefault(target, {})[c["key"]] = c.get("value", "")
+    changes_by_file.setdefault(target, {})[c["key"]] = {
+        "value": c.get("value", ""),
+        "op":    op,
+    }
 
 for target, kv_map in changes_by_file.items():
     if not os.path.exists(target):
@@ -283,11 +437,20 @@ for target, kv_map in changes_by_file.items():
             open(target, "w").close()
             os.chmod(target, 0o600)
         else:
+            # Per-app env missing AND we're only doing reverts for it:
+            # nothing to delete, treat as no-op.
+            if all(v["op"] == "revert" for v in kv_map.values()):
+                continue
             print(f"per-app env missing: {target}", file=sys.stderr)
             sys.exit(2)
+
     with open(target) as f:
         existing = f.read().splitlines()
 
+    # Walk the file; for each existing key in kv_map: replace the line
+    # (op=set) or skip the line entirely (op=revert). Keys in kv_map
+    # not in the file get appended as set; reverts on missing keys are
+    # already a no-op.
     new_lines = []
     handled = set()
     for line in existing:
@@ -295,13 +458,20 @@ for target, kv_map in changes_by_file.items():
         if "=" in s and not s.lstrip().startswith("#"):
             k = s.split("=", 1)[0]
             if k in kv_map:
-                new_lines.append(f"{k}={kv_map[k]}")
                 handled.add(k)
+                op = kv_map[k]["op"]
+                if op == "revert":
+                    # Drop the line entirely. Inheritance restored.
+                    continue
+                new_lines.append(f"{k}={kv_map[k]['value']}")
                 continue
         new_lines.append(s)
     for k, v in kv_map.items():
-        if k not in handled:
-            new_lines.append(f"{k}={v}")
+        if k in handled:
+            continue
+        if v["op"] == "revert":
+            continue   # nothing to delete
+        new_lines.append(f"{k}={v['value']}")
 
     tmp = target + ".tmp"
     with open(tmp, "w") as f:

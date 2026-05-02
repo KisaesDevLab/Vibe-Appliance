@@ -131,6 +131,12 @@ for slug, app_state in (state.get("apps", {}) or {}).items():
 # default_upstream + emergencyNote. Skip apps without an emergencyPort
 # (e.g. userFacing=false services).
 frontends = []
+# Track ports across ALL manifests too — two apps declaring the same
+# port (e.g. typo) would emit duplicate `bind *:N` lines and HAProxy
+# would refuse to start. First-declarer wins; the rest get a stderr
+# warning. The 5199 stats port is internally bound by the global config
+# (not via candidates) so doesn't conflict here.
+seen_ports_global = set()
 for slug in enabled_apps:
     mpath = Path(manifests_dir) / f"{slug}.json"
     if not mpath.exists():
@@ -140,34 +146,95 @@ for slug in enabled_apps:
             m = json.load(f)
     except (json.JSONDecodeError, OSError):
         continue
-    port = m.get("emergencyPort")
-    if not port:
-        continue
-    # Belt-and-suspenders type + range check. The schema enforces
-    # `"type": "integer"` and the 5171-5198 range at validation time,
-    # but a hand-edited manifest could bypass that. Reject anything
-    # that's not a plain int (refuse strings, floats, bools — bool is
-    # technically an int subclass in Python so check explicitly).
-    if (not isinstance(port, int)
-            or isinstance(port, bool)
-            or not (5171 <= port <= 5198)):
-        sys.stderr.write(
-          f"render-haproxy: refusing emergencyPort={port!r} in {slug} "
-          f"manifest (must be integer in 5171-5198)\n")
-        continue
     if m.get("userFacing") is False:
         continue
     upstream = m.get("routing", {}).get("default_upstream")
     if not upstream:
         continue
-    frontends.append({
-        "slug":     slug,
-        "name":     slug.replace("-", "_"),
-        "port":     port,
-        "upstream": upstream,
-        "label":    m.get("displayName", slug),
-        "note":     m.get("emergencyNote", ""),
-    })
+
+    # Phase 8.5 v1.2 — multi-subdomain support. If the manifest declares
+    # a subdomains[] array, emit one frontend per item that has an
+    # emergencyPort. Otherwise fall back to the single top-level
+    # emergencyPort (v1.1 path). Vibe-Connect uses subdomains[] to expose
+    # both the staff portal (5181) and client portal (5182) separately
+    # while still pointing at the same default_upstream until the
+    # upstream Vibe-Connect repo splits its client container.
+    candidates = []
+    subdomains = m.get("subdomains") or []
+    if subdomains:
+        for sd in subdomains:
+            if not isinstance(sd, dict):
+                continue
+            sd_port = sd.get("emergencyPort")
+            if sd_port is None:
+                continue
+            # Build a label suffix when this subdomain has a distinct
+            # audience or name from the entry's own name. Comparing to
+            # the per-subdomain `name` (not the manifest top-level
+            # `subdomain`) — the prior comparison was semantically off
+            # because audience is per-subdomain metadata, not app-wide.
+            label_suffix = ""
+            audience = sd.get("audience")
+            if audience and audience != sd.get("name"):
+                label_suffix = f" — {audience}"
+            elif sd.get("name") and sd["name"] != m.get("subdomain"):
+                label_suffix = f" — {sd['name']}"
+            candidates.append({
+                "port":  sd_port,
+                "name_suffix": "_" + sd.get("name", "").replace("-", "_"),
+                "label_suffix": label_suffix,
+                "note":  sd.get("emergencyNote") or m.get("emergencyNote") or "",
+            })
+    else:
+        port = m.get("emergencyPort")
+        if port is not None:
+            candidates.append({
+                "port":  port,
+                "name_suffix": "",
+                "label_suffix": "",
+                "note":  m.get("emergencyNote", ""),
+            })
+
+    # Belt-and-suspenders: detect duplicate ports within this manifest's
+    # subdomains[]. JSON Schema can't express "unique emergencyPort
+    # across array items"; if two items share a port, HAProxy refuses
+    # to bind the second. Catch it here with a clear stderr warning
+    # rather than letting HAProxy fail at runtime.
+    seen_ports_local = set()
+    for c in candidates:
+        port = c["port"]
+        if port in seen_ports_local:
+            sys.stderr.write(
+              f"render-haproxy: duplicate emergencyPort={port} in {slug} "
+              f"manifest's subdomains[]; skipping the second declaration\n")
+            continue
+        seen_ports_local.add(port)
+        # Belt-and-suspenders type + range check. The schema enforces
+        # `"type": "integer"` and the 5171-5198 range at validation time,
+        # but a hand-edited manifest could bypass that. Reject anything
+        # that's not a plain int (refuse strings, floats, bools — bool is
+        # technically an int subclass in Python so check explicitly).
+        if (not isinstance(port, int)
+                or isinstance(port, bool)
+                or not (5171 <= port <= 5198)):
+            sys.stderr.write(
+              f"render-haproxy: refusing emergencyPort={port!r} in {slug} "
+              f"manifest (must be integer in 5171-5198)\n")
+            continue
+        if port in seen_ports_global:
+            sys.stderr.write(
+              f"render-haproxy: emergencyPort={port} in {slug} clashes with "
+              f"a port already claimed by an earlier manifest; skipping\n")
+            continue
+        seen_ports_global.add(port)
+        frontends.append({
+            "slug":     slug,
+            "name":     slug.replace("-", "_") + c["name_suffix"],
+            "port":     port,
+            "upstream": upstream,
+            "label":    m.get("displayName", slug) + c["label_suffix"],
+            "note":     c["note"],
+        })
 
 # ---- Emit haproxy.cfg ----------------------------------------------------
 lines = []

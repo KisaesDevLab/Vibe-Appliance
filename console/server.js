@@ -173,11 +173,17 @@ function readState() {
 // Load every manifest under console/manifests/*.json. Manifests that
 // fail to parse are logged and skipped — the rest of the registry stays
 // usable.
+//
+// Files starting with `_` are NOT treated as app manifests — they're
+// reserved for special registries like _appliance.json (loaded via
+// loadApplianceSettings). Lets us colocate operator-only Tier-1
+// settings without creating a fake "app".
 function loadManifests() {
   const out = {};
   let files = [];
   try {
-    files = fs.readdirSync(MANIFESTS_DIR).filter((f) => f.endsWith('.json'));
+    files = fs.readdirSync(MANIFESTS_DIR).filter((f) =>
+      f.endsWith('.json') && !f.startsWith('_'));
   } catch (err) {
     log('warn', 'manifests directory unreadable', { dir: MANIFESTS_DIR, err: err.code });
     return out;
@@ -200,6 +206,51 @@ function loadManifests() {
 
 const MANIFESTS = loadManifests();
 log('info', 'manifests loaded', { count: Object.keys(MANIFESTS).length, slugs: Object.keys(MANIFESTS) });
+
+// Phase 8.5 v1.2 — appliance-only settings registry. Holds operator-
+// level Tier-1 settings (TAILSCALE_ENABLED, DNS_PROVIDER, UPDATE_CHANNEL,
+// LOG_LEVEL_DEFAULT, etc.) that don't have an app-level consumer.
+// Loaded from console/manifests/_appliance.json (file starts with `_`
+// so loadManifests() skips it, keeping app-manifest semantics clean).
+function loadApplianceSettings() {
+  const file = path.join(MANIFESTS_DIR, '_appliance.json');
+  try {
+    const raw = fs.readFileSync(file, 'utf8');
+    const obj = JSON.parse(raw);
+    if (!Array.isArray(obj.settings)) {
+      log('warn', '_appliance.json missing settings[] array; skipping');
+      return [];
+    }
+    // Lightweight per-entry validation. We don't want one typo in
+    // _appliance.json to silently strip every operator-level setting
+    // from the Settings UI — surface the bad rows in logs and skip
+    // them, but keep the good ones.
+    const out = [];
+    for (let i = 0; i < obj.settings.length; i++) {
+      const e = obj.settings[i];
+      if (!e || typeof e !== 'object') {
+        log('warn', '_appliance.json[' + i + ']: not an object; skipped');
+        continue;
+      }
+      if (typeof e.name !== 'string' || !/^[A-Z][A-Z0-9_]*$/.test(e.name)) {
+        log('warn', '_appliance.json[' + i + ']: bad name', { name: e.name });
+        continue;
+      }
+      if (e.ui && typeof e.ui !== 'object') {
+        log('warn', '_appliance.json[' + i + ']: ui must be an object', { name: e.name });
+        continue;
+      }
+      out.push(e);
+    }
+    return out;
+  } catch (err) {
+    if (err.code === 'ENOENT') return [];
+    log('warn', '_appliance.json failed to parse; skipping', { err: err.message });
+    return [];
+  }
+}
+const APPLIANCE_SETTINGS = loadApplianceSettings();
+log('info', 'appliance settings loaded', { count: APPLIANCE_SETTINGS.length });
 
 // ----- GHCR availability cache -----------------------------------------
 //
@@ -626,6 +677,11 @@ const APPLIANCE_CATEGORIES = new Set([
 
 function _fieldDescriptor(envEntry, providingSlug) {
   const ui = envEntry.ui || {};
+  // Resolve the providing manifest's displayName so the per-app sub-tab
+  // shows "Vibe MyBooks" instead of "vibe-mybooks". Falls back to slug
+  // for the special _appliance entry which has no MANIFESTS row.
+  const m = MANIFESTS[providingSlug];
+  const providingDisplayName = (m && m.displayName) || providingSlug;
   return {
     key:                 envEntry.name,
     scope:               ui.appliance || 'per-app',
@@ -643,6 +699,7 @@ function _fieldDescriptor(envEntry, providingSlug) {
     restartRequired:     ui.restartRequired !== false,
     healthCheckTimeout:  ui.healthCheckTimeout || null,
     providingSlug,
+    providingDisplayName,
   };
 }
 
@@ -658,6 +715,32 @@ function buildSettingsRegistry() {
   const allKeys   = new Map();
   const sharedSeen = new Set();   // dedupe shared keys declared on multiple manifests
 
+  // Phase 8.5 v1.2 — load appliance-only settings first so they take
+  // precedence in the dedupe logic (operator-level declarations win
+  // over app-level ones for the same key).
+  for (const e of APPLIANCE_SETTINGS) {
+    if (!e.ui || e.ui.tier !== 1) {
+      // Tier 2 settings (read-only with rotation hint) are also
+      // surfaced — admin's password-change-flow lives at tier 2.
+      if (e.ui && e.ui.tier === 2) {
+        const f = _fieldDescriptor(e, '_appliance');
+        const cat = e.ui.category;
+        if (cat) {
+          (appliance[cat] = appliance[cat] || []).push(f);
+          allKeys.set(f.key, f);
+          sharedSeen.add(f.key);
+        }
+      }
+      continue;
+    }
+    const f = _fieldDescriptor(e, '_appliance');
+    const cat = e.ui.category;
+    if (!cat) continue;
+    sharedSeen.add(f.key);
+    (appliance[cat] = appliance[cat] || []).push(f);
+    allKeys.set(f.key, f);
+  }
+
   for (const m of Object.values(MANIFESTS)) {
     const entries = [...(m.env.required || []), ...(m.env.optional || [])];
     for (const e of entries) {
@@ -668,7 +751,8 @@ function buildSettingsRegistry() {
 
       if (f.scope === 'shared' || f.scope === 'both') {
         // Goes under the appliance tab. Dedupe — first declaration wins
-        // for shared keys (multiple apps may declare same EMAIL_PROVIDER).
+        // for shared keys (multiple apps may declare same EMAIL_PROVIDER,
+        // and _appliance.json declarations always come first).
         if (!sharedSeen.has(f.key)) {
           sharedSeen.add(f.key);
           (appliance[cat] = appliance[cat] || []).push(f);
@@ -921,18 +1005,23 @@ app.post('/api/v1/settings/save', requireAdmin, testRateLimit, (req, res) => {
       exit_code:     code,
     };
     for (const c of body.changes) {
-      const newVal = c.secret
-        ? (c.value ? '(set)' : '(empty)')
-        : (c.value === undefined ? '' : String(c.value));
+      let newVal;
+      if (c.op === 'revert') {
+        newVal = '(reverted to appliance)';
+      } else if (c.secret) {
+        newVal = c.value ? '(set)' : '(empty)';
+      } else {
+        newVal = c.value === undefined ? '' : String(c.value);
+      }
       try {
         auditStmt.run(
           ts, ADMIN_USER,
           c.category || 'unknown',
           c.key,
-          null,                                       // old_value — would need pre-write read; v1.2
+          null,                                       // old_value — would need pre-write read; v1.2 follow-up
           newVal,
           result.result || 'unknown',
-          JSON.stringify({ ...detailsBase, scope: c.scope })
+          JSON.stringify({ ...detailsBase, scope: c.scope, op: c.op || 'set' })
         );
       } catch (err) {
         log('warn', 'audit-log insert failed', { err: err.message, key: c.key });
@@ -1279,30 +1368,133 @@ app.post('/api/v1/admin/test/sms', requireAdmin, testRateLimit, async (req, res)
   return res.status(400).json({ ok: false, error: `unknown SMS_PROVIDER: ${provider || '(empty)'}` });
 });
 
-// Phase 8.5 — three stub test endpoints. Implementing them properly
-// requires npm deps the v1.1 image deliberately doesn't carry (AWS SDK
-// for backup S3/B2, acme-client for DNS-01 staging, tailscale CLI for
-// authkey validation). Returning 501 with a clear path forward so the
-// Settings UI's Test button shows a helpful message rather than a
-// generic 404. v1.2 lands the real implementations.
-app.post('/api/v1/admin/test/backup', requireAdmin, testRateLimit, (_req, res) => {
-  res.status(501).json({
-    ok: false,
-    message: 'Backup destination test not implemented in v1.1. Configure inside the Duplicati UI directly (its own subdomain) — Duplicati validates credentials at job-config time and runs a test backup.',
+// Phase 8.5 v1.2 — pragmatic test endpoint stubs. Real cred-validating
+// probes require npm deps we deliberately keep out of the v1 image
+// (AWS SDK for S3/B2, acme-client for DNS-01 staging, tailscale CLI
+// auth-flow for authkey validation). What we CAN do without deps:
+// shape-check the values and probe local resources. Better than the
+// generic 501 the UI showed before.
+//
+// Not a substitute for real end-to-end tests — operator should still
+// validate via the actual Save flow once the values are in place.
+
+app.post('/api/v1/admin/test/backup', requireAdmin, testRateLimit, async (req, res) => {
+  const b = req.body || {};
+  const dest = (b.BACKUP_DESTINATION_TYPE || '').trim().toLowerCase();
+  const known = new Set(['none', 's3', 'b2', 'sftp', 'local']);
+  if (!known.has(dest)) {
+    return res.json({
+      ok: false,
+      message: `Unknown destination type "${dest}". Pick one of: none, s3, b2, sftp, local.`,
+    });
+  }
+  if (dest === 'none') {
+    return res.json({
+      ok: true,
+      message: 'No destination selected — Duplicati will not run automated backups, and Vibe-Connect will block new vault uploads after 30 days.',
+    });
+  }
+  // Probe the Duplicati container — destination credentials are
+  // configured INSIDE Duplicati's UI, not in env. So the best we can
+  // do here is confirm Duplicati is up and reachable.
+  let duplicatiUp = false;
+  try {
+    const c = docker.getContainer('vibe-duplicati');
+    const info = await c.inspect();
+    duplicatiUp = info.State && info.State.Running;
+  } catch { /* not found */ }
+  if (!duplicatiUp) {
+    return res.json({
+      ok: false,
+      message: 'Duplicati container is not running. Start it: cd /opt/vibe/appliance && sudo docker compose up -d duplicati. Then visit https://backup.<your-domain>/ to configure the destination.',
+    });
+  }
+  return res.json({
+    ok: true,
+    message: `Destination type "${dest}" is supported. Configure credentials and run a test backup inside Duplicati's own UI at https://backup.<your-domain>/. The appliance does not store backup credentials directly.`,
   });
 });
 
-app.post('/api/v1/admin/test/dns', requireAdmin, testRateLimit, (_req, res) => {
-  res.status(501).json({
+app.post('/api/v1/admin/test/dns', requireAdmin, testRateLimit, async (req, res) => {
+  const b = req.body || {};
+  const provider = (b.DNS_PROVIDER || '').trim().toLowerCase();
+  if (provider === 'http-01' || provider === '') {
+    return res.json({
+      ok: true,
+      message: 'HTTP-01 is the default — no DNS-side configuration needed. Caddy validates by serving a token on port 80. Verify port 80 is reachable from the public internet.',
+    });
+  }
+  if (provider === 'cloudflare') {
+    const token = (b.CLOUDFLARE_API_TOKEN || '').trim();
+    if (!token) {
+      return res.json({
+        ok: false,
+        message: 'CLOUDFLARE_API_TOKEN required for Cloudflare DNS-01.',
+      });
+    }
+    // Token format: 40 alphanumeric / underscore chars. Tighter than
+    // Cloudflare's actual constraint but catches obvious typos before
+    // we hit the API.
+    if (!/^[A-Za-z0-9_-]{30,80}$/.test(token)) {
+      return res.json({
+        ok: false,
+        message: 'CLOUDFLARE_API_TOKEN does not look like a valid token (expected 30-80 chars of [A-Za-z0-9_-]). Double-check by copying from https://dash.cloudflare.com/profile/api-tokens.',
+      });
+    }
+    // Probe Cloudflare's token-verify endpoint — costs nothing, no
+    // permissions used, just confirms the token is valid.
+    const result = await _testFetch('https://api.cloudflare.com/client/v4/user/tokens/verify', {
+      headers: { 'Authorization': 'Bearer ' + token },
+    });
+    if (result.ok) {
+      try {
+        const parsed = JSON.parse(result.body);
+        if (parsed && parsed.success) {
+          return res.json({
+            ok: true,
+            message: 'Cloudflare token verified (status: ' + (parsed.result?.status || 'active') + '). Ensure it has Zone:DNS:Edit scope on your domain.',
+          });
+        }
+      } catch { /* fall through */ }
+    }
+    return res.json({
+      ok: false,
+      message: 'Cloudflare rejected the token: HTTP ' + result.status + ' — ' + (result.body || result.error || 'check token validity').slice(0, 200),
+    });
+  }
+  return res.json({
     ok: false,
-    message: 'DNS provider test not implemented in v1.1. The default install uses HTTP-01 (port 80 reachability is the validator); Cloudflare DNS-01 is opt-in via the custom Caddy build at caddy/Dockerfile.cloudflare.',
+    message: `Unknown DNS_PROVIDER "${provider}". Supported: http-01, cloudflare.`,
   });
 });
 
-app.post('/api/v1/admin/test/tailscale', requireAdmin, testRateLimit, (_req, res) => {
-  res.status(501).json({
-    ok: false,
-    message: 'Tailscale authkey test not implemented in v1.1 (would require running tailscale up against an ephemeral instance, with risk of locking out the host). Validate by running: sudo bootstrap.sh --tailscale --tailscale-authkey ...',
+app.post('/api/v1/admin/test/tailscale', requireAdmin, testRateLimit, (req, res) => {
+  const b = req.body || {};
+  const authkey = (b.TAILSCALE_AUTHKEY || '').trim();
+  if (!authkey) {
+    return res.json({
+      ok: false,
+      message: 'TAILSCALE_AUTHKEY required.',
+    });
+  }
+  // Tailscale authkeys: tskey-auth-... (reusable) or tskey-... (legacy)
+  // Format: tskey-(auth-)?<base32-ish>
+  // Tailscale keys: tskey-... or tskey-auth-..., with [A-Za-z0-9_-] body
+  // (real keys have dashes; the prior regex without `-` rejected them).
+  if (!/^tskey-(auth-)?[A-Za-z0-9_-]{8,}$/.test(authkey)) {
+    return res.json({
+      ok: false,
+      message: 'TAILSCALE_AUTHKEY does not look like a valid key (expected tskey-... or tskey-auth-... format). Generate at https://login.tailscale.com/admin/settings/keys.',
+    });
+  }
+  // Real `tailscale up --authkey ... --reset` against an ephemeral
+  // identity would be the strong validator, but on this host that
+  // would actually consume the key and could lock the operator out
+  // if Tailscale was already configured. Defer to Save flow's
+  // postSaveJob = 'tailscale-toggle' which actually runs `tailscale up`.
+  return res.json({
+    ok: true,
+    message: 'Auth key format looks valid. The actual `tailscale up` runs when you Save (postSaveJob: tailscale-toggle). Generate keys at https://login.tailscale.com/admin/settings/keys; ensure they are reusable + not pre-authorized if your tailnet uses ACLs.',
   });
 });
 

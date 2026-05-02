@@ -45,6 +45,12 @@ services:
       # path (caddy/Dockerfile.cloudflare) can read CLOUDFLARE_API_TOKEN
       # at runtime. The default image ignores it.
       - /opt/vibe/env/shared.env
+      # Phase 8.5 v1.2 — appliance.env also mounted so the Settings
+      # page's CLOUDFLARE_API_TOKEN write (admin Settings → Network)
+      # reaches Caddy without needing a re-bootstrap. Compose merges
+      # in declaration order, so appliance.env values OVERRIDE shared.env
+      # for the same key — Settings wins over the legacy bootstrap path.
+      - /opt/vibe/env/appliance.env
     volumes:
       # Mount the PARENT directory, not the Caddyfile itself. Caddyfile
       # is rewritten via atomic rename (lib/render-caddyfile.sh) on

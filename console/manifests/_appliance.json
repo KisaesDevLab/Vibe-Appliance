@@ -1,0 +1,143 @@
+{
+  "schemaVersion": 1,
+  "kind": "appliance",
+  "displayName": "Appliance",
+  "description": "Operator-level Tier-1 settings that don't belong to any single Vibe app — Tailscale toggle, DNS provider for ACME, update channel, default log level. Per addendum admin-config-surface.md §2.1, these are appliance-wide and live in /opt/vibe/env/appliance.env.",
+  "settings": [
+    {
+      "name":  "TAILSCALE_ENABLED",
+      "value": "false",
+      "doc":   "Whether Tailscale is enabled on the host. Read-only mirror of state.config.tailscale; toggle here triggers the Tailscale up/down postSaveJob (v1.2 special-case flow).",
+      "ui": {
+        "tier":            1,
+        "category":        "Network",
+        "label":           "Tailscale",
+        "helpText":        "Enables tailnet-only HTTPS access (https://<host>.<tailnet>.ts.net) alongside the primary mode. Toggle ON requires a Tailscale auth key.",
+        "input":           "toggle",
+        "appliance":       "shared",
+        "validate":        "enum",
+        "options": [
+          { "value": "true",  "label": "Enabled"  },
+          { "value": "false", "label": "Disabled" }
+        ],
+        "postSaveJob":     "tailscale-toggle"
+      }
+    },
+    {
+      "name":  "TAILSCALE_AUTHKEY",
+      "secret": true,
+      "doc":   "Tailscale auth key for unattended `tailscale up`. Required when TAILSCALE_ENABLED transitions false→true. Cleared after successful authentication.",
+      "ui": {
+        "tier":            1,
+        "category":        "Network",
+        "label":           "Tailscale auth key",
+        "helpText":        "Generate at https://login.tailscale.com/admin/settings/keys (reusable, ephemeral=false).",
+        "input":           "password",
+        "appliance":       "shared",
+        "dependsOnFields": ["TAILSCALE_ENABLED"],
+        "showIf":          { "TAILSCALE_ENABLED": "true" },
+        "testEndpoint":    "/api/v1/admin/test/tailscale"
+      }
+    },
+    {
+      "name":  "DNS_PROVIDER",
+      "value": "http-01",
+      "doc":   "ACME challenge type. http-01 (default) needs port 80 reachable from the public internet; cloudflare uses DNS-01 wildcard certs and requires the custom Caddy build (caddy/Dockerfile.cloudflare) — see PLAN.md §4.1.",
+      "ui": {
+        "tier":            1,
+        "category":        "Network",
+        "label":           "DNS / cert challenge",
+        "helpText":        "http-01 is the default and works with the stock caddy:2-alpine image. cloudflare requires the opt-in custom Caddy build with the Cloudflare DNS plugin baked in.",
+        "input":           "dropdown",
+        "appliance":       "shared",
+        "validate":        "enum",
+        "testEndpoint":    "/api/v1/admin/test/dns",
+        "options": [
+          { "value": "http-01",     "label": "HTTP-01 (default; per-subdomain certs)" },
+          { "value": "cloudflare",  "label": "Cloudflare DNS-01 (wildcard; needs custom Caddy build)" }
+        ],
+        "postSaveJob":     "dns-provider-switch"
+      }
+    },
+    {
+      "name":   "CLOUDFLARE_API_TOKEN",
+      "secret": true,
+      "doc":    "Cloudflare API token with Zone:DNS:Edit. Today writes to /opt/vibe/env/appliance.env via the standard Settings save flow. The Caddy container's env_file list is updated to include appliance.env so the cloudflare plugin reads the value at runtime. (Pre-v1.2 operators using bootstrap.sh --cloudflare-api-token can continue — that path writes to shared.env, which still wins as a legacy override.)",
+      "ui": {
+        "tier":            1,
+        "category":        "Network",
+        "label":           "Cloudflare API token",
+        "helpText":        "Required when DNS provider is cloudflare. Token must have Zone:DNS:Edit on the appliance's domain.",
+        "input":           "password",
+        "appliance":       "shared",
+        "validate":        "non-empty",
+        "dependsOnFields": ["DNS_PROVIDER"],
+        "showIf":          { "DNS_PROVIDER": "cloudflare" }
+      }
+    },
+    {
+      "name":  "TZ",
+      "value": "Etc/UTC",
+      "doc":   "IANA time zone for the appliance host. Cascades to per-app TZ env vars unless an app overrides it (Vibe-Payroll-Time declares TZ as appliance:both).",
+      "ui": {
+        "tier":            1,
+        "category":        "Time & Logging",
+        "label":           "Time zone",
+        "helpText":        "e.g. America/Chicago. Drives log timestamps and per-app TZ defaults.",
+        "input":           "time-zone",
+        "appliance":       "shared",
+        "validate":        "iana-timezone"
+      }
+    },
+    {
+      "name":  "UPDATE_CHANNEL",
+      "value": "stable",
+      "doc":   "Which image-tag track update.sh follows when the operator clicks Update. stable = latest released GHCR tag; beta = latest pre-release; pinned = no auto-suggest, operator picks tags manually.",
+      "ui": {
+        "tier":      1,
+        "category":  "System",
+        "label":     "Update channel",
+        "helpText":  "Affects what 'Update available' badges look at. Use pinned for production-critical hosts where update timing must be deliberate.",
+        "input":     "dropdown",
+        "appliance": "shared",
+        "validate":  "enum",
+        "options": [
+          { "value": "stable", "label": "Stable (latest released)" },
+          { "value": "beta",   "label": "Beta (pre-release)"        },
+          { "value": "pinned", "label": "Pinned (manual only)"      }
+        ]
+      }
+    },
+    {
+      "name":  "LOG_LEVEL_DEFAULT",
+      "value": "info",
+      "doc":   "Default log level cascading to per-app LOG_LEVEL env. Apps with their own LOG_LEVEL declared (Vibe-MyBooks does) override this.",
+      "ui": {
+        "tier":      1,
+        "category":  "Time & Logging",
+        "label":     "Default log level",
+        "input":     "dropdown",
+        "appliance": "shared",
+        "validate":  "enum",
+        "options": [
+          { "value": "error", "label": "error" },
+          { "value": "warn",  "label": "warn"  },
+          { "value": "info",  "label": "info"  },
+          { "value": "debug", "label": "debug (high volume; use only when investigating)" }
+        ]
+      }
+    },
+    {
+      "name":   "CONSOLE_ADMIN_PASSWORD_INFO",
+      "doc":    "Admin password rotation pointer (Tier 2 read-only). The actual password lives in shared.env, not appliance.env, and inline rotation needs a special flow that writes to console.sqlite + reloads the basic-auth comparator without restarting the console (which would log out the operator mid-session). v1.3 lands the inline rotation; today operators use bootstrap.sh --reset-env or hand-edit shared.env + restart the console.",
+      "ui": {
+        "tier":      2,
+        "category":  "System",
+        "label":     "Admin password",
+        "helpText":  "Rotation requires shell access today. Run: sudo bootstrap.sh --reset-env (rotates ALL secrets), or sudo nano /opt/vibe/env/shared.env then docker compose restart console. Inline rotation arrives in v1.3.",
+        "input":     "password-change-flow",
+        "appliance": "shared"
+      }
+    }
+  ]
+}

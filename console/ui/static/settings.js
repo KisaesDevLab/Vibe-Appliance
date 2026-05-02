@@ -36,9 +36,19 @@
   const state = {
     schema:  null,           // { appliance: {cat: [field, ...]}, perApp: {...} }
     values:  null,           // { appliance: {key: {value, source}}, perApp: {...} }
-    dirty:   new Map(),      // key -> { scope, value, field }
-    activeTab: null,
+    dirty:   new Map(),      // dirtyKey -> { scope, key, value, field, op }
+                             //   dirtyKey is "<scope>::<key>" so per-app
+                             //   overrides don't collide with appliance
+                             //   edits to the same key.
+                             //   op: 'set' (default) or 'revert' (delete
+                             //   from per-app env to restore inheritance)
+    activeTab: null,         // appliance category name OR special "Apps"
+    activeAppSlug: null,     // when activeTab === 'Apps', selected slug
   };
+
+  // dirtyKey constructor — single point of truth so the UI's set / get
+  // both agree on the per-app vs appliance namespacing.
+  const dirtyKey = (scope, key) => scope + '::' + key;
 
   // ---------- DOM refs -------------------------------------------------
   const tabsEl    = document.getElementById('settings-tabs');
@@ -55,7 +65,8 @@
 
   // ---------- field rendering -----------------------------------------
   function renderField(field, currentRaw) {
-    const dirty = state.dirty.get(field.key);
+    const dKey = dirtyKey('appliance', field.key);
+    const dirty = state.dirty.get(dKey);
     const isDirty = !!dirty;
     const value = isDirty ? dirty.value
                           : (field.secret ? '' : (currentRaw == null ? field.default || '' : currentRaw));
@@ -112,7 +123,16 @@
   function collectCategoryValues() {
     const out = {};
     if (!state.activeTab) return out;
-    const fields = (state.schema.appliance[state.activeTab] || []);
+    // For the Apps tab, gather fields from the active app's per-app
+    // schema (flattened across categories). For appliance category
+    // tabs, use the appliance schema as before. Without this branch,
+    // Apps-tab Test buttons would POST empty payloads.
+    let fields;
+    if (state.activeTab === 'Apps' && state.activeAppSlug) {
+      fields = Object.values((state.schema.perApp || {})[state.activeAppSlug] || {}).flat();
+    } else {
+      fields = (state.schema.appliance[state.activeTab] || []);
+    }
     for (const f of fields) {
       const wrap = panelEl.querySelector(`[data-key="${CSS.escape(f.key)}"]`);
       if (!wrap) continue;
@@ -255,20 +275,20 @@
   function onFieldChange(field, input) {
     const newVal = readInputValue(input);
     const currentRaw = currentRawFor(field);
+    const dKey = dirtyKey('appliance', field.key);
 
     // For secrets, leaving the field blank means "no change" — strip
     // from the dirty map. Non-secret fields use a value comparison.
     if (field.secret && newVal === '') {
-      state.dirty.delete(field.key);
+      state.dirty.delete(dKey);
     } else if (!field.secret && newVal === (currentRaw == null ? field.default || '' : currentRaw)) {
-      state.dirty.delete(field.key);
+      state.dirty.delete(dKey);
     } else {
-      state.dirty.set(field.key, {
-        scope: field.scope === 'shared' ? 'appliance'
-             : field.scope === 'per-app' ? `per-app:${field.providingSlug}`
-             : 'appliance',                    // 'both' → appliance level for substrate
+      state.dirty.set(dKey, {
+        scope: 'appliance',                    // appliance tab always writes appliance scope
+        key:   field.key,
         value: newVal,
-        field,
+        field, op: 'set',
       });
     }
 
@@ -285,19 +305,29 @@
   // dirty + saved values of dependency fields.
   function updateConditionals() {
     if (!state.activeTab) return;
-    const fields = (state.schema.appliance[state.activeTab] || []);
+    let fields, scope, valuesMap;
+    if (state.activeTab === 'Apps' && state.activeAppSlug) {
+      const slugMap = (state.schema.perApp || {})[state.activeAppSlug] || {};
+      fields = Object.values(slugMap).flat();
+      scope = 'per-app:' + state.activeAppSlug;
+      valuesMap = (state.values.perApp || {})[state.activeAppSlug] || {};
+    } else {
+      fields = (state.schema.appliance[state.activeTab] || []);
+      scope = 'appliance';
+      valuesMap = state.values.appliance || {};
+    }
     for (const f of fields) {
       if (!f.showIf) continue;
       const wrap = panelEl.querySelector(`[data-key="${CSS.escape(f.key)}"]`);
       if (!wrap) continue;
       const ok = Object.entries(f.showIf).every(([depKey, depVal]) => {
-        const dirty = state.dirty.get(depKey);
+        // Same-scope dirty check first.
+        const dirty = state.dirty.get(dirtyKey(scope, depKey));
         if (dirty) return String(dirty.value) === String(depVal);
-        // Defensive: depKey may reference a per-app field not yet in
-        // the appliance values map (e.g. a v1.2 cross-scope showIf).
-        // Optional chaining returns undefined cleanly rather than
-        // throwing on null.value access.
-        const cur = state.values && state.values.appliance && state.values.appliance[depKey];
+        // Fall back to the saved value for the active scope; if not
+        // present (e.g. a per-app showIf depending on an inherited
+        // appliance field), check appliance values too.
+        const cur = valuesMap[depKey] || (state.values.appliance || {})[depKey];
         return cur != null && String(cur.value) === String(depVal);
       });
       wrap.style.display = ok ? '' : 'none';
@@ -309,7 +339,8 @@
     tabsEl.innerHTML = '';
     tabsEl.removeAttribute('aria-busy');
     const cats = Object.keys(state.schema.appliance).sort();
-    if (!cats.length) {
+    const slugs = Object.keys(state.schema.perApp || {}).sort();
+    if (!cats.length && !slugs.length) {
       tabsEl.appendChild(el('span', { class: 'muted' }, ['No Tier-1 settings declared in any manifest.']));
       return;
     }
@@ -317,22 +348,44 @@
       const btn = el('button', {
         class: 'settings-tab',
         role: 'tab',
+        'data-tab': cat,
         'aria-selected': cat === state.activeTab ? 'true' : 'false',
         onclick: () => selectTab(cat),
       }, [cat]);
       tabsEl.appendChild(btn);
     }
-    if (!state.activeTab) state.activeTab = cats[0];
+    // v1.2 — Apps top-level tab. Sub-tabs render inside the panel.
+    if (slugs.length) {
+      const btn = el('button', {
+        class: 'settings-tab',
+        role: 'tab',
+        'data-tab': 'Apps',
+        'aria-selected': state.activeTab === 'Apps' ? 'true' : 'false',
+        onclick: () => selectTab('Apps'),
+      }, ['Apps']);
+      tabsEl.appendChild(btn);
+    }
+    if (!state.activeTab) state.activeTab = cats[0] || 'Apps';
     selectTab(state.activeTab);
   }
 
   function selectTab(cat) {
     state.activeTab = cat;
+    // Mark the selected top-level tab via the data-tab attribute (set
+    // at render time below). Using textContent failed for the Apps
+    // pseudo-tab once Apps had its own sub-nav: the matcher saw
+    // sub-tab text and never updated the top-level button.
     for (const b of tabsEl.querySelectorAll('.settings-tab')) {
-      b.setAttribute('aria-selected', b.textContent === cat ? 'true' : 'false');
+      b.setAttribute('aria-selected', b.dataset.tab === cat ? 'true' : 'false');
     }
     panelEl.innerHTML = '';
     panelEl.removeAttribute('aria-busy');
+
+    if (cat === 'Apps') {
+      renderAppsPanel();
+      return;
+    }
+
     const fields = state.schema.appliance[cat] || [];
     if (!fields.length) {
       panelEl.appendChild(el('p', { class: 'muted' }, ['No fields in this category.']));
@@ -345,6 +398,218 @@
     }
     panelEl.appendChild(form);
     updateConditionals();
+  }
+
+  // v1.2 — Apps tab. Top row: sub-tabs per slug. Below: that slug's
+  // per-app fields grouped by category, with Override / Revert buttons
+  // for fields that have an appliance-level counterpart (scope: 'both').
+  function renderAppsPanel() {
+    const slugs = Object.keys(state.schema.perApp || {}).sort();
+    if (!slugs.length) {
+      panelEl.appendChild(el('p', { class: 'muted' }, ['No apps with per-app settings declared.']));
+      return;
+    }
+    if (!state.activeAppSlug || !slugs.includes(state.activeAppSlug)) {
+      state.activeAppSlug = slugs[0];
+    }
+
+    // Sub-tab nav — same .settings-tabs class for visual continuity.
+    const subNav = el('nav', {
+      class: 'settings-tabs', style: 'margin-bottom:1rem;',
+      role: 'tablist', 'aria-label': 'Per-app settings',
+    });
+    for (const slug of slugs) {
+      // Use the manifest's displayName if it's exposed in the schema
+      // (added in v1.2 — server returns it on each field as
+      // .providingDisplayName). Falls back to slug, which is what the
+      // prior code accidentally always did because of a botched
+      // ternary that evaluated `(truthy && slug) || slug`.
+      const fields = Object.values(state.schema.perApp[slug] || {})[0] || [];
+      const displayName = (fields[0] && fields[0].providingDisplayName) || slug;
+      subNav.appendChild(el('button', {
+        class: 'settings-tab',
+        role: 'tab',
+        'aria-selected': slug === state.activeAppSlug ? 'true' : 'false',
+        onclick: () => { state.activeAppSlug = slug; selectTab('Apps'); },
+      }, [displayName]));
+    }
+    panelEl.appendChild(subNav);
+
+    const slug = state.activeAppSlug;
+    const slugMap = state.schema.perApp[slug] || {};
+    const cats = Object.keys(slugMap).sort();
+
+    const form = el('form', { class: 'settings-form', onsubmit: e => { e.preventDefault(); saveAll(); } });
+
+    for (const cat of cats) {
+      form.appendChild(el('h3', {
+        style: 'margin: 1.2rem 0 0.4rem; font-size: 1rem; color: #6b4423;',
+      }, [cat]));
+      for (const f of slugMap[cat]) {
+        form.appendChild(renderPerAppField(slug, f));
+      }
+    }
+    panelEl.appendChild(form);
+    updateConditionals();
+  }
+
+  // Per-app field renderer. For 'both'-scope fields, distinguishes
+  // inherited (read-only with Override button) vs overridden (editable
+  // with Revert button). For 'per-app'-only fields, simple editable.
+  function renderPerAppField(slug, field) {
+    const valuesForSlug = (state.values.perApp && state.values.perApp[slug]) || {};
+    const v = valuesForSlug[field.key];
+    const source = v && v.source;     // 'inherited' | 'overridden' | 'per-app'
+    const dKey = dirtyKey('per-app:' + slug, field.key);
+    const dirty = state.dirty.get(dKey);
+
+    const wrap = el('div', { class: 'settings-field', 'data-key': field.key, 'data-slug': slug });
+
+    // Header label + scope badges
+    const labelLine = el('label', { for: 'f-' + slug + '-' + field.key }, [
+      field.label,
+      ' ',
+      el('span', {
+        class: 'scope-badge scope-badge--' +
+          (source === 'inherited' ? 'shared'
+           : source === 'overridden' ? 'per-app'
+           : 'per-app'),
+      }, [source || 'per-app']),
+      field.secret ? el('span', { class: 'scope-badge scope-badge--secret' }, ['secret']) : null,
+    ]);
+    wrap.appendChild(labelLine);
+
+    const isInherited = source === 'inherited' && !dirty;
+    const isOverridden = source === 'overridden' || (dirty && dirty.op === 'set');
+
+    let displayValue;
+    if (dirty) {
+      displayValue = dirty.op === 'revert' ? '' : dirty.value;
+    } else if (field.secret) {
+      displayValue = '';
+    } else {
+      displayValue = (v && v.value != null) ? v.value : (field.default || '');
+    }
+
+    const input = renderInput(field, displayValue);
+    input.id = 'f-' + slug + '-' + field.key;
+    if (isInherited) {
+      input.setAttribute('disabled', 'disabled');
+    }
+    input.addEventListener('change', () => onPerAppFieldChange(slug, field, input));
+    input.addEventListener('input',  () => onPerAppFieldChange(slug, field, input));
+    wrap.appendChild(input);
+
+    if (field.helpText) wrap.appendChild(el('p', { class: 'help' }, [field.helpText]));
+
+    // Override / Revert button row for 'both'-scope fields
+    if (field.scope === 'both') {
+      const btnRow = el('div', { class: 'cta-row', style: 'margin-top:0.4rem;gap:0.5rem;' });
+      if (isInherited) {
+        const applianceVal = v && v.value != null ? v.value : (field.default || '');
+        wrap.appendChild(el('p', { class: 'help' }, [
+          'Inherited from appliance: ',
+          el('span', { class: 'mono' }, [field.secret ? '(set)' : String(applianceVal)]),
+        ]));
+        btnRow.appendChild(el('button', {
+          type: 'button',
+          class: 'btn btn--ghost',
+          onclick: () => beginOverride(slug, field, input),
+        }, ['Override for this app']));
+      } else if (isOverridden || (dirty && dirty.op === 'set')) {
+        // Pull the appliance value from any of three places:
+        //   1. v.applianceValue (after a save the server sends this).
+        //   2. dirty.applianceValueAtOverride (we stash it during
+        //      beginOverride so the help text stays correct between
+        //      override-click and save).
+        //   3. v.value when source is 'inherited' (mid-override, before
+        //      first save).
+        //   4. field.default as final fallback.
+        let applianceVal;
+        if (v && v.applianceValue != null) {
+          applianceVal = v.applianceValue;
+        } else if (dirty && dirty.applianceValueAtOverride != null) {
+          applianceVal = dirty.applianceValueAtOverride;
+        } else if (v && v.source === 'inherited' && v.value != null) {
+          applianceVal = v.value;
+        } else {
+          applianceVal = field.default || '';
+        }
+        wrap.appendChild(el('p', { class: 'help' }, [
+          'Overridden — appliance value: ',
+          el('span', { class: 'mono' }, [field.secret ? '(set)' : String(applianceVal)]),
+        ]));
+        btnRow.appendChild(el('button', {
+          type: 'button',
+          class: 'btn btn--ghost',
+          onclick: () => revertOverride(slug, field, input),
+        }, ['Revert to appliance']));
+      }
+      wrap.appendChild(btnRow);
+    }
+
+    return wrap;
+  }
+
+  function beginOverride(slug, field, input) {
+    // Enable input, set dirty to current applianceValue so save will
+    // write that exact value to the per-app env. Operator can then
+    // edit the input to a new value. Stash the applianceValue on the
+    // dirty entry so renderPerAppField's "Overridden — appliance value: X"
+    // help text remains accurate after re-render.
+    input.removeAttribute('disabled');
+    const v = (state.values.perApp[slug] || {})[field.key];
+    const applianceVal = (v && v.value != null) ? v.value : (field.default || '');
+    if (!field.secret) input.value = applianceVal;
+    const dKey = dirtyKey('per-app:' + slug, field.key);
+    state.dirty.set(dKey, {
+      scope: 'per-app:' + slug,
+      key:   field.key,
+      value: field.secret ? '' : applianceVal,
+      field, op: 'set',
+      applianceValueAtOverride: applianceVal,
+    });
+    updateSaveBar();
+    selectTab('Apps');     // re-render to flip the button to Revert
+  }
+
+  function revertOverride(slug, field, input) {
+    // Mark for revert — settings_save_apply will delete the key from
+    // the per-app env file, restoring inheritance from appliance.env.
+    const dKey = dirtyKey('per-app:' + slug, field.key);
+    state.dirty.set(dKey, {
+      scope: 'per-app:' + slug,
+      key:   field.key,
+      value: '',
+      field, op: 'revert',
+    });
+    input.value = '';
+    input.setAttribute('disabled', 'disabled');
+    updateSaveBar();
+    selectTab('Apps');
+  }
+
+  function onPerAppFieldChange(slug, field, input) {
+    const newVal = readInputValue(input);
+    const v = (state.values.perApp[slug] || {})[field.key];
+    const dKey = dirtyKey('per-app:' + slug, field.key);
+
+    // Empty + secret + inherited → no-op (operator's typing into a
+    // disabled-then-overridden field; clearing without commit reverts).
+    if (field.secret && newVal === '' && state.dirty.has(dKey) && state.dirty.get(dKey).op !== 'revert') {
+      state.dirty.delete(dKey);
+    } else if (!field.secret && v && v.value != null && newVal === String(v.value) && v.source !== 'inherited') {
+      // Match current per-app value: not dirty
+      state.dirty.delete(dKey);
+    } else {
+      state.dirty.set(dKey, {
+        scope: 'per-app:' + slug,
+        key:   field.key,
+        value: newVal,
+        field, op: 'set',
+      });
+    }
+    updateSaveBar();
   }
 
   // ---------- save bar -------------------------------------------------
@@ -411,19 +676,28 @@
     }
     // For showIf'd fields not in active tab (different category dirty
     // values), keep them — only filter against the active tab's fields.
-    const activeFields = new Set(
-      (state.schema.appliance[state.activeTab] || []).map(f => f.key)
-    );
+    // Apps tab: pull from perApp schema for the active slug, not the
+    // appliance map (which is empty for 'Apps').
+    let activeFields;
+    if (state.activeTab === 'Apps' && state.activeAppSlug) {
+      const slugMap = (state.schema.perApp || {})[state.activeAppSlug] || {};
+      activeFields = new Set(Object.values(slugMap).flat().map(f => f.key));
+    } else {
+      activeFields = new Set(
+        (state.schema.appliance[state.activeTab] || []).map(f => f.key)
+      );
+    }
 
     const changes = [];
-    for (const [key, d] of state.dirty) {
-      if (activeFields.has(key) && !visibleKeys.has(key)) continue;
+    for (const [, d] of state.dirty) {
+      if (activeFields.has(d.key) && !visibleKeys.has(d.key)) continue;
       changes.push({
         scope:    d.scope,
-        key:      d.field.key,
+        key:      d.key,
         value:    d.value,
-        category: categoryFor(d.field.key),
+        category: categoryFor(d.key) || 'unknown',
         secret:   d.field.secret,
+        op:       d.op || 'set',         // 'set' | 'revert' (delete from per-app env)
       });
     }
 
@@ -461,6 +735,13 @@
   function categoryFor(key) {
     for (const [cat, fields] of Object.entries(state.schema.appliance)) {
       if (fields.some(f => f.key === key)) return cat;
+    }
+    // v1.2 — also walk per-app categories so audit log gets the right
+    // category for per-app saves rather than 'unknown'.
+    for (const slug of Object.keys(state.schema.perApp || {})) {
+      for (const [cat, fields] of Object.entries(state.schema.perApp[slug])) {
+        if (fields.some(f => f.key === key)) return cat;
+      }
     }
     return 'unknown';
   }

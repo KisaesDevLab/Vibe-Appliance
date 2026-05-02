@@ -47,6 +47,39 @@
       "maxLength": 40
     },
 
+    "subdomains": {
+      "type": "array",
+      "description": "Phase 8.5 v1.2 — opt-in multi-subdomain manifest. When present, this list controls EMERGENCY-ACCESS wiring only (HAProxy emits one frontend per item with emergencyPort). The PRIMARY Caddy vhost still uses the top-level `subdomain` field — per-subdomain Caddy routing is a future enhancement gated on backend container splits in the upstream Vibe-* repos. Vibe-Connect's staff/client split is the canonical use case. Manifests should declare BOTH the legacy `subdomain` field (for Caddy) AND `subdomains[]` (for HAProxy multi-port emergency access); declaring `subdomains` alone is allowed but means no Caddy vhost. The `emergencyPort` values across items must be unique per manifest (HAProxy refuses to bind the same port twice).",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*$",
+            "minLength": 1,
+            "maxLength": 40
+          },
+          "audience": {
+            "type": "string",
+            "description": "Free-form label shown in the Emergency Access panel. Conventional values: 'staff', 'client', 'default'."
+          },
+          "emergencyPort": {
+            "type": "integer",
+            "minimum": 5171,
+            "maximum": 5198
+          },
+          "emergencyNote": {
+            "type": "string",
+            "maxLength": 200
+          }
+        }
+      }
+    },
+
     "emergencyPort": {
       "type": "integer",
       "minimum": 5171,

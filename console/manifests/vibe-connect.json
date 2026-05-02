@@ -13,7 +13,19 @@
 
   "subdomain":     "connect",
   "emergencyPort": 5181,
-  "emergencyNote": "Staff access only; client portal magic-link flows require HTTPS and won't work over the emergency port.",
+  "subdomains": [
+    {
+      "name":          "connect",
+      "audience":      "staff",
+      "emergencyPort": 5181
+    },
+    {
+      "name":          "client",
+      "audience":      "client portal",
+      "emergencyPort": 5182,
+      "emergencyNote": "Staff emergency access only — client magic-link flows require HTTPS cookies and won't work over the plain-HTTP emergency port."
+    }
+  ],
   "ports":         { "server": 4000, "client": 80 },
 
   "routing": {

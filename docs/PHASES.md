@@ -284,14 +284,23 @@ If any audit item fails, open a PR against the app repo before integrating.
   - `uninstall.sh` (`remove_claude_code()`)
   - `docs/MANIFEST_SCHEMA.md` (ui block reference)
 
-**Deferred to v1.2.**
-- Per-app override UX ("Override for this app" / "Revert to appliance" buttons) — substrate honors `appliance: "both"` in the registry, but the per-app tab + override toggles aren't rendered yet.
-- Special-case save flow dispatchers — `postSaveJob` declarative hook is in the schema; the bash dispatcher in `settings-save.sh` is stubbed with TODO notes. Specifically: corpus-sync (Tax-Research ENABLED_STATES), Tailscale enable/disable, console admin password change (currently shared.env-managed), DNS provider switch.
-- Backup-destination + Tailscale + DNS-provider Tier-1 settings (no manifest declares them today; addendum §2.1 lists them but Connect's manifest currently owns only EMAIL_*/SMS_*/Compliance).
-- ui blocks on `vibe-glm-ocr` manifest — pending the GLM-OCR addendum being written.
-- SMTP + TextLink test endpoints — stubbed 501 in v1.1 since they need npm deps (nodemailer) or LAN-side hardware respectively.
+**Landed in v1.2 substrate (2026-05-02):**
+- Multi-subdomain manifest schema — `subdomains[]` array unblocks Vibe-Connect's staff/client emergency-port split (5181 + 5182).
+- Appliance-only settings via `console/manifests/_appliance.json` — operator-level Tier-1 settings (TAILSCALE_ENABLED, TAILSCALE_AUTHKEY, DNS_PROVIDER, CLOUDFLARE_API_TOKEN, TZ, UPDATE_CHANNEL, LOG_LEVEL_DEFAULT) finally have a home; loaded specially by `loadApplianceSettings()` and merged into `SETTINGS_REGISTRY.appliance`.
+- Per-app override UX in Settings page — Apps tab with per-slug sub-tabs; Override / Revert buttons for `appliance: "both"` fields; revert actually deletes the key from the per-app env file so inheritance is restored.
+- Special-case save flow dispatcher in `lib/settings-save.sh` — `_settings_run_post_save_jobs` walks the change set and dispatches `_post_save_tailscale_toggle` (runs `tailscale up/down` based on TAILSCALE_ENABLED), `_post_save_dns_provider_switch` (verifies Caddy has the matching plugin, refuses with clear instructions otherwise), `_post_save_corpus_sync` (stub — Tax-Research-Chat needs an upstream sync endpoint).
+- Improved test endpoint stubs — `/test/backup` probes Duplicati container reachability; `/test/dns` shape-checks then calls Cloudflare's free token-verify endpoint; `/test/tailscale` validates authkey format. Real `tailscale up` / S3 / DNS-01 still deferred (need different mechanisms).
+- Caddy now mounts `appliance.env` so the Settings page's CLOUDFLARE_API_TOKEN write reaches the cloudflare DNS plugin without re-bootstrap.
+
+**Still deferred to v1.3+:**
+- Console admin password inline rotation (CONSOLE_ADMIN_PASSWORD lives in shared.env; rotation needs a flow that writes to console.sqlite and reloads the basic-auth comparator without restarting the console mid-session).
 - Real Backup destination test (write/read/delete on S3/B2/etc) — needs AWS SDK or comparable.
 - DNS-01 staging cert test — needs acme-client npm dep.
+- SMTP + TextLink test endpoints — needs nodemailer or TextLink LAN appliance.
+- ui blocks on `vibe-glm-ocr` manifest — pending the GLM-OCR addendum being written.
+- Per-subdomain Caddy routing (subdomains[].target) — gated on backend container splits in upstream Vibe-* repos. v1.2 schema permits `subdomains[]` but Caddy still only honors top-level `subdomain`.
+- Tax-Research-Chat corpus-sync background job — upstream app needs a /admin/sync endpoint first.
+- App-side emergency-access compatibility audit per addendum §9 — separate per-app PR work.
 
 **Landed in Session 1 (2026-05-02).** Previously deferred items now substrate-ready:
 - ui blocks on `vibe-mybooks`, `vibe-connect`, `vibe-payroll` manifests per addendum §10 (3 / 13 / 5 Tier-1 settings respectively, plus 1-each on vibe-tb and vibe-tax-research from the original substrate work — total **23 Tier-1 settings** declared across 5 manifests).
