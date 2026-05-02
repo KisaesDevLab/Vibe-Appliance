@@ -83,6 +83,7 @@
         <label for="log-picker" class="visually-hidden" style="position:absolute;clip:rect(0 0 0 0);width:1px;height:1px;overflow:hidden;">Log file to tail</label>
         <select id="log-picker" class="btn btn--ghost" aria-label="Log file to tail"></select>
         <button class="btn btn--ghost" id="log-refresh">Refresh</button>
+        <button class="btn btn--ghost" id="log-copy" title="Select all log text and copy to clipboard">Copy</button>
         <span id="log-meta" class="muted"></span>
       </div>
       <pre class="app-card__output" id="log-tail" style="max-height: 480px;">Pick a log file…</pre>
@@ -694,6 +695,37 @@
 
     logPicker.addEventListener('change', loadLog);
     logRefresh.addEventListener('click', loadLog);
+    document.getElementById('log-copy').addEventListener('click', copyLog);
+
+    // Select + copy the whole tailed log. The select pass is so the
+    // user sees what was copied (and can extend the selection or
+    // re-copy via Ctrl-C if the clipboard write below silently fails
+    // — e.g. on http:// non-localhost where the Clipboard API isn't a
+    // secure context). LAN-mode admin access is plain http, so the
+    // execCommand('copy') fallback matters here.
+    async function copyLog() {
+      const btn  = document.getElementById('log-copy');
+      const text = logTail.textContent || '';
+      const sel  = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(logTail);
+      sel.removeAllRanges();
+      sel.addRange(range);
+
+      let ok = false;
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+          ok = true;
+        } else {
+          ok = document.execCommand('copy');
+        }
+      } catch (_) { ok = false; }
+
+      const orig = btn.textContent;
+      btn.textContent = ok ? 'Copied!' : 'Press Ctrl-C';
+      setTimeout(() => { btn.textContent = orig; }, 1500);
+    }
 
     async function loadLogList() {
       try {
