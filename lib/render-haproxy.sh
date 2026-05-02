@@ -368,7 +368,16 @@ else:
         lines.append(f"  default_backend be_{fe['name']}")
         lines.append(f"backend be_{fe['name']}")
         lines.append(f"  option httpchk GET {fe.get('health', '/api/v1/ping')}")
-        lines.append(f"  http-check expect status 200")
+        # Apps expose /api/v1/ping as a strict 200 (codebase convention)
+        # — match exactly. Infra services (Portainer/Duplicati) probe `/`
+        # which redirects to login (302). For those we just want "alive,
+        # not 5xx-ing" — `! rstatus ^5..` rejects 5xx, accepts everything
+        # else. Without this, HAProxy marks the redirect-only backend
+        # DOWN and the emergency port serves a permanent 503.
+        if fe.get('kind') == 'infra':
+            lines.append(f"  http-check expect ! rstatus ^5..")
+        else:
+            lines.append(f"  http-check expect status 200")
         lines.append(f"  server {fe['name']} {fe['upstream']} check inter 30s fall 3 rise 1 resolvers docker init-addr last,libc,none")
 
 with open(out_path, "w") as f:
