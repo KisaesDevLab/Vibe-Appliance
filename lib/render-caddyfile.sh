@@ -48,6 +48,13 @@ render_caddyfile() {
 
   local tmp
   tmp="$(mktemp "${VIBE_CADDYFILE}.XXXXXX")"
+  # mktemp's default mode 600 only works for `caddy validate` because
+  # caddy:2-alpine runs as root today. Defensively flip to 644 to
+  # match the eventual final-file mode and survive a future Caddy
+  # image that switches to a non-root user (caddy:2-builder already
+  # does — runs as `caddy`). Caddyfile contains routing only, no
+  # secrets — env_file pulls those at Caddy runtime.
+  chmod 644 "$tmp"
 
   python3 - \
       "$tmpl" "$snippets_dir" "$manifests_dir" \

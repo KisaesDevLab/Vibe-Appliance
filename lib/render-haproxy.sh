@@ -106,6 +106,13 @@ STUB
 
   local tmp
   tmp="$(mktemp "${VIBE_HAPROXY_CFG}.XXXXXX")"
+  # mktemp defaults to mode 600 (owner-only). The downstream validation
+  # step bind-mounts this file into a one-shot haproxy:2.9-alpine
+  # container that runs as the unprivileged `haproxy` user — which
+  # cannot read mode-600 root-owned files. Flipping to 644 (matching
+  # the eventual final-file mode) lets validation actually work.
+  # haproxy.cfg contains routing config, no secrets — 644 is safe.
+  chmod 644 "$tmp"
 
   python3 - "$manifests_dir" "$VIBE_STATE_FILE" "$tmp" <<'PYEOF'
 import json, os, sys
