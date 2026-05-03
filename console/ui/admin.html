@@ -796,7 +796,6 @@ sudo systemctl start cloudflared</pre>
             ${a.enabled && a.update_history && a.update_history.length
               ? '<button class="btn btn--ghost" data-action="rollback" data-slug="' + escapeHtml(a.slug) + '">Roll back</button>'
               : ''}
-            <button class="btn btn--ghost" data-action="container-logs" data-slug="${escapeHtml(a.slug)}">View container logs</button>
           </div>
           ${a.update_history && a.update_history.length ? `
             <details class="app-card__history">
@@ -818,13 +817,7 @@ sudo systemctl start cloudflared</pre>
       }).join('');
 
       list.querySelectorAll('button[data-action]').forEach(btn => {
-        btn.addEventListener('click', () => {
-          if (btn.dataset.action === 'container-logs') {
-            viewContainerLogs(btn);
-          } else {
-            toggle(btn);
-          }
-        });
+        btn.addEventListener('click', () => toggle(btn));
       });
     }
 
@@ -870,36 +863,6 @@ sudo systemctl start cloudflared</pre>
         out.textContent = 'request failed: ' + err.message;
       } finally {
         await refresh();
-      }
-    }
-
-    // Phase 8.5 v1.2 — on-demand container logs. Hits the
-    // /api/v1/container-logs endpoint and dumps text/plain into the
-    // same <pre> the toggle output uses. Re-running replaces the
-    // contents (no append) so the operator can re-tail without scroll
-    // confusion. Unlike toggle, this is non-destructive — the button
-    // re-enables itself on completion regardless of success.
-    async function viewContainerLogs(btn) {
-      const slug = btn.dataset.slug;
-      const card = document.getElementById('app-' + slug);
-      const out  = card.querySelector('.app-card__output');
-      const orig = btn.textContent;
-      btn.disabled = true;
-      btn.textContent = 'Loading…';
-      out.hidden = false;
-      out.textContent = 'Fetching last 200 lines…';
-      try {
-        const r = await fetch('/api/v1/container-logs/' + encodeURIComponent(slug) + '?lines=200',
-                              { credentials: 'same-origin' });
-        const text = await r.text();
-        out.textContent = r.ok ? text : ('error (HTTP ' + r.status + '):\n' + text);
-        // Auto-scroll to bottom — most useful tail is at the end.
-        out.scrollTop = out.scrollHeight;
-      } catch (err) {
-        out.textContent = 'request failed: ' + err.message;
-      } finally {
-        btn.textContent = orig;
-        btn.disabled = false;
       }
     }
 
