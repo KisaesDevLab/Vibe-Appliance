@@ -156,11 +156,22 @@ enable_app() {
   # DNS being healthy yet.
   if ! _wait_for_app_health "$slug" "$manifest"; then
     _state_app_set "$slug" status failed error "health check timeout"
-    log_step "last 50 lines of $slug logs"
+    # Visible divider so the operator scanning the toggle output can
+    # find the actual container logs amid the bash trace. The runToggle
+    # endpoint captures stderr verbatim and surfaces it in the app card,
+    # so this banner shows up in the UI too — not just enable-app.log.
+    {
+      printf '\n========================================\n'
+      printf '== Container logs (last 50 lines)\n'
+      printf '== from: docker compose -f %s -f apps/%s.yml logs --tail=50 %s\n' \
+        "docker-compose.yml" "$slug" "$services"
+      printf '========================================\n'
+    } >&2
     # shellcheck disable=SC2086
-    ( cd "$APPLIANCE_DIR" && docker compose -f docker-compose.yml -f "apps/${slug}.yml" logs --tail=50 $services ) \
+    ( cd "$APPLIANCE_DIR" && docker compose -f docker-compose.yml -f "apps/${slug}.yml" logs --tail=50 --no-color $services ) \
       2>&1 | tee -a "$VIBE_LOG_FILE" >&2 || true
-    die "App $slug did not become healthy within 120s. See logs above."
+    printf '========================================\n\n' >&2
+    die "App $slug did not become healthy within 120s. See container logs above."
   fi
 
   # 7. Re-render Caddyfile and reload Caddy so the new vhost goes live.
