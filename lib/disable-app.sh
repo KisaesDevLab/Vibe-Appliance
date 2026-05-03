@@ -42,13 +42,21 @@ disable_app() {
   [[ -f "$manifest" ]] || die "manifest not found: $manifest"
 
   # Compute service names BEFORE flipping enabled=false so the
-  # manifest-driven extraction is unambiguous. These are the only
-  # containers we touch — bare `compose stop` would take down every
-  # service in the merged file, which includes Caddy, Postgres,
-  # Redis, the console, Duplicati, Portainer. That'd be catastrophic.
+  # extraction is unambiguous. We need EVERY service the overlay
+  # declares — not just the ones Caddy reverse-proxies — because
+  # backend tiers (vibe-connect-server, vibe-tb-server, etc.) are
+  # depends_on TARGETS, not routing upstreams, and a manifest-driven
+  # list misses them. Missing them leaves orphan containers that
+  # compose warns about on the next bootstrap and that keep eating
+  # RAM until the host reboots.
+  #
+  # Bare `compose stop` (no args) is NOT an option — it would take
+  # down every service in the merged file (Caddy, Postgres, Redis,
+  # the console, Duplicati, Portainer), which would be catastrophic.
+  # The diff approach gives us exactly the overlay's contribution.
   local services
-  services="$(_app_services "$manifest")"
-  [[ -n "$services" ]] || die "could not derive service names from manifest routing for $slug"
+  services="$(_overlay_services "$slug")"
+  [[ -n "$services" ]] || die "could not derive service names from overlay $overlay"
 
   log_step "disabling app" slug="$slug" services="$services"
 
@@ -98,42 +106,23 @@ disable_app() {
   log_ok "$slug stopped (data preserved under /opt/vibe/data)"
 }
 
-# Manifest field reader (Python eval over `data`).
-_manifest_field() {
-  local file="$1" expr="$2"
-  python3 - "$file" "$expr" <<'PYEOF'
-import json, sys
-with open(sys.argv[1]) as f:
-    data = json.load(f)
-v = eval(sys.argv[2], {"data": data})
-if v is None:
-    sys.exit(0)
-print(v)
-PYEOF
-}
-
-# Same shape as enable-app.sh's _app_services. Duplicated rather than
-# sourced because both scripts run as standalone /bin/bash entries
-# from the console's spawn paths.
-_app_services() {
-  local manifest="$1"
-  python3 - "$manifest" <<'PYEOF'
-import json, re, sys
-with open(sys.argv[1]) as f:
-    m = json.load(f)
-upstream_re = re.compile(r"^([a-z0-9.-]+):\d+$")
-seen = []
-def add(spec):
-    if not spec: return
-    mm = upstream_re.match(spec)
-    if mm and mm.group(1) not in seen:
-        seen.append(mm.group(1))
-routing = m.get("routing", {})
-add(routing.get("default_upstream", ""))
-for matcher in routing.get("matchers", []) or []:
-    add(matcher.get("upstream", ""))
-print(" ".join(seen))
-PYEOF
+# Every service the overlay contributes — i.e. the merged service set
+# minus the core set. We use `docker compose config --services` because
+# it's the canonical compose interpretation and doesn't require a YAML
+# library on the host. The two-call diff is deliberate: parsing the
+# overlay alone would fail because the overlay references vibe_net,
+# which is declared only in docker-compose.yml.
+#
+# Output order is deterministic because both `config --services`
+# invocations sort alphabetically; comm preserves that.
+_overlay_services() {
+  local slug="$1"
+  local core_compose="${APPLIANCE_DIR}/docker-compose.yml"
+  local overlay="${APPLIANCE_DIR}/apps/${slug}.yml"
+  local all_svc core_svc
+  all_svc="$(docker compose -f "$core_compose" -f "$overlay" config --services 2>/dev/null | sort -u)"
+  core_svc="$(docker compose -f "$core_compose" config --services 2>/dev/null | sort -u)"
+  comm -23 <(printf '%s\n' "$all_svc") <(printf '%s\n' "$core_svc") | tr '\n' ' '
 }
 
 # Same helper as in enable-app.sh — duplicated rather than sourced both

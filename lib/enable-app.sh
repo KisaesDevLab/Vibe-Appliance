@@ -764,9 +764,17 @@ PYEOF
 # is always up and on vibe_net, and it has curl installed (carried in
 # from the docker.com apt setup in console/Dockerfile). Each probe
 # costs ~50 ms instead of 1-2 s of container spawn.
+#
+# Crashloop fast-path: if the upstream container's docker state is
+# anything but `running` after a failed probe, return early with the
+# container's logs surfaced. Without this, a container that crashes at
+# startup (bad config, missing cert, port conflict) would burn the
+# full health timeout while every probe returned "Could not resolve
+# host" — a misleading symptom that sends the operator hunting for a
+# DNS bug instead of reading the actual crash reason.
 _wait_for_app_health() {
   local slug="$1" manifest="$2"
-  local upstream health timeout_s
+  local upstream health timeout_s container
   # The python expression runs through `eval()`. Multi-line expressions
   # outside brackets parse as two statements with the second
   # erroneously indented — that yields an IndentationError at eval
@@ -779,6 +787,10 @@ _wait_for_app_health() {
   # higher because it loads a 461 MiB vision model on startup.
   timeout_s="$(_manifest_field "$manifest" 'data.get("health_timeout_s", 120)')"
   timeout_s="${timeout_s:-120}"
+  # Probe target's container_name (e.g. vibe-connect-client:80 →
+  # vibe-connect-client). We compare the container's State.Status
+  # against `running` to decide whether to keep waiting or bail.
+  container="${upstream%:*}"
 
   log_step "waiting for $slug health" upstream="$upstream" path="$health" timeout_s="$timeout_s"
 
@@ -789,6 +801,24 @@ _wait_for_app_health() {
       log_ok "$slug is healthy"
       return 0
     fi
+    # Probe failed. If the container isn't running, no amount of
+    # additional waiting will help — surface the crash logs and bail.
+    # `docker inspect` can still race with compose during the very
+    # first second after `up -d`, so an empty/unknown status is treated
+    # as "keep waiting" rather than fatal.
+    local status
+    status="$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null || true)"
+    case "$status" in
+      running|"") : ;;  # keep waiting
+      restarting|exited|dead|removing|paused|created)
+        log_error "container $container is in state '$status' — not waiting for /health"
+        log_error "last 50 lines of docker logs $container:"
+        docker logs --tail 50 "$container" 2>&1 | sed 's/^/  | /' >&2 || true
+        # Also tee to the log file for the post-mortem in /opt/vibe/logs.
+        docker logs --tail 50 "$container" >>"$VIBE_LOG_FILE" 2>&1 || true
+        return 1
+        ;;
+    esac
     sleep 3
   done
   return 1
