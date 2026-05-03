@@ -62,7 +62,7 @@
     "type":     "default-credentials-forced-reset",
     "username": "admin",
     "password": "admin1234",
-    "note":     "Source: upstream seed server/seeds/001_default_admin.js. First login forces a password rotation. If 'invalid credentials', the seed didn't run — diagnose with: sudo docker exec vibe-postgres psql -U vibetb -d vibe_tb_db -c 'SELECT username FROM users;'.",
+    "note":     "Source: upstream seed server/seeds/001_default_admin.js, run automatically by enable-app.sh after migrations. App forces a password rotation on first login. If you see 'invalid credentials', re-run the seed manually: sudo docker exec vibe-tb-server node dist/seed.js",
     "url":      "/login"
   },
 
@@ -71,5 +71,10 @@
   "migrations": {
     "command":    ["node", "dist/migrate.js"],
     "autoEnvVar": "MIGRATIONS_AUTO"
+  },
+
+  "seed": {
+    "command":     ["node", "dist/seed.js"],
+    "description": "Inserts the default admin user (admin / admin1234). Without this step the app starts with no users and the operator can't log in. Run-once via state.apps.vibe-tb.seeded — re-runs would hit a unique-constraint violation."
   }
 }

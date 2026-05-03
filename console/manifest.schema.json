@@ -213,6 +213,17 @@
         "command":    { "type": "array", "items": { "type": "string" }, "minItems": 1 },
         "autoEnvVar": { "type": "string" }
       }
+    },
+
+    "seed": {
+      "type": "object",
+      "required": ["command"],
+      "additionalProperties": false,
+      "description": "Optional. Run-once command (executed via docker exec on the server container) for apps whose admin-user seed is separate from migrations. enable-app.sh runs this after _wait_for_app_health succeeds and gates re-runs via state.apps.<slug>.seeded. See docs/MANIFEST_SCHEMA.md#seed.",
+      "properties": {
+        "command":     { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "description": { "type": "string" }
+      }
     }
   },
 

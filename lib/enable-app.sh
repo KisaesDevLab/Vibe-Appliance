@@ -197,6 +197,17 @@ enable_app() {
     die "App $slug did not become healthy within 120s. See container logs above."
   fi
 
+  # 6b. Run the manifest's seed command (if any) once. Some upstream
+  # apps ship migrations and admin-user seeds as separate invocations
+  # — Vibe-TB does this: MIGRATIONS_AUTO=true runs migrations on
+  # container start, but the admin-user seed (server/src/seed.ts) is
+  # a separate `node dist/seed.js`. Without this step, the operator
+  # sees admin/admin1234 in the First-login info card and gets
+  # "invalid credentials" because the user row was never inserted.
+  # State.apps.<slug>.seeded gates re-runs (true → skip).
+  _run_app_seed_if_needed "$slug" "$manifest" \
+    || log_warn "seed for $slug did not complete; check container logs and re-run manually if login fails" slug="$slug"
+
   # 7. Re-render Caddyfile and reload Caddy so the new vhost goes live.
   log_step "re-rendering Caddyfile to include $slug"
   render_caddyfile \
@@ -418,6 +429,81 @@ PYEOF
 # ANTHROPIC_API_KEY) are also preserved by merging the new render with
 # the existing file: anything in the existing file but NOT in the
 # template is kept; anything in the template wins for keys it touches.
+# Run the manifest's optional `seed` command exactly once per install.
+# Triggered from enable-app.sh after _wait_for_app_health succeeds.
+#
+# Manifest shape:
+#   "seed": {
+#     "command":     ["node", "dist/seed.js"],
+#     "description": "Inserts the default admin user."
+#   }
+#
+# Idempotency: state.apps.<slug>.seeded is set to "true" on success.
+# Re-running enable on an already-seeded app is a no-op for this step.
+# The bash `_state_app_set <slug> seeded true` writes the flag.
+#
+# Failure semantics: if the seed command exits non-zero, log a warning
+# and return non-zero so the caller can flag it — but don't `die` and
+# tear down the enable. The app is healthy; it just lacks the seed
+# user. The admin can run the seed manually via:
+#   sudo docker exec <container> <command>
+# (the diagnostic docker-exec hint shows up in enable-app.log).
+_run_app_seed_if_needed() {
+  local slug="$1" manifest="$2"
+
+  # Manifests without a seed block: nothing to do.
+  local has_seed
+  has_seed="$(_manifest_field "$manifest" '"yes" if "seed" in data and isinstance(data["seed"], dict) and data["seed"].get("command") else ""')"
+  [[ "$has_seed" != "yes" ]] && return 0
+
+  # Already seeded? state.apps.<slug>.seeded == "True" (python's bool repr
+  # via _state_get → "True" / "False" / empty).
+  local seeded
+  seeded="$(python3 -c "
+import json
+try:
+    s = json.load(open('${VIBE_STATE_FILE}'))
+    print(s.get('apps', {}).get('${slug}', {}).get('seeded', False))
+except Exception:
+    print(False)
+" 2>/dev/null)"
+  if [[ "$seeded" == "True" ]]; then
+    log_info "seed already ran for $slug; skipping" slug="$slug"
+    return 0
+  fi
+
+  # Resolve the target container — the server's container_name from
+  # routing.default_upstream (e.g. "vibe-tb-server:3000" → "vibe-tb-server").
+  local upstream container
+  upstream="$(_manifest_field "$manifest" 'data["routing"]["default_upstream"]')"
+  container="${upstream%:*}"
+  [[ -n "$container" ]] || { log_warn "could not resolve seed target container" slug="$slug"; return 1; }
+
+  # Pull the command into a bash array via python so multi-arg commands
+  # with spaces, quotes, etc. survive intact. Python writes one arg per
+  # line; mapfile reconstructs the array. Equivalent to xargs but with
+  # JSON-correct quote handling.
+  local seed_cmd_json
+  seed_cmd_json="$(_manifest_field "$manifest" 'json.dumps(data["seed"]["command"])')"
+  local -a seed_cmd
+  mapfile -t seed_cmd < <(python3 -c "
+import json, sys
+for x in json.loads(sys.argv[1]):
+    print(x)
+" "$seed_cmd_json")
+  [[ ${#seed_cmd[@]} -gt 0 ]] || { log_warn "seed command is empty" slug="$slug"; return 1; }
+
+  log_step "running seed for $slug" container="$container" cmd="${seed_cmd[*]}"
+  if docker exec "$container" "${seed_cmd[@]}" >>"$VIBE_LOG_FILE" 2>&1; then
+    log_ok "seed completed for $slug"
+    _state_app_set "$slug" seeded true
+    return 0
+  fi
+  # On failure, surface what to run by hand.
+  log_warn "seed exited non-zero — manual recovery: sudo docker exec $container ${seed_cmd[*]}" slug="$slug"
+  return 1
+}
+
 # Pre-create and chown the bind-mount source directories under
 # /opt/vibe/data/apps/<slug>/ so the container's runtime user can write
 # to them. Without this, Docker auto-creates bind-mount source paths as

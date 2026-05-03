@@ -273,6 +273,35 @@ silent breakage happens at the worst possible moment (April 14, 11pm).
 
 ---
 
+## `seed`
+
+```jsonc
+"seed": {
+  "command":     ["node", "dist/seed.js"],          // run inside the server container
+  "description": "Inserts the default admin user."  // surfaced in enable-app logs
+}
+```
+
+Optional. For apps that ship their admin-user seed as a separate
+invocation from migrations (Vibe-TB does this — `node dist/migrate.js`
+creates the schema, `node dist/seed.js` inserts the admin row). Without
+this step the app starts with an empty users table and the operator
+gets "invalid credentials" trying the password the First-login info
+card displays.
+
+The appliance runs this exactly once after `_wait_for_app_health`
+returns. Subsequent enables check `state.apps.<slug>.seeded` and skip
+when set. To force a re-seed (e.g. after wiping the per-app DB),
+remove that key from `state.json` and re-enable, OR run the command
+manually via `docker exec`.
+
+Failure semantics: a non-zero exit from the seed command produces a
+WARN, not a FAIL. The app stays running and the rest of the enable
+completes. The operator gets a hint in the logs telling them how to
+re-run the seed by hand.
+
+---
+
 ## Validation
 
 Manifests are validated against `console/manifest.schema.json` at:
