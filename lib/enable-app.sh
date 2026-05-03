@@ -104,14 +104,20 @@ enable_app() {
     || { _state_app_set "$slug" status failed error "env render failed"; \
          die "Could not render $env_out"; }
 
-  # 2. Pull images for the overlay (only the app's services).
+  # 2. Pull images for the overlay. --include-deps pulls services that
+  # the named services depend on (e.g. vibe-connect-client depends_on
+  # vibe-connect-server, so both get pulled). Without this, the chown
+  # step at 4b can't read the server image's USER directive — docker
+  # inspect on a not-yet-pulled image returns empty Config.User and
+  # the helper falls back to root, leaving the bind mount with wrong
+  # ownership when compose later auto-pulls the server.
   log_step "pulling images for $slug" services="$services"
   local default_tag
   default_tag="$(_manifest_field "$manifest" 'data["image"]["defaultTag"]')"
   export APP_TAG="$default_tag"
   # shellcheck disable=SC2086
   if ! ( cd "$APPLIANCE_DIR" && \
-         docker compose -f docker-compose.yml -f "apps/${slug}.yml" pull $services ) >>"$VIBE_LOG_FILE" 2>&1; then
+         docker compose -f docker-compose.yml -f "apps/${slug}.yml" pull --include-deps $services ) >>"$VIBE_LOG_FILE" 2>&1; then
     _state_app_set "$slug" status failed error "image pull failed"
     die "Image pull failed for $slug. See $VIBE_LOG_FILE; common cause is a registry rate limit."
   fi
@@ -535,6 +541,19 @@ _seed_app_data_dirs() {
   default_tag="$(_manifest_field "$manifest" 'data["image"]["defaultTag"]')"
   default_tag="${default_tag:-latest}"
   local image="${server_image}:${default_tag}"
+
+  # Defense in depth: if step 2's pull missed this image (e.g. an
+  # older overlay where --include-deps didn't propagate, or an image
+  # listed in compose only as a depends_on target), pull it now.
+  # docker inspect on a missing image returns empty Config.User which
+  # falls back to root in _image_uid_gid, leaving the bind mount with
+  # wrong ownership. Pulling here costs ~10s once and is idempotent.
+  if ! docker image inspect "$image" >/dev/null 2>&1; then
+    log_step "pulling $image to read its USER directive"
+    if ! docker pull "$image" >>"$VIBE_LOG_FILE" 2>&1; then
+      log_warn "could not pull $image; UID will fall back to root and bind mount may end up with wrong ownership" image="$image"
+    fi
+  fi
 
   local uid_gid
   uid_gid="$(_image_uid_gid "$image")"
