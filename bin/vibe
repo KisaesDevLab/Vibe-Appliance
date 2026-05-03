@@ -30,6 +30,9 @@ COMMANDS
                                rollback on failure).
   update  <slug> --rollback    Roll back to the prior image.
   status                       Print the current state.json snapshot.
+  credentials                  Print /opt/vibe/CREDENTIALS.txt to stdout.
+                               Pipe-friendly for SSH-based download:
+                                 ssh host 'sudo vibe credentials' > local.txt
   logs   [name]                Tail /opt/vibe/logs/<name>.log
                                (defaults to bootstrap.log).
   bootstrap [args…]            Re-run the full bootstrap.
@@ -65,6 +68,23 @@ case "$cmd" in
       echo "no state.json yet — has bootstrap run?" >&2
       exit 1
     fi
+    ;;
+  credentials|creds)
+    # Print CREDENTIALS.txt to stdout. The file is mode 600 root-owned
+    # so this needs sudo. The pipe-friendly invocation is the whole
+    # point — operators do `ssh host 'sudo vibe credentials' > local.txt`
+    # to grab the file from a workstation without sftp gymnastics.
+    file="/opt/vibe/CREDENTIALS.txt"
+    if [[ ! -e "$file" ]]; then
+      echo "no $file yet — bootstrap hasn't completed phase 8 (credentials)" >&2
+      exit 1
+    fi
+    if [[ ! -r "$file" ]]; then
+      echo "$file exists but is not readable by uid $(id -u). Run via sudo:" >&2
+      echo "  sudo vibe credentials" >&2
+      exit 1
+    fi
+    exec cat "$file"
     ;;
   logs)
     name="${1:-bootstrap}"
