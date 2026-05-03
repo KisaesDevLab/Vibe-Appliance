@@ -137,6 +137,14 @@ enable_app() {
   # enable doesn't have that, and a wrong manifest.migrations.command
   # would unrecoverably fail every first-enable.)
 
+  # 4b. Pre-create + chown the per-app data directory so a non-root
+  # container user (e.g. vibe-connect-server runs as uid 10001) can
+  # write into the bind-mounted volume. Without this, Docker creates
+  # the host path as root:root on first volume mount and the container
+  # crashes with EACCES on first mkdir of a sub-directory.
+  _seed_app_data_dirs "$slug" "$manifest" \
+    || log_warn "could not pre-seed data dirs for $slug; container may hit EACCES" slug="$slug"
+
   # 5. Bring up the app's services (only theirs — bare `up -d` would
   # un-stop core services the operator may have manually stopped).
   log_step "starting containers for $slug" services="$services"
@@ -410,6 +418,95 @@ PYEOF
 # ANTHROPIC_API_KEY) are also preserved by merging the new render with
 # the existing file: anything in the existing file but NOT in the
 # template is kept; anything in the template wins for keys it touches.
+# Pre-create and chown the bind-mount source directories under
+# /opt/vibe/data/apps/<slug>/ so the container's runtime user can write
+# to them. Without this, Docker auto-creates bind-mount source paths as
+# root:root and any non-root container user (most upstream images
+# nowadays) crashes with EACCES on first mkdir.
+#
+# Strategy: resolve the server image's runtime UID:GID, mkdir the
+# top-level /opt/vibe/data/apps/<slug>/ if missing, and chown -R it.
+# The recursive chown is safe because the path is owned exclusively by
+# this app (appliance convention; data dirs are bind-mounted from
+# /opt/vibe/data/apps/<slug>/...). If the image runs as root (USER not
+# set or set to 0), the chown is a no-op and we skip it cleanly.
+#
+# Idempotent: re-running on an already-correct tree is a fast no-op
+# (chown -R only writes inodes whose ownership actually changes on
+# modern filesystems, and even on older ones the operation is harmless).
+_seed_app_data_dirs() {
+  local slug="$1" manifest="$2"
+  local data_dir="${VIBE_DIR}/data/apps/${slug}"
+  local server_image
+  server_image="$(_manifest_field "$manifest" 'data["image"]["server"]')"
+  if [[ -z "$server_image" ]]; then
+    log_info "no manifest.image.server; skipping data-dir chown" slug="$slug"
+    return 0
+  fi
+
+  # Tag to inspect — match what compose uses (manifest defaultTag).
+  local default_tag
+  default_tag="$(_manifest_field "$manifest" 'data["image"]["defaultTag"]')"
+  default_tag="${default_tag:-latest}"
+  local image="${server_image}:${default_tag}"
+
+  local uid_gid
+  uid_gid="$(_image_uid_gid "$image")"
+  if [[ -z "$uid_gid" || "$uid_gid" == "0:0" ]]; then
+    log_info "image runs as root; no chown needed" slug="$slug" image="$image"
+    mkdir -p "$data_dir"
+    return 0
+  fi
+
+  log_step "ensuring $data_dir is owned by $uid_gid (image $image)"
+  mkdir -p "$data_dir"
+  chown -R "$uid_gid" "$data_dir" \
+    || { log_warn "chown failed on $data_dir" uid_gid="$uid_gid"; return 1; }
+  return 0
+}
+
+# Resolve the runtime UID:GID for a Docker image.
+#   - empty USER directive            → 0:0 (root)
+#   - numeric USER ("1000" or "1:2")  → returned verbatim (single → both)
+#   - named USER ("vibe", "node")     → resolved by running `id -u && id -g`
+#                                        in a one-shot container with the
+#                                        image's default entrypoint replaced
+#                                        by sh, so we don't trigger the app's
+#                                        own startup logic.
+# Always echoes "<uid>:<gid>" — falls back to 0:0 on any error so the
+# caller can tell "skip chown" from "actually root."
+_image_uid_gid() {
+  local image="$1"
+  local user
+  user="$(docker inspect "$image" --format '{{.Config.User}}' 2>/dev/null || true)"
+  if [[ -z "$user" ]]; then
+    printf '0:0'
+    return 0
+  fi
+  if [[ "$user" =~ ^[0-9]+(:[0-9]+)?$ ]]; then
+    if [[ "$user" == *:* ]]; then
+      printf '%s' "$user"
+    else
+      printf '%s:%s' "$user" "$user"
+    fi
+    return 0
+  fi
+  # Named user — resolve via the image. --entrypoint sh skips the app's
+  # actual entrypoint (e.g. server boot) so we don't pay startup cost
+  # or trigger env validation.
+  local out
+  out="$(docker run --rm --entrypoint sh "$image" -c 'id -u; id -g' 2>/dev/null || true)"
+  local uid gid
+  uid="$(echo "$out" | sed -n '1p' | tr -d '[:space:]')"
+  gid="$(echo "$out" | sed -n '2p' | tr -d '[:space:]')"
+  if [[ -z "$uid" || -z "$gid" ]]; then
+    log_warn "could not resolve UID:GID for $image (got user=$user); falling back to root" image="$image"
+    printf '0:0'
+    return 0
+  fi
+  printf '%s:%s' "$uid" "$gid"
+}
+
 _render_app_env() {
   local slug="$1" manifest="$2" tmpl="$3" out="$4"
 
