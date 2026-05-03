@@ -155,16 +155,20 @@ enable_app() {
   # un-stop core services the operator may have manually stopped).
   log_step "starting containers for $slug" services="$services"
   # Tee compose output to BOTH the log file AND stderr so the runToggle
-  # endpoint surfaces it in the app card. Previous version sent it
-  # only to the file, which meant a failed `docker compose up -d`
-  # produced a generic "compose up failed" in the UI without the actual
-  # compose error visible. PIPESTATUS[0] catches docker's exit code
-  # through the tee.
+  # endpoint surfaces it in the app card. Previously this used a bare
+  # pipeline followed by `if (( PIPESTATUS[0] != 0 ))`, but with
+  # `errexit + pipefail` (set by bootstrap.sh and by enable-app.sh's
+  # own standalone wrapper) a failed compose-up triggers errexit on
+  # the pipeline and kills the (sub)shell BEFORE the if-check runs —
+  # so the log-dump branch was never reached. Wrapping in `|| { ... }`
+  # puts the pipeline in an OR-list, which suppresses errexit, and
+  # routes failure into the same handler intentionally.
   # shellcheck disable=SC2086
-  ( cd "$APPLIANCE_DIR" && \
-      docker compose -f docker-compose.yml -f "apps/${slug}.yml" up -d $services ) \
-    2>&1 | tee -a "$VIBE_LOG_FILE" >&2
-  if (( ${PIPESTATUS[0]} != 0 )); then
+  {
+    ( cd "$APPLIANCE_DIR" && \
+        docker compose -f docker-compose.yml -f "apps/${slug}.yml" up -d $services ) \
+      2>&1 | tee -a "$VIBE_LOG_FILE" >&2
+  } || {
     _state_app_set "$slug" status failed error "compose up failed"
     {
       printf '\n========================================\n'
@@ -178,7 +182,7 @@ enable_app() {
       2>&1 | tee -a "$VIBE_LOG_FILE" >&2 || true
     printf '========================================\n\n' >&2
     die "Could not bring up $slug. See compose output and container logs above."
-  fi
+  }
 
   # 6. Wait for the app's /health (manifest.health). We use Caddy's
   # internal address rather than the public URL so we don't depend on
