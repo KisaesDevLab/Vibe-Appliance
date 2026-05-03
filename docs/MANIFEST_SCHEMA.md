@@ -36,11 +36,27 @@ document is the human-readable companion.
 
   "env":        { ... },                    // required envelope, see below
   "database":   { ... },                    // optional; omit for stateless apps
+  "requiredExtensions": ["vector"],         // optional; PG extensions the app's migrations need
 
   "firstLogin": { ... },                    // optional, default credentials surfaced in admin
   "health":     "/api/v1/health",           // required, path that returns 200 only when fully up
   "migrations": { ... }                     // optional; how the appliance runs migrations
 }
+
+### `requiredExtensions`
+
+Optional array of Postgres extension names (lowercase, e.g. `vector`,
+`pg_search`) that the app's migrations will `CREATE EXTENSION`.
+`enable-app.sh`'s pre-flight queries `pg_available_extensions` on
+`vibe-postgres` and refuses to enable the app if any are missing —
+turning the would-be confusing mid-migration failure ("extension X
+is not available") into a clean, actionable error before the app
+container ever starts.
+
+The shared Postgres image declared in this repo's `docker-compose.yml`
+is `paradedb/paradedb:0.23.2-pg16`, which provides `vector` and
+`pg_search`. If you override that image, the override must ship every
+`requiredExtensions` value used by every enabled app.
 ```
 
 ---

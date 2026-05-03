@@ -331,6 +331,56 @@ Fix:      sudo docker compose -f /opt/vibe/appliance/docker-compose.yml restart 
   fi
 }
 
+# vibe-postgres should be ParadeDB so vector + pg_search are available
+# for vibe-tax-research's hybrid retrieval (and any future app that
+# declares either as a requiredExtension). If the operator has swapped
+# in a different image, surface it here BEFORE an enable-app preflight
+# would catch it — running doctor is a faster feedback loop than
+# clicking Enable in the admin UI.
+#
+# We don't FAIL on missing extensions, only WARN: a deployment that
+# never enables vector-using apps is fine on stock postgres:16.
+check_postgres_extensions() {
+  _check_begin "Postgres extensions (vector + pg_search via ParadeDB)"
+  local image
+  image="$(docker inspect vibe-postgres --format '{{.Config.Image}}' 2>/dev/null || echo "")"
+  if [[ -z "$image" ]]; then
+    _check_warn "could not inspect vibe-postgres image"
+    return
+  fi
+
+  # Query pg_available_extensions for the two extensions we ship for.
+  # tA = tuples-only + unaligned, gives one extension name per line.
+  local available
+  available="$(docker exec vibe-postgres psql -U postgres -tA -c \
+    "SELECT name FROM pg_available_extensions WHERE name IN ('vector','pg_search') ORDER BY 1;" \
+    2>/dev/null | tr -d ' \r' | sort -u)"
+
+  local has_vector=0 has_pg_search=0
+  echo "$available" | grep -qx vector    && has_vector=1
+  echo "$available" | grep -qx pg_search && has_pg_search=1
+
+  if (( has_vector == 1 && has_pg_search == 1 )); then
+    _check_pass "both extensions available (image: $image)"
+  elif (( has_vector == 0 && has_pg_search == 0 )); then
+    _check_warn "neither vector nor pg_search are in pg_available_extensions" \
+      "vibe-postgres is currently running: $image
+Apps that declare requiredExtensions (e.g. vibe-tax-research) will refuse
+to enable until the shared Postgres provides them.
+Fix: restore the docker-compose.yml default
+       image: paradedb/paradedb:0.23.2-pg16
+     then sudo docker compose -f /opt/vibe/appliance/docker-compose.yml \\
+            up -d --force-recreate postgres"
+  else
+    local missing=""
+    (( has_vector == 0 ))    && missing+=" vector"
+    (( has_pg_search == 0 )) && missing+=" pg_search"
+    _check_warn "missing extension(s):$missing (image: $image)" \
+      "Some apps will refuse to enable. Use ParadeDB or another distribution
+that includes these:$missing"
+  fi
+}
+
 check_redis_connectivity() {
   _check_begin "Redis connectivity"
   # Redis is auth-required; pull the password from shared.env.
@@ -785,6 +835,7 @@ check_core_container vibe-redis    "Redis"
 check_core_container vibe-console  "Console"
 
 check_postgres_connectivity
+check_postgres_extensions
 check_redis_connectivity
 check_console_health
 

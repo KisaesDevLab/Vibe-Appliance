@@ -57,6 +57,8 @@
   "database": { "name": "vibe_tax_research_db", "user": "vibetaxresearch" },
   "redis":    { "db": 3 },
 
+  "requiredExtensions": ["vector", "pg_search"],
+
   "firstLogin": {
     "type": "setup-wizard",
     "note": "First-run wizard at /setup creates the SuperAdmin. The dev-only seed (SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD in upstream .env.example) is NOT applied in appliance mode — those env vars are unset.",

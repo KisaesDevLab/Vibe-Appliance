@@ -332,7 +332,55 @@ PYEOF
     ((errors++)) || true
   fi
 
-  # 7. Env render dry-run — does the template have any @MARKER@s the
+  # 7. Required Postgres extensions are available on the shared
+  # cluster. Manifest declares `requiredExtensions` (e.g.
+  # vibe-tax-research's hybrid retrieval needs `vector` + `pg_search`).
+  # If the operator has overridden the postgres image to one that
+  # doesn't ship them, the app's first migration would fail mid-run
+  # with a confusing "extension X is not available" error AFTER the
+  # container had already created roles + spent time pulling. Catch
+  # it here and turn the failure into a clean preflight FAIL with a
+  # pointer at the right config knob.
+  if [[ "$missing_containers" != *vibe-postgres* ]]; then
+    local req_exts
+    req_exts="$(_manifest_field "$manifest" '" ".join(data.get("requiredExtensions") or [])')"
+    if [[ -n "$req_exts" ]]; then
+      local missing_exts="" ext
+      for ext in $req_exts; do
+        # Whitelist extension name shape — protects the SQL
+        # interpolation below from a malicious manifest, and catches
+        # typos at lint time.
+        case "$ext" in
+          [a-z_]*) ;;
+          *)
+            log_error "preflight FAIL: invalid requiredExtensions entry '$ext' (lowercase letters / digits / underscores only)"
+            ((errors++)) || true
+            continue
+            ;;
+        esac
+        if ! docker exec vibe-postgres psql -U "${POSTGRES_USER:-postgres}" -tA -c \
+               "SELECT 1 FROM pg_available_extensions WHERE name = '$ext';" 2>/dev/null \
+               | grep -q '^1$'; then
+          missing_exts+=" $ext"
+        fi
+      done
+      if [[ -n "$missing_exts" ]]; then
+        log_error "preflight FAIL: postgres image lacks required extension(s):$missing_exts"
+        log_error "         The appliance's shared Postgres (vibe-postgres) must ship the"
+        log_error "         extensions declared in $slug's manifest.requiredExtensions."
+        log_error "         Default image in docker-compose.yml is"
+        log_error "             paradedb/paradedb:0.23.2-pg16"
+        log_error "         which provides vector + pg_search. If your docker-compose.yml"
+        log_error "         has a different postgres image, switch back to ParadeDB or"
+        log_error "         pick another distribution that includes:$missing_exts"
+        log_error "         Diagnose: sudo docker exec vibe-postgres psql -U postgres -c \\"
+        log_error "                   \"SELECT name FROM pg_available_extensions ORDER BY 1;\""
+        ((errors++)) || true
+      fi
+    fi
+  fi
+
+  # 8. Env render dry-run — does the template have any @MARKER@s the
   # renderer doesn't fill? This is the bug class that historically
   # bit Vibe-Payroll (SECRETS_ENCRYPTION_KEY), Vibe-MyBooks
   # (PLAID_ENCRYPTION_KEY), Vibe-Tax-Research (MASTER_KEY +

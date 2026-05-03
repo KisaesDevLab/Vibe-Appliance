@@ -180,6 +180,13 @@
       "description": "Logical Redis DB index (0-15). Each app gets its own to prevent key collisions on the shared Redis instance."
     },
 
+    "requiredExtensions": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z_][a-z0-9_]*$" },
+      "uniqueItems": true,
+      "description": "Postgres extensions the app's migrations CREATE EXTENSION on first boot (e.g. ['vector','pg_search']). enable-app's pre-flight queries pg_available_extensions and refuses to start the app if any are missing — turning a confusing mid-migration failure into a clean preflight FAIL with a hint pointing at docker-compose.yml's postgres image."
+    },
+
     "firstLogin": {
       "type": "object",
       "required": ["type"],

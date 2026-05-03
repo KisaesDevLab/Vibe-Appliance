@@ -607,6 +607,7 @@ phase_core_up() {
       vibe-console 2>/dev/null || true)"
     if [[ "$health" == "healthy" ]]; then
       log_ok "console healthy"
+      _check_core_image_drift
       state_set_phase core ok
       return 0
     fi
@@ -619,6 +620,60 @@ phase_core_up() {
   ( cd "$APPLIANCE_DIR" && docker compose logs --tail=50 console ) 2>&1 \
     | tee -a "$VIBE_LOG_FILE" >&2 || true
   die "Console health-check timed out. Inspect logs above and re-run."
+}
+
+# Verify each core service's running container is on the same image
+# the compose file currently declares. Catches the upgrade scenario
+# where docker-compose.yml's image: line changed (e.g. postgres bumped
+# from `postgres:16-alpine` to `paradedb/paradedb:0.23.2-pg16`) but
+# `docker compose up -d` decided not to recreate the container —
+# leaving the host on stale infrastructure under what looks like a
+# fresh bootstrap. We saw exactly this scenario during the ParadeDB
+# rollout: the compose file changed on disk, postgres stayed alpine,
+# vibe-tax-research's CREATE EXTENSION crashloop'd despite "everything
+# pulled." Surfaced as WARN (not fail) with the recovery command —
+# apps that don't depend on the new image keep working, the operator
+# decides whether to force-recreate.
+_check_core_image_drift() {
+  log_step "verifying core container images match docker-compose.yml"
+
+  local triples
+  triples="$(cd "$APPLIANCE_DIR" && docker compose config --format json 2>/dev/null \
+    | python3 - <<'PYEOF'
+import json, sys
+cfg = json.load(sys.stdin)
+for name, svc in cfg.get('services', {}).items():
+    img = svc.get('image') or ''
+    cname = svc.get('container_name') or ''
+    if img and cname:
+        print(f'{name}\t{img}\t{cname}')
+PYEOF
+)"
+
+  if [[ -z "$triples" ]]; then
+    log_warn "could not read docker-compose.yml services; skipping image-drift check"
+    return 0
+  fi
+
+  local drift=0
+  while IFS=$'\t' read -r svc declared_image container_name; do
+    [[ -z "$svc" ]] && continue
+    local running_image
+    running_image="$(docker inspect "$container_name" --format '{{.Config.Image}}' 2>/dev/null || true)"
+    # Container not running yet → not drift, just race during first
+    # boot; phase_core_up will re-pole until console is healthy and
+    # will catch any actual failures via that path.
+    [[ -z "$running_image" ]] && continue
+    if [[ "$running_image" != "$declared_image" ]]; then
+      log_warn "image drift: $container_name is running '$running_image' but compose declares '$declared_image'"
+      log_warn "             fix: sudo docker compose -f $APPLIANCE_DIR/docker-compose.yml up -d --force-recreate $svc"
+      ((drift++)) || true
+    fi
+  done <<<"$triples"
+
+  if (( drift == 0 )); then
+    log_ok "core container images match docker-compose.yml"
+  fi
 }
 
 # --- Phase 7+ — install host-side infra (Cockpit) --------------------
