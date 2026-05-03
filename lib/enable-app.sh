@@ -140,15 +140,30 @@ enable_app() {
   # 5. Bring up the app's services (only theirs — bare `up -d` would
   # un-stop core services the operator may have manually stopped).
   log_step "starting containers for $slug" services="$services"
+  # Tee compose output to BOTH the log file AND stderr so the runToggle
+  # endpoint surfaces it in the app card. Previous version sent it
+  # only to the file, which meant a failed `docker compose up -d`
+  # produced a generic "compose up failed" in the UI without the actual
+  # compose error visible. PIPESTATUS[0] catches docker's exit code
+  # through the tee.
   # shellcheck disable=SC2086
-  if ! ( cd "$APPLIANCE_DIR" && \
-         docker compose -f docker-compose.yml -f "apps/${slug}.yml" up -d $services ) >>"$VIBE_LOG_FILE" 2>&1; then
+  ( cd "$APPLIANCE_DIR" && \
+      docker compose -f docker-compose.yml -f "apps/${slug}.yml" up -d $services ) \
+    2>&1 | tee -a "$VIBE_LOG_FILE" >&2
+  if (( ${PIPESTATUS[0]} != 0 )); then
     _state_app_set "$slug" status failed error "compose up failed"
-    log_step "last 50 lines of $slug logs"
+    {
+      printf '\n========================================\n'
+      printf '== Container logs (last 50 lines)\n'
+      printf '== from: docker compose -f %s -f apps/%s.yml logs --tail=50 %s\n' \
+        "docker-compose.yml" "$slug" "$services"
+      printf '========================================\n'
+    } >&2
     # shellcheck disable=SC2086
-    ( cd "$APPLIANCE_DIR" && docker compose -f docker-compose.yml -f "apps/${slug}.yml" logs --tail=50 $services ) \
+    ( cd "$APPLIANCE_DIR" && docker compose -f docker-compose.yml -f "apps/${slug}.yml" logs --tail=50 --no-color $services ) \
       2>&1 | tee -a "$VIBE_LOG_FILE" >&2 || true
-    die "Could not bring up $slug. Inspect logs above and re-run."
+    printf '========================================\n\n' >&2
+    die "Could not bring up $slug. See compose output and container logs above."
   fi
 
   # 6. Wait for the app's /health (manifest.health). We use Caddy's
