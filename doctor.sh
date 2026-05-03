@@ -354,16 +354,27 @@ Fix:      sudo docker compose -f /opt/vibe/appliance/docker-compose.yml restart 
 
 check_console_health() {
   _check_begin "Console /health"
+  # From inside the console container, 127.0.0.1 is the container's own
+  # loopback — Caddy runs in a sibling container, not here. The console
+  # has host.docker.internal:host-gateway in its extra_hosts, so we
+  # reach Caddy via the published host port through that name. On the
+  # host shell, plain 127.0.0.1 works.
+  local target="http://127.0.0.1/health"
+  if _in_container; then
+    target="http://host.docker.internal/health"
+  fi
+  # -w '%{http_code}' prints "000" on connection failure, so the
+  # || echo fallback is unnecessary and would double-print.
   local code
-  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1/health 2>/dev/null || echo 000)"
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$target" 2>/dev/null)"
   if [[ "$code" == "200" ]]; then
-    _check_pass "200 via Caddy"
+    _check_pass "200 via Caddy ($target)"
   elif [[ "$code" == "000" ]]; then
-    _check_fail "Caddy didn't answer on :80" \
+    _check_fail "Caddy didn't answer on :80 ($target)" \
       "Diagnose: docker ps --filter name=^vibe-caddy\$
 Fix:      sudo docker compose -f /opt/vibe/appliance/docker-compose.yml restart caddy"
   else
-    _check_fail "Caddy returned HTTP $code (expected 200)" \
+    _check_fail "Caddy returned HTTP $code (expected 200) for $target" \
       "Diagnose: docker logs vibe-console --tail 40"
   fi
 }
