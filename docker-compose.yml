@@ -103,7 +103,27 @@ services:
       start_period: 10s
 
   postgres:
-    image: postgres:16-alpine
+    # ParadeDB is the appliance's shared Postgres image, per
+    # docs/PLAN.md and the vibe-tax-research-chat-compatibility-addendum
+    # §5.2: it ships pgvector (HNSW vector indexes) AND pg_search
+    # (BM25/ParadeDB extension) on top of stock Postgres 16, so apps
+    # that need hybrid retrieval (Tax-Research-Chat today, possibly
+    # other apps later) "just work" against the shared cluster
+    # without per-app Postgres deployments.
+    #
+    # The `-pg16` tag is binary-compatible with vanilla `postgres:16`
+    # — same PG16 series, same on-disk PGDATA layout — so existing
+    # /opt/vibe/data/postgres volumes from `postgres:16-alpine` mount
+    # in place. The image goes from alpine/musl to debian/glibc, so
+    # text-collation ordering may differ for indexes built on the old
+    # image. After the first restart on the new image, run
+    # `REINDEX DATABASE <each-vibe-db>` from psql if you observe odd
+    # ordering on text columns. New installs aren't affected.
+    #
+    # Pin to an explicit version (not :latest) so a ParadeDB upstream
+    # bump never surprise-changes the appliance's Postgres behavior.
+    # Bumping is a deliberate update.sh path.
+    image: paradedb/paradedb:0.23.2-pg16
     container_name: vibe-postgres
     restart: unless-stopped
     env_file:
