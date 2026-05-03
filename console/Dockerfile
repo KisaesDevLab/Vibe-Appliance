@@ -4,11 +4,11 @@
 # image size lands ~150 MB on linux/amd64.
 
 # ---- deps stage --------------------------------------------------------
-FROM node:20-bookworm-slim AS deps
+FROM node:24-bookworm-slim AS deps
 WORKDIR /app
 
 # better-sqlite3 ships prebuilds for linux-x64-glibc and linux-arm64-glibc
-# on Node 20, so the toolchain is only used as a fallback. Install it
+# on Node 24, so the toolchain is only used as a fallback. Install it
 # anyway so a missing prebuild doesn't fail the bootstrap.
 RUN apt-get update -qq \
  && apt-get install -y --no-install-recommends python3 make g++ \
@@ -18,7 +18,7 @@ COPY package.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 
 # ---- runtime stage -----------------------------------------------------
-FROM node:20-bookworm-slim
+FROM node:24-bookworm-slim
 WORKDIR /app
 
 # Same /opt/vibe layout as the host so paths in env vars (VIBE_DIR,
@@ -28,7 +28,7 @@ RUN mkdir -p /opt/vibe
 # The console shells out to /opt/vibe/appliance/lib/enable-app.sh and
 # disable-app.sh. Those scripts use:
 #   - bash  (already present)
-#   - openssl (already present, comes with node:20-bookworm-slim)
+#   - openssl (already present, comes with node:24-bookworm-slim)
 #   - python3 (NOT present — install)
 #   - docker CLI + compose plugin (NOT present — install from docker.com)
 RUN apt-get update -qq \
