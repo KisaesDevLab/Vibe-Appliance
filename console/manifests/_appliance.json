@@ -128,6 +128,21 @@
       }
     },
     {
+      "name":   "ANTHROPIC_API_KEY",
+      "secret": true,
+      "doc":    "Anthropic API key for the appliance support assistant ('Ask Claude' on the Logs page) and any Vibe app whose manifest declares ui.appliance: \"both\" on this key. Stored in /opt/vibe/env/appliance.env, mode 600. Operator brings their own key — the appliance never proxies through a vendor key.",
+      "ui": {
+        "tier":         1,
+        "category":     "AI",
+        "label":        "Anthropic API key",
+        "helpText":     "Powers the 'Ask Claude' button on the Logs page (admin → Logs). Logs sent to Anthropic may include hostnames, IPs, container names, and configuration details — set this only if you'd be willing to share those with a vendor support team. Get a key at https://console.anthropic.com/settings/keys.",
+        "input":        "password",
+        "appliance":    "shared",
+        "validate":     "anthropic-api-key",
+        "testEndpoint": "/api/v1/admin/test/anthropic"
+      }
+    },
+    {
       "name":   "CONSOLE_ADMIN_PASSWORD_INFO",
       "doc":    "Admin password rotation pointer (Tier 2 read-only). The actual password lives in shared.env, not appliance.env, and inline rotation needs a special flow that writes to console.sqlite + reloads the basic-auth comparator without restarting the console (which would log out the operator mid-session). v1.3 lands the inline rotation; today operators use bootstrap.sh --reset-env or hand-edit shared.env + restart the console.",
       "ui": {

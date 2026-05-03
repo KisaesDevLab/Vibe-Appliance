@@ -398,6 +398,14 @@ app.get('/admin/settings', requireAdmin, (_req, res) => {
   res.sendFile(path.join(__dirname, 'ui', 'settings.html'));
 });
 
+// Logs page — picks one of the appliance log files, shows the tail,
+// optionally sends it to Claude for a fix suggestion. The Anthropic
+// key comes from /opt/vibe/env/appliance.env (Settings → AI). Per
+// CLAUDE.md rule 4, suggestions are advice only — never executed.
+app.get('/admin/logs', requireAdmin, (_req, res) => {
+  res.sendFile(path.join(__dirname, 'ui', 'logs.html'));
+});
+
 app.get('/api/v1/state', requireAdmin, (_req, res) => {
   res.json(readState());
 });
@@ -1357,6 +1365,243 @@ app.post('/api/v1/admin/test/anthropic', requireAdmin, testRateLimit, async (req
     ok: false,
     message: 'Anthropic rejected the request: ' + detail,
     status: result.status,
+  });
+});
+
+// Static system prompt for the appliance support assistant. Sent on
+// every /api/v1/admin/analyze-log call. Cached via Anthropic prompt
+// caching (cache_control: ephemeral) so subsequent calls within ~5 min
+// pay ~10% of the input price for this block. Keep it stable — every
+// edit invalidates the cache.
+const ANALYZE_LOG_SYSTEM_PROMPT = [
+  'You are the diagnostic assistant for the Vibe Appliance — a Docker-Compose-based meta-installer that runs a family of accounting apps (vibe-tb, vibe-mybooks, vibe-connect, vibe-tax-research, vibe-payroll, vibe-glm-ocr) on a single Ubuntu 24.04 host alongside Tailscale, Caddy, Portainer, Cockpit, and Duplicati.',
+  '',
+  'Your audience is a NOVICE CPA, not a sysadmin. You are READ-ONLY ADVICE. You never executed anything; you cannot execute anything. The operator runs commands themselves via Cockpit Terminal or SSH after reading your suggestion.',
+  '',
+  'Runtime layout on the host:',
+  '  /opt/vibe/appliance/  — the cloned repo (bootstrap.sh, doctor.sh, lib/, apps/)',
+  '  /opt/vibe/data/       — persistent volumes (postgres, redis, per-app uploads)',
+  '  /opt/vibe/env/        — rendered env files (shared.env, appliance.env, <slug>.env), mode 600',
+  '  /opt/vibe/state.json  — install state, apps enabled list, mode (domain|lan|tailscale)',
+  '  /opt/vibe/logs/       — JSONL logs (bootstrap.log, doctor.log, enable-app.log, disable-app.log, update.log)',
+  '',
+  'Key facts:',
+  '  - Shared Postgres image is paradedb/paradedb:0.23.2-pg16 (provides vector + pg_search).',
+  '  - Each app has /opt/vibe/appliance/apps/<slug>.yml as a compose overlay.',
+  '  - Apps DO NOT define their own Postgres/Redis — they share the core ones.',
+  '  - lib/enable-app.sh enables an app (renders env, bootstraps DB role, compose up, /health probe).',
+  '  - lib/disable-app.sh stops an app, preserves data.',
+  '  - sudo bash /opt/vibe/appliance/doctor.sh runs all the post-install checks.',
+  '',
+  'Output format — strict:',
+  '  1. ONE-SENTENCE plain-English diagnosis (what went wrong, in CPA-readable terms).',
+  '  2. The most likely fix as copy-pasteable shell commands inside ```bash fences.',
+  '  3. A short "If that does not work" line with the next thing to try.',
+  '  Markdown allowed: paragraphs, bold, inline code, fenced code blocks. No tables, no images, no links to javascript:. Stay under 400 words.',
+  '  Never suggest commands that destroy data (rm -rf /opt/vibe/data, docker volume rm, DROP DATABASE) without an EXPLICIT WARNING line above the command.',
+].join('\n');
+
+// Trim a log tail to a hard byte ceiling without splitting in the
+// middle of a line. Keeps the LAST `maxChars` chars (errors live at
+// the end), prefixes a marker if anything was dropped.
+function _truncateLogTail(text, maxChars) {
+  if (text.length <= maxChars) return text;
+  const slice = text.slice(text.length - maxChars);
+  // Drop any partial first line so the model doesn't see a half-line.
+  const firstNewline = slice.indexOf('\n');
+  const clean = firstNewline >= 0 ? slice.slice(firstNewline + 1) : slice;
+  return '[…earlier lines truncated…]\n' + clean;
+}
+
+// POST /api/v1/admin/analyze-log — send a log tail to Claude and
+// return its diagnosis + suggested fix. Operator brings their own
+// Anthropic key (Settings → AI → ANTHROPIC_API_KEY). Failure responses
+// use ok:false envelopes with a `code` and a copy-paste-friendly
+// `hint` so the UI can surface them uniformly.
+//
+// Cost control: NONE in v1 — operator owns their key, owns their cost.
+// The audit trail and per-call JSONL line let them see usage if they
+// want to add a cap later.
+const ANALYZE_LOG_AUDIT_STMT = db.prepare(
+  'INSERT INTO settings_audit (ts, user, category, setting, old_value, new_value, result, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+);
+app.post('/api/v1/admin/analyze-log', requireAdmin, async (req, res) => {
+  const t0 = Date.now();
+  const body = req.body || {};
+  const logName = String(body.log || '');
+  let lines = parseInt(body.lines || '300', 10);
+  if (!Number.isFinite(lines) || lines <= 0) lines = 300;
+  if (lines < 50)   lines = 50;
+  if (lines > 2000) lines = 2000;
+
+  const ctx = body.context && typeof body.context === 'object' ? body.context : null;
+  // Cap the context block so an oversized payload can't pad the
+  // outbound request beyond reasonable. 4 KB is plenty for a slug + a
+  // sentence of "what I was doing."
+  const ctxJson = ctx ? JSON.stringify(ctx).slice(0, 4096) : '';
+
+  // Validate the log name against the existing whitelist.
+  if (!LOG_NAMES.has(logName)) {
+    return res.status(400).json({
+      ok: false, code: 'log-not-allowed',
+      message: `Log "${logName}" is not in the allow-list.`,
+      hint: 'Pick one of: ' + Array.from(LOG_NAMES).join(', ') + '.',
+    });
+  }
+
+  // Read the API key per-request (not cached at startup). Operator
+  // may have JUST saved a new key via Settings → AI; we want the next
+  // click to use it without restarting the console.
+  const applianceEnv = parseEnvFile(path.join(ENV_DIR, 'appliance.env'));
+  const apiKey = (applianceEnv.ANTHROPIC_API_KEY || '').trim();
+  if (!apiKey) {
+    log('info', 'analyze-log', { log_name: logName, lines_sent: 0, ok: false,
+                                  duration_ms: Date.now() - t0, code: 'no-api-key' });
+    return res.status(200).json({
+      ok: false, code: 'no-api-key',
+      message: 'Anthropic API key not configured.',
+      hint: "Open Settings → AI, paste an Anthropic API key into 'Anthropic API key', click Save, then click Test connection. Get a key at https://console.anthropic.com/settings/keys.",
+    });
+  }
+
+  // Read the log tail. Reuse the same tail logic as GET /api/v1/logs/:name.
+  const full = path.join(LOGS_DIR, logName);
+  let raw = '';
+  try {
+    raw = fs.readFileSync(full, 'utf8');
+  } catch (err) {
+    return res.status(200).json({
+      ok: false, code: 'log-empty',
+      message: `Could not read ${logName}: ${err.code || err.message}.`,
+      hint: 'The file may not exist yet — has bootstrap or the relevant action been run?',
+    });
+  }
+  const all = raw.split('\n');
+  const tailText = all.slice(Math.max(0, all.length - lines)).join('\n').trim();
+  if (!tailText) {
+    return res.status(200).json({
+      ok: false, code: 'log-empty',
+      message: `${logName} is empty.`,
+      hint: 'Trigger the action you want diagnosed (e.g., enable an app), then retry.',
+    });
+  }
+
+  // Hard cap log content at ~16 KB chars (~4 K input tokens) before
+  // sending. Errors live at the end, so we trim from the front.
+  const trimmedTail = _truncateLogTail(tailText, 16384);
+
+  // Build the user message: optional JSON context, then a fenced log block.
+  let userText = '';
+  if (ctxJson && ctxJson !== '{}') {
+    userText += 'Operator context (optional):\n```json\n' + ctxJson + '\n```\n\n';
+  }
+  userText += `Recent ${lines} lines of \`${logName}\`:\n\`\`\`log\n${trimmedTail}\n\`\`\``;
+
+  const model = process.env.ANTHROPIC_MODEL_DEBUG || 'claude-haiku-4-5-20251001';
+
+  // Single call to Anthropic. Server-side timeout 60s — analyses take
+  // more compute than the 1-token /test/anthropic probe.
+  const result = await _testFetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type':       'application/json',
+      'x-api-key':          apiKey,
+      'anthropic-version':  '2023-06-01',
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: 1024,
+      // Cache the static system prompt so subsequent calls within
+      // ~5 min cost ~10% of the input price for this block.
+      system: [
+        { type: 'text', text: ANALYZE_LOG_SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } },
+      ],
+      messages: [{ role: 'user', content: userText }],
+    }),
+  }, 60_000);
+
+  const durationMs = Date.now() - t0;
+
+  // _testFetch maps thrown errors to {ok:false, status:0, error:<msg>}.
+  // Distinguish "we couldn't reach Anthropic" from "Anthropic returned 4xx".
+  if (!result.ok && result.status === 0) {
+    log('warn', 'analyze-log', { log_name: logName, lines_sent: lines, ok: false,
+                                  duration_ms: durationMs, code: 'network-down' });
+    try {
+      ANALYZE_LOG_AUDIT_STMT.run(new Date().toISOString(), ADMIN_USER,
+        'ai-support', 'analyze_log', null, null, 'failed',
+        JSON.stringify({ log: logName, lines_sent: lines, model, error_code: 'network-down' }));
+    } catch (err) { log('warn', 'analyze-log audit failed', { err: err.message }); }
+    return res.status(200).json({
+      ok: false, code: 'network-down',
+      message: 'Could not reach api.anthropic.com — this appliance may not have outbound internet right now.',
+      hint: 'From Cockpit Terminal: curl -v https://api.anthropic.com/v1/messages',
+    });
+  }
+
+  if (!result.ok) {
+    let detail = `HTTP ${result.status}`;
+    if (result.body) {
+      try {
+        const parsed = JSON.parse(result.body);
+        if (parsed.error && parsed.error.message) detail = parsed.error.message;
+      } catch { /* leave as HTTP code */ }
+    }
+    log('warn', 'analyze-log', { log_name: logName, lines_sent: lines, ok: false,
+                                  duration_ms: durationMs, code: 'anthropic-rejected', status: result.status });
+    try {
+      ANALYZE_LOG_AUDIT_STMT.run(new Date().toISOString(), ADMIN_USER,
+        'ai-support', 'analyze_log', null, null, 'failed',
+        JSON.stringify({ log: logName, lines_sent: lines, model, error_code: 'anthropic-rejected', status: result.status }));
+    } catch (err) { log('warn', 'analyze-log audit failed', { err: err.message }); }
+    return res.status(200).json({
+      ok: false, code: 'anthropic-rejected',
+      message: 'Anthropic rejected the request: ' + detail,
+      hint: result.status === 401
+        ? 'The key in Settings → AI may be invalid. Click Test connection there to confirm.'
+        : 'See the message above. Retry once if it looks transient.',
+    });
+  }
+
+  // Success — extract the assistant text from Anthropic's response.
+  let analysis = '';
+  let usage = null;
+  try {
+    const parsed = JSON.parse(result.body);
+    if (Array.isArray(parsed.content)) {
+      analysis = parsed.content
+        .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+        .map((b) => b.text)
+        .join('\n')
+        .trim();
+    }
+    usage = parsed.usage || null;
+  } catch { /* analysis stays empty */ }
+
+  if (!analysis) {
+    return res.status(200).json({
+      ok: false, code: 'anthropic-rejected',
+      message: 'Anthropic returned 200 but the response had no text content.',
+      hint: 'Retry; if persistent, the model may be temporarily unavailable.',
+    });
+  }
+
+  log('info', 'analyze-log', { log_name: logName, lines_sent: lines, ok: true,
+                                duration_ms: durationMs, model });
+  try {
+    ANALYZE_LOG_AUDIT_STMT.run(new Date().toISOString(), ADMIN_USER,
+      'ai-support', 'analyze_log', null, null, 'saved',
+      JSON.stringify({ log: logName, lines_sent: lines, model, usage }));
+  } catch (err) { log('warn', 'analyze-log audit failed', { err: err.message }); }
+
+  return res.json({
+    ok: true,
+    analysis,
+    model,
+    log: logName,
+    lines_sent: lines,
+    duration_ms: durationMs,
+    usage,
   });
 });
 

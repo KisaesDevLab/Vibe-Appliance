@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Logs · Vibe Appliance</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <style>
+    /* Logs-page-specific layout. Keeps the global styles.css clean. */
+    .logs-controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      align-items: center;
+      margin-bottom: 1rem;
+    }
+    .logs-controls label {
+      font-size: 0.9em;
+      color: #6b4423;
+    }
+    .logs-controls select,
+    .logs-controls input {
+      padding: 0.3rem 0.5rem;
+      border: 1px solid #e0d8c8;
+      border-radius: 4px;
+      font: inherit;
+      background: #fff;
+    }
+    .logs-tail {
+      background: #1c1814;
+      color: #e8e0d0;
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 0.85em;
+      line-height: 1.45;
+      padding: 0.75rem;
+      border-radius: 6px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 24rem;
+      overflow-y: auto;
+      margin: 0;
+    }
+    .logs-tail--empty {
+      color: #8a7860;
+      background: #faf7f2;
+      font-style: italic;
+    }
+
+    /* Ask Claude panel */
+    .claude-panel {
+      margin-top: 2rem;
+      padding: 1rem;
+      border: 1px solid #e0d8c8;
+      border-radius: 6px;
+      background: #fdfaf4;
+    }
+    .claude-panel h2 {
+      margin: 0 0 0.5rem;
+      font-size: 1.1em;
+    }
+    .claude-context {
+      display: grid;
+      gap: 0.5rem;
+      max-width: 36rem;
+      margin: 0.5rem 0 1rem;
+    }
+    .claude-context label {
+      font-size: 0.9em;
+      font-weight: 600;
+      color: #6b4423;
+    }
+    .claude-context textarea,
+    .claude-context select {
+      padding: 0.4rem 0.6rem;
+      border: 1px solid #e0d8c8;
+      border-radius: 4px;
+      font: inherit;
+      background: #fff;
+      width: 100%;
+    }
+    .claude-context textarea {
+      min-height: 3rem;
+      resize: vertical;
+    }
+    .claude-spinner {
+      display: inline-block;
+      width: 0.85em;
+      height: 0.85em;
+      border: 2px solid #e0d8c8;
+      border-top-color: #b8722e;
+      border-radius: 50%;
+      animation: claude-spin 0.8s linear infinite;
+      vertical-align: -0.1em;
+      margin-right: 0.4rem;
+    }
+    @keyframes claude-spin {
+      to { transform: rotate(360deg); }
+    }
+    .claude-result {
+      margin-top: 1rem;
+      padding: 0.75rem 1rem;
+      background: #fff;
+      border: 1px solid #e0d8c8;
+      border-radius: 6px;
+    }
+    .claude-result h3 {
+      margin: 0 0 0.5rem;
+      font-size: 0.95em;
+      color: #6b4423;
+    }
+    .claude-result p {
+      margin: 0 0 0.6rem;
+      line-height: 1.5;
+    }
+    .claude-result code {
+      background: #f4ebd9;
+      padding: 0.05em 0.3em;
+      border-radius: 3px;
+      font-size: 0.92em;
+    }
+    .claude-result pre.code-block {
+      position: relative;
+      background: #1c1814;
+      color: #e8e0d0;
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 0.85em;
+      line-height: 1.45;
+      padding: 0.75rem 0.75rem 0.75rem 0.75rem;
+      border-radius: 6px;
+      overflow-x: auto;
+      margin: 0.5rem 0;
+    }
+    .claude-result pre.code-block .copy-btn {
+      position: absolute;
+      top: 0.4rem;
+      right: 0.4rem;
+      padding: 0.15rem 0.5rem;
+      font-size: 0.8em;
+      background: #3a322a;
+      color: #e8e0d0;
+      border: 1px solid #5a4f42;
+      border-radius: 3px;
+      cursor: pointer;
+    }
+    .claude-result pre.code-block .copy-btn:hover {
+      background: #4a4034;
+    }
+    .claude-meta {
+      margin-top: 0.5rem;
+      font-size: 0.8em;
+      color: #8a7860;
+    }
+    .claude-disclaimer {
+      margin-top: 1rem;
+      padding: 0.5rem 0.75rem;
+      background: #fdf0e0;
+      border-left: 3px solid #b8722e;
+      border-radius: 3px;
+      font-size: 0.85em;
+      color: #6b3a1c;
+    }
+  </style>
+</head>
+<body>
+  <main class="container container--admin">
+    <header class="hero">
+      <p class="eyebrow">Admin · Logs</p>
+      <h1>Logs</h1>
+      <p class="lede">
+        Pick a log, see the tail, and optionally ask Claude for a fix suggestion.
+        <a href="/admin">Back to admin home</a> ·
+        <a href="/admin/settings">Settings</a>
+      </p>
+    </header>
+
+    <div id="error" class="error-banner" hidden></div>
+
+    <div class="logs-controls">
+      <label for="log-picker">Log file</label>
+      <select id="log-picker" aria-busy="true">
+        <option value="">loading…</option>
+      </select>
+
+      <label for="log-lines">Lines</label>
+      <select id="log-lines">
+        <option value="50">50</option>
+        <option value="200">200</option>
+        <option value="300" selected>300</option>
+        <option value="500">500</option>
+        <option value="1000">1000</option>
+        <option value="2000">2000</option>
+      </select>
+
+      <button class="btn btn--ghost" id="log-refresh">Refresh</button>
+      <button class="btn btn--ghost" id="log-copy" disabled>Copy</button>
+    </div>
+
+    <pre class="logs-tail logs-tail--empty" id="log-tail">Pick a log to view its tail.</pre>
+
+    <section class="claude-panel" id="claude-panel">
+      <h2>Ask Claude for a fix suggestion</h2>
+      <p class="muted" style="margin: 0 0 0.5rem;">
+        Sends the tail above plus the optional context below to Anthropic.
+        Requires an Anthropic API key in <a href="/admin/settings">Settings → AI</a>.
+      </p>
+
+      <div class="claude-context">
+        <label for="claude-what">What were you trying to do? (optional, helps Claude)</label>
+        <textarea id="claude-what" placeholder="e.g. clicked Enable on Vibe Tax Research; install fresh on a clean droplet"></textarea>
+
+        <label for="claude-slug">Related app (optional)</label>
+        <select id="claude-slug">
+          <option value="">(none)</option>
+          <option value="vibe-tb">vibe-tb</option>
+          <option value="vibe-mybooks">vibe-mybooks</option>
+          <option value="vibe-connect">vibe-connect</option>
+          <option value="vibe-tax-research">vibe-tax-research</option>
+          <option value="vibe-payroll">vibe-payroll</option>
+          <option value="vibe-glm-ocr">vibe-glm-ocr</option>
+        </select>
+      </div>
+
+      <button class="btn" id="claude-ask" disabled>Ask Claude</button>
+      <span class="muted" id="claude-status" style="margin-left: 0.6rem;"></span>
+
+      <div id="claude-result"></div>
+
+      <p class="claude-disclaimer" id="claude-disclaimer" hidden>
+        Claude's suggestions are advice, not commands. Read carefully, then run them
+        yourself via Cockpit Terminal or SSH. Never paste a command you don't understand.
+      </p>
+    </section>
+
+    <footer class="footer">
+      <p class="muted">
+        Logs are JSONL under <span class="mono">/opt/vibe/logs/</span>.
+        Calls to Anthropic are audited at <a href="/api/v1/audit?category=ai-support&pageSize=20">audit log (JSON)</a>.
+      </p>
+    </footer>
+  </main>
+
+  <script src="/static/logs.js"></script>
+</body>
+</html>
