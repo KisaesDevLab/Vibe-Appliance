@@ -298,7 +298,8 @@
   "database": { "name": "vibe_connect_db", "user": "vibeconnect" },
 
   "firstLogin": {
-    "type": "none",
+    "type": "setup-wizard",
+    "note": "Upstream ships dev-only seed users (kurt/alice/bob/carol with publicly-known passwords) that are NOT applied in appliance mode — only migrations run, not the yarn db:seed step. Visit /install for the first-run setup that creates your real admin account. If /install 404s on a fresh install, the upstream may not yet have wired the wizard for appliance deployments — file a bug.",
     "url":  "/install"
   },
 

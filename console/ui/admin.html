@@ -638,32 +638,73 @@ sudo systemctl start cloudflared</pre>
       }
       list.innerHTML = '<div class="apps-list">' + items.map(item => {
         const enabled = item.enabled && item.status === 'running';
-        // Server-supplied note (per-item, e.g. "Pre-seeded via env...")
-        // wins over the type-derived generic note. Apps without a custom
-        // note still get the original "forces reset" / "rotate manually"
-        // hint based on type.
-        const note = item.note
-          ? item.note
-          : (item.type === 'default-credentials-forced-reset'
-              ? 'app forces a password reset at first login'
-              : item.type === 'default-credentials-passive'
-                ? 'app does NOT force reset; rotate manually'
-                : '');
-        const stillDefault = item.changed
-          ? '<span class="badge badge--good">changed</span>'
-          : '<span class="badge badge--warn">still default</span>';
+        const t = item.type || 'unknown';
+
+        // Type-derived defaults; explicit per-item note wins. The four
+        // valid types are:
+        //   default-credentials-forced-reset — admin/admin1234 etc, app
+        //                                      forces rotation at first login
+        //   default-credentials-passive      — admin/admin etc, no rotation
+        //   setup-wizard                     — operator picks creds via
+        //                                      a wizard at item.login_url
+        //   no-auth                          — internal service, no login
+        const defaultNoteByType = {
+          'default-credentials-forced-reset': 'App forces a password reset at first login. Use these credentials once, then set your own.',
+          'default-credentials-passive':      'App does NOT force a reset — rotate the password manually after first login.',
+          'setup-wizard':                     'No baked-in credentials. Visit the URL below to run the first-run setup wizard, which creates your account.',
+          'no-auth':                          'Internal service — no login. The appliance and other Vibe apps reach it directly inside the docker network.',
+        };
+        const note = item.note || defaultNoteByType[t] || '';
+
+        // Badge — different semantics per type.
+        let headerBadge;
+        if (!enabled) {
+          headerBadge = '<span class="badge badge--muted">not running</span>';
+        } else if (t === 'no-auth') {
+          headerBadge = '<span class="badge badge--muted">no login</span>';
+        } else if (t === 'setup-wizard') {
+          headerBadge = item.changed
+            ? '<span class="badge badge--good">set up</span>'
+            : '<span class="badge badge--warn">setup pending</span>';
+        } else {
+          // default-credentials-{forced-reset,passive}
+          headerBadge = item.changed
+            ? '<span class="badge badge--good">changed</span>'
+            : '<span class="badge badge--warn">still default</span>';
+        }
+
+        // Field rows — username/password only meaningful for
+        // default-credentials-* types. Setup-wizard apps show
+        // "(set during setup)" so the operator doesn't think the
+        // appliance silently lost their values.
+        const showCredFields = (t === 'default-credentials-forced-reset' ||
+                                t === 'default-credentials-passive');
+        const credRows = showCredFields
+          ? `
+            <dt>username</dt><dd>${escapeHtml(item.username || '—')}</dd>
+            <dt>password</dt><dd>${escapeHtml(item.password || '—')}</dd>`
+          : t === 'setup-wizard'
+            ? `
+            <dt>username</dt><dd><span class="muted">(set during setup)</span></dd>
+            <dt>password</dt><dd><span class="muted">(set during setup)</span></dd>`
+            : '';  // no-auth: no credential rows
+
+        const linkRow = item.login_url
+          ? `<dt>${t === 'setup-wizard' ? 'setup' : 'login'}</dt><dd>${
+              enabled && item.login_url.startsWith('http')
+                ? '<a href="' + escapeHtml(item.login_url) + '">' + escapeHtml(item.login_url) + '</a>'
+                : '<span class="muted">' + escapeHtml(item.login_url) + '</span>'}</dd>`
+          : '';
+
         return `
           <article class="app-card">
             <header class="app-card__head">
               <h3 class="app-card__title">${escapeHtml(item.displayName)}</h3>
-              ${enabled ? stillDefault : '<span class="badge badge--muted">not running</span>'}
+              ${headerBadge}
             </header>
             <dl class="kv app-card__kv">
-              <dt>username</dt><dd>${escapeHtml(item.username || '—')}</dd>
-              <dt>password</dt><dd>${escapeHtml(item.password || '—')}</dd>
-              <dt>login</dt><dd>${enabled && item.login_url.startsWith('http')
-                ? '<a href="' + escapeHtml(item.login_url) + '">' + escapeHtml(item.login_url) + '</a>'
-                : '<span class="muted">' + escapeHtml(item.login_url) + '</span>'}</dd>
+              ${credRows}
+              ${linkRow}
             </dl>
             ${note ? '<p class="muted">' + escapeHtml(note) + '</p>' : ''}
           </article>`;

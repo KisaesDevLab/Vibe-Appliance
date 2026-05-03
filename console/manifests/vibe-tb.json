@@ -61,7 +61,8 @@
   "firstLogin": {
     "type":     "default-credentials-forced-reset",
     "username": "admin",
-    "password": "admin",
+    "password": "admin1234",
+    "note":     "Source: upstream seed server/seeds/001_default_admin.js. First login forces a password rotation. If 'invalid credentials', the seed didn't run — diagnose with: sudo docker exec vibe-postgres psql -U vibetb -d vibe_tb_db -c 'SELECT username FROM users;'.",
     "url":      "/login"
   },
 

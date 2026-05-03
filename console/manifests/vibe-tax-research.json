@@ -58,10 +58,9 @@
   "redis":    { "db": 3 },
 
   "firstLogin": {
-    "type":     "default-credentials-forced-reset",
-    "username": "admin",
-    "password": "admin",
-    "url":      "/login"
+    "type": "setup-wizard",
+    "note": "First-run wizard at /setup creates the SuperAdmin. The dev-only seed (SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD in upstream .env.example) is NOT applied in appliance mode — those env vars are unset.",
+    "url":  "/setup"
   },
 
   "health": "/api/health",

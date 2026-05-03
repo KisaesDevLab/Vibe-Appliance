@@ -95,10 +95,9 @@
   "redis":    { "db": 1 },
 
   "firstLogin": {
-    "type":     "default-credentials-forced-reset",
-    "username": "admin",
-    "password": "admin",
-    "url":      "/login"
+    "type": "setup-wizard",
+    "note": "First-run setup wizard creates the operator's account — no baked-in defaults. Visit the URL below; the wizard prompts for an email and password.",
+    "url":  "/"
   },
 
   "health": "/health",

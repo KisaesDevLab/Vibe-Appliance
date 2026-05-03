@@ -216,23 +216,36 @@ the role gets only the privileges it needs on its own database.
 "firstLogin": {
   "type":     "default-credentials-forced-reset",
   "username": "admin",
-  "password": "admin",
-  "url":      "/login"
+  "password": "admin1234",
+  "url":      "/login",
+  "note":     "Optional free-text override for the card's caveat line."
 }
 ```
 
 Surfaced in the admin "First Login Info" tab so a fresh customer knows
-what to type. The console marks credentials as `still-default` or
-`changed` based on whether `state.apps.<slug>.first_login_completed` has
-been set (apps can flip this flag via a webhook or by their own check).
+what to type. The console marks credentials as `still-default` /
+`changed` (or `setup pending` / `set up` for wizard apps) based on
+whether `state.apps.<slug>.first_login_completed` has been set (apps
+can flip this flag via a webhook or by their own check).
 
-`type` values:
+`type` values (verified against upstream sources before declaring):
 
-| Value                                 | Meaning                                                       |
-|---------------------------------------|---------------------------------------------------------------|
-| `default-credentials-forced-reset`    | App displays default creds at first login and forces a reset  |
-| `default-credentials-passive`         | App displays default creds; reset is operator's responsibility|
-| `none`                                | App handles its own onboarding; appliance shows nothing       |
+| Value                                 | Meaning                                                                                  |
+|---------------------------------------|------------------------------------------------------------------------------------------|
+| `default-credentials-forced-reset`    | App ships seed user. Operator logs in once with the displayed creds, then app forces rotation. Required fields: `username`, `password`, `url`. |
+| `default-credentials-passive`         | App ships seed user with NO forced rotation — operator is responsible for changing the password. Required fields: `username`, `password`, `url`. |
+| `setup-wizard`                        | No baked-in user. Operator visits `url` to run a first-run wizard that creates the account. Username/password fields ignored; the card shows "(set during setup)" instead. |
+| `no-auth`                             | Internal service — no user model, no login. The appliance and other apps reach it server-to-server. Card hides credential rows entirely. |
+| `none`                                | Legacy: app handles its own onboarding. Prefer `setup-wizard` or `no-auth` for new manifests so the card UI can render appropriately. |
+
+**Verifying against upstream**: don't assert defaults from convention.
+Look at the actual upstream source — seed scripts (`db/seeds/*.{js,ts}`,
+`*/seeds.sql`), migrations that `INSERT INTO users`, and the README.
+If the upstream uses a setup wizard, declare `setup-wizard`. If the
+upstream's seed only runs in dev (e.g. `yarn db:seed` not part of the
+container entrypoint), the appliance's container won't have the user
+either — declare `setup-wizard` and use the `note` field to call out
+that the dev-seed user does NOT exist in appliance mode.
 
 ---
 

@@ -34,10 +34,9 @@
   "redis": { "db": 5 },
 
   "firstLogin": {
-    "type":     "default-credentials-passive",
-    "username": "admin",
-    "password": "admin",
-    "url":      "/"
+    "type": "no-auth",
+    "note": "Internal stateless service — exposes /v1/chat/completions on vibe_net for server-to-server calls from other Vibe apps (Vibe-MyBooks attachments, etc.). No user model, no login. Health: /health.",
+    "url":  ""
   },
 
   "health": "/health",
