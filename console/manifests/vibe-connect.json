@@ -50,9 +50,11 @@
       { "name": "POSTFIX_RAW_BRIDGE_SECRET", "secret": true,
         "doc": "Raw email bridge secret (self-hosted Postfix)." },
       { "name": "CLAMD_HOST",
-        "doc": "ClamAV host for attachment scanning. Omit to skip scanning." },
+        "doc": "ClamAV host for attachment scanning. Omit AND set ALLOW_UNSCANNED_UPLOADS=1 to skip scanning. Server refuses to start with neither set." },
       { "name": "CLAMD_PORT",
         "doc": "ClamAV port. Default 3310." },
+      { "name": "ALLOW_UNSCANNED_UPLOADS",
+        "doc": "Set to 1 to acknowledge shipping without AV scanning. Required if CLAMD_HOST is unset. Appliance default in env-templates/per-app/vibe-connect.env.tmpl." },
 
       {
         "name":  "EMAIL_PROVIDER",
