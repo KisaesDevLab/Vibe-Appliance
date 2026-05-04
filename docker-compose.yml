@@ -253,13 +253,14 @@ services:
   portainer:
     # Lightweight container UI. Admin password is pre-seeded by
     # lib/secrets.sh's secrets_seed_portainer_password — the plain
-    # value lives in shared.env (PORTAINER_ADMIN_PASSWORD) and is
-    # surfaced in /opt/vibe/CREDENTIALS.txt and the admin First-login
-    # info card. The bcrypt hash gets written to
-    # /opt/vibe/data/portainer/.admin-pw (mode 600), and Portainer
-    # reads it via --admin-password-file. The flag only takes effect
-    # if no admin user exists yet — for established installs the
-    # operator's manually-set password keeps working.
+    # value lives in shared.env (PORTAINER_ADMIN_PASSWORD), is surfaced
+    # in /opt/vibe/CREDENTIALS.txt and the admin First-login info card,
+    # and is written verbatim (plain, NOT bcrypt-hashed — see the long
+    # comment in lib/secrets.sh) to /opt/vibe/data/portainer/.admin-pw
+    # (mode 600). Portainer reads it via --admin-password-file and
+    # hashes it itself. The flag only takes effect if no admin user
+    # exists yet — for established installs the operator's manually-set
+    # password keeps working.
     image: portainer/portainer-ce:lts
     container_name: vibe-portainer
     restart: unless-stopped

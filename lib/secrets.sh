@@ -312,23 +312,27 @@ secrets_set_kv_per_app() {
   _secrets_set_kv_in "$file" "$key" "$val"
 }
 
-# Pre-seed Portainer's admin password. Portainer doesn't accept a plain
-# password via env — it expects a bcrypt-hashed value in a file passed
-# via the `--admin-password-file` startup flag. This function hashes
-# the plain password from shared.env using a one-shot httpd:2.4-alpine
-# container (htpasswd is the most portable bcrypt tool we can rely on
-# without installing anything on the host) and writes the result to
-# /opt/vibe/data/portainer/.admin-pw, mode 600.
+# Pre-seed Portainer's admin password by writing the PLAIN password to
+# /opt/vibe/data/portainer/.admin-pw, which Portainer reads via its
+# --admin-password-file startup flag.
 #
-# Idempotency: preserves existing hash file unless force=true (passed
-# from --reset-env). On force, regenerates from the (likely rotated)
-# plain password.
+# WARNING: Counter-intuitively, Portainer's --admin-password-file expects
+# a plain-text password, not a bcrypt hash. Source (api/cmd/portainer/
+# main.go in 2.39.x):
 #
-# Note: Portainer applies --admin-password-file ONLY if the admin user
-# doesn't already exist in its database. If the operator already
-# created an admin manually before this code shipped, the seeded hash
-# is ignored (Portainer logs a notice). To force-apply: stop portainer,
-# delete /opt/vibe/data/portainer (loses all Portainer state), bootstrap.
+#     content, _ := fileService.GetFileContent(*flags.AdminPasswordFile, "")
+#     adminPasswordHash, _ = cryptoService.Hash(strings.TrimSuffix(string(content), "\n"))
+#
+# Portainer hashes the file content itself before storing. The companion
+# flag --admin-password (without -file) is the one that takes a
+# pre-hashed value. Earlier versions of this function bcrypt-hashed the
+# plain via httpd:2.4-alpine and wrote the hash to the file — Portainer
+# then hashed that hash, storing bcrypt(bcrypt(plain)) in boltdb. The
+# password we surface in CREDENTIALS.txt could never be typed to log in.
+#
+# Idempotency: preserves existing file unless force=true (--reset-env).
+# Security: same posture as shared.env (which already holds the same
+# plain in PORTAINER_ADMIN_PASSWORD) — root-owned, mode 600.
 secrets_seed_portainer_password() {
   local force="${1:-false}"
   local pw_dir="${VIBE_DIR}/data/portainer"
@@ -342,33 +346,26 @@ secrets_seed_portainer_password() {
   fi
 
   if [[ -f "$pw_file" && "$force" != "true" ]]; then
-    log_info "portainer admin password file already present (preserving)" path="$pw_file"
-    return 0
-  fi
-
-  if ! command -v docker >/dev/null 2>&1; then
-    log_warn "docker not available; skipping Portainer password hash (will retry next bootstrap)"
-    return 0
+    # File may exist but contain a stale bcrypt hash from the buggy
+    # earlier seed code. Detect that and overwrite with the correct
+    # plain — otherwise existing installs upgrading past this fix would
+    # never recover until the operator manually deleted the file.
+    local existing
+    existing="$(cat "$pw_file" 2>/dev/null || true)"
+    if [[ "$existing" == \$2[aby]\$* ]]; then
+      log_warn "portainer admin password file contains a stale bcrypt hash (legacy bug); rewriting with plain password"
+    else
+      log_info "portainer admin password file already present (preserving)" path="$pw_file"
+      return 0
+    fi
   fi
 
   mkdir -p "$pw_dir"
 
-  log_step "computing portainer admin password hash via httpd:2.4-alpine"
-  local hash
-  hash="$(docker run --rm httpd:2.4-alpine \
-            htpasswd -bnB admin "$plain" 2>/dev/null \
-            | awk -F: '{print $2}' | tr -d '\r\n')"
-
-  if [[ -z "$hash" || "$hash" != \$2y\$* ]]; then
-    log_warn "failed to compute Portainer password hash (got: ${hash:-empty}); skipping seed"
-    return 0
-  fi
-
-  # Write atomically. mode 600 + root-owned so non-privileged users
-  # can't read the hash from the bind-mount source.
+  log_step "writing portainer admin password to $pw_file"
   local tmp
   tmp="$(mktemp "${pw_file}.XXXXXX")"
-  printf '%s' "$hash" > "$tmp"
+  printf '%s' "$plain" > "$tmp"
   chmod 600 "$tmp"
   mv "$tmp" "$pw_file"
   log_info "portainer admin password seeded" path="$pw_file"
@@ -516,11 +513,18 @@ Username:  admin
 Password:  ${portainer_pw}
 
 Pre-seeded by lib/secrets.sh into /opt/vibe/data/portainer/.admin-pw
-as a bcrypt hash. If you've already created an admin manually before
-this seed shipped, this value is unused (Portainer ignores
---admin-password-file once an admin user exists). To force-apply:
-stop portainer, remove /opt/vibe/data/portainer (loses all Portainer
-state including stack registrations), and re-bootstrap.
+(plain text — Portainer hashes it itself). If you've already created
+an admin manually, or if a previous bootstrap seeded a wrong value,
+Portainer's --admin-password-file is ignored once an admin user
+exists. To force-reapply this password, run:
+
+  sudo docker compose -f /opt/vibe/appliance/docker-compose.yml stop portainer
+  sudo rm -f /opt/vibe/data/portainer/portainer.db
+  sudo /opt/vibe/appliance/bootstrap.sh
+
+This loses Portainer's stack registrations and environment list (your
+containers and volumes are untouched — Portainer just rediscovers
+them on first login).
 ================================================================
 EOF
   mv "$tmp" "$VIBE_CREDS_FILE"
