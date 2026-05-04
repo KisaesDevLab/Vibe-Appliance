@@ -637,21 +637,31 @@ phase_core_up() {
 _check_core_image_drift() {
   log_step "verifying core container images match docker-compose.yml"
 
-  local triples
-  triples="$(cd "$APPLIANCE_DIR" && docker compose config --format json 2>/dev/null \
-    | python3 - <<'PYEOF'
+  # Note: don't use `python3 - <<EOF` here. The heredoc would clobber
+  # python's stdin (replacing the pipe from `docker compose config`),
+  # python would read the heredoc as its script, and json.load(stdin)
+  # would crash on empty input — leaking a Python traceback to the
+  # operator's terminal. Pass the script via -c instead so stdin stays
+  # connected to the JSON pipe.
+  local config_json triples
+  config_json="$(cd "$APPLIANCE_DIR" && docker compose config --format json 2>/dev/null || true)"
+  if [[ -z "$config_json" ]]; then
+    log_warn "could not read docker-compose.yml services; skipping image-drift check"
+    return 0
+  fi
+
+  triples="$(printf '%s' "$config_json" | python3 -c '
 import json, sys
 cfg = json.load(sys.stdin)
-for name, svc in cfg.get('services', {}).items():
-    img = svc.get('image') or ''
-    cname = svc.get('container_name') or ''
+for name, svc in cfg.get("services", {}).items():
+    img = svc.get("image") or ""
+    cname = svc.get("container_name") or ""
     if img and cname:
-        print(f'{name}\t{img}\t{cname}')
-PYEOF
-)"
+        print(f"{name}\t{img}\t{cname}")
+' 2>/dev/null || true)"
 
   if [[ -z "$triples" ]]; then
-    log_warn "could not read docker-compose.yml services; skipping image-drift check"
+    log_warn "could not parse docker-compose.yml services; skipping image-drift check"
     return 0
   fi
 
