@@ -1658,6 +1658,25 @@ app.post('/api/v1/admin/test/email', requireAdmin, testRateLimit, async (req, re
     return res.json({ ok: false, message: 'Postmark rejected: ' + (result.error || `HTTP ${result.status}: ${result.body.slice(0, 200) + (result.body.length > 200 ? '…' : '')}`) });
   }
 
+  if (provider === 'emailit') {
+    // EmailIt v1 emails endpoint — Bearer auth, JSON body shaped like
+    // Resend's. If EmailIt revises the URL or schema, the failure path
+    // returns the upstream error verbatim so the operator can diagnose.
+    const key = b.EMAILIT_API_KEY || '';
+    if (!key) return res.status(400).json({ ok: false, error: 'EMAILIT_API_KEY required' });
+    const result = await _testFetch('https://api.emailit.com/v1/emails', {
+      method: 'POST',
+      headers: { 'authorization': 'Bearer ' + key, 'content-type': 'application/json' },
+      body: JSON.stringify({ from, to: from, subject, text }),
+    });
+    if (result.ok) {
+      let id = '';
+      try { id = (JSON.parse(result.body) || {}).id || ''; } catch { /* ignore */ }
+      return res.json({ ok: true, message: `Test email sent via EmailIt to ${from}.`, message_id: id });
+    }
+    return res.json({ ok: false, message: 'EmailIt rejected: ' + (result.error || `HTTP ${result.status}: ${result.body.slice(0, 200) + (result.body.length > 200 ? '…' : '')}`) });
+  }
+
   if (provider === 'smtp') {
     // Real SMTP needs nodemailer (or comparable). Deferred to v1.2 when
     // the npm dep + Dockerfile rebuild lands. Returns 501 with a clear
@@ -1679,8 +1698,12 @@ app.post('/api/v1/admin/test/sms', requireAdmin, testRateLimit, async (req, res)
   const provider = (b.SMS_PROVIDER || '').trim().toLowerCase();
   const to       = (b.TO_NUMBER  || '').trim();
   const from     = (b.FROM_NUMBER || '').trim();
-  if (!to)   return res.status(400).json({ ok: false, error: 'TO_NUMBER required (entered in modal)' });
-  if (!from) return res.status(400).json({ ok: false, error: 'FROM_NUMBER required (your Twilio sender)' });
+  // TO_NUMBER is universally required; FROM_NUMBER is twilio-specific
+  // (the TextLink LAN appliance manages its own sender).
+  if (!to) return res.status(400).json({ ok: false, error: 'TO_NUMBER required (entered in modal)' });
+  if (provider === 'twilio' && !from) {
+    return res.status(400).json({ ok: false, error: 'FROM_NUMBER required (your Twilio sender)' });
+  }
 
   if (provider === 'twilio') {
     const sid   = b.TWILIO_ACCOUNT_SID || '';
@@ -1708,9 +1731,29 @@ app.post('/api/v1/admin/test/sms', requireAdmin, testRateLimit, async (req, res)
   }
 
   if (provider === 'textlink') {
-    return res.status(501).json({
-      ok: false,
-      message: 'TextLink test requires the TextLink LAN appliance reachable from this host. Implement in v1.2 when the appliance discovery flow lands.',
+    // TextLink is a self-hosted LAN gateway with a vendor-specific send
+    // API. We don't dispatch a real SMS from here — Vibe-Connect owns
+    // that path. Instead, probe the configured base URL with the API
+    // key so the operator can confirm URL + key + LAN reachability in
+    // one click. A 2xx/3xx/401/403/404 all confirm the host is up; only
+    // network errors and 5xx flag a configuration problem.
+    const url = (b.TEXTLINK_API_URL || '').trim().replace(/\/+$/, '');
+    const key = (b.TEXTLINK_API_KEY || '').trim();
+    if (!url) return res.status(400).json({ ok: false, error: 'TEXTLINK_API_URL required' });
+    if (!key) return res.status(400).json({ ok: false, error: 'TEXTLINK_API_KEY required' });
+    const result = await _testFetch(url + '/', {
+      method: 'GET',
+      headers: { 'authorization': 'Bearer ' + key },
+    }, 8_000);
+    if (result.error) {
+      return res.json({ ok: false, message: `TextLink unreachable at ${url}: ${result.error}` });
+    }
+    if (result.status >= 500) {
+      return res.json({ ok: false, message: `TextLink at ${url} returned HTTP ${result.status} — gateway error.` });
+    }
+    return res.json({
+      ok: true,
+      message: `TextLink reachable at ${url} (HTTP ${result.status}). URL + key are persisted; Vibe-Connect dispatches actual SMS.`,
     });
   }
 

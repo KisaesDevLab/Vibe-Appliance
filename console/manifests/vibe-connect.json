@@ -74,6 +74,7 @@
             { "value": "none",     "label": "None (client portal disabled)" },
             { "value": "resend",   "label": "Resend" },
             { "value": "postmark", "label": "Postmark" },
+            { "value": "emailit",  "label": "EmailIt" },
             { "value": "smtp",     "label": "SMTP server" }
           ],
           "disabledImpacts": ["client-portal-in-vibe-connect"]
@@ -125,6 +126,22 @@
           "validate":        "non-empty",
           "dependsOnFields": ["EMAIL_PROVIDER"],
           "showIf":          { "EMAIL_PROVIDER": "postmark" }
+        }
+      },
+      {
+        "name":   "EMAILIT_API_KEY",
+        "from":   "appliance:EMAILIT_API_KEY",
+        "secret": true,
+        "doc":    "EmailIt API key. Visible at https://emailit.com under API keys.",
+        "ui": {
+          "tier":            1,
+          "category":        "Email & SMS",
+          "label":           "EmailIt API key",
+          "input":           "password",
+          "appliance":       "shared",
+          "validate":        "non-empty",
+          "dependsOnFields": ["EMAIL_PROVIDER"],
+          "showIf":          { "EMAIL_PROVIDER": "emailit" }
         }
       },
       {
@@ -237,6 +254,38 @@
           "validate":        "non-empty",
           "dependsOnFields": ["SMS_PROVIDER"],
           "showIf":          { "SMS_PROVIDER": "twilio" }
+        }
+      },
+      {
+        "name": "TEXTLINK_API_URL",
+        "from": "appliance:TEXTLINK_API_URL",
+        "doc":  "Base URL of the TextLink LAN appliance, e.g. http://192.168.1.50:8080. Reachable from this host on LAN or Tailnet.",
+        "ui": {
+          "tier":            1,
+          "category":        "Email & SMS",
+          "label":           "TextLink API URL",
+          "helpText":        "Base URL of your TextLink box (no trailing slash). Test runs a reachability probe; actual SMS sending happens from Vibe-Connect.",
+          "input":           "text",
+          "appliance":       "shared",
+          "validate":        "url",
+          "dependsOnFields": ["SMS_PROVIDER"],
+          "showIf":          { "SMS_PROVIDER": "textlink" }
+        }
+      },
+      {
+        "name":   "TEXTLINK_API_KEY",
+        "from":   "appliance:TEXTLINK_API_KEY",
+        "secret": true,
+        "doc":    "API key issued by the TextLink LAN appliance. Sent as a Bearer token in the Authorization header.",
+        "ui": {
+          "tier":            1,
+          "category":        "Email & SMS",
+          "label":           "TextLink API key",
+          "input":           "password",
+          "appliance":       "shared",
+          "validate":        "non-empty",
+          "dependsOnFields": ["SMS_PROVIDER"],
+          "showIf":          { "SMS_PROVIDER": "textlink" }
         }
       },
 

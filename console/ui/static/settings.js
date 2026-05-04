@@ -169,7 +169,7 @@
     // SMS test needs an explicit recipient that isn't in the form.
     // Prompt the operator for it and add to the payload. Validate E.164
     // format client-side so a typo gets a clear error rather than a
-    // cryptic Twilio rejection.
+    // cryptic provider rejection.
     if (field.testEndpoint.endsWith('/sms')) {
       const E164 = /^\+\d{8,15}$/;
       const to = window.prompt('Phone number to send the test SMS to (E.164 format, e.g. +15551234567):');
@@ -180,10 +180,11 @@
         return;
       }
       payload.TO_NUMBER = toTrim;
-      // FROM_NUMBER comes from the form if there's a TWILIO_FROM_NUMBER
-      // field declared. Fallback prompts. (Connect's manifest doesn't
-      // declare it as a field today; v1.2 adds it.)
-      if (!payload.FROM_NUMBER) {
+      // FROM_NUMBER is twilio-specific (the TextLink LAN appliance
+      // manages its own sender). Only prompt when the operator picked
+      // twilio AND the form didn't already supply a TWILIO_FROM_NUMBER
+      // field (Connect's manifest doesn't declare one today; v1.2 adds it).
+      if (payload.SMS_PROVIDER === 'twilio' && !payload.FROM_NUMBER) {
         const from = window.prompt('Your Twilio "From" phone number (the sender, E.164 format):');
         if (!from) return;
         const fromTrim = from.trim();
