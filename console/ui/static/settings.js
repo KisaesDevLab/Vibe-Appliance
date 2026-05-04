@@ -249,13 +249,29 @@
         }
         return sel;
       }
-      // Multi-select, time-zone, state-codes — render as plain text for
-      // substrate (comma-separated). Real widgets land in v1.2.
+      // Multi-select, state-codes — render as plain text for substrate
+      // (comma-separated). Real widgets land in v1.2.
       case 'multi-select':
       case 'state-codes':
         return el('input', { type: 'text', value, placeholder: 'comma-separated (e.g. TX,CA,NY)' });
-      case 'time-zone':
-        return el('input', { type: 'text', value, placeholder: 'e.g. America/Chicago' });
+      case 'time-zone': {
+        if (typeof Intl.supportedValuesOf !== 'function') {
+          return el('input', { type: 'text', value, placeholder: 'e.g. America/Chicago' });
+        }
+        const sel = el('select', null, []);
+        const zones = Intl.supportedValuesOf('timeZone');
+        // Preserve a non-standard saved value as a selectable option so
+        // it isn't silently dropped on first edit.
+        if (value && !zones.includes(value)) {
+          sel.appendChild(el('option', { value }, [value + ' (current)']));
+        }
+        for (const tz of zones) {
+          const o = el('option', { value: tz }, [tz]);
+          if (tz === value) o.selected = true;
+          sel.appendChild(o);
+        }
+        return sel;
+      }
       case 'password-change-flow':
         // Deferred to v1.2 — render a disabled placeholder so the field
         // exists in the form but can't be edited.
