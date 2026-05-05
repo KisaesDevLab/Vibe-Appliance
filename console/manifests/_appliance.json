@@ -143,6 +143,26 @@
       }
     },
     {
+      "name":  "ANTHROPIC_MODEL",
+      "value": "claude-haiku-4-5-20251001",
+      "doc":   "Anthropic model used by the 'Ask Claude' button on the Logs page. Haiku is fastest and cheapest; Sonnet is the balanced default for most analyses; Opus is slowest and most expensive but goes deepest on tangled multi-cause failures. Model IDs are sent verbatim to api.anthropic.com/v1/messages.",
+      "ui": {
+        "tier":      1,
+        "category":  "AI",
+        "label":     "Claude model",
+        "helpText":  "Pick faster/cheaper or slower/deeper based on what you ask. The dropdown is auto-populated from api.anthropic.com/v1/models when an API key is configured; the three baseline options below are the fallback when the live list isn't reachable.",
+        "input":     "dropdown",
+        "appliance": "shared",
+        "validate":  "enum",
+        "dynamic":   "anthropic-models",
+        "options": [
+          { "value": "claude-haiku-4-5-20251001", "label": "Haiku 4.5  — fastest, cheapest (default)" },
+          { "value": "claude-sonnet-4-6",         "label": "Sonnet 4.6 — balanced"                    },
+          { "value": "claude-opus-4-7",           "label": "Opus 4.7   — deepest, slowest, costliest" }
+        ]
+      }
+    },
+    {
       "name":   "CONSOLE_ADMIN_PASSWORD_INFO",
       "doc":    "Admin password rotation pointer (Tier 2 read-only). The actual password lives in shared.env, not appliance.env, and inline rotation needs a special flow that writes to console.sqlite + reloads the basic-auth comparator without restarting the console (which would log out the operator mid-session). v1.3 lands the inline rotation; today operators use bootstrap.sh --reset-env or hand-edit shared.env + restart the console.",
       "ui": {

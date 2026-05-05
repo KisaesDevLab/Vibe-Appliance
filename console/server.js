@@ -1368,6 +1368,58 @@ app.post('/api/v1/admin/test/anthropic', requireAdmin, testRateLimit, async (req
   });
 });
 
+// GET /api/v1/admin/anthropic-models — live model catalog from
+// api.anthropic.com/v1/models, used to populate the ANTHROPIC_MODEL
+// dropdown in Settings → AI without requiring an appliance update each
+// time Anthropic ships a new model. Cached in-process for 5 min keyed
+// by sha256-prefix of the API key, so paging through tabs doesn't fan
+// out to upstream. Falls back gracefully when no key is set or the
+// fetch fails — the manifest's static option list remains usable.
+const ANTHROPIC_MODELS_CACHE = new Map();      // keyHash → { ts, models }
+const ANTHROPIC_MODELS_TTL_MS = 5 * 60 * 1000;
+
+app.get('/api/v1/admin/anthropic-models', requireAdmin, async (_req, res) => {
+  const applianceEnv = parseEnvFile(path.join(ENV_DIR, 'appliance.env'));
+  const apiKey = (applianceEnv.ANTHROPIC_API_KEY || '').trim();
+  if (!apiKey) {
+    return res.json({ ok: false, code: 'no-api-key', models: [] });
+  }
+  const keyHash = crypto.createHash('sha256').update(apiKey).digest('hex').slice(0, 16);
+  const now = Date.now();
+  const hit = ANTHROPIC_MODELS_CACHE.get(keyHash);
+  if (hit && (now - hit.ts) < ANTHROPIC_MODELS_TTL_MS) {
+    return res.json({ ok: true, cached: true, models: hit.models });
+  }
+  const result = await _testFetch('https://api.anthropic.com/v1/models?limit=100', {
+    method: 'GET',
+    headers: {
+      'x-api-key':         apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+  }, 10_000);
+  if (!result.ok) {
+    let detail = result.error || `HTTP ${result.status}`;
+    if (result.body) {
+      try {
+        const parsed = JSON.parse(result.body);
+        if (parsed.error && parsed.error.message) detail = parsed.error.message;
+      } catch { /* leave raw */ }
+    }
+    return res.json({ ok: false, code: 'fetch-failed', message: detail, models: [] });
+  }
+  let models = [];
+  try {
+    const parsed = JSON.parse(result.body);
+    models = (parsed.data || [])
+      .filter(m => m && typeof m.id === 'string')
+      .map(m => ({ id: m.id, display_name: m.display_name || m.id }));
+  } catch (err) {
+    return res.json({ ok: false, code: 'parse-failed', message: err.message, models: [] });
+  }
+  ANTHROPIC_MODELS_CACHE.set(keyHash, { ts: now, models });
+  return res.json({ ok: true, cached: false, models });
+});
+
 // Static system prompt for the appliance support assistant. Sent on
 // every /api/v1/admin/analyze-log call. Cached via Anthropic prompt
 // caching (cache_control: ephemeral) so subsequent calls within ~5 min
@@ -1497,7 +1549,14 @@ app.post('/api/v1/admin/analyze-log', requireAdmin, async (req, res) => {
   }
   userText += `Recent ${lines} lines of \`${logName}\`:\n\`\`\`log\n${trimmedTail}\n\`\`\``;
 
-  const model = process.env.ANTHROPIC_MODEL_DEBUG || 'claude-haiku-4-5-20251001';
+  // Model preference: appliance.env (operator-set via Settings → AI) wins,
+  // ANTHROPIC_MODEL_DEBUG overrides for ad-hoc local testing, default to
+  // Haiku 4.5. Read per-request so a freshly-saved model takes effect on
+  // the next click without a console restart (same pattern as the API key).
+  const model =
+    process.env.ANTHROPIC_MODEL_DEBUG ||
+    (applianceEnv.ANTHROPIC_MODEL || '').trim() ||
+    'claude-haiku-4-5-20251001';
 
   // Single call to Anthropic. Server-side timeout 60s — analyses take
   // more compute than the 1-token /test/anthropic probe.

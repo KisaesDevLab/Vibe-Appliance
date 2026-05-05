@@ -130,6 +130,17 @@
       overflow-x: auto;
       margin: 0.5rem 0;
     }
+    /* Reset inline-code styling for code inside fenced blocks. Without
+       this the inner <code> picks up the light beige background from the
+       inline rule above and inherits the light text color from the dark
+       pre — net effect light text on light bg, code invisible. */
+    .claude-result pre.code-block code {
+      background: transparent;
+      color: inherit;
+      padding: 0;
+      font-size: inherit;
+      border-radius: 0;
+    }
     .claude-result pre.code-block .copy-btn {
       position: absolute;
       top: 0.4rem;

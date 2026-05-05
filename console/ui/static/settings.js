@@ -44,6 +44,10 @@
                              //   from per-app env to restore inheritance)
     activeTab: null,         // appliance category name OR special "Apps"
     activeAppSlug: null,     // when activeTab === 'Apps', selected slug
+    dynamicModels: null,     // live Anthropic model catalog when loaded;
+                             //   null until /api/v1/admin/anthropic-models
+                             //   responds. Manifest options render alone
+                             //   when this is null.
   };
 
   // dirtyKey constructor — single point of truth so the UI's set / get
@@ -243,7 +247,33 @@
       }
       case 'dropdown': {
         const sel = el('select', null, []);
+        // Build the option list. Manifest-declared options come first
+        // (stable defaults that work without network). When a field
+        // declares dynamic: 'anthropic-models' AND state.dynamicModels
+        // has loaded, merge live IDs that aren't already listed —
+        // futureproofs the dropdown against new Claude releases without
+        // needing an appliance update each time.
+        const seen = new Set();
+        const opts = [];
         for (const opt of field.options || []) {
+          if (seen.has(opt.value)) continue;
+          seen.add(opt.value);
+          opts.push({ value: opt.value, label: opt.label });
+        }
+        if (field.dynamic === 'anthropic-models' && Array.isArray(state.dynamicModels)) {
+          for (const m of state.dynamicModels) {
+            if (!m || seen.has(m.id)) continue;
+            seen.add(m.id);
+            opts.push({ value: m.id, label: m.display_name ? `${m.display_name} (${m.id})` : m.id });
+          }
+        }
+        // Preserve a saved value missing from both manifest and live list
+        // (hand-edit, retired model, etc.) so a stray Save can't silently
+        // overwrite it. Same pattern as the time-zone case below.
+        if (value && !seen.has(value)) {
+          sel.appendChild(el('option', { value }, [value + ' (current)']));
+        }
+        for (const opt of opts) {
           const o = el('option', { value: opt.value }, [opt.label]);
           if (String(opt.value) === String(value)) o.selected = true;
           sel.appendChild(o);
@@ -805,11 +835,39 @@
     state.values = await r.json();
   }
 
+  // Best-effort fetch of the live Anthropic model catalog. Only called
+  // when the schema declares a field with dynamic: 'anthropic-models'.
+  // Failure (no API key set, network down, upstream 5xx) leaves
+  // state.dynamicModels unchanged so the manifest's static fallback
+  // options still render.
+  async function loadDynamicModels() {
+    let needed = false;
+    for (const fields of Object.values(state.schema.appliance || {})) {
+      if (fields.some(f => f.dynamic === 'anthropic-models')) { needed = true; break; }
+    }
+    if (!needed) return;
+    try {
+      const r = await fetch('/api/v1/admin/anthropic-models', { credentials: 'same-origin' });
+      if (!r.ok) return;
+      const data = await r.json();
+      if (data && data.ok && Array.isArray(data.models)) {
+        state.dynamicModels = data.models;
+        // Re-render if the active tab contains the dynamic field, so
+        // the dropdown picks up the live list without a page reload.
+        if (state.activeTab && state.activeTab !== 'Apps') {
+          const fs = state.schema.appliance[state.activeTab] || [];
+          if (fs.some(f => f.dynamic === 'anthropic-models')) selectTab(state.activeTab);
+        }
+      }
+    } catch { /* manifest fallback is fine */ }
+  }
+
   (async function init() {
     try {
       await Promise.all([loadSchema(), loadValues()]);
       renderTabs();
       updateSaveBar();
+      loadDynamicModels();   // fire and forget — manifest fallback covers the gap
     } catch (err) {
       errorEl.hidden = false;
       errorEl.textContent = 'Could not load settings: ' + err.message;

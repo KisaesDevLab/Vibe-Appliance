@@ -295,6 +295,10 @@
             }
           }
         },
+        "dynamic": {
+          "enum": ["anthropic-models"],
+          "description": "If set, the client merges live values from a server-provided source into the static options list at render time. Currently only 'anthropic-models' is supported (GET /api/v1/admin/anthropic-models)."
+        },
         "appliance": {
           "enum": ["shared", "per-app", "both"],
           "description": "Where the value lives. shared = appliance.env (cascades to all apps); per-app = vibe-<slug>.env (default); both = declared at both levels with per-app override."
