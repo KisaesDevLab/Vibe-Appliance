@@ -1,0 +1,77 @@
+{
+  "_doc": "Imported from Vibe-Calculators/.appliance/manifest.json (upstream commit on main, 2026-05-05). Schema-conformant against console/manifest.schema.json without translation.",
+
+  "schemaVersion": 1,
+  "slug": "vibe-calculators",
+  "displayName": "Vibe Calculators",
+  "description": "TValue-grade time-value-of-money calculations and a tax-advisory calculator suite for CPA firms.",
+  "logo": "vibe-calculators.svg",
+
+  "image": {
+    "server":     "ghcr.io/kisaesdevlab/vibe-calculators-server",
+    "client":     "ghcr.io/kisaesdevlab/vibe-calculators-client",
+    "defaultTag": "latest"
+  },
+
+  "subdomain":     "calc",
+  "emergencyPort": 5174,
+  "ports":         { "server": 3000, "client": 80 },
+
+  "routing": {
+    "default_upstream": "vibe-calculators-client:80",
+    "matchers": [
+      { "name": "api", "path": "/api/*", "upstream": "vibe-calculators-server:3000" }
+    ]
+  },
+
+  "depends": ["postgres", "redis"],
+
+  "env": {
+    "required": [
+      { "name": "ALLOWED_ORIGIN",  "from": "subdomain-url" },
+      { "name": "DATABASE_URL",    "from": "database-url" },
+      { "name": "REDIS_URL",       "from": "redis-url" },
+      { "name": "MIGRATIONS_AUTO", "from": "static:false" }
+    ],
+    "optional": [
+      {
+        "name":   "VIBE_KMS_KEY",
+        "from":   "shared:ENCRYPTION_KEY",
+        "secret": true,
+        "doc":    "AES-256-GCM key (32 bytes, base64) used to encrypt the per-firm Anthropic API key at rest. Aliased to the appliance-wide ENCRYPTION_KEY."
+      },
+      {
+        "name":   "ANTHROPIC_API_KEY",
+        "from":   "appliance:ANTHROPIC_API_KEY",
+        "secret": true,
+        "doc":    "Claude API key for AI-assisted loan-agreement extraction (Phase 23). Inherited from appliance.env unless overridden per-app.",
+        "ui": {
+          "tier":     2,
+          "category": "AI",
+          "label":    "Anthropic API key",
+          "helpText": "Powers AI-assisted loan-agreement extraction. The same key is used appliance-wide unless overridden per-app.",
+          "input":    "password",
+          "appliance": "both",
+          "validate": "anthropic-api-key"
+        }
+      },
+      { "name": "VIBE_AFR_FEED_URL",     "from": "appliance:VIBE_AFR_FEED_URL", "doc": "IRS AFR feed URL. Defaults to the appliance-wide value." }
+    ]
+  },
+
+  "database": { "name": "vibe_calculators_db", "user": "vibecalculators" },
+  "redis":    { "db": 2 },
+
+  "firstLogin": {
+    "type": "setup-wizard",
+    "note": "First request lands on /install; create the admin account there.",
+    "url":  "/install"
+  },
+
+  "health": "/api/health",
+
+  "migrations": {
+    "command":    ["/nodejs/bin/node", "/app/node_modules/@vibe-calc/db/dist/migrate.js"],
+    "autoEnvVar": "MIGRATIONS_AUTO"
+  }
+}

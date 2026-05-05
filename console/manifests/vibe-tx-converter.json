@@ -1,0 +1,74 @@
+{
+  "_doc": "Translated from Vibe-Transaction-Convertor/appliance.manifest.json (upstream uses an older flat schema and depends on a `llm-gateway` service the appliance does not yet ship). This manifest reroutes LLM access through the appliance's existing ANTHROPIC_API_KEY plumbing — operator picks the model via Settings → AI; no local LLM gateway required. GLM-OCR access uses the in-network address of vibe-glm-ocr when that app is also enabled. Open an upstream PR to align Vibe-Transaction-Convertor/appliance.manifest.json with this schema once the appliance side is verified.",
+
+  "schemaVersion": 1,
+  "slug": "vibe-tx-converter",
+  "displayName": "Vibe Transactions Converter",
+  "description": "Converts bank and credit-card PDF statements into CSV, OFX 2.x, QFX, and QBO Web Connect files for re-import into QuickBooks Online, QuickBooks Desktop, Quicken, and Xero.",
+  "logo": "vibe-tx-converter.svg",
+
+  "image": {
+    "server":     "ghcr.io/kisaesdevlab/vibe-tx-converter",
+    "defaultTag": "latest"
+  },
+
+  "subdomain":     "vibetc",
+  "emergencyPort": 5175,
+  "ports":         { "server": 4000 },
+
+  "routing": {
+    "default_upstream": "vibe-tx-converter:4000"
+  },
+
+  "depends":         ["postgres", "redis"],
+  "optionalDepends": ["vibe-glm-ocr"],
+
+  "env": {
+    "required": [
+      { "name": "ALLOWED_ORIGIN",  "from": "subdomain-url" },
+      { "name": "WEB_BASE_URL",    "from": "subdomain-url" },
+      { "name": "DATABASE_URL",    "from": "database-url" },
+      { "name": "REDIS_URL",       "from": "redis-url" },
+      { "name": "SESSION_SECRET",  "from": "shared:JWT_SECRET" },
+      { "name": "MIGRATIONS_AUTO", "from": "static:false" }
+    ],
+    "optional": [
+      {
+        "name":   "ANTHROPIC_API_KEY",
+        "from":   "appliance:ANTHROPIC_API_KEY",
+        "secret": true,
+        "doc":    "Claude API key. Required when LLM_PROVIDER=anthropic (the appliance default for this app). Inherited from appliance.env unless overridden.",
+        "ui": {
+          "tier":       2,
+          "category":   "AI",
+          "label":      "Anthropic API key",
+          "helpText":   "Required for the AI-assisted extraction path. The appliance-wide key is used unless overridden per-app.",
+          "input":      "password",
+          "appliance":  "both",
+          "validate":   "anthropic-api-key"
+        }
+      },
+      {
+        "name":  "ANTHROPIC_MODEL",
+        "from":  "appliance:ANTHROPIC_MODEL",
+        "doc":   "Claude model used when LLM_PROVIDER=anthropic. Inherited from the appliance Settings → AI selection."
+      }
+    ]
+  },
+
+  "database": { "name": "vibe_tx_converter_db", "user": "vibetc" },
+  "redis":    { "db": 6 },
+
+  "firstLogin": {
+    "type": "setup-wizard",
+    "note": "First request lands on /register because no users exist; create the admin there.",
+    "url":  "/register"
+  },
+
+  "health": "/api/health/live",
+
+  "migrations": {
+    "command":    ["/nodejs/bin/node", "/app/dist/migrate.js"],
+    "autoEnvVar": "MIGRATIONS_AUTO"
+  }
+}

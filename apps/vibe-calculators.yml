@@ -1,0 +1,69 @@
+# apps/vibe-calculators.yml — Vibe Calculators overlay.
+#
+# Used as a docker-compose overlay on top of the core docker-compose.yml.
+# enable-app.sh and disable-app.sh invoke compose like:
+#
+#   docker compose -f docker-compose.yml -f apps/vibe-calculators.yml up -d
+#   docker compose -f docker-compose.yml -f apps/vibe-calculators.yml stop
+#
+# Reads /opt/vibe/env/vibe-calculators.env (rendered from
+# env-templates/per-app/vibe-calculators.env.tmpl).
+#
+# Two-tier topology like vibe-tb / vibe-mybooks: a Node server on :3000
+# and a static SPA bundle served by an inner Caddy on :80. Caddy in
+# the appliance routes /api/* to the server and everything else to the
+# client per the manifest's routing.matchers.
+
+name: vibe
+
+services:
+  vibe-calculators-server:
+    image: ghcr.io/kisaesdevlab/vibe-calculators-server:${APP_TAG:-latest}
+    container_name: vibe-calculators-server
+    restart: unless-stopped
+    init: true
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-calculators.env
+    volumes:
+      # Persistent storage matching upstream prod compose:
+      #   exports — generated PDFs the operator downloads
+      #   backups — snapshot archives surfaced read-only by the
+      #             restore-wizard UI; the host writes here.
+      - /opt/vibe/data/apps/vibe-calculators/exports:/data/exports
+      - /opt/vibe/data/apps/vibe-calculators/backups:/data/backups:ro
+    networks:
+      - vibe_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # Distroless image — no shell or curl. Drive node's fetch directly.
+      # Absolute path required because /nodejs/bin is not on docker exec's
+      # default PATH.
+      test:
+        - CMD
+        - /nodejs/bin/node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  vibe-calculators-client:
+    image: ghcr.io/kisaesdevlab/vibe-calculators-client:${APP_TAG:-latest}
+    container_name: vibe-calculators-client
+    restart: unless-stopped
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-calculators.env
+    networks:
+      - vibe_net
+    depends_on:
+      vibe-calculators-server:
+        condition: service_healthy

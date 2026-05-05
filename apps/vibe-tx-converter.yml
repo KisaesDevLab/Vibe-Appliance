@@ -1,0 +1,55 @@
+# apps/vibe-tx-converter.yml — Vibe Transactions Converter overlay.
+#
+# Used as a docker-compose overlay on top of the core docker-compose.yml.
+# enable-app.sh and disable-app.sh invoke compose like:
+#
+#   docker compose -f docker-compose.yml -f apps/vibe-tx-converter.yml up -d
+#   docker compose -f docker-compose.yml -f apps/vibe-tx-converter.yml stop
+#
+# Reads /opt/vibe/env/vibe-tx-converter.env (rendered from
+# env-templates/per-app/vibe-tx-converter.env.tmpl).
+#
+# Single-service topology: the upstream image bundles its own static
+# UI on the same Express server at :4000, so there's no separate
+# client tier (unlike vibe-tb / vibe-mybooks).
+#
+# We deliberately do NOT use the upstream's docker-compose.appliance.yml
+# because it hard-requires a shared `llm-gateway` service this appliance
+# does not ship. This overlay reroutes LLM access through Anthropic
+# (LLM_PROVIDER=anthropic) using the appliance's own ANTHROPIC_API_KEY.
+
+name: vibe
+
+services:
+  vibe-tx-converter:
+    image: ghcr.io/kisaesdevlab/vibe-tx-converter:${APP_TAG:-latest}
+    container_name: vibe-tx-converter
+    restart: unless-stopped
+    init: true
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-tx-converter.env
+    volumes:
+      # Persistent storage for converted statement output and the
+      # GLM-OCR cache the converter shares with vibe-glm-ocr (same
+      # cache dir convention as vibe-tb).
+      - /opt/vibe/data/apps/vibe-tx-converter/uploads:/data/uploads
+      - /opt/vibe/data/apps/vibe-tx-converter/exports:/data/exports
+      - /opt/vibe/data/apps/vibe-tx-converter/state:/var/lib/vibetc
+    networks:
+      - vibe_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # Upstream Dockerfile bakes a HEALTHCHECK that hits
+      # /api/health/live with curl; mirror it here so compose-level
+      # checks line up with the manifest's health path.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:4000/api/health/live || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
