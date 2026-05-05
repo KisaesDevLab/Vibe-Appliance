@@ -667,11 +667,19 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   case "${1:-}" in
     snapshot) settings_snapshot_env ;;
     restore)  settings_restore_env "${2:?usage: settings-save.sh restore <snap_dir>}" ;;
+    apply)
+      # Console-driven save. The /api/v1/settings/save handler spawns
+      # us with a temp JSON payload and parses the single JSON line
+      # written by _settings_emit_result on stdout. settings_save_apply
+      # exits 0 on saved, 1 on rolled-back/degraded — propagate that.
+      settings_save_apply "${2:?usage: settings-save.sh apply <payload.json>}"
+      ;;
     *)
-      cat <<EOF
+      cat <<EOF >&2
 Usage: $0 <command> [args]
   snapshot                  Write a timestamped env snapshot, print the path.
   restore <snap_dir>        Restore env files from a prior snapshot.
+  apply <payload.json>      Apply a settings-save payload (console-driven).
 EOF
       exit 1
       ;;
