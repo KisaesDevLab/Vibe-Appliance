@@ -214,7 +214,9 @@ _resolve_server_ip() {
       2>/dev/null || true)"
   fi
   if [[ -z "$ip" ]]; then
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    # _host_lan_ip skips docker bridges; bare `hostname -I | awk` would
+    # happily return 172.x for vibe_net.
+    ip="$(_host_lan_ip)"
   fi
   printf '%s' "$ip"
 }

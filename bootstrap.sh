@@ -914,9 +914,12 @@ _resolve_server_url() {
           2>/dev/null || true)"             # AWS
   fi
 
-  # Fallback: first non-loopback IPv4 the kernel knows about.
+  # Fallback: first non-loopback, non-docker-bridge IPv4 the kernel knows
+  # about. _host_lan_ip filters out 172.x.x.x docker bridges that
+  # `hostname -I` is happy to return first when Docker's interfaces come
+  # up before the physical NIC.
   if [[ -z "$ip" ]]; then
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    ip="$(_host_lan_ip)"
   fi
 
   if [[ -n "$ip" && "$ip" =~ ^[0-9.]+$ ]]; then
@@ -998,9 +1001,12 @@ main() {
 
   # Cache the host's primary LAN IPv4 so the console can render LAN-mode
   # Cockpit and emergency-access URLs as concrete clickable links rather
-  # than placeholders. Best-effort — falls back gracefully if `hostname
-  # -I` returns nothing on a misconfigured host. (Phase 8.5 Workstream A.)
-  _host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  # than placeholders. _host_lan_ip skips docker bridges so we don't
+  # cache a 172.x address that nothing on the actual LAN can reach.
+  # Best-effort — empty result silently leaves host_ip unset, the
+  # console renders a "(not detected)" hint and the operator can edit
+  # state.json. (Phase 8.5 Workstream A.)
+  _host_ip="$(_host_lan_ip)"
   if [[ -n "${_host_ip:-}" ]]; then
     state_set_config_kv host_ip "$_host_ip"
   fi

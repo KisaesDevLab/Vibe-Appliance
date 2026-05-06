@@ -682,7 +682,7 @@ _render_app_env() {
     # Domain mode → app lives at its own subdomain, served from root.
     vite_base_path="/"
   else
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    ip="$(_host_lan_ip)"
     allowed_origin="http://${ip:-localhost}"
     # LAN / Tailscale → Caddy path-prefix /<slug>/. The web image's
     # /docker-entrypoint.d/40-base-path.sh reads VITE_BASE_PATH and

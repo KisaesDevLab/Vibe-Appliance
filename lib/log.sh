@@ -246,3 +246,46 @@ die() {
     "$_C_RED" "$_C_RESET" "$VIBE_LOG_FILE" >&2
   exit 1
 }
+
+# --- host introspection ----------------------------------------------------
+
+# Resolve the host's primary LAN IPv4 — the address a user on the LAN would
+# dial. Skips docker-managed bridges (docker0, br-*, veth*, vibe_net) which
+# `hostname -I` is happy to return as the first IP if Docker's interfaces
+# come up before the physical NIC. Without this filter, ALLOWED_ORIGIN ended
+# up as `http://172.18.0.6` (a docker bridge) for vibe-tx-converter, and the
+# app's CORS check rejected every browser request from the actual LAN IP.
+#
+# Strategy:
+#   1. `ip route get 1.1.1.1` — kernel reports the source addr it would use
+#      for outbound traffic, i.e. the host's primary interface. Reliable on
+#      any internet-connected host (including DigitalOcean droplets, our
+#      canonical test target).
+#   2. Fallback: scan `ip -4 addr show` for the first IPv4 on a non-docker,
+#      non-loopback, non-virtual interface. Handles offline LAN-only hosts.
+#   3. Final fallback: first `hostname -I` IP, or empty.
+#
+# Prints the chosen IP (or empty) on stdout. Never fails; callers should
+# default to "localhost" when the result is empty.
+_host_lan_ip() {
+  local ip
+  # 1. Default-route source IPv4.
+  ip="$(ip -4 -o route get 1.1.1.1 2>/dev/null \
+        | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  if [[ -n "$ip" ]]; then
+    printf '%s' "$ip"
+    return 0
+  fi
+  # 2. First non-docker, non-loopback, non-virtual IPv4.
+  ip="$(ip -4 -o addr show 2>/dev/null \
+        | awk '$2 !~ /^(lo|docker|br-|veth|vibe_)/ && $4 ~ /\// {
+                 split($4, a, "/"); print a[1]; exit
+               }')"
+  if [[ -n "$ip" ]]; then
+    printf '%s' "$ip"
+    return 0
+  fi
+  # 3. Last resort — whatever hostname -I says first, even if it's wrong.
+  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  printf '%s' "${ip:-}"
+}

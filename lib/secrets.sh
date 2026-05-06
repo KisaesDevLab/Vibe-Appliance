@@ -411,8 +411,10 @@ secrets_write_credentials() {
 
   # Best-effort detection of LAN + Tailscale IPs for the emergency-access
   # section. Both fall back to a placeholder when unavailable.
+  # _host_lan_ip skips docker bridges so CREDENTIALS.txt doesn't print
+  # a 172.x address the operator's browser can't reach.
   local lan_ip ts_ip
-  lan_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  lan_ip="$(_host_lan_ip)"
   [[ -z "$lan_ip" ]] && lan_ip="<your-server-ip>"
   if command -v tailscale >/dev/null 2>&1; then
     ts_ip="$(tailscale ip -4 2>/dev/null | head -1)"
