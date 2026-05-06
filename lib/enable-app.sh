@@ -744,24 +744,37 @@ _render_app_env() {
       "${ENCRYPTION_KEY:-}" "${JWT_SECRET:-}" \
       "$db_name" "$db_user" "$db_pass" \
       "$vite_base_path" "$session_secure" <<'PYEOF'
-import sys
+import base64, sys
 src, dst, allowed_origin, database_url, redis_url, \
     encryption_key, jwt_secret, db_name, db_user, db_pass, \
     vite_base_path, session_secure = sys.argv[1:13]
+# Some upstream apps want the appliance's 32-byte AES key as base64 (32
+# raw bytes -> 44-char base64 with padding) rather than the hex form
+# we ship in shared.env. Derive it once here so per-app templates can
+# reference @ENCRYPTION_KEY_B64@ without each app re-encoding by hand.
+# Falls back to empty if the hex value is malformed (preserves the
+# placeholder unset rather than crashing render).
+encryption_key_b64 = ""
+try:
+    if encryption_key:
+        encryption_key_b64 = base64.b64encode(bytes.fromhex(encryption_key)).decode("ascii")
+except ValueError:
+    pass
 with open(src) as f:
     body = f.read()
-body = body.replace("@ALLOWED_ORIGIN@",  allowed_origin)
-body = body.replace("@DATABASE_URL@",    database_url)
-body = body.replace("@REDIS_URL@",       redis_url)
-body = body.replace("@ENCRYPTION_KEY@",  encryption_key)
-body = body.replace("@JWT_SECRET@",      jwt_secret)
-body = body.replace("@DB_NAME@",         db_name)
-body = body.replace("@DB_USER@",         db_user)
-body = body.replace("@DB_PASSWORD@",     db_pass)
-body = body.replace("@DB_HOST@",         "postgres")
-body = body.replace("@DB_PORT@",         "5432")
-body = body.replace("@VITE_BASE_PATH@",  vite_base_path)
-body = body.replace("@SESSION_SECURE@",  session_secure)
+body = body.replace("@ALLOWED_ORIGIN@",     allowed_origin)
+body = body.replace("@DATABASE_URL@",       database_url)
+body = body.replace("@REDIS_URL@",          redis_url)
+body = body.replace("@ENCRYPTION_KEY@",     encryption_key)
+body = body.replace("@ENCRYPTION_KEY_B64@", encryption_key_b64)
+body = body.replace("@JWT_SECRET@",         jwt_secret)
+body = body.replace("@DB_NAME@",            db_name)
+body = body.replace("@DB_USER@",            db_user)
+body = body.replace("@DB_PASSWORD@",        db_pass)
+body = body.replace("@DB_HOST@",            "postgres")
+body = body.replace("@DB_PORT@",            "5432")
+body = body.replace("@VITE_BASE_PATH@",     vite_base_path)
+body = body.replace("@SESSION_SECURE@",     session_secure)
 with open(dst, "w") as f:
     f.write(body)
 PYEOF
