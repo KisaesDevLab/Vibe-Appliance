@@ -534,6 +534,15 @@ app.post('/api/v1/disable/:slug', requireAdmin, testRateLimit, async (req, res) 
 });
 
 // --- Update endpoints --------------------------------------------------
+// Route order matters: the /check route must come before /:slug or
+// Express matches POST /update/check with slug="check", fails the
+// MANIFESTS lookup, and returns "unknown app" instead of running the
+// check script.
+
+// One-off update check that the operator can fire by hand.
+app.post('/api/v1/update/check', requireAdmin, testRateLimit, async (_req, res) => {
+  await runShell(res, [UPDATE_SCRIPT, '--check'], 'update-check');
+});
 
 app.post('/api/v1/update/:slug', requireAdmin, testRateLimit, async (req, res) => {
   const slug = req.params.slug;
@@ -547,11 +556,6 @@ app.post('/api/v1/update/:slug/rollback', requireAdmin, testRateLimit, async (re
   if (!SLUG_RE.test(slug)) return res.status(400).json({ error: 'invalid slug' });
   if (!MANIFESTS[slug])    return res.status(404).json({ error: 'unknown app' });
   await runShell(res, [UPDATE_SCRIPT, slug, '--rollback'], 'rollback', { slug });
-});
-
-// One-off update check that the operator can fire by hand.
-app.post('/api/v1/update/check', requireAdmin, testRateLimit, async (_req, res) => {
-  await runShell(res, [UPDATE_SCRIPT, '--check'], 'update-check');
 });
 
 // --- Infra services (Phase 8) ------------------------------------------
