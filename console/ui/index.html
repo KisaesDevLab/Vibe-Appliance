@@ -11,9 +11,6 @@
     <header class="hero">
       <p class="eyebrow">Vibe Appliance</p>
       <h1>Your firm's stack, one box.</h1>
-      <p class="lede">
-        Trial Balance, MyBooks, Connect, Tax-Research, Payroll &amp; Time, GLM-OCR — all running on this server, served at the URLs below as you switch them on.
-      </p>
     </header>
 
     <section id="apps-section" aria-busy="true">
@@ -102,7 +99,7 @@
             ${userRow}
           </dl>
           <div class="app-card__actions">
-            <a class="btn" href="${escapeHtml(a.url)}">Open</a>
+            <a class="btn" href="${escapeHtml(a.url)}" target="_blank" rel="noopener noreferrer">Open</a>
           </div>
         </article>`;
       }).join('');

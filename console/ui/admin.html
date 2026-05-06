@@ -35,6 +35,10 @@
     <section>
       <h2>Apps</h2>
       <p class="muted" id="apps-summary">—</p>
+      <div class="cta-row">
+        <button class="btn btn--ghost" id="updates-check">Check for updates</button>
+        <span class="muted" id="updates-status"></span>
+      </div>
       <div class="apps-list" id="apps-list"></div>
     </section>
 
@@ -915,6 +919,43 @@ sudo systemctl start cloudflared</pre>
 
     refresh();
     setInterval(refresh, 15000);
+
+    // ---------- Check for updates ----------
+    // Calls POST /api/v1/update/check which runs `update.sh --check`
+    // and writes update_available + image_tag_latest into state.json.
+    // The Update buttons on each card stay disabled until that flag
+    // is true; without this trigger nothing else flips it.
+    document.getElementById('updates-check').addEventListener('click', checkUpdates);
+
+    async function checkUpdates() {
+      const btn  = document.getElementById('updates-check');
+      const stat = document.getElementById('updates-status');
+      btn.disabled = true;
+      btn.textContent = 'Checking…';
+      stat.textContent = '';
+      try {
+        const r = await fetch('/api/v1/update/check', {
+          method: 'POST', credentials: 'same-origin',
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          stat.style.color = '#8b3a1c';
+          stat.textContent = 'Check failed: ' + (data.stderr || data.error || 'HTTP ' + r.status);
+        } else {
+          stat.style.color = '';
+          stat.textContent = 'Checked at ' + new Date().toISOString();
+        }
+      } catch (err) {
+        stat.style.color = '#8b3a1c';
+        stat.textContent = 'Check failed: ' + err.message;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Check for updates';
+        // Refresh app cards so the now-true update_available flag
+        // (if any) lights up the Update buttons immediately.
+        await refresh();
+      }
+    }
 
     // ---------- Doctor ----------
     document.getElementById('doctor-run').addEventListener('click', runDoctor);
