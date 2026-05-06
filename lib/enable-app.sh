@@ -237,6 +237,11 @@ enable_app() {
   fi
 
   _state_app_set "$slug" enabled true status running image_tag "$default_tag"
+  # Clear any stale failure messages from a prior enable attempt. Without
+  # this the admin card renders a "compose up failed" banner alongside
+  # the running badge after a successful retry, because _state_app_set
+  # only merges keys — it never removes them.
+  _state_app_clear_keys "$slug" error update_error
   log_ok "$slug is up"
 }
 
@@ -933,6 +938,45 @@ for k in it:
         entry[k] = (v == "true")
     else:
         entry[k] = v
+entry["at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(s, f, indent=2, sort_keys=True)
+    f.write("\n")
+os.rename(tmp, path)
+PYEOF
+}
+
+# _state_app_clear_keys <slug> <key1> [<key2> ...]
+#   Remove the given keys from state.apps.<slug>. Used on the enable
+#   success path to clear stale failure messages that _state_app_set
+#   left behind on a prior failed attempt — passing an empty string to
+#   _state_app_set would only overwrite-with-empty, leaving a noisy key
+#   in state.json that the admin card still treats as truthy in some
+#   render paths.
+_state_app_clear_keys() {
+  local slug="$1"; shift
+  [[ "$#" -eq 0 ]] && return 0
+  python3 - "$VIBE_STATE_FILE" "$slug" "$@" <<'PYEOF'
+import json, sys, os, datetime, fcntl
+path, slug, *keys = sys.argv[1:]
+_lk = open(path + ".lock", "w")
+fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
+try:
+    with open(path) as f:
+        s = json.load(f)
+except (FileNotFoundError, ValueError):
+    sys.exit(0)
+entry = s.get("apps", {}).get(slug)
+if not entry:
+    sys.exit(0)
+changed = False
+for k in keys:
+    if k in entry:
+        del entry[k]
+        changed = True
+if not changed:
+    sys.exit(0)
 entry["at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 tmp = path + ".tmp"
 with open(tmp, "w") as f:
