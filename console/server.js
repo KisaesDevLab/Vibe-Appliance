@@ -395,12 +395,42 @@ async function ddnsUpdateOne(host, domain, password, ip) {
     //     ...
     //   </interface-response>
     // Anything other than <ErrCount>0</ErrCount> is a failure even
-    // if the HTTP status is 200.
+    // if the HTTP status is 200. On failure, <errors><Err1>...</Err1>
+    // ...</errors> carries Namecheap's reason — extract it so the UI
+    // can render an operator-friendly line instead of a raw XML dump.
     const ok = r.ok && /<ErrCount>0<\/ErrCount>/i.test(body);
-    return { ok, status: r.status, body: body.slice(0, 400) };
+    if (ok) return { ok: true, status: r.status, body: body.slice(0, 400) };
+
+    const errMatch = body.match(/<Err\d+>([^<]+)<\/Err\d+>/i);
+    const reason   = errMatch ? errMatch[1].trim() : null;
+    return {
+      ok: false,
+      status: r.status,
+      reason,           // clean one-liner from <Err1>
+      hint: _ddnsHint(reason),
+      body: body.slice(0, 400),
+    };
   } catch (err) {
     return { ok: false, error: (err && err.message) || String(err) };
   }
+}
+
+// Map common Namecheap DDNS error strings to actionable recovery hints.
+// Returns null when no specific hint applies — caller falls back to
+// the raw `reason` text in that case.
+function _ddnsHint(reason) {
+  if (!reason) return null;
+  const r = reason.toLowerCase();
+  if (r.includes('a record not found') || r.includes('no records updated')) {
+    return 'Namecheap DDNS only UPDATES existing A records — it does not create them. Add the host as an A record at Namecheap (Domain List → Manage → Advanced DNS → Host Records) with any initial IP, then retry. The appliance will overwrite the IP on the next tick.';
+  }
+  if (r.includes('passwords do not match') || r.includes('password is incorrect')) {
+    return 'Namecheap rejected the DDNS password. Make sure you copied the per-domain Dynamic DNS password (Domain List → Manage → Advanced DNS → Dynamic DNS — hover the password circle), not your account password.';
+  }
+  if (r.includes('domain name not found') || r.includes('domain is not active')) {
+    return 'Domain not recognized at Namecheap. Confirm the apex spelling and that the domain is active under your Namecheap account with BasicDNS, PremiumDNS, or FreeDNS as its nameserver.';
+  }
+  return null;
 }
 
 // One pass over the host list. force=true bypasses the IP-unchanged
@@ -2336,13 +2366,18 @@ app.post('/api/v1/admin/test/ddns', requireAdmin, testRateLimit, async (req, res
   if (result.ok) {
     return res.json({
       ok: true,
-      message: `Namecheap accepted update: ${domain} A → ${ip}. Save these settings; the appliance will keep this and every enabled app's subdomain current going forward.`,
+      message: `Namecheap accepted update: ${domain} A → ${ip}. Save these settings; the appliance will keep this and every enabled app's subdomain current going forward. Make sure A records exist at Namecheap for every host you'll publish (@, www, plus each enabled app's subdomain) — DDNS only updates existing records.`,
     });
   }
-  return res.json({
-    ok: false,
-    message: 'Namecheap rejected the update: ' + (result.error || `HTTP ${result.status}: ${(result.body || '').slice(0, 250)}`),
-  });
+  // Surface Namecheap's <Err1> string + a recovery hint when we have
+  // one, so the UI doesn't dump raw XML at the operator. The hint is
+  // the single most common reason DDNS fails on first run (host record
+  // doesn't exist yet).
+  const reason = result.reason || result.error || `HTTP ${result.status}`;
+  const message = result.hint
+    ? `Namecheap rejected: ${reason}. ${result.hint}`
+    : `Namecheap rejected: ${reason}`;
+  return res.json({ ok: false, message });
 });
 
 // Network-tab status panel data. Mirrors the Backup/info shape: returns

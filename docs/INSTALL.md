@@ -141,21 +141,49 @@ Setup:
    domain → **Advanced DNS** tab.
 2. Find the **Dynamic DNS** section and toggle it **on**. Mouse over
    the **Dynamic DNS Password** circle that appears — copy the value.
-3. Manually add an A record once for the bare domain (`@ → your-current-public-ip`).
-   The appliance will take over from here. (You can find your current
-   public IP at `https://api.ipify.org`.)
+3. **Pre-create every A record the appliance will publish.** This is
+   the step most operators miss. Namecheap's DDNS protocol *only
+   updates existing records — it does not create them*, and an update
+   to a non-existent host returns "No Records updated. A record not
+   Found." Under the **Host Records** section of the Advanced DNS tab,
+   add one A record per host:
+
+   ```
+   Type    Host          Value              TTL
+   ----    -----         -----              ---
+   A       @             <current-public-ip>  Automatic
+   A       www           <current-public-ip>  Automatic
+   A       tb            <current-public-ip>  Automatic   # if enabling Vibe-TB
+   A       mybooks       <current-public-ip>  Automatic   # if enabling Vibe-MyBooks
+   A       calc          <current-public-ip>  Automatic   # if enabling Vibe-Calculators
+   A       payroll       <current-public-ip>  Automatic   # if enabling Vibe-Payroll-Time
+   A       taxresearch   <current-public-ip>  Automatic   # if enabling Vibe-Tax-Research-Chat
+   A       vibetc        <current-public-ip>  Automatic   # if enabling Vibe-TX-Converter
+   A       backup        <current-public-ip>  Automatic   # Duplicati subdomain
+   A       cockpit       <current-public-ip>  Automatic   # Cockpit subdomain
+   A       portainer     <current-public-ip>  Automatic   # Portainer subdomain
+   ```
+
+   The initial value can be any IP; the appliance overwrites it on the
+   first DDNS tick. Find your current public IP at
+   `https://api.ipify.org` — paste that as a placeholder.
+
 4. Run the appliance installer in domain mode (HTTP-01 — Cloudflare
    DNS-01 is incompatible because it requires Cloudflare nameservers).
 5. Once the admin console is up, go to **Configuration → Network** and:
    - Set **Dynamic DNS provider** to `Namecheap`.
    - Paste the domain (e.g. `firm.com`).
    - Paste the DDNS password from step 2.
-   - Click **Test** — Namecheap should accept an update for `@`.
+   - Click **Test** — Namecheap should accept an update for `@`. If
+     you see "A record not Found", you skipped step 3 for the bare
+     domain — go back and add it.
    - **Save**. The console restarts; once it's back, the updater is
      running.
-6. The console publishes one A record per enabled app automatically
-   (`tb.firm.com`, `mybooks.firm.com`, etc.) — no need to add them at
-   Namecheap by hand.
+6. The appliance keeps every host record current going forward. When
+   you enable a new app later, **first** add its A record at Namecheap
+   (one of the rows above), then enable the app from the admin Apps
+   tab. The Network tab's status panel will show "✓ N hosts up-to-date"
+   on each tick.
 
 Trade-offs:
 - Cert renewal during ISP IP rotation has a small window: if your IP

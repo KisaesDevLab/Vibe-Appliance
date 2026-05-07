@@ -860,7 +860,9 @@
       forceBtn.style.opacity = '';
 
       // Per-host details — collapsed-style dump so a busy install
-      // (10+ apps) doesn't take over the screen.
+      // (10+ apps) doesn't take over the screen. Failure lines prefer
+      // the parsed Namecheap <Err1> string + recovery hint over the
+      // raw XML body so missing-record errors read as actionable.
       if (data.last_results) {
         output.hidden = false;
         const lines = [];
@@ -869,8 +871,8 @@
           if (r.ok) {
             lines.push(`✓ ${fqdn}  (HTTP ${r.status || '200'})`);
           } else {
-            const err = r.error || `HTTP ${r.status}: ${(r.body || '').replace(/\s+/g, ' ').slice(0, 120)}`;
-            lines.push(`✗ ${fqdn}  ${err}`);
+            const reason = r.reason || r.error || `HTTP ${r.status}`;
+            lines.push(`✗ ${fqdn}  ${reason}` + (r.hint ? `\n     → ${r.hint}` : ''));
           }
         }
         output.textContent = lines.join('\n');
