@@ -673,6 +673,14 @@
     if (cat === 'Backup') {
       renderBackupSection(panelEl);
     }
+
+    // Network tab — DDNS status panel. Only meaningful when the
+    // operator has set DDNS_PROVIDER=namecheap; for the default
+    // "none" config the panel surfaces a one-line muted note instead
+    // of the full status grid so it doesn't add noise.
+    if (cat === 'Network') {
+      renderDdnsSection(panelEl);
+    }
     updateConditionals();
   }
 
@@ -731,6 +739,184 @@
       }
     }
     return form;
+  }
+
+  // Network tab — DDNS status panel. Mirrors the Backup section's
+  // shape (heading + status row + cta-row + collapsible output) so the
+  // tabs feel consistent. Polls /api/v1/admin/ddns/info on render and
+  // renders three lines: overall state, current vs. last public IP,
+  // per-host result list. The Force-update button calls
+  // /api/v1/admin/ddns/update which bypasses the IP-unchanged
+  // short-circuit on the server side.
+  function renderDdnsSection(host) {
+    const section = el('section', {
+      class: 'maintenance',
+      'aria-labelledby': 'ddns-h',
+      'data-ddns-section': '1',
+    });
+    section.appendChild(el('h2', { id: 'ddns-h' }, ['Dynamic DNS status']));
+
+    const row = el('div', { class: 'maintenance__row' });
+    const status   = el('p', { class: 'help', 'data-ddns-status': '1' }, ['Loading…']);
+    const ipLine   = el('p', { class: 'help', 'data-ddns-ip': '1' }, ['']);
+    const cta      = el('div', { class: 'cta-row', style: 'gap:0.5rem;align-items:center;flex-wrap:wrap;' });
+    const forceBtn = el('button', {
+      type: 'button',
+      class: 'btn',
+      'data-ddns-force': '1',
+      style: 'pointer-events:none;opacity:0.5;',
+      onclick: () => forceDdnsUpdate(section),
+    }, ['Force update']);
+    const refreshBtn = el('button', {
+      type: 'button',
+      class: 'btn btn--ghost',
+      onclick: () => loadDdnsInfo(section),
+    }, ['Refresh']);
+    cta.appendChild(forceBtn);
+    cta.appendChild(refreshBtn);
+
+    const output = el('pre', { class: 'maintenance__output', 'data-ddns-output': '1', hidden: '' }, []);
+
+    row.appendChild(status);
+    row.appendChild(ipLine);
+    row.appendChild(cta);
+    row.appendChild(output);
+    section.appendChild(row);
+    host.appendChild(section);
+
+    loadDdnsInfo(section);
+  }
+
+  async function loadDdnsInfo(section) {
+    const status   = section.querySelector('[data-ddns-status]');
+    const ipLine   = section.querySelector('[data-ddns-ip]');
+    const forceBtn = section.querySelector('[data-ddns-force]');
+    const output   = section.querySelector('[data-ddns-output]');
+
+    status.textContent = 'Loading…';
+    status.style.color = 'var(--text-muted)';
+    ipLine.textContent = '';
+    output.hidden = true;
+    output.textContent = '';
+
+    try {
+      const r = await fetch('/api/v1/admin/ddns/info', { credentials: 'same-origin' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+
+      if (!data.enabled) {
+        status.style.color = 'var(--text-muted)';
+        status.textContent = 'DDNS disabled. Pick "namecheap" above and save to start the updater (one console restart needed for the env vars to load).';
+        forceBtn.style.pointerEvents = 'none';
+        forceBtn.style.opacity = '0.5';
+        return;
+      }
+
+      const liveIp = data.public_ip_now;
+      const lastIp = data.last_ip;
+      const ts     = data.last_update_ts;
+
+      // Top-line status. last_error wins (red); otherwise pick from
+      // last_results vs. an unrun-yet state.
+      if (data.last_error) {
+        status.style.color = 'var(--bad)';
+        status.textContent = '✗ ' + data.last_error;
+      } else if (!data.last_results) {
+        status.style.color = 'var(--text-muted)';
+        status.textContent = `Updater armed (every ${data.interval_min} min). First update fires within 30 s of console boot, then on IP change.`;
+      } else {
+        const okCount  = Object.values(data.last_results).filter(r => r.ok).length;
+        const totCount = Object.keys(data.last_results).length;
+        if (okCount === totCount) {
+          status.style.color = 'var(--good)';
+          status.textContent = `✓ All ${totCount} host(s) up-to-date at Namecheap.`;
+        } else if (okCount === 0) {
+          status.style.color = 'var(--bad)';
+          status.textContent = `✗ Namecheap rejected every host (${totCount}/${totCount} failed). See per-host details below.`;
+        } else {
+          status.style.color = 'var(--warn)';
+          status.textContent = `⚠ Partial: ${okCount}/${totCount} host(s) updated; ${totCount - okCount} failed.`;
+        }
+      }
+
+      // IP line.
+      let ipText = '';
+      if (liveIp && lastIp && liveIp !== lastIp) {
+        ipText = `Public IP now: ${liveIp} — last pushed to Namecheap: ${lastIp}` +
+                 (ts ? ` (${humanAge(ts)} ago).` : '.') +
+                 ' Next tick will update; or click Force update.';
+        ipLine.style.color = 'var(--warn)';
+      } else if (liveIp) {
+        ipText = `Public IP: ${liveIp}` + (ts ? ` (last update ${humanAge(ts)} ago)` : '') + '.';
+        ipLine.style.color = 'var(--text-muted)';
+      } else {
+        ipText = 'Could not detect current public IP. Outbound HTTPS to api.ipify.org / ifconfig.me may be blocked.';
+        ipLine.style.color = 'var(--bad)';
+      }
+      ipLine.textContent = ipText;
+
+      // Force button — enabled only when DDNS is on.
+      forceBtn.style.pointerEvents = '';
+      forceBtn.style.opacity = '';
+
+      // Per-host details — collapsed-style dump so a busy install
+      // (10+ apps) doesn't take over the screen.
+      if (data.last_results) {
+        output.hidden = false;
+        const lines = [];
+        for (const [host, r] of Object.entries(data.last_results)) {
+          const fqdn = host === '@' ? data.domain : host + '.' + data.domain;
+          if (r.ok) {
+            lines.push(`✓ ${fqdn}  (HTTP ${r.status || '200'})`);
+          } else {
+            const err = r.error || `HTTP ${r.status}: ${(r.body || '').replace(/\s+/g, ' ').slice(0, 120)}`;
+            lines.push(`✗ ${fqdn}  ${err}`);
+          }
+        }
+        output.textContent = lines.join('\n');
+      }
+    } catch (err) {
+      status.style.color = 'var(--bad)';
+      status.textContent = '✗ Could not load DDNS info: ' + err.message;
+    }
+  }
+
+  async function forceDdnsUpdate(section) {
+    const forceBtn = section.querySelector('[data-ddns-force]');
+    const status   = section.querySelector('[data-ddns-status]');
+    forceBtn.disabled = true;
+    const orig = forceBtn.textContent;
+    forceBtn.textContent = 'Updating…';
+    status.style.color = 'var(--text-muted)';
+    status.textContent = 'Pushing all hosts to Namecheap…';
+    try {
+      const r = await fetch('/api/v1/admin/ddns/update', { method: 'POST', credentials: 'same-origin' });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        status.style.color = 'var(--bad)';
+        status.textContent = '✗ ' + (data.error || `HTTP ${r.status}`);
+        return;
+      }
+    } catch (err) {
+      status.style.color = 'var(--bad)';
+      status.textContent = '✗ ' + err.message;
+      return;
+    } finally {
+      forceBtn.disabled = false;
+      forceBtn.textContent = orig;
+    }
+    // Re-fetch the info to render the fresh per-host results.
+    await loadDdnsInfo(section);
+  }
+
+  function humanAge(iso) {
+    const ms = Date.now() - Date.parse(iso);
+    if (!Number.isFinite(ms) || ms < 0) return '?';
+    const s = Math.floor(ms / 1000);
+    if (s < 60)        return s + 's';
+    if (s < 3600)      return Math.floor(s / 60) + 'm';
+    if (s < 86400)     return Math.floor(s / 3600) + 'h';
+    return Math.floor(s / 86400) + 'd';
   }
 
   function renderBackupSection(host) {

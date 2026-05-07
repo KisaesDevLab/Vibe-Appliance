@@ -171,6 +171,15 @@ services:
     init: true
     env_file:
       - /opt/vibe/env/shared.env
+      # appliance.env carries Tier-1 operator-editable settings that
+      # the console process itself acts on at runtime — currently the
+      # DDNS updater (DDNS_PROVIDER, NAMECHEAP_DDNS_*, DDNS_INTERVAL_MIN).
+      # Created unconditionally by phase_secrets in bootstrap.sh, so it
+      # exists by the time this service starts. Same load-order as
+      # caddy's env_file: shared.env first, then appliance.env, so an
+      # appliance.env override wins on key collision (matches the
+      # caddy block's documented semantics).
+      - /opt/vibe/env/appliance.env
     environment:
       VIBE_DIR: /opt/vibe
       NODE_ENV: production

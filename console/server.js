@@ -326,6 +326,146 @@ async function prewarmGhcrCache() {
 setTimeout(prewarmGhcrCache, 10_000);
 setInterval(prewarmGhcrCache, GHCR_TTL_MS);
 
+// ----- Dynamic DNS (Namecheap) -----------------------------------------
+//
+// The console runs an in-process updater so non-static-IP installs don't
+// need a host-level cron. Public IP is fetched from a third-party probe
+// (Namecheap recommends this — their endpoint can also auto-detect from
+// source IP, but a confused NAT or upstream proxy would silently set the
+// wrong record). On a real change, one HTTPS GET per host fans out to
+// dynamicdns.park-your-domain.com — the bare domain (@), www, and every
+// enabled app's manifest.subdomain.
+//
+// Only fires when DDNS_PROVIDER === 'namecheap'. The settings page edits
+// take effect on the next console restart (the env file gets re-read);
+// we don't dynamically swap providers mid-process — that path leads to
+// stale-callback bugs and is out of scope for v1.
+
+const DDNS_PROVIDER     = (process.env.DDNS_PROVIDER || 'none').trim();
+const DDNS_DOMAIN       = (process.env.NAMECHEAP_DDNS_DOMAIN || '').trim();
+const DDNS_PASSWORD_RAW = (process.env.NAMECHEAP_DDNS_PASSWORD || '').trim();
+const DDNS_INTERVAL_MIN = (() => {
+  const n = parseInt(process.env.DDNS_INTERVAL_MIN || '15', 10);
+  if (!Number.isFinite(n)) return 15;
+  return Math.max(5, Math.min(60, n));
+})();
+
+const ddnsState = {
+  enabled:        DDNS_PROVIDER === 'namecheap',
+  last_ip:        null,
+  last_update_ts: null,
+  last_results:   null,    // { host: { ok, status?, body?|error? } }
+  last_error:     null,
+};
+
+// Fetch the host's public IP. ipify is the canonical free probe; we
+// fall back to ifconfig.me so a single-vendor outage doesn't block the
+// loop. Returns null if both fail.
+async function fetchPublicIp() {
+  const probes = [
+    'https://api.ipify.org/?format=text',
+    'https://ifconfig.me/ip',
+  ];
+  for (const url of probes) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(5000) });
+      if (!r.ok) continue;
+      const ip = (await r.text()).trim();
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) return ip;
+    } catch { /* try next */ }
+  }
+  return null;
+}
+
+// Push a single host update to Namecheap. Returns
+// { ok, status?, body?|error? } — caller stores it on ddnsState.
+async function ddnsUpdateOne(host, domain, password, ip) {
+  const u = new URL('https://dynamicdns.park-your-domain.com/update');
+  u.searchParams.set('host',     host);
+  u.searchParams.set('domain',   domain);
+  u.searchParams.set('password', password);
+  u.searchParams.set('ip',       ip);
+  try {
+    const r = await fetch(u.toString(), { signal: AbortSignal.timeout(10_000) });
+    const body = await r.text();
+    // Namecheap returns XML like:
+    //   <interface-response>
+    //     <Command>SETDNSHOST</Command>
+    //     <ErrCount>0</ErrCount>
+    //     ...
+    //   </interface-response>
+    // Anything other than <ErrCount>0</ErrCount> is a failure even
+    // if the HTTP status is 200.
+    const ok = r.ok && /<ErrCount>0<\/ErrCount>/i.test(body);
+    return { ok, status: r.status, body: body.slice(0, 400) };
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || String(err) };
+  }
+}
+
+// One pass over the host list. force=true bypasses the IP-unchanged
+// short-circuit and updates every host even if nothing rotated — used
+// by the manual "Force update" button and the test endpoint.
+async function ddnsUpdateCycle(force = false) {
+  if (!ddnsState.enabled) return;
+  if (!DDNS_DOMAIN || !DDNS_PASSWORD_RAW) {
+    ddnsState.last_error = 'NAMECHEAP_DDNS_DOMAIN and NAMECHEAP_DDNS_PASSWORD required';
+    return;
+  }
+
+  const ip = await fetchPublicIp();
+  if (!ip) {
+    ddnsState.last_error = 'could not fetch public IP from ipify or ifconfig.me';
+    log('warn', 'ddns: no public IP', { last_known: ddnsState.last_ip });
+    return;
+  }
+  if (!force && ip === ddnsState.last_ip) {
+    log('info', 'ddns: public IP unchanged, skipping update', { ip });
+    return;
+  }
+
+  // Host list: bare domain + www + every enabled app's subdomain. The
+  // Set dedupes if a manifest accidentally declared 'www' as its
+  // subdomain — Namecheap rejects duplicates in a tight cycle.
+  const hosts = new Set(['@', 'www']);
+  const state = readState();
+  for (const slug of Object.keys(state.apps || {})) {
+    const app = state.apps[slug];
+    if (!app || !app.enabled) continue;
+    const m = MANIFESTS[slug];
+    if (m && m.subdomain) hosts.add(m.subdomain);
+  }
+
+  const results = {};
+  for (const host of hosts) {
+    results[host] = await ddnsUpdateOne(host, DDNS_DOMAIN, DDNS_PASSWORD_RAW, ip);
+  }
+
+  ddnsState.last_ip        = ip;
+  ddnsState.last_update_ts = new Date().toISOString();
+  ddnsState.last_results   = results;
+  ddnsState.last_error     = null;
+
+  const okCount = Object.values(results).filter(r => r.ok).length;
+  log('info', 'ddns: cycle complete', {
+    ip,
+    host_count: Object.keys(results).length,
+    success_count: okCount,
+    forced: !!force,
+  });
+}
+
+if (ddnsState.enabled) {
+  // Initial update 30s after boot — gives the docker network time to
+  // settle and lets the operator see the result on the Network tab
+  // before they leave for the day.
+  setTimeout(() => ddnsUpdateCycle(true), 30_000);
+  setInterval(ddnsUpdateCycle, DDNS_INTERVAL_MIN * 60 * 1000);
+  log('info', 'ddns: scheduler armed', {
+    provider: DDNS_PROVIDER, domain: DDNS_DOMAIN, interval_min: DDNS_INTERVAL_MIN,
+  });
+}
+
 function constantTimeStringEquals(a, b) {
   const ba = Buffer.from(a, 'utf8');
   const bb = Buffer.from(b, 'utf8');
@@ -2163,6 +2303,81 @@ app.post('/api/v1/admin/test/dns', requireAdmin, testRateLimit, async (req, res)
   return res.json({
     ok: false,
     message: `Unknown DNS_PROVIDER "${provider}". Supported: http-01, cloudflare.`,
+  });
+});
+
+// Tier-1 test for the DDNS provider field. Confirms the appliance can
+// fetch a public IP and that the supplied password authenticates with
+// Namecheap by sending a real update for the bare domain (@). Same UX
+// risk as the email/SMS tests — one real API call, but DDNS calls are
+// idempotent so re-pinning the same IP costs nothing.
+app.post('/api/v1/admin/test/ddns', requireAdmin, testRateLimit, async (req, res) => {
+  const b = req.body || {};
+  const provider = (b.DDNS_PROVIDER || '').trim().toLowerCase();
+  if (!provider || provider === 'none') {
+    return res.json({ ok: true, message: 'DDNS disabled — no probe needed.' });
+  }
+  if (provider !== 'namecheap') {
+    return res.json({ ok: false, message: `Unknown DDNS_PROVIDER "${provider}". Supported: none, namecheap.` });
+  }
+  const domain   = (b.NAMECHEAP_DDNS_DOMAIN  || '').trim();
+  const password = (b.NAMECHEAP_DDNS_PASSWORD || '').trim();
+  if (!domain || !password) {
+    return res.json({ ok: false, message: 'NAMECHEAP_DDNS_DOMAIN and NAMECHEAP_DDNS_PASSWORD are both required.' });
+  }
+  const ip = await fetchPublicIp();
+  if (!ip) {
+    return res.json({
+      ok: false,
+      message: 'Could not fetch public IP from ipify.org or ifconfig.me. The appliance may be blocked from outbound HTTPS — check egress firewall rules.',
+    });
+  }
+  const result = await ddnsUpdateOne('@', domain, password, ip);
+  if (result.ok) {
+    return res.json({
+      ok: true,
+      message: `Namecheap accepted update: ${domain} A → ${ip}. Save these settings; the appliance will keep this and every enabled app's subdomain current going forward.`,
+    });
+  }
+  return res.json({
+    ok: false,
+    message: 'Namecheap rejected the update: ' + (result.error || `HTTP ${result.status}: ${(result.body || '').slice(0, 250)}`),
+  });
+});
+
+// Network-tab status panel data. Mirrors the Backup/info shape: returns
+// every signal the operator needs to decide if DDNS is healthy without
+// asking them to grep logs.
+app.get('/api/v1/admin/ddns/info', requireAdmin, async (_req, res) => {
+  const ip = ddnsState.enabled ? await fetchPublicIp() : null;
+  res.json({
+    enabled:        ddnsState.enabled,
+    provider:       DDNS_PROVIDER,
+    domain:         DDNS_DOMAIN || null,
+    interval_min:   DDNS_INTERVAL_MIN,
+    public_ip_now:  ip,
+    last_ip:        ddnsState.last_ip,
+    last_update_ts: ddnsState.last_update_ts,
+    last_results:   ddnsState.last_results,
+    last_error:     ddnsState.last_error,
+  });
+});
+
+// "Force update" button on the Network tab. Bypasses the
+// IP-unchanged short-circuit so the operator can re-pin the records
+// after a manual DNS edit at Namecheap (e.g. they accidentally pointed
+// the bare domain somewhere else and want the appliance to reclaim it).
+app.post('/api/v1/admin/ddns/update', requireAdmin, testRateLimit, async (_req, res) => {
+  if (!ddnsState.enabled) {
+    return res.status(400).json({ ok: false, error: 'DDNS_PROVIDER is not namecheap. Set it in Settings → Network and restart the console.' });
+  }
+  await ddnsUpdateCycle(true);
+  res.json({
+    ok: !ddnsState.last_error && !!ddnsState.last_results,
+    last_ip:        ddnsState.last_ip,
+    last_update_ts: ddnsState.last_update_ts,
+    last_results:   ddnsState.last_results,
+    last_error:     ddnsState.last_error,
   });
 });
 

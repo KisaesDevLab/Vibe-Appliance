@@ -122,6 +122,51 @@ The appliance will issue per-subdomain certificates from Let's Encrypt
 on each app's first request. Slower than DNS-01 (one cert challenge
 per app) but works on any DNS host.
 
+### Option C: Namecheap Dynamic DNS (no static IP)
+
+Use this if your domain is registered with Namecheap **and** your
+appliance is on a residential / SOHO / home-office connection where
+the public IP rotates. The appliance will keep your A records pointed
+at the current IP automatically.
+
+Requirements:
+- Domain registered with Namecheap, using BasicDNS, PremiumDNS, or
+  FreeDNS (free with the registration).
+- A residential ISP that allows inbound HTTPS on ports 80 and 443
+  (most do; some block 80 — if so, this option won't work because
+  Caddy needs port 80 reachable for Let's Encrypt HTTP-01 challenges).
+
+Setup:
+1. Sign into Namecheap → Domain List → click **Manage** next to your
+   domain → **Advanced DNS** tab.
+2. Find the **Dynamic DNS** section and toggle it **on**. Mouse over
+   the **Dynamic DNS Password** circle that appears — copy the value.
+3. Manually add an A record once for the bare domain (`@ → your-current-public-ip`).
+   The appliance will take over from here. (You can find your current
+   public IP at `https://api.ipify.org`.)
+4. Run the appliance installer in domain mode (HTTP-01 — Cloudflare
+   DNS-01 is incompatible because it requires Cloudflare nameservers).
+5. Once the admin console is up, go to **Configuration → Network** and:
+   - Set **Dynamic DNS provider** to `Namecheap`.
+   - Paste the domain (e.g. `firm.com`).
+   - Paste the DDNS password from step 2.
+   - Click **Test** — Namecheap should accept an update for `@`.
+   - **Save**. The console restarts; once it's back, the updater is
+     running.
+6. The console publishes one A record per enabled app automatically
+   (`tb.firm.com`, `mybooks.firm.com`, etc.) — no need to add them at
+   Namecheap by hand.
+
+Trade-offs:
+- Cert renewal during ISP IP rotation has a small window: if your IP
+  flips and Caddy attempts a renewal before the next DDNS check
+  (default 15 min, configurable 5–60), the renewal fails until the
+  appliance catches up. Caddy retries aggressively, so this self-heals,
+  but a sub-1-hour cert outage is possible if rotations align poorly.
+- Namecheap's update protocol is IPv4 only (no AAAA records).
+- The DDNS password lives in `/opt/vibe/env/appliance.env` (mode 600,
+  root-owned). Same protection as the rest of the appliance secrets.
+
 Either way, **wait until your DNS records actually resolve before
 running the install** — `dig tb.firm.com +short` from your laptop
 should return the droplet IP. DNS propagation usually takes 1–10
