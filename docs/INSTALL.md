@@ -177,8 +177,10 @@ Setup:
    - Click **Test** — Namecheap should accept an update for `@`. If
      you see "A record not Found", you skipped step 3 for the bare
      domain — go back and add it.
-   - **Save**. The console restarts; once it's back, the updater is
-     running.
+   - **Save**. The updater picks up the new config on its next cycle
+     (within seconds — config is re-read fresh per cycle). No console
+     restart required. The "Force update" button on the same panel
+     lights up once Save completes.
 6. The appliance keeps every host record current going forward. When
    you enable a new app later, **first** add its A record at Namecheap
    (one of the rows above), then enable the app from the admin Apps

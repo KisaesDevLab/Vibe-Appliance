@@ -806,7 +806,7 @@
 
       if (!data.enabled) {
         status.style.color = 'var(--text-muted)';
-        status.textContent = 'DDNS disabled. Pick "namecheap" above and save to start the updater (one console restart needed for the env vars to load).';
+        status.textContent = 'DDNS disabled. Pick "namecheap" above, fill the domain + password, and Save — the updater picks up the change on the next cycle, no console restart required.';
         forceBtn.style.pointerEvents = 'none';
         forceBtn.style.opacity = '0.5';
         return;

@@ -336,26 +336,38 @@ setInterval(prewarmGhcrCache, GHCR_TTL_MS);
 // dynamicdns.park-your-domain.com — the bare domain (@), www, and every
 // enabled app's manifest.subdomain.
 //
-// Only fires when DDNS_PROVIDER === 'namecheap'. The settings page edits
-// take effect on the next console restart (the env file gets re-read);
-// we don't dynamically swap providers mid-process — that path leads to
-// stale-callback bugs and is out of scope for v1.
+// Config is read FRESH from /opt/vibe/env/appliance.env on every cycle
+// and every API call. That way a Settings → Save (which writes to the
+// env file) takes effect without restarting the console — important
+// because settings-save runs INSIDE the console and can't restart its
+// own host without dropping the response. Boot-time process.env values
+// are still consulted as a fallback so a fresh install with the env
+// passed via env_file works on first tick.
 
-const DDNS_PROVIDER     = (process.env.DDNS_PROVIDER || 'none').trim();
-const DDNS_DOMAIN       = (process.env.NAMECHEAP_DDNS_DOMAIN || '').trim();
-const DDNS_PASSWORD_RAW = (process.env.NAMECHEAP_DDNS_PASSWORD || '').trim();
-const DDNS_INTERVAL_MIN = (() => {
-  const n = parseInt(process.env.DDNS_INTERVAL_MIN || '15', 10);
-  if (!Number.isFinite(n)) return 15;
-  return Math.max(5, Math.min(60, n));
-})();
+function readDdnsConfig() {
+  const fileEnv = parseEnvFile(path.join(ENV_DIR, 'appliance.env'));
+  const fromEither = (k) => {
+    if (fileEnv[k] !== undefined && fileEnv[k] !== '') return fileEnv[k];
+    if (process.env[k] !== undefined && process.env[k] !== '') return process.env[k];
+    return '';
+  };
+  let interval = parseInt(fromEither('DDNS_INTERVAL_MIN') || '15', 10);
+  if (!Number.isFinite(interval)) interval = 15;
+  interval = Math.max(5, Math.min(60, interval));
+  return {
+    provider: (fromEither('DDNS_PROVIDER') || 'none').trim(),
+    domain:   (fromEither('NAMECHEAP_DDNS_DOMAIN') || '').trim(),
+    password: (fromEither('NAMECHEAP_DDNS_PASSWORD') || '').trim(),
+    interval_min: interval,
+  };
+}
 
 const ddnsState = {
-  enabled:        DDNS_PROVIDER === 'namecheap',
   last_ip:        null,
   last_update_ts: null,
   last_results:   null,    // { host: { ok, status?, body?|error? } }
   last_error:     null,
+  last_interval:  null,    // remembered so we can re-arm setInterval on change
 };
 
 // Fetch the host's public IP. ipify is the canonical free probe; we
@@ -436,9 +448,12 @@ function _ddnsHint(reason) {
 // One pass over the host list. force=true bypasses the IP-unchanged
 // short-circuit and updates every host even if nothing rotated — used
 // by the manual "Force update" button and the test endpoint.
+// Reads config fresh each call so a Settings save propagates without
+// a console restart.
 async function ddnsUpdateCycle(force = false) {
-  if (!ddnsState.enabled) return;
-  if (!DDNS_DOMAIN || !DDNS_PASSWORD_RAW) {
+  const cfg = readDdnsConfig();
+  if (cfg.provider !== 'namecheap') return;
+  if (!cfg.domain || !cfg.password) {
     ddnsState.last_error = 'NAMECHEAP_DDNS_DOMAIN and NAMECHEAP_DDNS_PASSWORD required';
     return;
   }
@@ -468,7 +483,7 @@ async function ddnsUpdateCycle(force = false) {
 
   const results = {};
   for (const host of hosts) {
-    results[host] = await ddnsUpdateOne(host, DDNS_DOMAIN, DDNS_PASSWORD_RAW, ip);
+    results[host] = await ddnsUpdateOne(host, cfg.domain, cfg.password, ip);
   }
 
   ddnsState.last_ip        = ip;
@@ -485,16 +500,31 @@ async function ddnsUpdateCycle(force = false) {
   });
 }
 
-if (ddnsState.enabled) {
-  // Initial update 30s after boot — gives the docker network time to
-  // settle and lets the operator see the result on the Network tab
-  // before they leave for the day.
-  setTimeout(() => ddnsUpdateCycle(true), 30_000);
-  setInterval(ddnsUpdateCycle, DDNS_INTERVAL_MIN * 60 * 1000);
-  log('info', 'ddns: scheduler armed', {
-    provider: DDNS_PROVIDER, domain: DDNS_DOMAIN, interval_min: DDNS_INTERVAL_MIN,
-  });
+// Self-rescheduling tick. Honors interval changes from Settings without
+// a restart: each tick reads the current interval from appliance.env
+// and schedules the next call accordingly. Initial tick fires 30s after
+// boot to give the network stack time to settle.
+let _ddnsTimer = null;
+function scheduleNextDdnsTick(initial = false) {
+  const cfg = readDdnsConfig();
+  const intervalMs = cfg.interval_min * 60 * 1000;
+  ddnsState.last_interval = cfg.interval_min;
+  const delayMs = initial ? 30_000 : intervalMs;
+  _ddnsTimer = setTimeout(async () => {
+    try {
+      // First post-boot fire is treated as a force-update so the
+      // operator sees the full per-host result list immediately on
+      // first config or first appliance boot, not 15 min later.
+      await ddnsUpdateCycle(initial);
+    } catch (err) {
+      log('warn', 'ddns: cycle threw', { err: err.message });
+    } finally {
+      scheduleNextDdnsTick(false);
+    }
+  }, delayMs);
 }
+scheduleNextDdnsTick(true);
+log('info', 'ddns: scheduler armed (config read fresh per tick)');
 
 function constantTimeStringEquals(a, b) {
   const ba = Buffer.from(a, 'utf8');
@@ -2382,14 +2412,17 @@ app.post('/api/v1/admin/test/ddns', requireAdmin, testRateLimit, async (req, res
 
 // Network-tab status panel data. Mirrors the Backup/info shape: returns
 // every signal the operator needs to decide if DDNS is healthy without
-// asking them to grep logs.
+// asking them to grep logs. Config is read fresh from appliance.env so
+// a recent Save flips `enabled` true without a console restart.
 app.get('/api/v1/admin/ddns/info', requireAdmin, async (_req, res) => {
-  const ip = ddnsState.enabled ? await fetchPublicIp() : null;
+  const cfg = readDdnsConfig();
+  const enabled = cfg.provider === 'namecheap';
+  const ip = enabled ? await fetchPublicIp() : null;
   res.json({
-    enabled:        ddnsState.enabled,
-    provider:       DDNS_PROVIDER,
-    domain:         DDNS_DOMAIN || null,
-    interval_min:   DDNS_INTERVAL_MIN,
+    enabled,
+    provider:       cfg.provider,
+    domain:         cfg.domain || null,
+    interval_min:   cfg.interval_min,
     public_ip_now:  ip,
     last_ip:        ddnsState.last_ip,
     last_update_ts: ddnsState.last_update_ts,
@@ -2403,8 +2436,12 @@ app.get('/api/v1/admin/ddns/info', requireAdmin, async (_req, res) => {
 // after a manual DNS edit at Namecheap (e.g. they accidentally pointed
 // the bare domain somewhere else and want the appliance to reclaim it).
 app.post('/api/v1/admin/ddns/update', requireAdmin, testRateLimit, async (_req, res) => {
-  if (!ddnsState.enabled) {
-    return res.status(400).json({ ok: false, error: 'DDNS_PROVIDER is not namecheap. Set it in Settings → Network and restart the console.' });
+  const cfg = readDdnsConfig();
+  if (cfg.provider !== 'namecheap') {
+    return res.status(400).json({
+      ok: false,
+      error: 'DDNS_PROVIDER is not namecheap. Set it in Settings → Network and Save (the change takes effect immediately — no console restart required).',
+    });
   }
   await ddnsUpdateCycle(true);
   res.json({
