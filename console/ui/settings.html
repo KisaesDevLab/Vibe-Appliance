@@ -6,12 +6,13 @@
   <title>Settings · Vibe Appliance</title>
   <link rel="stylesheet" href="/static/styles.css" />
   <style>
-    /* Settings-page-specific layout. Keeps the global styles.css clean. */
+    /* Settings-page-specific layout. Tokens come from styles.css; only
+       page-local rhythm lives here. */
     .settings-tabs {
       display: flex;
       flex-wrap: wrap;
       gap: 0.25rem;
-      border-bottom: 1px solid #e0d8c8;
+      border-bottom: 1px solid var(--border);
       margin-bottom: 1.5rem;
     }
     .settings-tab {
@@ -20,13 +21,37 @@
       border: 0;
       border-bottom: 2px solid transparent;
       font: inherit;
-      color: #6b4423;
+      color: var(--text-muted);
       cursor: pointer;
     }
     .settings-tab[aria-selected="true"] {
-      border-bottom-color: #b8722e;
+      border-bottom-color: var(--accent);
+      color: var(--text);
       font-weight: 600;
     }
+    /* Dirty-state pip on inactive tabs that hold unsaved changes. */
+    .settings-tab[data-dirty="true"]::after {
+      content: "";
+      display: inline-block;
+      width: 0.45rem;
+      height: 0.45rem;
+      margin-left: 0.45rem;
+      border-radius: 50%;
+      background: var(--accent);
+      vertical-align: middle;
+    }
+    /* Apps sub-nav — same nav element reused, but visually demoted so
+       you can tell which tab row you're in. */
+    .settings-subtabs {
+      border-bottom-style: dashed;
+      margin-top: -0.5rem;
+      margin-bottom: 1rem;
+    }
+    .settings-subtabs .settings-tab {
+      font-size: 0.92em;
+      padding: 0.35rem 0.85rem;
+    }
+
     .settings-form {
       display: grid;
       gap: 1rem;
@@ -39,70 +64,144 @@
     .settings-field label {
       font-weight: 600;
       font-size: 0.95em;
+      color: var(--text);
     }
     .settings-field input[type="text"],
     .settings-field input[type="password"],
     .settings-field input[type="number"],
     .settings-field select,
     .settings-field textarea {
-      padding: 0.4rem 0.6rem;
-      border: 1px solid #e0d8c8;
+      padding: 0.45rem 0.65rem;
+      border: 1px solid var(--border);
       border-radius: 4px;
       font: inherit;
-      background: #fff;
+      background: var(--surface);
+      color: var(--text);
+    }
+    .settings-field input:focus,
+    .settings-field select:focus,
+    .settings-field textarea:focus {
+      outline: 2px solid var(--accent-soft);
+      outline-offset: 1px;
+      border-color: var(--accent);
     }
     .settings-field .help {
       font-size: 0.85em;
-      color: #8a7860;
+      color: var(--text-muted);
     }
     .settings-field .scope-badge {
       display: inline-block;
-      font-size: 0.75em;
-      padding: 0.1rem 0.4rem;
+      font-size: 0.72em;
+      padding: 0.1rem 0.45rem;
       border-radius: 3px;
-      background: #efe9df;
-      color: #6b4423;
+      background: var(--surface-2);
+      color: var(--text-muted);
       margin-left: 0.5rem;
+      letter-spacing: 0.02em;
+      vertical-align: middle;
     }
-    .settings-field .scope-badge--shared    { background: #e0e8d4; color: #4a6b1f; }
-    .settings-field .scope-badge--per-app   { background: #e8d8c8; color: #6b4423; }
-    .settings-field .scope-badge--secret    { background: #fceadf; color: #8b3a1c; }
+    .settings-field .scope-badge--shared    { background: rgba(47,125,79,0.12);  color: var(--good); }
+    .settings-field .scope-badge--per-app   { background: var(--surface-2);       color: var(--text-muted); }
+    .settings-field .scope-badge--secret    { background: rgba(176,58,46,0.10);   color: var(--bad); }
+
+    /* Password-change-flow — three inputs in a row inside one field. */
+    .password-change {
+      display: grid;
+      gap: 0.5rem;
+    }
+    .password-change input[type="password"] {
+      padding: 0.45rem 0.65rem;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font: inherit;
+      background: var(--surface);
+    }
+    .password-change__row {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-top: 0.25rem;
+    }
+    .password-change__status {
+      font-size: 0.88em;
+      color: var(--text-muted);
+    }
+
+    /* Sticky save bar — bleeds full-width via negative-margin trick so
+       its background spans the viewport on wide screens, while the
+       inner row stays aligned with the container's column. */
     .settings-save-bar {
       position: sticky;
       bottom: 0;
-      background: #faf7f2;
-      border-top: 1px solid #e0d8c8;
-      padding: 1rem 0;
-      margin-top: 2rem;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      box-shadow: 0 -8px 14px -10px rgba(42,34,27,0.18);
+      padding: 0.85rem 1.5rem;
+      margin: 2rem calc(50% - 50vw) 0;
       display: flex;
       gap: 0.75rem;
       align-items: center;
+      z-index: 5;
     }
+    .settings-save-bar > * { max-width: 1080px; }
     .settings-save-bar.dirty {
       background: #fdf6e8;
-      border-top-color: #b8722e;
+      border-top-color: var(--accent);
     }
     .settings-save-status {
       flex: 1;
-      color: #8a7860;
+      color: var(--text-muted);
       font-size: 0.9em;
     }
+
     .impact-warning {
-      background: #fdf0e0;
-      border: 1px solid #b8722e;
+      background: rgba(176,122,23,0.10);
+      border: 1px solid rgba(176,122,23,0.4);
       padding: 0.75rem;
       border-radius: 4px;
       margin-bottom: 1rem;
-      color: #6b3a1c;
+      color: var(--warn);
     }
     .save-result {
       padding: 0.75rem;
       border-radius: 4px;
       margin-top: 1rem;
     }
-    .save-result--saved      { background: #e0e8d4; color: #2d4a14; }
-    .save-result--rolled-back { background: #fdf0e0; color: #6b3a1c; }
-    .save-result--degraded   { background: #fce0e0; color: #6b1c1c; font-weight: 600; }
+    .save-result--saved       { background: rgba(47,125,79,0.12);  color: var(--good); }
+    .save-result--rolled-back { background: rgba(176,122,23,0.12); color: var(--warn); }
+    .save-result--degraded    { background: rgba(176,58,46,0.12);  color: var(--bad);  font-weight: 600; }
+    .save-result--error       { background: rgba(176,58,46,0.12);  color: var(--bad); }
+
+    /* Maintenance section — sits in the natural document flow ABOVE the
+       sticky save bar so the bar can't occlude it. */
+    .maintenance {
+      margin-top: 2.5rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--border);
+    }
+    .maintenance h2 {
+      font-size: 1.25rem;
+      margin: 0 0 0.4rem;
+      color: var(--text);
+    }
+    .maintenance__row {
+      max-width: 36rem;
+      display: grid;
+      gap: 0.4rem;
+    }
+    .maintenance__output {
+      margin-top: 0.5rem;
+      padding: 0.6rem 0.75rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font-family: var(--mono);
+      font-size: 0.85em;
+      white-space: pre-wrap;
+      max-height: 18rem;
+      overflow: auto;
+    }
   </style>
 </head>
 <body>
@@ -116,7 +215,7 @@
         snapshot taken at save time.
       </p>
       <div class="cta-row">
-        <a class="btn" href="/admin">&larr; Status</a>
+        <a class="btn btn--ghost" href="/admin">&larr; Status</a>
       </div>
     </header>
 
@@ -130,36 +229,36 @@
       <p class="muted">fetching schema…</p>
     </section>
 
-    <div id="save-result" hidden></div>
-
-    <div class="settings-save-bar" id="save-bar">
-      <span class="settings-save-status" id="save-status">No changes pending.</span>
-      <button class="btn btn--ghost" id="save-discard" disabled>Discard</button>
-      <button class="btn"           id="save-apply"   disabled>Save changes</button>
-    </div>
-
     <section class="maintenance" aria-labelledby="maint-h">
-      <h2 id="maint-h" style="margin-top:2rem;font-size:1.1rem;color:#6b4423;">Maintenance</h2>
-      <div class="settings-field" style="max-width:36rem;">
-        <label>Reclaim disk space</label>
+      <h2 id="maint-h">Maintenance</h2>
+      <div class="maintenance__row">
+        <strong>Reclaim disk space</strong>
         <p class="help">
-          Removes Docker images not referenced by any container (running or
-          stopped). Active app images stay. Anything pruned is re-pulled the
-          next time the app is enabled or updated.
+          Removes Docker images not referenced by any container (running or stopped).
+          Active app images stay. Anything pruned is re-pulled the next time the app is
+          enabled or updated.
         </p>
         <div class="cta-row" style="gap:0.5rem;align-items:center;">
           <button class="btn btn--ghost" id="prune-images-btn" type="button">Prune unused Docker images</button>
           <span class="help" id="prune-images-status"></span>
         </div>
-        <pre id="prune-images-output" class="mono" hidden
-             style="margin-top:0.5rem;padding:0.6rem;background:#fff;border:1px solid #e0d8c8;border-radius:4px;font-size:0.85em;white-space:pre-wrap;max-height:18rem;overflow:auto;"></pre>
+        <pre class="maintenance__output" id="prune-images-output" hidden></pre>
       </div>
     </section>
+
+    <div class="settings-save-bar" id="save-bar">
+      <span class="settings-save-status" id="save-status">No changes pending.</span>
+      <button class="btn btn--ghost" id="save-discard" disabled>Discard</button>
+      <button class="btn"            id="save-apply"   disabled>Save changes</button>
+    </div>
+
+    <div id="save-result" hidden></div>
 
     <footer class="footer">
       <p class="muted">
         Audit log: <a href="/api/v1/audit?pageSize=20">recent saves (JSON)</a>.
         See <span class="mono">/opt/vibe/data/env-history/</span> for env snapshots.
+        Tip: <span class="mono">Ctrl+S</span> saves pending changes from anywhere on this page.
       </p>
     </footer>
   </main>

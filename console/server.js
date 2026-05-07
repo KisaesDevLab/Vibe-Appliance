@@ -29,7 +29,7 @@ const VIBE_DIR       = process.env.VIBE_DIR || '/opt/vibe';
 const APPLIANCE_DIR  = process.env.APPLIANCE_DIR || path.join(VIBE_DIR, 'appliance');
 const PORT           = parseInt(process.env.CONSOLE_PORT || '3000', 10);
 const ADMIN_USER     = process.env.CONSOLE_ADMIN_USER || 'admin';
-const ADMIN_PASS     = process.env.CONSOLE_ADMIN_PASSWORD || '';
+const ADMIN_PASS_BOOT = process.env.CONSOLE_ADMIN_PASSWORD || '';
 const STATE_PATH     = path.join(VIBE_DIR, 'state.json');
 const SQLITE_DIR     = path.join(VIBE_DIR, 'data', 'console');
 const SQLITE_PATH    = path.join(SQLITE_DIR, 'console.sqlite');
@@ -58,7 +58,7 @@ const LOG_NAMES = new Set([
 // /api/v1/enable/../../etc/passwd-style URLs.
 const SLUG_RE = /^[a-z][a-z0-9-]+$/;
 
-if (!ADMIN_PASS) {
+if (!ADMIN_PASS_BOOT) {
   // Fail fast and loud — silent password = open admin endpoint.
   console.error(JSON.stringify({
     ts: new Date().toISOString(),
@@ -338,6 +338,44 @@ function constantTimeStringEquals(a, b) {
   return crypto.timingSafeEqual(ba, bb);
 }
 
+// scrypt-based password hashing for the inline rotation flow. Stored as
+// "salt$hex" in the meta table so we don't need a second column. Uses
+// Node's built-in crypto module — no new npm dep.
+function hashPassword(plain) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const key  = crypto.scryptSync(plain, salt, 64).toString('hex');
+  return salt + '$' + key;
+}
+function verifyHashedPassword(plain, stored) {
+  const sep = stored.indexOf('$');
+  if (sep < 0) return false;
+  const salt = stored.slice(0, sep);
+  const key  = stored.slice(sep + 1);
+  const calc = crypto.scryptSync(plain, salt, 64).toString('hex');
+  const a = Buffer.from(calc, 'hex');
+  const b = Buffer.from(key, 'hex');
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+// Cached override hash from the meta table (key: 'admin_password_hash').
+// `null` means "no override set; fall back to ADMIN_PASS_BOOT". Updated
+// in-memory by the change-password endpoint so the new password takes
+// effect on the next request without restarting the console (which
+// would otherwise log the operator out mid-session).
+let adminPasswordOverride = null;
+try {
+  const row = db.prepare("SELECT value FROM meta WHERE key = 'admin_password_hash'").get();
+  if (row && row.value) adminPasswordOverride = row.value;
+} catch (err) {
+  log('warn', 'meta lookup for admin override failed', { err: err.message });
+}
+
+function verifyAdminPassword(supplied) {
+  if (adminPasswordOverride) return verifyHashedPassword(supplied, adminPasswordOverride);
+  return constantTimeStringEquals(supplied, ADMIN_PASS_BOOT);
+}
+
 function requireAdmin(req, res, next) {
   const header = req.headers.authorization || '';
   if (!header.toLowerCase().startsWith('basic ')) return adminChallenge(res);
@@ -353,7 +391,7 @@ function requireAdmin(req, res, next) {
   const pass = decoded.slice(sep + 1);
   if (
     !constantTimeStringEquals(user, ADMIN_USER) ||
-    !constantTimeStringEquals(pass, ADMIN_PASS)
+    !verifyAdminPassword(pass)
   ) {
     log('warn', 'admin auth failed', { user });
     return adminChallenge(res);
@@ -551,6 +589,58 @@ app.post('/api/v1/update/check', requireAdmin, testRateLimit, async (_req, res) 
 // re-pulled on the next enable-app / update run.
 app.post('/api/v1/admin/prune-images', requireAdmin, testRateLimit, async (_req, res) => {
   await runShell(res, [PRUNE_SCRIPT], 'prune-images');
+});
+
+// Inline admin-password rotation. Persists a scrypt hash to the meta
+// table and updates the in-memory comparator immediately, so the next
+// request re-prompts for basic auth and the new password is the one
+// that works. Does NOT touch /opt/vibe/env/shared.env — the boot-time
+// password stays as a recovery backstop until the operator re-runs
+// `bootstrap.sh --reset-env` (rotates everything) or hand-edits
+// shared.env. The override wins until then.
+app.post('/api/v1/admin/change-admin-password', requireAdmin, testRateLimit, (req, res) => {
+  const body = req.body || {};
+  const current = typeof body.currentPassword === 'string' ? body.currentPassword : '';
+  const next    = typeof body.newPassword     === 'string' ? body.newPassword     : '';
+
+  if (!current || !next) {
+    return res.status(400).json({ ok: false, error: 'currentPassword and newPassword are required' });
+  }
+  if (next.length < 12) {
+    return res.status(400).json({ ok: false, error: 'newPassword must be at least 12 characters' });
+  }
+  if (next === current) {
+    return res.status(400).json({ ok: false, error: 'newPassword must differ from currentPassword' });
+  }
+  if (!verifyAdminPassword(current)) {
+    log('warn', 'admin password change rejected: current password mismatch');
+    return res.status(401).json({ ok: false, error: 'current password incorrect' });
+  }
+
+  const hash = hashPassword(next);
+  try {
+    db.prepare(`
+      INSERT INTO meta (key, value) VALUES ('admin_password_hash', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(hash);
+  } catch (err) {
+    log('error', 'admin password persist failed', { err: err.message });
+    return res.status(500).json({ ok: false, error: 'could not persist new password' });
+  }
+
+  adminPasswordOverride = hash;
+  log('info', 'admin password rotated via inline flow');
+  // Audit-log the rotation without recording the password value.
+  try {
+    db.prepare(`
+      INSERT INTO settings_audit (ts, user, category, setting, old_value, new_value, result, details)
+      VALUES (?, ?, 'System', 'CONSOLE_ADMIN_PASSWORD', '(set)', '(rotated)', 'saved', ?)
+    `).run(new Date().toISOString(), ADMIN_USER, JSON.stringify({ source: 'inline-rotation' }));
+  } catch (err) {
+    log('warn', 'audit insert for password rotation failed', { err: err.message });
+  }
+
+  res.json({ ok: true, message: 'Password rotated. Re-authenticate with the new password.' });
 });
 
 app.post('/api/v1/update/:slug', requireAdmin, testRateLimit, async (req, res) => {

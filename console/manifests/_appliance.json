@@ -164,12 +164,12 @@
     },
     {
       "name":   "CONSOLE_ADMIN_PASSWORD_INFO",
-      "doc":    "Admin password rotation pointer (Tier 2 read-only). The actual password lives in shared.env, not appliance.env, and inline rotation needs a special flow that writes to console.sqlite + reloads the basic-auth comparator without restarting the console (which would log out the operator mid-session). v1.3 lands the inline rotation; today operators use bootstrap.sh --reset-env or hand-edit shared.env + restart the console.",
+      "doc":    "Admin password rotation widget. Posts to /api/v1/admin/change-admin-password, which scrypt-hashes the new password into the meta table and updates the in-memory comparator immediately — no console restart needed. The boot-time password from shared.env stays as a recovery backstop until the operator re-runs bootstrap.sh --reset-env or hand-edits shared.env.",
       "ui": {
         "tier":      2,
         "category":  "System",
         "label":     "Admin password",
-        "helpText":  "Rotation requires shell access today. Run: sudo bootstrap.sh --reset-env (rotates ALL secrets), or sudo nano /opt/vibe/env/shared.env then docker compose restart console. Inline rotation arrives in v1.3.",
+        "helpText":  "Rotates the admin password without a console restart. Persists to console.sqlite; takes effect on the next request. To also rotate the recovery password baked into /opt/vibe/env/shared.env, run sudo bootstrap.sh --reset-env from the host.",
         "input":     "password-change-flow",
         "appliance": "shared"
       }

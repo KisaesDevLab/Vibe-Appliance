@@ -106,10 +106,10 @@
       } catch { /* no summary line — fall through */ }
 
       if (r.ok && data.exit_code === 0) {
-        pruneStat.style.color  = '#2d4a14';
+        pruneStat.style.color  = 'var(--good)';
         pruneStat.textContent  = '✓ Done. Reclaimed ' + (reclaimed || '0B') + '.';
       } else {
-        pruneStat.style.color  = '#8b3a1c';
+        pruneStat.style.color  = 'var(--bad)';
         pruneStat.textContent  = '✗ Failed (exit ' + (data.exit_code != null ? data.exit_code : '?') + ').';
       }
 
@@ -120,7 +120,7 @@
         pruneOutput.textContent = blob;
       }
     } catch (err) {
-      pruneStat.style.color = '#8b3a1c';
+      pruneStat.style.color = 'var(--bad)';
       pruneStat.textContent = '✗ ' + err.message;
     } finally {
       pruneBtn.disabled = false;
@@ -147,6 +147,19 @@
       field.secret ? el('span', { class: 'scope-badge scope-badge--secret' }, ['secret']) : null,
     ]);
     wrap.appendChild(labelLine);
+
+    // password-change-flow is a special case: instead of a single input
+    // bound to the appliance dirty map, render a 3-field self-contained
+    // widget that POSTs to /api/v1/admin/change-admin-password. It does
+    // NOT participate in the normal save flow — admin password lives in
+    // shared.env (read once at console start) and the special endpoint
+    // updates an in-memory override that takes effect on the next
+    // request without restarting the console.
+    if (field.input === 'password-change-flow') {
+      renderPasswordChangeFlow(wrap, field);
+      if (field.helpText) wrap.appendChild(el('p', { class: 'help' }, [field.helpText]));
+      return wrap;
+    }
 
     // The input widget itself
     const input = renderInput(field, value);
@@ -274,14 +287,14 @@
       });
       const data = await r.json();
       if (data.ok) {
-        resultSpan.style.color = '#2d4a14';
+        resultSpan.style.color = 'var(--good)';
         resultSpan.textContent = '✓ ' + (data.message || 'Test passed.');
       } else {
-        resultSpan.style.color = '#8b3a1c';
+        resultSpan.style.color = 'var(--bad)';
         resultSpan.textContent = '✗ ' + (data.message || data.error || `HTTP ${r.status}`);
       }
     } catch (err) {
-      resultSpan.style.color = '#8b3a1c';
+      resultSpan.style.color = 'var(--bad)';
       resultSpan.textContent = '✗ ' + err.message;
     } finally {
       btn.disabled = false;
@@ -298,12 +311,12 @@
       case 'number':
         return el('input', { type: 'number', value, step: 'any' });
       case 'toggle': {
-        const wrap = el('label', null, []);
+        // Renders just the checkbox. The field's display label is
+        // already rendered above by renderField, so adding " enabled"
+        // here would just be visual clutter.
         const cb = el('input', { type: 'checkbox' });
         if (value === 'true' || value === true) cb.checked = true;
-        wrap.appendChild(cb);
-        wrap.appendChild(document.createTextNode(' enabled'));
-        return cb;            // outer .change listener still works
+        return cb;
       }
       case 'dropdown': {
         const sel = el('select', null, []);
@@ -364,9 +377,10 @@
         return sel;
       }
       case 'password-change-flow':
-        // Deferred to v1.2 — render a disabled placeholder so the field
-        // exists in the form but can't be edited.
-        return el('input', { type: 'password', value: '', disabled: 'disabled', placeholder: '(special flow — v1.2)' });
+        // Handled out-of-line in renderField — we never reach here when
+        // the special widget is rendering. This branch only fires if a
+        // future code path forgets to special-case the type.
+        return el('input', { type: 'password', value: '', disabled: 'disabled', placeholder: '(use the password-change widget)' });
       case 'text':
       default:
         return el('input', { type: 'text', value });
@@ -377,6 +391,95 @@
     if (input.tagName === 'SELECT')   return input.value;
     if (input.type === 'checkbox')    return input.checked ? 'true' : 'false';
     return input.value;
+  }
+
+  // ---- password-change-flow widget ------------------------------------
+  // Special-case for the admin password rotation flow. Three inputs +
+  // dedicated submit button. Bypasses the normal save bar because the
+  // change persists via /api/v1/admin/change-admin-password and takes
+  // effect immediately (no console restart). The new password is
+  // session-scoped on the server side until shared.env is rewritten.
+  const PW_MIN_LEN = 12;
+
+  function renderPasswordChangeFlow(wrap, field) {
+    const cur  = el('input', { type: 'password', placeholder: 'Current password',     autocomplete: 'current-password' });
+    const nw   = el('input', { type: 'password', placeholder: 'New password (≥ ' + PW_MIN_LEN + ' chars)', autocomplete: 'new-password' });
+    const conf = el('input', { type: 'password', placeholder: 'Confirm new password', autocomplete: 'new-password' });
+    cur.id  = 'f-' + field.key + '-current';
+    nw.id   = 'f-' + field.key + '-new';
+    conf.id = 'f-' + field.key + '-confirm';
+
+    const status = el('span', { class: 'password-change__status', 'data-pw-status': '1' }, ['']);
+    const btn = el('button', {
+      type: 'button',
+      class: 'btn',
+      onclick: () => submitPasswordChange(cur, nw, conf, btn, status),
+    }, ['Change password']);
+
+    const grid = el('div', { class: 'password-change' }, [cur, nw, conf]);
+    const row  = el('div', { class: 'password-change__row' }, [btn, status]);
+    wrap.appendChild(grid);
+    wrap.appendChild(row);
+  }
+
+  async function submitPasswordChange(curEl, newEl, confEl, btn, status) {
+    const current = curEl.value;
+    const next    = newEl.value;
+    const confirm = confEl.value;
+
+    status.style.color = '';
+    status.textContent = '';
+
+    if (!current || !next || !confirm) {
+      status.style.color = 'var(--bad)';
+      status.textContent = '✗ All three fields are required.';
+      return;
+    }
+    if (next !== confirm) {
+      status.style.color = 'var(--bad)';
+      status.textContent = '✗ New password and confirmation do not match.';
+      return;
+    }
+    if (next.length < PW_MIN_LEN) {
+      status.style.color = 'var(--bad)';
+      status.textContent = '✗ New password must be at least ' + PW_MIN_LEN + ' characters.';
+      return;
+    }
+    if (next === current) {
+      status.style.color = 'var(--bad)';
+      status.textContent = '✗ New password must differ from the current one.';
+      return;
+    }
+
+    btn.disabled = true;
+    const orig = btn.textContent;
+    btn.textContent = 'Changing…';
+    status.style.color = 'var(--text-muted)';
+    status.textContent = 'Verifying…';
+
+    try {
+      const r = await fetch('/api/v1/admin/change-admin-password', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ currentPassword: current, newPassword: next }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (r.ok && data.ok) {
+        curEl.value = ''; newEl.value = ''; confEl.value = '';
+        status.style.color = 'var(--good)';
+        status.textContent = '✓ Password changed. The next request will re-prompt — log in with the new password.';
+      } else {
+        status.style.color = 'var(--bad)';
+        status.textContent = '✗ ' + (data.error || data.message || ('HTTP ' + r.status));
+      }
+    } catch (err) {
+      status.style.color = 'var(--bad)';
+      status.textContent = '✗ ' + err.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = orig;
+    }
   }
 
   function onFieldChange(field, input) {
@@ -734,6 +837,38 @@
     saveStat.textContent = n === 0
       ? 'No changes pending.'
       : `${n} change${n === 1 ? '' : 's'} pending. Save will restart dependent apps and roll back on health failure.`;
+    updateDirtyTabPips();
+  }
+
+  // Walk dirty entries and mark each tab whose category contains an
+  // unsaved change. Lets the operator notice that switching tabs
+  // doesn't drop their edits — they're still pending elsewhere.
+  function updateDirtyTabPips() {
+    if (!state.schema) return;
+    const dirtyApplianceCats = new Set();
+    const dirtyAppSlugs = new Set();
+    for (const [, d] of state.dirty) {
+      if (d.scope === 'appliance') {
+        // Find which appliance category this key lives in.
+        for (const [cat, fields] of Object.entries(state.schema.appliance || {})) {
+          if (fields.some(f => f.key === d.key)) {
+            dirtyApplianceCats.add(cat);
+            break;
+          }
+        }
+      } else if (d.scope.startsWith('per-app:')) {
+        dirtyAppSlugs.add(d.scope.slice('per-app:'.length));
+      }
+    }
+    const appsTabDirty = dirtyAppSlugs.size > 0;
+    for (const tab of tabsEl.querySelectorAll('.settings-tab')) {
+      const which = tab.dataset.tab;
+      const isDirty = which === 'Apps'
+        ? appsTabDirty
+        : dirtyApplianceCats.has(which);
+      if (isDirty) tab.setAttribute('data-dirty', 'true');
+      else tab.removeAttribute('data-dirty');
+    }
   }
 
   function discardAll() {
@@ -921,6 +1056,18 @@
       }
     } catch { /* manifest fallback is fine */ }
   }
+
+  // Ctrl/Cmd+S — save pending changes from anywhere on the page, the
+  // way every form-heavy app already trains operators to expect.
+  // Browser default is "save page as HTML"; we hijack only when there
+  // are dirty changes so the default still works on a clean form.
+  document.addEventListener('keydown', (e) => {
+    const cmd = e.ctrlKey || e.metaKey;
+    if (!cmd || e.key !== 's') return;
+    if (state.dirty.size === 0) return;
+    e.preventDefault();
+    saveAll();
+  });
 
   (async function init() {
     try {
