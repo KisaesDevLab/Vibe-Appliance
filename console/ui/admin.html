@@ -686,12 +686,17 @@ sudo systemctl start cloudflared</pre>
         // Field rows — username/password only meaningful for
         // default-credentials-* types. Setup-wizard apps show
         // "(set during setup)" so the operator doesn't think the
-        // appliance silently lost their values.
+        // appliance silently lost their values. We label the row
+        // "email" when the value looks like an email address so
+        // operators know to enter it in an email field rather than
+        // a plain username field — matters for apps whose login form
+        // explicitly types the input as email.
         const showCredFields = (t === 'default-credentials-forced-reset' ||
                                 t === 'default-credentials-passive');
+        const usernameLabel = (item.username && /@/.test(item.username)) ? 'email' : 'username';
         const credRows = showCredFields
           ? `
-            <dt>username</dt><dd>${escapeHtml(item.username || '—')}</dd>
+            <dt>${usernameLabel}</dt><dd>${escapeHtml(item.username || '—')}</dd>
             <dt>password</dt><dd>${escapeHtml(item.password || '—')}</dd>`
           : t === 'setup-wizard'
             ? `

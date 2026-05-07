@@ -63,9 +63,11 @@
   "redis":    { "db": 2 },
 
   "firstLogin": {
-    "type": "setup-wizard",
-    "note": "First request lands on /install; create the admin account there.",
-    "url":  "/install"
+    "type":     "default-credentials-forced-reset",
+    "username": "admin@local.test",
+    "password": "vibe-admin-changeme",
+    "note":     "Default admin baked into the upstream calculators image. The app forces a password rotation on first login. If these credentials are rejected, the seed never ran — re-enable the app from the admin Apps tab to retry.",
+    "url":      "/login"
   },
 
   "health": "/api/health",
