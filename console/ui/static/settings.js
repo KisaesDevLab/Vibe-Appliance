@@ -67,6 +67,66 @@
   saveBtn.addEventListener('click', saveAll);
   discBtn.addEventListener('click', discardAll);
 
+  // Maintenance — prune unused Docker images. Confirms first because
+  // pruned images get re-pulled on next enable/update (a brief delay
+  // and bandwidth cost the operator should opt into knowingly).
+  const pruneBtn    = document.getElementById('prune-images-btn');
+  const pruneStat   = document.getElementById('prune-images-status');
+  const pruneOutput = document.getElementById('prune-images-output');
+  if (pruneBtn) pruneBtn.addEventListener('click', pruneImages);
+
+  async function pruneImages() {
+    const ok = window.confirm(
+      'Remove all Docker images not currently used by any container?\n\n' +
+      'Active app images stay. Pruned images will re-pull the next time ' +
+      'the app is enabled or updated (one-time bandwidth + delay).\n\n' +
+      'Continue?'
+    );
+    if (!ok) return;
+
+    pruneBtn.disabled  = true;
+    pruneStat.style.color = '';
+    pruneStat.textContent = 'Pruning…';
+    pruneOutput.hidden = true;
+    pruneOutput.textContent = '';
+
+    try {
+      const r = await fetch('/api/v1/admin/prune-images', {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+      const data = await r.json();
+      // Server wraps the script's stdout/stderr; the script's last
+      // stdout line is a JSON summary with .reclaimed.
+      let reclaimed = null;
+      const lastLine = (data.stdout || '').trim().split('\n').pop();
+      try {
+        const summary = JSON.parse(lastLine);
+        if (summary && summary.ok) reclaimed = summary.reclaimed;
+      } catch { /* no summary line — fall through */ }
+
+      if (r.ok && data.exit_code === 0) {
+        pruneStat.style.color  = '#2d4a14';
+        pruneStat.textContent  = '✓ Done. Reclaimed ' + (reclaimed || '0B') + '.';
+      } else {
+        pruneStat.style.color  = '#8b3a1c';
+        pruneStat.textContent  = '✗ Failed (exit ' + (data.exit_code != null ? data.exit_code : '?') + ').';
+      }
+
+      // Always show the docker output (deletion list lives on stderr).
+      const blob = [data.stdout, data.stderr].filter(Boolean).join('\n').trim();
+      if (blob) {
+        pruneOutput.hidden = false;
+        pruneOutput.textContent = blob;
+      }
+    } catch (err) {
+      pruneStat.style.color = '#8b3a1c';
+      pruneStat.textContent = '✗ ' + err.message;
+    } finally {
+      pruneBtn.disabled = false;
+    }
+  }
+
   // ---------- field rendering -----------------------------------------
   function renderField(field, currentRaw) {
     const dKey = dirtyKey('appliance', field.key);

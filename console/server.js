@@ -38,6 +38,7 @@ const ENABLE_SCRIPT  = path.join(APPLIANCE_DIR, 'lib', 'enable-app.sh');
 const DISABLE_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'disable-app.sh');
 const DOCTOR_SCRIPT  = path.join(APPLIANCE_DIR, 'doctor.sh');
 const UPDATE_SCRIPT  = path.join(APPLIANCE_DIR, 'update.sh');
+const PRUNE_SCRIPT   = path.join(APPLIANCE_DIR, 'prune-images.sh');
 const LOGS_DIR       = path.join(VIBE_DIR, 'logs');
 
 // Whitelist of log file basenames the admin tail endpoint will serve.
@@ -49,6 +50,7 @@ const LOG_NAMES = new Set([
   'enable-app.log',
   'disable-app.log',
   'update.log',
+  'prune-images.log',
 ]);
 
 // Slug pattern: must match manifest.schema.json's slug constraint. Used
@@ -542,6 +544,13 @@ app.post('/api/v1/disable/:slug', requireAdmin, testRateLimit, async (req, res) 
 // One-off update check that the operator can fire by hand.
 app.post('/api/v1/update/check', requireAdmin, testRateLimit, async (_req, res) => {
   await runShell(res, [UPDATE_SCRIPT, '--check'], 'update-check');
+});
+
+// Reclaim disk by removing images not referenced by any container
+// (running or stopped). Active app images are kept. Removed images are
+// re-pulled on the next enable-app / update run.
+app.post('/api/v1/admin/prune-images', requireAdmin, testRateLimit, async (_req, res) => {
+  await runShell(res, [PRUNE_SCRIPT], 'prune-images');
 });
 
 app.post('/api/v1/update/:slug', requireAdmin, testRateLimit, async (req, res) => {

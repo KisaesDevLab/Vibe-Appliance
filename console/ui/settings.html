@@ -138,6 +138,24 @@
       <button class="btn"           id="save-apply"   disabled>Save changes</button>
     </div>
 
+    <section class="maintenance" aria-labelledby="maint-h">
+      <h2 id="maint-h" style="margin-top:2rem;font-size:1.1rem;color:#6b4423;">Maintenance</h2>
+      <div class="settings-field" style="max-width:36rem;">
+        <label>Reclaim disk space</label>
+        <p class="help">
+          Removes Docker images not referenced by any container (running or
+          stopped). Active app images stay. Anything pruned is re-pulled the
+          next time the app is enabled or updated.
+        </p>
+        <div class="cta-row" style="gap:0.5rem;align-items:center;">
+          <button class="btn btn--ghost" id="prune-images-btn" type="button">Prune unused Docker images</button>
+          <span class="help" id="prune-images-status"></span>
+        </div>
+        <pre id="prune-images-output" class="mono" hidden
+             style="margin-top:0.5rem;padding:0.6rem;background:#fff;border:1px solid #e0d8c8;border-radius:4px;font-size:0.85em;white-space:pre-wrap;max-height:18rem;overflow:auto;"></pre>
+      </div>
+    </section>
+
     <footer class="footer">
       <p class="muted">
         Audit log: <a href="/api/v1/audit?pageSize=20">recent saves (JSON)</a>.
