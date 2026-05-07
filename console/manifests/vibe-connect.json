@@ -88,12 +88,12 @@
           "tier":             1,
           "category":         "Email & SMS",
           "label":            "From address",
-          "helpText":         "e.g. noreply@firm.com — must be verified with your email provider.",
+          "helpText":         "e.g. noreply@firm.com — must be verified with your email provider's sending-domain settings.",
           "input":            "text",
           "appliance":        "shared",
           "validate":         "email",
           "dependsOnFields":  ["EMAIL_PROVIDER"],
-          "showIf":           { "EMAIL_PROVIDER": "resend" }
+          "showIf":           { "EMAIL_PROVIDER": ["resend", "postmark", "emailit", "smtp"] }
         }
       },
       {
@@ -105,6 +105,7 @@
           "tier":            1,
           "category":        "Email & SMS",
           "label":           "Resend API key",
+          "helpText":        "Starts with re_. Generate at https://resend.com/api-keys (Sending Access scope is enough).",
           "input":           "password",
           "appliance":       "shared",
           "validate":        "non-empty",
@@ -121,6 +122,7 @@
           "tier":            1,
           "category":        "Email & SMS",
           "label":           "Postmark server token",
+          "helpText":        "Per-server token (UUID-shaped). Find at https://account.postmarkapp.com under Servers → API Tokens. Use a token from a Transactional Stream — Broadcast tokens are rejected for one-off sends.",
           "input":           "password",
           "appliance":       "shared",
           "validate":        "non-empty",
@@ -137,6 +139,7 @@
           "tier":            1,
           "category":        "Email & SMS",
           "label":           "EmailIt API key",
+          "helpText":        "Starts with em_ (live or test). Create one at https://emailit.com under workspace Settings → API. Test keys land in the v2 sandbox; live keys deliver real mail.",
           "input":           "password",
           "appliance":       "shared",
           "validate":        "non-empty",
@@ -152,6 +155,7 @@
           "tier":            1,
           "category":        "Email & SMS",
           "label":           "SMTP host",
+          "helpText":        "Hostname only (no scheme), e.g. smtp.gmail.com or mail.example.com.",
           "input":           "text",
           "appliance":       "shared",
           "validate":        "non-empty",
@@ -168,6 +172,7 @@
           "tier":            1,
           "category":        "Email & SMS",
           "label":           "SMTP port",
+          "helpText":        "587 for STARTTLS (most providers). 465 for implicit TLS. 25 is plain SMTP and usually blocked outbound on cloud hosts.",
           "input":           "number",
           "appliance":       "shared",
           "validate":        "number-range:1:65535",
@@ -183,8 +188,10 @@
           "tier":            1,
           "category":        "Email & SMS",
           "label":           "SMTP username",
+          "helpText":        "Often the same as the From address. Gmail/Workspace requires an App Password — your account password won't authenticate.",
           "input":           "text",
           "appliance":       "shared",
+          "validate":        "non-empty",
           "dependsOnFields": ["EMAIL_PROVIDER"],
           "showIf":          { "EMAIL_PROVIDER": "smtp" }
         }
@@ -198,8 +205,10 @@
           "tier":            1,
           "category":        "Email & SMS",
           "label":           "SMTP password",
+          "helpText":        "Provider password or App Password (Gmail, Outlook, etc.). The Test button does a TCP-connect probe to verify host:port reachability — actual credential validation happens on first send.",
           "input":           "password",
           "appliance":       "shared",
+          "validate":        "non-empty",
           "dependsOnFields": ["EMAIL_PROVIDER"],
           "showIf":          { "EMAIL_PROVIDER": "smtp" }
         }
@@ -214,6 +223,7 @@
           "tier":         1,
           "category":     "Email & SMS",
           "label":        "SMS provider",
+          "helpText":     "Optional. Magic-link email is the primary 2FA path; SMS is a backup. Twilio is the canonical cloud provider; TextLink is a budget cloud SMS service that delivers through your own Android phone (the phone acts as the SIM).",
           "input":        "dropdown",
           "appliance":    "shared",
           "validate":     "enum",
@@ -221,7 +231,7 @@
           "options": [
             { "value": "none",     "label": "None (SMS 2FA disabled)" },
             { "value": "twilio",   "label": "Twilio" },
-            { "value": "textlink", "label": "TextLink (LAN appliance)" }
+            { "value": "textlink", "label": "TextLink" }
           ]
         }
       },
@@ -234,6 +244,7 @@
           "tier":            1,
           "category":        "Email & SMS",
           "label":           "Twilio auth token",
+          "helpText":        "32-character hex token paired with the Account SID. Find at https://console.twilio.com under Account → API keys & tokens (the primary auth token).",
           "input":           "password",
           "appliance":       "shared",
           "validate":        "non-empty",
@@ -249,6 +260,7 @@
           "tier":            1,
           "category":        "Email & SMS",
           "label":           "Twilio account SID",
+          "helpText":        "34 chars, starts with AC. Same dashboard as the auth token. Subaccount SIDs work — pair with that subaccount's auth token.",
           "input":           "text",
           "appliance":       "shared",
           "validate":        "non-empty",
@@ -257,14 +269,15 @@
         }
       },
       {
-        "name": "TEXTLINK_API_URL",
-        "from": "appliance:TEXTLINK_API_URL",
-        "doc":  "Base URL of the TextLink LAN appliance, e.g. http://192.168.1.50:8080. Reachable from this host on LAN or Tailnet.",
+        "name":  "TEXTLINK_API_URL",
+        "from":  "appliance:TEXTLINK_API_URL",
+        "value": "https://textlinksms.com",
+        "doc":   "TextLink API base URL. Default https://textlinksms.com works for the hosted service. Override only if you run a self-hosted TextLink Bridge.",
         "ui": {
           "tier":            1,
           "category":        "Email & SMS",
-          "label":           "TextLink API URL",
-          "helpText":        "Base URL of your TextLink box (no trailing slash). Test runs a reachability probe; actual SMS sending happens from Vibe-Connect.",
+          "label":           "TextLink API base URL",
+          "helpText":        "Leave the default (https://textlinksms.com) unless you run TextLink Bridge on your own infrastructure. The /api/send-sms path is appended automatically.",
           "input":           "text",
           "appliance":       "shared",
           "validate":        "url",
@@ -276,11 +289,12 @@
         "name":   "TEXTLINK_API_KEY",
         "from":   "appliance:TEXTLINK_API_KEY",
         "secret": true,
-        "doc":    "API key issued by the TextLink LAN appliance. Sent as a Bearer token in the Authorization header.",
+        "doc":    "API key from your TextLink account. Sent as Authorization: Bearer <key>.",
         "ui": {
           "tier":            1,
           "category":        "Email & SMS",
           "label":           "TextLink API key",
+          "helpText":        "Generate in the TextLink web console under API. Test sends a real SMS to the number you supply (uses one credit). The phone running the TextLink Android app must be online for delivery.",
           "input":           "password",
           "appliance":       "shared",
           "validate":        "non-empty",

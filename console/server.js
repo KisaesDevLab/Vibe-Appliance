@@ -1427,6 +1427,26 @@ async function _testFetch(url, opts, timeoutMs) {
   }
 }
 
+// TCP-connect probe used by the SMTP test. We don't speak SMTP itself
+// (no nodemailer dep in the v1 image) — the probe just confirms the
+// host is resolvable and the port accepts connections, which catches
+// the most common "wrong host / wrong port / firewall blocking" errors
+// without requiring the operator to wait for an actual delivery.
+function _probeTcp(host, port, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const net = require('net');
+    const sock = net.createConnection({ host, port });
+    const finish = (result) => {
+      try { sock.destroy(); } catch { /* ignore */ }
+      resolve(result);
+    };
+    sock.setTimeout(timeoutMs);
+    sock.once('connect', () => finish({ ok: true }));
+    sock.once('timeout', () => finish({ ok: false, error: 'timeout after ' + timeoutMs + 'ms' }));
+    sock.once('error',   (err) => finish({ ok: false, error: err.code || err.message || String(err) }));
+  });
+}
+
 // 1-token ping to api.anthropic.com. Validates that the key is good
 // without burning meaningful credit. Body: { ANTHROPIC_API_KEY }.
 app.post('/api/v1/admin/test/anthropic', requireAdmin, testRateLimit, async (req, res) => {
@@ -1821,15 +1841,17 @@ app.post('/api/v1/admin/test/email', requireAdmin, testRateLimit, async (req, re
   }
 
   if (provider === 'emailit') {
-    // EmailIt v1 emails endpoint — Bearer auth, JSON body shaped like
-    // Resend's. If EmailIt revises the URL or schema, the failure path
-    // returns the upstream error verbatim so the operator can diagnose.
+    // EmailIt v2 emails endpoint per https://emailit.com/docs/api-reference/emails/send
+    // (v1 was deprecated through Feb 2026). Bearer auth, JSON body.
+    // The schema requires html OR text — we send both for safety
+    // because some sandbox environments reject text-only payloads.
     const key = b.EMAILIT_API_KEY || '';
     if (!key) return res.status(400).json({ ok: false, error: 'EMAILIT_API_KEY required' });
-    const result = await _testFetch('https://api.emailit.com/v1/emails', {
+    const html = '<p>' + text.replace(/\n/g, '<br>') + '</p>';
+    const result = await _testFetch('https://api.emailit.com/v2/emails', {
       method: 'POST',
       headers: { 'authorization': 'Bearer ' + key, 'content-type': 'application/json' },
-      body: JSON.stringify({ from, to: from, subject, text }),
+      body: JSON.stringify({ from, to: from, subject, html, text }),
     });
     if (result.ok) {
       let id = '';
@@ -1840,12 +1862,31 @@ app.post('/api/v1/admin/test/email', requireAdmin, testRateLimit, async (req, re
   }
 
   if (provider === 'smtp') {
-    // Real SMTP needs nodemailer (or comparable). Deferred to v1.2 when
-    // the npm dep + Dockerfile rebuild lands. Returns 501 with a clear
-    // path forward so the operator isn't left guessing.
-    return res.status(501).json({
-      ok: false,
-      message: 'SMTP test not implemented in v1.1. Add nodemailer to console/Dockerfile and POST to mail server directly. Resend/Postmark work today.',
+    // We don't speak SMTP from inside the console (no nodemailer dep
+    // in the v1 image) — the probe just confirms the host is
+    // reachable on the configured port. Catches wrong-host /
+    // wrong-port / firewall-blocking before the operator hits Save
+    // and waits for the first real send to fail.
+    const host = (b.SMTP_HOST || '').trim();
+    const portRaw = (b.SMTP_PORT || '587').trim();
+    const port = parseInt(portRaw, 10);
+    if (!host) return res.status(400).json({ ok: false, error: 'SMTP_HOST required' });
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return res.status(400).json({ ok: false, error: 'SMTP_PORT must be 1–65535' });
+    }
+    if (!b.SMTP_USER || !b.SMTP_PASSWORD) {
+      return res.status(400).json({ ok: false, error: 'SMTP_USER and SMTP_PASSWORD required' });
+    }
+    const probe = await _probeTcp(host, port, 5000);
+    if (!probe.ok) {
+      return res.json({
+        ok: false,
+        message: `SMTP server ${host}:${port} unreachable (${probe.error}). Check the host/port and that outbound TCP is allowed.`,
+      });
+    }
+    return res.json({
+      ok: true,
+      message: `SMTP server ${host}:${port} is reachable. Credentials are not validated by this probe — they're tested on the first real send. Trigger any feature that emails (e.g. Vibe-Connect magic link) to confirm end-to-end.`,
     });
   }
 
@@ -1893,29 +1934,47 @@ app.post('/api/v1/admin/test/sms', requireAdmin, testRateLimit, async (req, res)
   }
 
   if (provider === 'textlink') {
-    // TextLink is a self-hosted LAN gateway with a vendor-specific send
-    // API. We don't dispatch a real SMS from here — Vibe-Connect owns
-    // that path. Instead, probe the configured base URL with the API
-    // key so the operator can confirm URL + key + LAN reachability in
-    // one click. A 2xx/3xx/401/403/404 all confirm the host is up; only
-    // network errors and 5xx flag a configuration problem.
-    const url = (b.TEXTLINK_API_URL || '').trim().replace(/\/+$/, '');
+    // TextLink is a hosted SMS service at https://textlinksms.com that
+    // delivers via the operator's own Android phone (the phone runs
+    // their app and acts as the SIM relay). Per docs.textlinksms.com,
+    // the send endpoint is POST <base>/api/send-sms with Bearer auth
+    // and body { phone_number, text }. The API always returns HTTP
+    // 200; success/failure is signalled by the body's `ok` field.
+    //
+    // We send a real SMS to the operator-supplied TO_NUMBER (uses one
+    // credit) — same UX as the Twilio test — because TextLink has no
+    // separate "validate key" endpoint and a hit on the base URL would
+    // just return the marketing landing page without exercising auth.
+    const baseUrl = (b.TEXTLINK_API_URL || 'https://textlinksms.com').trim().replace(/\/+$/, '');
     const key = (b.TEXTLINK_API_KEY || '').trim();
-    if (!url) return res.status(400).json({ ok: false, error: 'TEXTLINK_API_URL required' });
     if (!key) return res.status(400).json({ ok: false, error: 'TEXTLINK_API_KEY required' });
-    const result = await _testFetch(url + '/', {
-      method: 'GET',
-      headers: { 'authorization': 'Bearer ' + key },
-    }, 8_000);
+    const result = await _testFetch(baseUrl + '/api/send-sms', {
+      method: 'POST',
+      headers: {
+        'authorization': 'Bearer ' + key,
+        'content-type':  'application/json',
+        'accept':        'application/json',
+      },
+      body: JSON.stringify({ phone_number: to, text: 'Vibe Appliance SMS test.' }),
+    }, 10_000);
     if (result.error) {
-      return res.json({ ok: false, message: `TextLink unreachable at ${url}: ${result.error}` });
+      return res.json({ ok: false, message: `TextLink unreachable at ${baseUrl}: ${result.error}` });
     }
-    if (result.status >= 500) {
-      return res.json({ ok: false, message: `TextLink at ${url} returned HTTP ${result.status} — gateway error.` });
+    // Per docs all responses are HTTP 200 with `{ok: true|false, ...}`.
+    let body = null;
+    try { body = JSON.parse(result.body); } catch { /* fall through */ }
+    if (body && body.ok === true) {
+      return res.json({
+        ok: true,
+        message: `Test SMS dispatched via TextLink to ${to}${body.queued ? ' (queued)' : ''}. Confirm receipt on the destination phone.`,
+      });
+    }
+    if (body && body.ok === false) {
+      return res.json({ ok: false, message: 'TextLink rejected: ' + (body.message || 'no message in response') });
     }
     return res.json({
-      ok: true,
-      message: `TextLink reachable at ${url} (HTTP ${result.status}). URL + key are persisted; Vibe-Connect dispatches actual SMS.`,
+      ok: false,
+      message: `TextLink returned HTTP ${result.status}, body did not parse as expected. Raw: ${result.body.slice(0, 200) + (result.body.length > 200 ? '…' : '')}`,
     });
   }
 

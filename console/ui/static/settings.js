@@ -557,6 +557,17 @@
       scope = 'appliance';
       valuesMap = state.values.appliance || {};
     }
+    // Predicate match — strings exact-match, arrays any-match. Arrays
+    // let one field declare visibility across multiple values of the
+    // same dependency, e.g. EMAIL_FROM showIf:
+    //   { EMAIL_PROVIDER: ["resend","postmark","emailit","smtp"] }
+    const showIfMatch = (got, expected) => {
+      if (got == null) return false;
+      const g = String(got);
+      if (Array.isArray(expected)) return expected.some(v => g === String(v));
+      return g === String(expected);
+    };
+
     for (const f of fields) {
       if (!f.showIf) continue;
       const wrap = panelEl.querySelector(`[data-key="${CSS.escape(f.key)}"]`);
@@ -564,12 +575,12 @@
       const ok = Object.entries(f.showIf).every(([depKey, depVal]) => {
         // Same-scope dirty check first.
         const dirty = state.dirty.get(dirtyKey(scope, depKey));
-        if (dirty) return String(dirty.value) === String(depVal);
+        if (dirty) return showIfMatch(dirty.value, depVal);
         // Fall back to the saved value for the active scope; if not
         // present (e.g. a per-app showIf depending on an inherited
         // appliance field), check appliance values too.
         const cur = valuesMap[depKey] || (state.values.appliance || {})[depKey];
-        return cur != null && String(cur.value) === String(depVal);
+        return cur != null && showIfMatch(cur.value, depVal);
       });
       wrap.style.display = ok ? '' : 'none';
     }
@@ -630,6 +641,13 @@
     const fields = state.schema.appliance[cat] || [];
     if (!fields.length) {
       panelEl.appendChild(el('p', { class: 'muted' }, ['No fields in this category.']));
+    } else if (cat === 'Email & SMS') {
+      // Email & SMS share a tab but are two distinct sub-flows. The
+      // default alphabetic sort interleaves them (SMS provider lands
+      // mid-email, Twilio fields next to SMTP fields, etc.). Split
+      // them by key prefix, render an h3 header for each, and put the
+      // provider dropdown first within each section.
+      panelEl.appendChild(renderEmailSmsForm(fields));
     } else {
       const form = el('form', { class: 'settings-form', onsubmit: e => { e.preventDefault(); saveAll(); } });
       for (const f of fields) {
@@ -656,6 +674,63 @@
       renderBackupSection(panelEl);
     }
     updateConditionals();
+  }
+
+  // Email & SMS tab: split fields into two sub-sections by key prefix,
+  // render an h3 header per section, and put the provider dropdown
+  // first so the operator picks it before being shown the conditional
+  // credential fields. The default alphabetic sort would otherwise
+  // bury EMAIL_PROVIDER below RESEND_API_KEY and slot SMS_PROVIDER
+  // between EMAIL_PROVIDER and SMTP_HOST.
+  const EMAIL_KEY_PREFIXES = ['EMAIL_', 'RESEND_', 'POSTMARK_', 'EMAILIT_', 'SMTP_'];
+  const SMS_KEY_PREFIXES   = ['SMS_', 'TWILIO_', 'TEXTLINK_'];
+
+  function renderEmailSmsForm(fields) {
+    const isEmailField = (f) => EMAIL_KEY_PREFIXES.some(p => f.key.startsWith(p));
+    const isSmsField   = (f) => SMS_KEY_PREFIXES.some(p => f.key.startsWith(p));
+
+    const orderInGroup = (a, b, providerKey) => {
+      // Provider dropdown first, then alphabetic by label.
+      if (a.key === providerKey) return -1;
+      if (b.key === providerKey) return 1;
+      return a.label.localeCompare(b.label);
+    };
+
+    const emailFields = fields.filter(isEmailField).sort((a, b) => orderInGroup(a, b, 'EMAIL_PROVIDER'));
+    const smsFields   = fields.filter(isSmsField).sort((a, b) => orderInGroup(a, b, 'SMS_PROVIDER'));
+    // Anything that doesn't match either prefix (a future addition,
+    // typo, etc.) falls into a third "Other" group so it doesn't
+    // silently disappear from the tab.
+    const otherFields = fields.filter(f => !isEmailField(f) && !isSmsField(f));
+
+    const form = el('form', {
+      class: 'settings-form',
+      onsubmit: e => { e.preventDefault(); saveAll(); },
+    });
+
+    const sectionHeader = (title) => el('h3', {
+      style: 'margin: 1.4rem 0 0.4rem; font-size: 1rem; color: var(--text); font-family: var(--sans); text-transform: uppercase; letter-spacing: 0.12em;',
+    }, [title]);
+
+    if (emailFields.length) {
+      form.appendChild(sectionHeader('Email'));
+      for (const f of emailFields) {
+        form.appendChild(renderField(f, currentRawFor(f)));
+      }
+    }
+    if (smsFields.length) {
+      form.appendChild(sectionHeader('SMS'));
+      for (const f of smsFields) {
+        form.appendChild(renderField(f, currentRawFor(f)));
+      }
+    }
+    if (otherFields.length) {
+      form.appendChild(sectionHeader('Other'));
+      for (const f of otherFields) {
+        form.appendChild(renderField(f, currentRawFor(f)));
+      }
+    }
+    return form;
   }
 
   function renderBackupSection(host) {

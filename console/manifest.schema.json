@@ -328,8 +328,13 @@
         },
         "showIf": {
           "type": "object",
-          "additionalProperties": { "type": "string" },
-          "description": "Predicate keyed by FIELD_NAME → required value. Field hidden until predicate satisfied."
+          "additionalProperties": {
+            "anyOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+            ]
+          },
+          "description": "Predicate keyed by FIELD_NAME → required value. Field hidden until predicate satisfied. Pass a string for exact match, or an array of strings for any-match (e.g. EMAIL_FROM should show for resend OR postmark OR emailit OR smtp)."
         },
         "postSaveJob": {
           "type": "string",
