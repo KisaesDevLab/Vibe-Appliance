@@ -647,7 +647,143 @@
     if (cat === TAB_FOR_MAINTENANCE) {
       renderMaintenanceSection(panelEl);
     }
+
+    // Backup tab — operator-aware status panel + Open Duplicati button.
+    // The dropdown alone doesn't communicate that destinations are
+    // configured INSIDE Duplicati, that there's a separate web
+    // password they need, or whether backups are actually running.
+    if (cat === 'Backup') {
+      renderBackupSection(panelEl);
+    }
     updateConditionals();
+  }
+
+  function renderBackupSection(host) {
+    const section = el('section', {
+      class: 'maintenance',
+      'aria-labelledby': 'backup-h',
+      'data-backup-section': '1',
+    });
+    section.appendChild(el('h2', { id: 'backup-h' }, ['Duplicati status & access']));
+
+    const row = el('div', { class: 'maintenance__row' });
+    const status   = el('p', { class: 'help', 'data-backup-status': '1' }, ['Loading…']);
+    const lastLine = el('p', { class: 'help', 'data-backup-last': '1' }, ['']);
+    const cta = el('div', { class: 'cta-row', style: 'gap:0.5rem;align-items:center;flex-wrap:wrap;' });
+    const openBtn = el('a', {
+      class: 'btn',
+      target: '_blank',
+      rel: 'noopener noreferrer',
+      'data-backup-open': '1',
+      style: 'pointer-events:none;opacity:0.5;',
+      href: '#',
+    }, ['Open Duplicati →']);
+    const refreshBtn = el('button', {
+      type: 'button',
+      class: 'btn btn--ghost',
+      onclick: () => loadBackupInfo(section),
+    }, ['Refresh']);
+    cta.appendChild(openBtn);
+    cta.appendChild(refreshBtn);
+
+    const creds = el('div', { 'data-backup-creds': '1', class: 'maintenance__output', hidden: '' }, []);
+
+    row.appendChild(status);
+    row.appendChild(lastLine);
+    row.appendChild(cta);
+    row.appendChild(creds);
+    section.appendChild(row);
+    host.appendChild(section);
+
+    loadBackupInfo(section);
+  }
+
+  async function loadBackupInfo(section) {
+    const status   = section.querySelector('[data-backup-status]');
+    const lastLine = section.querySelector('[data-backup-last]');
+    const openBtn  = section.querySelector('[data-backup-open]');
+    const creds    = section.querySelector('[data-backup-creds]');
+
+    status.textContent = 'Loading…';
+    status.style.color = 'var(--text-muted)';
+    lastLine.textContent = '';
+    creds.hidden = true;
+    creds.textContent = '';
+    openBtn.style.pointerEvents = 'none';
+    openBtn.style.opacity = '0.5';
+
+    try {
+      const r = await fetch('/api/v1/admin/backup/info', { credentials: 'same-origin' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+
+      // Container status line.
+      const cs = data.container_status;
+      if (cs === 'running') {
+        status.style.color = 'var(--good)';
+        status.textContent = '✓ Duplicati container running.';
+      } else if (cs === 'stopped') {
+        status.style.color = 'var(--warn)';
+        status.textContent = '⚠ Duplicati container stopped. Start it with: cd /opt/vibe/appliance && sudo docker compose up -d duplicati';
+      } else if (cs === 'not-found') {
+        status.style.color = 'var(--bad)';
+        status.textContent = '✗ Duplicati container not found. The infra service may not have been deployed — re-run sudo bootstrap.sh.';
+      } else {
+        status.style.color = 'var(--text-muted)';
+        status.textContent = 'Container status: ' + cs;
+      }
+
+      // Last-backup line — only meaningful when the probe found something.
+      if (data.last_backup && data.last_backup.ts) {
+        const ts = data.last_backup.ts;
+        const parsed = Date.parse(ts);
+        const days = Number.isFinite(parsed) ? Math.floor((Date.now() - parsed) / 86400000) : null;
+        const human = Number.isFinite(parsed) ? new Date(parsed).toLocaleString() : ts;
+        let connectGate = '';
+        // Vibe-Connect blocks vault uploads after 30 days without a
+        // backup. Surface the countdown when the data is fresh enough
+        // to compute, so operators see the deadline before it bites.
+        if (days != null && days >= 0) {
+          const remaining = 30 - days;
+          if (remaining <= 0)        connectGate = ' Vibe-Connect vault uploads are now BLOCKED (30-day stale-backup gate tripped).';
+          else if (remaining <= 7)   connectGate = ` ${remaining} day(s) until Vibe-Connect blocks new vault uploads.`;
+        }
+        lastLine.style.color = (days != null && days > 30) ? 'var(--bad)'
+                             : (days != null && days > 7)  ? 'var(--warn)'
+                             : 'var(--text-muted)';
+        lastLine.textContent = `Last backup: ${human} (${data.last_backup.jobs} job(s) configured).${connectGate}`;
+      } else if (data.probe_error) {
+        lastLine.style.color = 'var(--text-muted)';
+        lastLine.textContent = 'Last-backup status unavailable (' + data.probe_error + '). Open Duplicati for backup history.';
+      } else if (cs === 'running') {
+        lastLine.style.color = 'var(--text-muted)';
+        lastLine.textContent = 'No backup jobs configured yet. Open Duplicati to create one.';
+      }
+
+      // Open-Duplicati link.
+      if (data.web_url && cs === 'running') {
+        openBtn.href = data.web_url;
+        openBtn.style.pointerEvents = '';
+        openBtn.style.opacity = '';
+      }
+
+      // Credentials disclosure — collapsed by default (an inline copy
+      // would add too much weight). Operator clicks Refresh to re-show
+      // if they cleared it via DevTools or similar.
+      if (data.web_password) {
+        creds.hidden = false;
+        creds.textContent =
+          'Web admin login\n' +
+          '  username: ' + (data.web_username || 'admin') + '\n' +
+          '  password: ' + data.web_password + '\n' +
+          (data.passphrase_set
+            ? '\nBackup-job AES passphrase is set (find it under Status → First-login info on /admin).'
+            : '\n⚠ Backup-job AES passphrase is NOT set — bootstrap may not have generated DUPLICATI_PASSPHRASE.');
+      }
+    } catch (err) {
+      status.style.color = 'var(--bad)';
+      status.textContent = '✗ Could not load backup info: ' + err.message;
+    }
   }
 
   // v1.2 — Apps tab. Top row: sub-tabs per slug. Below: that slug's

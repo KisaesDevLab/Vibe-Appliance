@@ -1932,6 +1932,91 @@ app.post('/api/v1/admin/test/sms', requireAdmin, testRateLimit, async (req, res)
 // Not a substitute for real end-to-end tests — operator should still
 // validate via the actual Save flow once the values are in place.
 
+// Backup-tab data: container status + Duplicati URL + creds + a
+// best-effort last-backup probe via Duplicati's HTTP API. If the API
+// call fails (Duplicati versions vary in auth shape, the daemon may be
+// mid-restart, etc.), the response still carries everything else so
+// the UI's Open Duplicati button keeps working.
+app.get('/api/v1/admin/backup/info', requireAdmin, async (_req, res) => {
+  const state = readState();
+  const config = state.config || {};
+  const dupWebPw = process.env.DUPLICATI__WEBSERVICE_PASSWORD || '';
+  const passphraseSet = !!(process.env.DUPLICATI_PASSPHRASE || '').trim();
+
+  let containerStatus = 'unknown';
+  try {
+    const c = docker.getContainer('vibe-duplicati');
+    const info = await c.inspect();
+    containerStatus = (info.State && info.State.Running) ? 'running' : 'stopped';
+  } catch {
+    containerStatus = 'not-found';
+  }
+
+  // Mode-aware Duplicati URL — mirrors the same logic that
+  // /api/v1/first-login uses for _infra_duplicati_web so the operator
+  // sees the same link no matter which page they're on.
+  let webUrl = null;
+  if (config.mode === 'domain' && config.domain) {
+    webUrl = `https://backup.${config.domain}/`;
+  } else if (config.host_ip) {
+    webUrl = `http://${config.host_ip}:5198/`;
+  }
+
+  // Last-backup probe — best effort. Duplicati's API auth differs by
+  // version (2.0 supports HTTP Basic, 2.1+ uses cookie-based login).
+  // Try Basic first because it's a single round-trip; fall back to
+  // null on any failure. The button + creds still work either way.
+  let lastBackup = null;
+  let probeError = null;
+  if (containerStatus === 'running' && dupWebPw) {
+    try {
+      const auth = 'Basic ' + Buffer.from(':' + dupWebPw, 'utf8').toString('base64');
+      const r = await fetch('http://vibe-duplicati:8200/api/v1/backups', {
+        method: 'GET',
+        headers: { 'Authorization': auth, 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(3000),
+      });
+      if (r.ok) {
+        const data = await r.json().catch(() => null);
+        if (Array.isArray(data) && data.length) {
+          // Each entry has shape { Backup: {...}, Schedule: {...} }.
+          // LastRun may live on Backup.Metadata.LastBackupFinished or
+          // Schedule.LastRun depending on version. Walk both.
+          let bestTs = null;
+          for (const entry of data) {
+            const b = (entry && entry.Backup) || {};
+            const meta = b.Metadata || {};
+            const candidates = [
+              meta.LastBackupFinished, meta.LastBackupStarted,
+              (entry.Schedule && entry.Schedule.LastRun) || null,
+            ].filter(Boolean);
+            for (const ts of candidates) {
+              if (!bestTs || ts > bestTs) bestTs = ts;
+            }
+          }
+          if (bestTs) {
+            lastBackup = { ts: bestTs, jobs: data.length };
+          }
+        }
+      } else {
+        probeError = 'duplicati api ' + r.status;
+      }
+    } catch (err) {
+      probeError = err && err.name === 'AbortError' ? 'duplicati api timeout' : (err.message || 'probe failed');
+    }
+  }
+
+  res.json({
+    container_status: containerStatus,
+    web_url: webUrl,
+    web_username: 'admin',
+    web_password: dupWebPw || null,
+    passphrase_set: passphraseSet,
+    last_backup: lastBackup,
+    probe_error: probeError,
+  });
+});
+
 app.post('/api/v1/admin/test/backup', requireAdmin, testRateLimit, async (req, res) => {
   const b = req.body || {};
   const dest = (b.BACKUP_DESTINATION_TYPE || '').trim().toLowerCase();
