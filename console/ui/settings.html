@@ -229,23 +229,6 @@
       <p class="muted">fetching schema…</p>
     </section>
 
-    <section class="maintenance" aria-labelledby="maint-h">
-      <h2 id="maint-h">Maintenance</h2>
-      <div class="maintenance__row">
-        <strong>Reclaim disk space</strong>
-        <p class="help">
-          Removes Docker images not referenced by any container (running or stopped).
-          Active app images stay. Anything pruned is re-pulled the next time the app is
-          enabled or updated.
-        </p>
-        <div class="cta-row" style="gap:0.5rem;align-items:center;">
-          <button class="btn btn--ghost" id="prune-images-btn" type="button">Prune unused Docker images</button>
-          <span class="help" id="prune-images-status"></span>
-        </div>
-        <pre class="maintenance__output" id="prune-images-output" hidden></pre>
-      </div>
-    </section>
-
     <div class="settings-save-bar" id="save-bar">
       <span class="settings-save-status" id="save-status">No changes pending.</span>
       <button class="btn btn--ghost" id="save-discard" disabled>Discard</button>

@@ -67,15 +67,46 @@
   saveBtn.addEventListener('click', saveAll);
   discBtn.addEventListener('click', discardAll);
 
-  // Maintenance — prune unused Docker images. Confirms first because
-  // pruned images get re-pulled on next enable/update (a brief delay
-  // and bandwidth cost the operator should opt into knowingly).
-  const pruneBtn    = document.getElementById('prune-images-btn');
-  const pruneStat   = document.getElementById('prune-images-status');
-  const pruneOutput = document.getElementById('prune-images-output');
-  if (pruneBtn) pruneBtn.addEventListener('click', pruneImages);
+  // Maintenance — prune unused Docker images. Lives under the System
+  // tab (built fresh on each render of that tab) so the operator only
+  // sees it where the rest of the host-level controls already live,
+  // not on every settings tab.
+  const TAB_FOR_MAINTENANCE = 'System';
 
-  async function pruneImages() {
+  function renderMaintenanceSection(host) {
+    const section = el('section', {
+      class: 'maintenance',
+      'aria-labelledby': 'maint-h',
+    });
+    section.appendChild(el('h2', { id: 'maint-h' }, ['Maintenance']));
+
+    const row = el('div', { class: 'maintenance__row' });
+    row.appendChild(el('strong', null, ['Reclaim disk space']));
+    row.appendChild(el('p', { class: 'help' }, [
+      'Removes Docker images not referenced by any container (running or stopped). ' +
+      'Active app images stay. Anything pruned is re-pulled the next time the app is ' +
+      'enabled or updated.',
+    ]));
+
+    const status = el('span', { class: 'help' }, ['']);
+    const output = el('pre', { class: 'maintenance__output', hidden: '' }, []);
+    const btn = el('button', {
+      type: 'button',
+      class: 'btn btn--ghost',
+      onclick: () => pruneImages(btn, status, output),
+    }, ['Prune unused Docker images']);
+
+    const ctaRow = el('div', { class: 'cta-row', style: 'gap:0.5rem;align-items:center;' });
+    ctaRow.appendChild(btn);
+    ctaRow.appendChild(status);
+    row.appendChild(ctaRow);
+    row.appendChild(output);
+
+    section.appendChild(row);
+    host.appendChild(section);
+  }
+
+  async function pruneImages(btn, status, output) {
     const ok = window.confirm(
       'Remove all Docker images not currently used by any container?\n\n' +
       'Active app images stay. Pruned images will re-pull the next time ' +
@@ -84,11 +115,11 @@
     );
     if (!ok) return;
 
-    pruneBtn.disabled  = true;
-    pruneStat.style.color = '';
-    pruneStat.textContent = 'Pruning…';
-    pruneOutput.hidden = true;
-    pruneOutput.textContent = '';
+    btn.disabled = true;
+    status.style.color = '';
+    status.textContent = 'Pruning…';
+    output.hidden = true;
+    output.textContent = '';
 
     try {
       const r = await fetch('/api/v1/admin/prune-images', {
@@ -106,24 +137,24 @@
       } catch { /* no summary line — fall through */ }
 
       if (r.ok && data.exit_code === 0) {
-        pruneStat.style.color  = 'var(--good)';
-        pruneStat.textContent  = '✓ Done. Reclaimed ' + (reclaimed || '0B') + '.';
+        status.style.color = 'var(--good)';
+        status.textContent = '✓ Done. Reclaimed ' + (reclaimed || '0B') + '.';
       } else {
-        pruneStat.style.color  = 'var(--bad)';
-        pruneStat.textContent  = '✗ Failed (exit ' + (data.exit_code != null ? data.exit_code : '?') + ').';
+        status.style.color = 'var(--bad)';
+        status.textContent = '✗ Failed (exit ' + (data.exit_code != null ? data.exit_code : '?') + ').';
       }
 
       // Always show the docker output (deletion list lives on stderr).
       const blob = [data.stdout, data.stderr].filter(Boolean).join('\n').trim();
       if (blob) {
-        pruneOutput.hidden = false;
-        pruneOutput.textContent = blob;
+        output.hidden = false;
+        output.textContent = blob;
       }
     } catch (err) {
-      pruneStat.style.color = 'var(--bad)';
-      pruneStat.textContent = '✗ ' + err.message;
+      status.style.color = 'var(--bad)';
+      status.textContent = '✗ ' + err.message;
     } finally {
-      pruneBtn.disabled = false;
+      btn.disabled = false;
     }
   }
 
@@ -599,14 +630,23 @@
     const fields = state.schema.appliance[cat] || [];
     if (!fields.length) {
       panelEl.appendChild(el('p', { class: 'muted' }, ['No fields in this category.']));
-      return;
+    } else {
+      const form = el('form', { class: 'settings-form', onsubmit: e => { e.preventDefault(); saveAll(); } });
+      for (const f of fields) {
+        const cur = currentRawFor(f);
+        form.appendChild(renderField(f, cur));
+      }
+      panelEl.appendChild(form);
     }
-    const form = el('form', { class: 'settings-form', onsubmit: e => { e.preventDefault(); saveAll(); } });
-    for (const f of fields) {
-      const cur = currentRawFor(f);
-      form.appendChild(renderField(f, cur));
+
+    // Maintenance section — bolted onto the System tab so the prune
+    // action lives next to the other host-level controls instead of
+    // being globally visible. If the operator's manifest set doesn't
+    // produce a System tab for some reason, the section still renders
+    // here so prune isn't unreachable.
+    if (cat === TAB_FOR_MAINTENANCE) {
+      renderMaintenanceSection(panelEl);
     }
-    panelEl.appendChild(form);
     updateConditionals();
   }
 
