@@ -219,14 +219,22 @@ Health check is timing out. The container is running but its
 
 **Diagnose:**
 ```
-sudo docker logs <slug>-server --tail 80
-sudo docker exec <slug>-server node -e \
-   "require('http').get('http://127.0.0.1:3001/api/v1/health',r=>console.log(r.statusCode))"
+sudo docker compose \
+  -f /opt/vibe/appliance/docker-compose.yml \
+  -f /opt/vibe/appliance/apps/<slug>.yml \
+  logs --tail 80
 ```
+This walks every container declared by the overlay — single-container
+apps, `<slug>-server`/`<slug>-client` pairs, and `<slug>-api`/`<slug>-web`
+pairs (MyBooks, Payroll, Tax-Research) all surface in one shot. The
+manifest under `console/manifests/<slug>.json` lists the exact
+container names and the health path being probed.
+
 **Fix:** if `/health` 500s, the app crashed on startup; check the env
-file at `/opt/vibe/env/<slug>.env` for missing values. If `/health`
-isn't the right path, check the manifest at
-`console/manifests/<slug>.json`.
+file at `/opt/vibe/env/<slug>.env` for missing values, and verify
+`MIGRATIONS_AUTO=true` is present (apps that ship with auto-migrations
+will fail health on first boot if it's missing). If `/health` isn't the
+right path, check the manifest's `health` field.
 
 ### Toggle ON → 502 on the subdomain
 

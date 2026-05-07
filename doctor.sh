@@ -448,8 +448,14 @@ check_app_health() {
        >>"$VIBE_LOG_FILE" 2>&1; then
     _check_pass "$upstream$health responds 200"
   else
+    # `docker compose ... logs` walks every container declared in the
+    # overlay, so it works for every app topology (single-container,
+    # web+api, client+server). The previous hint hardcoded `<slug>-server`
+    # which is wrong for vibe-mybooks-api, vibe-payroll-api,
+    # vibe-tax-research-api, vibe-glm-ocr (single), and vibe-tx-converter
+    # (single).
     _check_fail "$upstream$health did not respond 200" \
-      "Diagnose: docker logs ${slug}-server --tail 40 2>/dev/null || docker compose -f /opt/vibe/appliance/docker-compose.yml -f /opt/vibe/appliance/apps/${slug}.yml logs --tail 40
+      "Diagnose: docker compose -f /opt/vibe/appliance/docker-compose.yml -f /opt/vibe/appliance/apps/${slug}.yml logs --tail 40
 Fix:      restart the app via the admin Apps tab (Disable, then Enable)"
   fi
 }
