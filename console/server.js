@@ -40,6 +40,7 @@ const DOCTOR_SCRIPT  = path.join(APPLIANCE_DIR, 'doctor.sh');
 const UPDATE_SCRIPT  = path.join(APPLIANCE_DIR, 'update.sh');
 const PRUNE_SCRIPT   = path.join(APPLIANCE_DIR, 'prune-images.sh');
 const LOGS_DIR       = path.join(VIBE_DIR, 'logs');
+const ENV_DIR        = path.join(VIBE_DIR, 'env');
 
 // Whitelist of log file basenames the admin tail endpoint will serve.
 // Restricting by name (rather than path) blocks ../ shenanigans up
@@ -1074,8 +1075,6 @@ app.get('/api/v1/host-services', requireAdmin, (_req, res) => {
 // entries with ui.tier === 1, and returns a structure the Settings UI
 // can render category tabs from. Computed once at startup; manifests
 // don't change at runtime so a static registry is safe.
-
-const ENV_DIR = path.join(VIBE_DIR, 'env');
 
 // Categories the UI renders as appliance-level tabs (see addendum §7.1).
 // Per-app-only categories ('Application', 'Compliance') get an "Apps"
