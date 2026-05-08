@@ -327,6 +327,103 @@ async function prewarmGhcrCache() {
 setTimeout(prewarmGhcrCache, 10_000);
 setInterval(prewarmGhcrCache, GHCR_TTL_MS);
 
+// ----- Host LAN IP refresher --------------------------------------------
+//
+// state.config.host_ip is set ONCE at bootstrap, then read all over the
+// admin UI: emergency URLs, Cockpit URL in LAN mode, Duplicati / Portainer
+// links in first-login info, app emergency-port URLs. When the host's LAN
+// IP changes (DHCP renewal, network reconfiguration, moved between
+// networks), every one of those URLs goes stale and there's no path
+// short of re-running bootstrap.sh to recover.
+//
+// Running inside a container, the console can't use `ip route` directly —
+// it'd see the docker bridge interfaces, not the host's. We spawn an
+// ephemeral alpine container with --network=host to query the actual
+// host network namespace via the already-mounted docker socket. Cheap
+// (~6 MB image, cached after first pull) and idempotent.
+//
+// Nothing else needs to reload on host_ip change: HAProxy binds to
+// *:port (doesn't care about specific IPs) and the Caddyfile renderer
+// doesn't reference host_ip either. State.json update is sufficient.
+
+const HOST_IP_REFRESH_INTERVAL_MS = 5 * 60 * 1000;   // 5 min
+const HOST_IP_REFRESH_WARMUP_MS   = 60 * 1000;       // first check 60s after boot
+const HOST_IP_DETECTOR_IMAGE      = 'alpine:latest';
+
+function detectHostLanIp() {
+  // Spawn `docker run --rm --network=host …` via the host's docker CLI
+  // (the console image bundles docker-ce-cli — see console/Dockerfile)
+  // because dockerode would require streaming stdout off an exec
+  // session, which is more bookkeeping for the same answer.
+  return new Promise((resolve) => {
+    const ipCmd =
+      "ip -4 -o route get 1.1.1.1 2>/dev/null " +
+      "| awk '{for(i=1;i<=NF;i++) if($i==\"src\"){print $(i+1); exit}}' " +
+      "|| hostname -I 2>/dev/null | awk '{print $1}'";
+    const child = spawn('docker', [
+      'run', '--rm', '--network=host', HOST_IP_DETECTOR_IMAGE,
+      'sh', '-c', ipCmd,
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (d) => { out += d.toString(); });
+    child.stderr.on('data', (d) => { err += d.toString(); });
+    child.on('error', (e) => resolve({ ok: false, error: e.message }));
+    child.on('exit', (code) => {
+      if (code !== 0) {
+        return resolve({ ok: false, error: `docker exit ${code}: ${(err || out).trim().slice(0, 200)}` });
+      }
+      const ip = out.trim();
+      if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
+        return resolve({ ok: false, error: 'docker output did not contain an IPv4: ' + (out || '(empty)').slice(0, 200) });
+      }
+      resolve({ ok: true, ip });
+    });
+  });
+}
+
+async function refreshHostIp(force = false) {
+  const detected = await detectHostLanIp();
+  if (!detected.ok) {
+    log('warn', 'host-ip refresh failed', { err: detected.error });
+    return { ok: false, error: detected.error };
+  }
+  const newIp = detected.ip;
+  let state;
+  try {
+    state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+  } catch (err) {
+    log('warn', 'host-ip refresh: state.json unreadable', { err: err.message });
+    return { ok: false, error: 'could not read state.json: ' + err.message };
+  }
+  state.config = state.config || {};
+  const previous = state.config.host_ip || null;
+  if (!force && previous === newIp) {
+    return { ok: true, host_ip: newIp, changed: false, previous };
+  }
+  state.config.host_ip = newIp;
+  // Atomic write — write to a tempfile, then rename. Same pattern
+  // bootstrap uses; means a crash mid-write doesn't truncate
+  // state.json.
+  const tmp = STATE_PATH + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+    fs.renameSync(tmp, STATE_PATH);
+  } catch (err) {
+    log('error', 'host-ip refresh: state.json write failed', { err: err.message });
+    return { ok: false, error: 'could not write state.json: ' + err.message };
+  }
+  log('info', 'host-ip refreshed', { previous, current: newIp });
+  return { ok: true, host_ip: newIp, previous, changed: true };
+}
+
+setTimeout(() => {
+  refreshHostIp(false).catch(err => log('warn', 'host-ip bg refresh threw', { err: err.message }));
+}, HOST_IP_REFRESH_WARMUP_MS);
+setInterval(() => {
+  refreshHostIp(false).catch(err => log('warn', 'host-ip bg refresh threw', { err: err.message }));
+}, HOST_IP_REFRESH_INTERVAL_MS);
+
 // ----- Dynamic DNS (Namecheap) -----------------------------------------
 //
 // The console runs an in-process updater so non-static-IP installs don't
@@ -790,6 +887,15 @@ app.post('/api/v1/update/check', requireAdmin, testRateLimit, async (_req, res) 
 // re-pulled on the next enable-app / update run.
 app.post('/api/v1/admin/prune-images', requireAdmin, testRateLimit, async (_req, res) => {
   await runShell(res, [PRUNE_SCRIPT], 'prune-images');
+});
+
+// Manual host-LAN-IP refresh — triggered by the "Refresh" button next
+// to the LAN IP on the admin Status panel. The same logic also runs
+// on a background timer (5 min cadence) — this endpoint just lets the
+// operator skip the wait when they know the IP just changed.
+app.post('/api/v1/admin/refresh-host-ip', requireAdmin, testRateLimit, async (_req, res) => {
+  const result = await refreshHostIp(true);
+  res.json(result);
 });
 
 // Inline admin-password rotation. Persists a scrypt hash to the meta

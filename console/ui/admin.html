@@ -456,13 +456,26 @@ sudo systemctl start cloudflared</pre>
 
       const lanIp  = config.host_ip || '';
       const tsHost = config.tailscale_hostname || '';
+      // Refresh link rebuilds host_ip in state.json by spawning a
+      // host-network alpine container that runs `ip route get 1.1.1.1`.
+      // The console daemon also runs this every 5 minutes in the
+      // background; the link just lets the operator skip the wait
+      // when they know the IP just changed (DHCP renewal, moved
+      // networks, etc.).
+      const refreshLink = ' <a href="#" id="host-ip-refresh" data-host-ip-refresh="1"' +
+        ' style="font-size:0.85em;margin-left:0.5em;">Refresh</a>';
       meta.innerHTML =
         'HAProxy sidecar: ' + proxyBadge +
         '   ·   Server LAN IP: <span class="mono">' +
           (lanIp ? escapeHtml(lanIp) : '(not detected — check `hostname -I` on the host)') + '</span>' +
+          refreshLink +
         (tsHost
           ? '   ·   Tailnet host: <span class="mono">' + escapeHtml(tsHost) + '</span>'
           : '');
+      // Attach the click handler each render — the meta innerHTML
+      // assignment above replaces any prior <a id="host-ip-refresh">.
+      const refreshEl = document.getElementById('host-ip-refresh');
+      if (refreshEl) refreshEl.addEventListener('click', refreshHostIp);
 
       // Build a unified list: apps with emergencyUrl, then infra
       // services with emergencyUrl. Cockpit gets a special entry
@@ -959,6 +972,47 @@ sudo systemctl start cloudflared</pre>
         // Refresh app cards so the now-true update_available flag
         // (if any) lights up the Update buttons immediately.
         await refresh();
+      }
+    }
+
+    // ---------- Host IP refresh ----------
+    // Triggered by the small "Refresh" link next to the Server LAN IP
+    // line in the Emergency-access meta. Server-side this re-detects
+    // via `docker run --network=host`, atomically updates
+    // state.config.host_ip in state.json, and returns the new value.
+    // We then reload the page so every URL on this admin view picks
+    // up the new IP — easier than surgically re-rendering each card.
+    async function refreshHostIp(ev) {
+      if (ev) ev.preventDefault();
+      const a = document.getElementById('host-ip-refresh');
+      if (!a) return;
+      const orig = a.textContent;
+      a.textContent = 'Refreshing…';
+      a.style.pointerEvents = 'none';
+      try {
+        const r = await fetch('/api/v1/admin/refresh-host-ip', {
+          method: 'POST', credentials: 'same-origin',
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || !data.ok) {
+          a.textContent = '✗ ' + (data.error || ('HTTP ' + r.status));
+          a.style.color = 'var(--bad)';
+          a.style.pointerEvents = '';
+          return;
+        }
+        // Reload to refresh every URL that reads config.host_ip.
+        // The new state.json is already on disk; the next render
+        // picks it up.
+        if (data.changed) {
+          window.location.reload();
+        } else {
+          a.textContent = '✓ unchanged (' + data.host_ip + ')';
+          setTimeout(() => { a.textContent = orig; a.style.pointerEvents = ''; }, 2500);
+        }
+      } catch (err) {
+        a.textContent = '✗ ' + err.message;
+        a.style.color = 'var(--bad)';
+        a.style.pointerEvents = '';
       }
     }
 
