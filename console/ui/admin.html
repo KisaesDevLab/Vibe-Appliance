@@ -688,11 +688,19 @@ curl -sI https://tb.yourdomain.com/</pre>
 
     function renderFirstLogin(items) {
       const list = document.getElementById('first-login-list');
-      if (!items.length) {
+      // Only apps with actual default credentials baked in belong on
+      // this section's cards. setup-wizard apps create credentials at
+      // runtime (the URL in their Apps card already takes the operator
+      // to the wizard), and no-auth services have no login at all —
+      // showing them here was noise.
+      const credItems = items.filter(it =>
+        it.type === 'default-credentials-forced-reset' ||
+        it.type === 'default-credentials-passive');
+      if (!credItems.length) {
         list.innerHTML = '<p class="muted">No apps with default credentials currently registered.</p>';
         return;
       }
-      list.innerHTML = '<div class="apps-list">' + items.map(item => {
+      list.innerHTML = '<div class="apps-list">' + credItems.map(item => {
         const enabled = item.enabled && item.status === 'running';
         const t = item.type || 'unknown';
 
