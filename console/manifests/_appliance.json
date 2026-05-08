@@ -123,6 +123,86 @@
       }
     },
     {
+      "name":  "CLOUDFLARE_TUNNEL_ENABLED",
+      "value": "false",
+      "doc":   "When true, bring the appliance online via a Cloudflare Tunnel instead of (or alongside) port-forwarded 80/443. Outbound-only — the tunnel originates from this host to Cloudflare's edge, no router-side forwarding required. Set up with `sudo bash /opt/vibe/appliance/infra/cloudflared-up.sh` after filling in the API fields below; the script creates the tunnel + DNS routes via the Cloudflare API, brings up a cloudflared container on vibe_net, and stores the connector token in shared.env. Hard prerequisite: the domain's nameservers must already point at Cloudflare (the tunnel's edge routing only works for Cloudflare-authoritative zones).",
+      "ui": {
+        "tier":            1,
+        "category":        "Network",
+        "label":           "Cloudflare Tunnel",
+        "helpText":        "Toggles the cloudflared service on or off. Requires the API token + account/zone IDs below. After enabling, run sudo bash /opt/vibe/appliance/infra/cloudflared-up.sh on the host to provision the tunnel and DNS routes.",
+        "input":           "toggle",
+        "appliance":       "shared",
+        "validate":        "enum",
+        "options": [
+          { "value": "true",  "label": "Enabled"  },
+          { "value": "false", "label": "Disabled" }
+        ]
+      }
+    },
+    {
+      "name":   "CLOUDFLARE_TUNNEL_API_TOKEN",
+      "secret": true,
+      "doc":    "Cloudflare API token used by infra/cloudflared-up.sh to create the tunnel and write CNAME records. Distinct from CLOUDFLARE_API_TOKEN (which is scoped Zone:DNS:Edit only for ACME-DNS challenges) — the tunnel needs Account.Cloudflare-Tunnel:Edit AND Zone.DNS:Edit on the target zone.",
+      "ui": {
+        "tier":            1,
+        "category":        "Network",
+        "label":           "Cloudflare API token (Tunnel)",
+        "helpText":        "Create at https://dash.cloudflare.com/profile/api-tokens with 'Account → Cloudflare Tunnel:Edit' AND 'Zone → DNS:Edit' scopes. Distinct from the DNS-01 token used for cert issuance — the tunnel script needs broader account-level Tunnel permissions.",
+        "input":           "password",
+        "appliance":       "shared",
+        "validate":        "non-empty",
+        "dependsOnFields": ["CLOUDFLARE_TUNNEL_ENABLED"],
+        "showIf":          { "CLOUDFLARE_TUNNEL_ENABLED": "true" }
+      }
+    },
+    {
+      "name": "CLOUDFLARE_ACCOUNT_ID",
+      "doc":  "Cloudflare account ID. Find at https://dash.cloudflare.com/?to=/:account → Workers & Pages → the right-hand sidebar shows Account ID. Or via the URL: dash.cloudflare.com/<this-string>/...",
+      "ui": {
+        "tier":            1,
+        "category":        "Network",
+        "label":           "Cloudflare account ID",
+        "helpText":        "32-char hex string. Visible at the top right of the Cloudflare dashboard once you select an account, or in the URL after dash.cloudflare.com/.",
+        "input":           "text",
+        "appliance":       "shared",
+        "validate":        "non-empty",
+        "dependsOnFields": ["CLOUDFLARE_TUNNEL_ENABLED"],
+        "showIf":          { "CLOUDFLARE_TUNNEL_ENABLED": "true" }
+      }
+    },
+    {
+      "name": "CLOUDFLARE_ZONE_ID",
+      "doc":  "Zone ID for the appliance's domain. Find on Cloudflare dashboard → pick the zone → bottom-right of the Overview page, 'Zone ID'.",
+      "ui": {
+        "tier":            1,
+        "category":        "Network",
+        "label":           "Cloudflare zone ID",
+        "helpText":        "32-char hex string. Per-zone — shown on the Overview tab of each domain in the Cloudflare dashboard.",
+        "input":           "text",
+        "appliance":       "shared",
+        "validate":        "non-empty",
+        "dependsOnFields": ["CLOUDFLARE_TUNNEL_ENABLED"],
+        "showIf":          { "CLOUDFLARE_TUNNEL_ENABLED": "true" }
+      }
+    },
+    {
+      "name":  "CLOUDFLARE_TUNNEL_NAME",
+      "value": "vibe-appliance",
+      "doc":   "Human-readable name for the tunnel object in Cloudflare's dashboard. The script creates one tunnel per name and reuses an existing one with the same name on re-run.",
+      "ui": {
+        "tier":            1,
+        "category":        "Network",
+        "label":           "Cloudflare tunnel name",
+        "helpText":        "Lowercase letters, digits, and dashes. Default 'vibe-appliance' is fine for single-appliance accounts. Use a different name only when running multiple appliances under one Cloudflare account.",
+        "input":           "text",
+        "appliance":       "shared",
+        "validate":        "non-empty",
+        "dependsOnFields": ["CLOUDFLARE_TUNNEL_ENABLED"],
+        "showIf":          { "CLOUDFLARE_TUNNEL_ENABLED": "true" }
+      }
+    },
+    {
       "name":  "DDNS_PROVIDER",
       "value": "none",
       "doc":   "Dynamic-DNS provider for non-static-IP installs. When set, the console runs a background updater that pushes the appliance's current public IP to the chosen provider on a regular cadence so A records stay accurate across ISP IP rotations.",

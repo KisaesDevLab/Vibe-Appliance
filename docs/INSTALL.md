@@ -122,6 +122,117 @@ The appliance will issue per-subdomain certificates from Let's Encrypt
 on each app's first request. Slower than DNS-01 (one cert challenge
 per app) but works on any DNS host.
 
+### Option E: Cloudflare Tunnel (no port forwarding)
+
+Use this if you can't or don't want to forward ports 80/443 from your
+router — residential ISPs that block inbound TCP/80, restrictive
+office networks, or just operators who'd rather avoid touching router
+config. The appliance dials *outbound* to Cloudflare's edge; public
+requests to your subdomains arrive over that tunnel.
+
+Hard prerequisite: **the domain's DNS must be hosted on Cloudflare's
+nameservers.** You can keep registration at any registrar (Namecheap,
+GoDaddy, etc.) — only the nameserver records change. The switch is
+free, doesn't touch your registration, and takes a few minutes to
+propagate. After the switch, Cloudflare DNS-01 (Option A) and
+Cloudflare Tunnel (this option) both become available.
+
+Setup:
+
+1. **Move DNS to Cloudflare** if you haven't already. Cloudflare's
+   onboarding walks you through it: sign up at cloudflare.com → Add
+   site → enter your domain → Cloudflare imports existing records →
+   Cloudflare gives you two nameservers → log into your registrar and
+   point the domain's NS records at those two values. Wait for
+   propagation (`dig NS firm.com +short` should show Cloudflare's
+   nameservers).
+
+2. **Create a Cloudflare API token** at
+   https://dash.cloudflare.com/profile/api-tokens → "Create Token" →
+   "Custom token". Permissions:
+   - **Account → Cloudflare Tunnel → Edit** (lets the script create + manage the tunnel)
+   - **Zone → DNS → Edit** (lets the script create CNAMEs for each subdomain)
+
+   Account Resources → "Include → Specific account → <your account>".
+   Zone Resources → "Include → Specific zone → <your domain>".
+
+3. **Find your account ID and zone ID.** Cloudflare dashboard:
+   - **Account ID** — visible at the top of any Account-level page
+     (Account Home, Workers & Pages sidebar). Or in the URL:
+     `dash.cloudflare.com/<account-id>/...`.
+   - **Zone ID** — bottom-right of the Overview page for the specific
+     domain. Or in the URL when viewing the zone:
+     `dash.cloudflare.com/<account-id>/<domain>` → "API" pane on the
+     right.
+
+4. **Save the four values in the appliance.** In the admin console,
+   **Configuration → Network**:
+   - **Cloudflare Tunnel** → toggle ON.
+   - **Cloudflare API token (Tunnel)** → the token from step 2.
+   - **Cloudflare account ID** → from step 3.
+   - **Cloudflare zone ID** → from step 3.
+   - **Cloudflare tunnel name** → leave the default `vibe-appliance`
+     unless you're running multiple appliances under one Cloudflare
+     account.
+
+   Click **Save**. The console restarts settings-save's downstream
+   apps (none, since these are tunnel-only); env values land in
+   `/opt/vibe/env/appliance.env`.
+
+5. **Run the setup script on the host** to provision the tunnel + DNS
+   routes + bring up the cloudflared container:
+
+   ```
+   sudo bash /opt/vibe/appliance/infra/cloudflared-up.sh
+   ```
+
+   The script is idempotent — re-runnable if you add new apps later.
+   It looks up the tunnel by name (creates it if missing), pushes the
+   ingress config, creates one CNAME per published host (apex, www,
+   cockpit, portainer, backup, plus every enabled app's subdomain)
+   pointing at `<tunnel-id>.cfargotunnel.com`, fetches the connector
+   token, writes it to `shared.env`, and runs `docker compose up -d
+   cloudflared`.
+
+6. **Verify** from outside your LAN (cellular tether is easiest):
+
+   ```
+   curl -sI https://firm.com/admin
+   curl -sI https://tb.firm.com/
+   ```
+
+   200/302/401 responses mean the tunnel is working. Connection refused
+   or timeout means cloudflared isn't connected — `sudo docker logs
+   vibe-cloudflared --tail 30` on the host will show why.
+
+What this gets you:
+- **Zero port forwarding required.** The router stays untouched. Only
+  outbound TCP 7844 (Cloudflare's tunnel-control protocol) needs to
+  exit the network — virtually all ISPs allow this.
+- **Public TLS handled by Cloudflare's edge.** Your appliance doesn't
+  need to issue Let's Encrypt certs at all (Caddy can serve self-
+  signed internally; the tunnel forwards via `noTLSVerify`).
+- **DDoS protection / WAF / analytics** for free (Cloudflare's standard
+  edge features).
+
+Sharp edges:
+- **You enable apps, then re-run cloudflared-up.sh.** The script reads
+  `state.apps[*].enabled` to know which subdomains to publish. New
+  apps don't get their CNAME until the script runs again. Build it
+  into your enable workflow: enable from admin, then run the script.
+- **Caddy still listens on 443 internally** to receive the tunnel's
+  forwarded requests. The Caddy cert situation is now moot (no public
+  client ever hits Caddy directly), but Caddy still needs *some*
+  cert to handshake on 443 — its self-signed default works because
+  the tunnel runs with `noTLSVerify`.
+- **The setup script needs `python3` and `curl` on the host.** Both
+  are present on a stock Ubuntu 24.04 install; the bootstrap pre-flight
+  already verifies them.
+- **To remove:** `sudo bash /opt/vibe/appliance/infra/cloudflared-down.sh`
+  stops the container, deletes the CNAMEs (only those pointing at this
+  tunnel), deletes the tunnel object at Cloudflare, strips
+  `TUNNEL_TOKEN` from shared.env. Re-runnable.
+
 ### Option D: Generic DNS-01 (Namecheap)
 
 Use this if your domain stays on Namecheap's nameservers **and** any of

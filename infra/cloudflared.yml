@@ -1,0 +1,50 @@
+# infra/cloudflared.yml — opt-in Cloudflare Tunnel sidecar.
+#
+# Loaded as a docker-compose extension on top of the main
+# docker-compose.yml when the operator runs infra/cloudflared-up.sh.
+# Standalone bootstrap installs do NOT bring this up; the tunnel is
+# explicit opt-in because it depends on Cloudflare-side state (a tunnel
+# object, CNAME records) that only exist after cloudflared-up.sh has
+# created them via the Cloudflare API.
+#
+# Once up, cloudflared dials out to Cloudflare's edge over TCP 7844 and
+# proxies inbound requests for the configured hostnames into vibe_net,
+# terminating at the caddy service. The host needs no inbound
+# port-forwarding for 80/443 — Cloudflare handles the public TLS edge.
+#
+# To bring up:
+#   docker compose -f docker-compose.yml -f infra/cloudflared.yml up -d cloudflared
+# To stop:
+#   docker compose -f docker-compose.yml -f infra/cloudflared.yml stop cloudflared
+# To remove:
+#   docker compose -f docker-compose.yml -f infra/cloudflared.yml rm -f cloudflared
+#
+# The infra/cloudflared-up.sh and infra/cloudflared-down.sh scripts
+# wrap these calls with the manifest-driven config generation.
+
+name: vibe
+
+services:
+  cloudflared:
+    # Official Cloudflare image. Pinned to a major (latest) like the
+    # other infra services; rotating Cloudflare's connector binary is
+    # the upstream's responsibility — we don't bake it.
+    image: cloudflare/cloudflared:latest
+    container_name: vibe-cloudflared
+    restart: unless-stopped
+    # `tunnel run` in connector-token mode. The token comes from the
+    # TUNNEL_TOKEN env var (set in shared.env by cloudflared-up.sh
+    # after the Cloudflare API returns it). --no-autoupdate keeps the
+    # binary version locked to whatever's in the image — safer for
+    # reproducibility, and updates land via image pulls instead.
+    command: tunnel --no-autoupdate run
+    env_file:
+      # Provides TUNNEL_TOKEN. shared.env already mounts mode 600
+      # root-owned per the appliance secrets convention; the token is
+      # treated like any other secret.
+      - /opt/vibe/env/shared.env
+    networks:
+      - vibe_net
+    depends_on:
+      caddy:
+        condition: service_healthy
