@@ -9,7 +9,16 @@
 // land in v1.2.
 'use strict';
 
+// SETTINGS_JS_VERSION — bumped whenever the wizard / settings code
+// ships a behavior change. Logged to the browser console on init so
+// operators can confirm in DevTools (F12 → Console) that the file
+// they're running is the version they expect, vs. a stale cached
+// copy. Compare against the server's /api/v1/version response.
+const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-3';
+
 (function () {
+  // eslint-disable-next-line no-console
+  console.log('[vibe] settings.js loaded — version', SETTINGS_JS_VERSION);
   // ---------- helpers --------------------------------------------------
   function escapeHtml(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
@@ -1022,7 +1031,19 @@
 
     function paint() {
       section.innerHTML = '';
-      section.appendChild(el('h2', { style: 'margin:0 0 0.6rem;' }, ['Cloudflare Tunnel']));
+      // Header row: title + tiny build-version stamp. The version
+      // makes deployment problems instantly visible — if the operator
+      // sees this header at all, the wizard is rendering AND they can
+      // verify the build version matches what they pulled. Solves
+      // 90% of "is my code current?" debugging.
+      const head = el('div', {
+        style: 'display:flex;align-items:baseline;justify-content:space-between;gap:0.5rem;margin:0 0 0.6rem;',
+      });
+      head.appendChild(el('h2', { style: 'margin:0;' }, ['Cloudflare Tunnel']));
+      head.appendChild(el('span', {
+        class: 'help', style: 'font-size:0.75em;color:var(--text-muted);',
+      }, ['build ' + SETTINGS_JS_VERSION]));
+      section.appendChild(head);
       switch (wiz.screen) {
         case 'LOADING':       paintLoading();      break;
         case 'IDLE':          paintIdle();         break;

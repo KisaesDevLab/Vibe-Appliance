@@ -909,6 +909,28 @@ app.post('/api/v1/admin/refresh-host-ip', requireAdmin, testRateLimit, async (_r
   res.json(result);
 });
 
+// Build / version visibility — solves "did my deploy actually take?"
+// Returns mtimes of the live settings.js and server.js inside the
+// running container. If the operator's wizard says "build X" but
+// /api/v1/version says the settings.js mtime is way old, they know
+// the console image hasn't been rebuilt since the change. No auth —
+// non-sensitive metadata, useful from a curl.
+app.get('/api/v1/version', (_req, res) => {
+  const out = {
+    settings_js: null,
+    server_js:   null,
+    started_at:  new Date(Date.now() - process.uptime() * 1000).toISOString(),
+    uptime_s:    Math.floor(process.uptime()),
+  };
+  try {
+    out.settings_js = fs.statSync(path.join(__dirname, 'ui', 'static', 'settings.js')).mtime.toISOString();
+  } catch { /* ignore */ }
+  try {
+    out.server_js = fs.statSync(path.join(__dirname, 'server.js')).mtime.toISOString();
+  } catch { /* ignore */ }
+  res.json(out);
+});
+
 // --- Cloudflare Tunnel setup wizard backends -------------------------
 //
 // The Network-tab wizard reduces a nine-step flow (registrar nameserver
@@ -1718,10 +1740,23 @@ app.post('/api/v1/settings/save', requireAdmin, testRateLimit, (req, res) => {
       exit_code:     code,
     };
     for (const c of body.changes) {
+      // Defense-in-depth: trust the manifest's declared `secret` flag
+      // FIRST and only fall back to the client-supplied flag for
+      // fields not in the registry (shouldn't happen — the validation
+      // pass above rejects those — but if a future code path lands
+      // unknown keys, we'd rather over-redact than leak a value). A
+      // misbehaving / hostile client setting `secret:false` on a real
+      // secret can't trick us into writing the plaintext to console.sqlite.
+      const lookupKey = c.scope === 'appliance'
+        ? c.key
+        : c.scope.slice(c.scope.indexOf(':') + 1) + '::' + c.key;
+      const fieldMeta = SETTINGS_REGISTRY.allKeys.get(lookupKey);
+      const isSecret  = fieldMeta ? !!fieldMeta.secret : !!c.secret;
+
       let newVal;
       if (c.op === 'revert') {
         newVal = '(reverted to appliance)';
-      } else if (c.secret) {
+      } else if (isSecret) {
         newVal = c.value ? '(set)' : '(empty)';
       } else {
         newVal = c.value === undefined ? '' : String(c.value);
