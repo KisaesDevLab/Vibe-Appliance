@@ -30,6 +30,40 @@ saves the most time on a back-and-forth.
 
 ---
 
+## Panic switch — back out of domain mode fast
+
+If the appliance is in domain mode and something has gone sideways
+(certs failing, Cloudflare Tunnel unhealthy, admin unreachable from
+the public domain), drop back to LAN mode in one command:
+
+```
+sudo bash /opt/vibe/appliance/lib/exit-domain-mode.sh
+```
+
+This stops the cloudflared container, sets `state.config.mode=lan`,
+clears the domain, flips `CLOUDFLARE_TUNNEL_ENABLED=false`, re-renders
+the Caddyfile in LAN mode, and reloads Caddy. Idempotent — safe to run
+even when already in LAN mode.
+
+After it finishes the appliance is reachable at
+`http://<host-ip>/admin`, with apps at `http://<host-ip>/<slug>/`.
+
+To return to domain mode when you've fixed the underlying issue:
+
+```
+sudo bash /opt/vibe/appliance/bootstrap.sh --mode domain --domain <yours>
+```
+
+To FULLY tear down the Cloudflare Tunnel (delete the tunnel object +
+CNAMEs at Cloudflare — the panic switch above only stops the local
+container, leaving Cloud-side state intact):
+
+```
+sudo bash /opt/vibe/appliance/infra/cloudflared-down.sh
+```
+
+---
+
 ## Pre-flight failures (PHASE 1)
 
 The installer's first phase is ruthlessly thorough. Each FAIL points
