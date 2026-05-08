@@ -790,8 +790,14 @@ app.get('/api/v1/public/apps', (_req, res) => {
       displayName: m.displayName,
       description: m.description,
       url:         appPublicUrl(m, config),
-      // Phase 8.5 — second URL for emergency/backup access via HAProxy
-      // sidecar on the LAN. Null when host_ip or emergencyPort missing.
+      // LAN-fallback URL — http://<host_ip>/<slug>/ via Caddy. Used
+      // by the app card's "backup" row when the primary mDNS/DNS path
+      // is the failure point. Null in domain mode and when host_ip
+      // hasn't been cached yet.
+      lanFallbackUrl: appLanFallbackUrl(m, config),
+      // HAProxy emergency-port URL — used only by the Emergency Access
+      // admin panel ("Caddy itself is down" failure mode). Kept on the
+      // public payload so the panel can build its list from one fetch.
       emergencyUrl:  appEmergencyUrl(m, config),
       emergencyNote: m.emergencyNote || null,
     }))
@@ -837,9 +843,14 @@ app.get('/api/v1/apps', requireAdmin, (_req, res) => {
         subdomain: m.subdomain,
         defaultTag: m.image && m.image.defaultTag,
         url: appPublicUrl(m, state.config || {}),
-        // Phase 8.5 — second URL for emergency/backup access; null if
-        // not available on this install (no host_ip cached or app
-        // declares no emergencyPort).
+        // LAN-fallback URL (http://<host_ip>/<slug>/ via Caddy) — what
+        // the app card's "backup" row uses. Caddy-routed; works when
+        // mDNS / vibe.local is the failure point.
+        lanFallbackUrl: appLanFallbackUrl(m, state.config || {}),
+        // HAProxy emergency-port URL — Emergency Access panel only.
+        // Bypasses Caddy entirely; for the "Caddy is down" failure
+        // mode. Has known SPA blank-page limitations per
+        // docs/addenda/emergency-access.md §9.1.
         emergencyUrl:  appEmergencyUrl(m, state.config || {}),
         emergencyNote: m.emergencyNote || null,
         // Default admin username only — password lives behind the
@@ -3108,11 +3119,37 @@ function trim(s, max = 16 * 1024) {
 // LAN IP comes from state.config.host_ip cached at bootstrap time. The
 // emergencyPort is the manifest's declared TCP port on the HAProxy
 // sidecar, gated by UFW to RFC1918 + Tailscale CGNAT.
+//
+// Used ONLY by the Emergency Access admin panel (the "Caddy itself is
+// down" failure mode). App cards' "backup" row uses appLanFallbackUrl
+// instead — see that function for the rationale.
 function appEmergencyUrl(manifest, config) {
   const port = manifest.emergencyPort;
   const ip = config.host_ip;
   if (!port || !ip) return null;
   return `http://${ip}:${port}/`;
+}
+
+// LAN fallback URL — http://<host_ip>/<slug>/. Goes through Caddy on
+// :80 with the same path-prefix routing as the primary vibe.local URL,
+// so it benefits from prefix stripping and per-route splitting (api/* →
+// server tier, default → client tier). The right fallback when the
+// primary failure is mDNS / DNS — devices that can't resolve
+// vibe.local can still reach the appliance by IP.
+//
+// Distinct from appEmergencyUrl, which uses the HAProxy emergency
+// sidecar and bypasses Caddy entirely. That's the right URL for "Caddy
+// itself is down" but produces blank pages for SPA apps because no
+// prefix stripping happens (see docs/addenda/emergency-access.md §9.1).
+//
+// Domain mode returns null — the catch-all on :80 doesn't carry the
+// per-app path handlers in domain mode (apps live at their subdomains).
+// LAN and Tailscale modes return the IP-with-path form.
+function appLanFallbackUrl(manifest, config) {
+  if (config.mode === 'domain') return null;
+  const ip = config.host_ip;
+  if (!ip) return null;
+  return `http://${ip}/${manifest.slug}/`;
 }
 
 function appPublicUrl(manifest, config) {

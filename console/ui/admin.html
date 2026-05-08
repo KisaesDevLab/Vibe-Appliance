@@ -885,8 +885,8 @@ curl -sI https://tb.yourdomain.com/</pre>
             <dt>url</dt><dd>${a.enabled && a.status === 'running' && a.url.startsWith('http')
                               ? '<a href="' + escapeHtml(a.url) + '">' + escapeHtml(a.url) + '</a>'
                               : '<span class="muted">' + escapeHtml(a.url) + '</span>'}</dd>
-            ${a.emergencyUrl ? `
-            <dt>backup</dt><dd><a href="${escapeHtml(a.emergencyUrl)}">${escapeHtml(a.emergencyUrl)}</a>
+            ${a.lanFallbackUrl ? `
+            <dt>backup</dt><dd><a href="${escapeHtml(a.lanFallbackUrl)}">${escapeHtml(a.lanFallbackUrl)}</a>
               <span class="muted">(LAN / Tailscale only)</span></dd>` : ''}
           </dl>
           ${imageHint}

@@ -72,12 +72,15 @@
           ? `<a href="${escapeHtml(a.url)}">${escapeHtml(a.url)}</a>`
           : `<span class="muted">${escapeHtml(a.url || '—')}</span>`;
 
-        // Emergency / backup URL row — shown only when the appliance
-        // has both a manifest emergencyPort AND a cached host_ip. Plain
-        // HTTP on the LAN; the proxy is UFW-gated to RFC1918 + tailnet.
-        const emergencyRow = a.emergencyUrl ? `
+        // LAN-fallback row — http://<host_ip>/<slug>/ via Caddy. The
+        // right URL when vibe.local mDNS isn't resolving but Caddy is
+        // up. Goes through the same path-prefix routing as the primary
+        // URL (prefix strip + api/* split), so SPAs and APIs both work.
+        // Distinct from the HAProxy emergency-port URLs which live in
+        // /admin's Emergency Access panel (different failure mode).
+        const fallbackRow = a.lanFallbackUrl ? `
           <dt>backup</dt>
-          <dd><a href="${escapeHtml(a.emergencyUrl)}">${escapeHtml(a.emergencyUrl)}</a>
+          <dd><a href="${escapeHtml(a.lanFallbackUrl)}">${escapeHtml(a.lanFallbackUrl)}</a>
             <span class="muted">(LAN/Tailscale only)</span></dd>` : '';
 
         return `
@@ -88,7 +91,7 @@
           <p class="app-card__desc">${escapeHtml(a.description)}</p>
           <dl class="kv app-card__kv">
             <dt>primary</dt><dd>${primaryUrl}</dd>
-            ${emergencyRow}
+            ${fallbackRow}
           </dl>
           <div class="app-card__actions">
             <a class="btn" href="${escapeHtml(a.url)}" target="_blank" rel="noopener noreferrer">Open</a>
