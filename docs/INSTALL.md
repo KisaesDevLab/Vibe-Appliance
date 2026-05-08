@@ -137,7 +137,44 @@ free, doesn't touch your registration, and takes a few minutes to
 propagate. After the switch, Cloudflare DNS-01 (Option A) and
 Cloudflare Tunnel (this option) both become available.
 
-Setup:
+#### Easy path: in-page setup wizard (recommended)
+
+After bootstrap completes:
+
+1. **Move DNS to Cloudflare** if you haven't already (free, takes
+   ~5 minutes — see the manual-path step 1 below for the exact
+   navigation).
+
+2. **Create a Cloudflare API token** at
+   https://dash.cloudflare.com/profile/api-tokens with these scopes:
+   - **Account → Cloudflare Tunnel → Edit**
+   - **Zone → DNS → Edit** on the target zone
+
+3. **Open the admin console** at `https://<your-host>/admin/settings`,
+   switch to the **Network** tab, toggle **Cloudflare Tunnel** ON. A
+   four-step wizard appears below the form:
+
+   - **Step 1** — auto-verifies that your domain's nameservers point at
+     Cloudflare. ✓ in 1–2 seconds when DNS has propagated.
+   - **Step 2** — paste your API token, click **Verify token**. The
+     wizard validates the token, lists your accessible accounts and
+     zones, and lets you pick the right one with dropdowns. Click
+     **Use these values** when you have them right.
+   - **Step 3** — click the standard **Save changes** button at the
+     bottom of the page (the wizard queued the three values into the
+     dirty map; this just persists them through the normal
+     snapshot/write/restart/rollback flow).
+   - **Step 4** — click **Provision tunnel now**. The wizard runs
+     `infra/cloudflared-up.sh` server-side via an admin endpoint and
+     streams the script output below. ~15–30 seconds end-to-end.
+
+4. **Verify from outside your LAN** (cellular tether):
+   `curl -sI https://firm.com/admin` should answer 200/302/401.
+
+The wizard is idempotent — safe to revisit anytime. The status badge
+at the top tells you whether the tunnel is currently up.
+
+#### Power-user path: hand-fill + SSH (skip if using the wizard)
 
 1. **Move DNS to Cloudflare** if you haven't already. Cloudflare's
    onboarding walks you through it: sign up at cloudflare.com → Add

@@ -38,9 +38,10 @@ const ENABLE_SCRIPT  = path.join(APPLIANCE_DIR, 'lib', 'enable-app.sh');
 const DISABLE_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'disable-app.sh');
 const DOCTOR_SCRIPT  = path.join(APPLIANCE_DIR, 'doctor.sh');
 const UPDATE_SCRIPT  = path.join(APPLIANCE_DIR, 'update.sh');
-const PRUNE_SCRIPT   = path.join(APPLIANCE_DIR, 'prune-images.sh');
-const LOGS_DIR       = path.join(VIBE_DIR, 'logs');
-const ENV_DIR        = path.join(VIBE_DIR, 'env');
+const PRUNE_SCRIPT          = path.join(APPLIANCE_DIR, 'prune-images.sh');
+const CLOUDFLARED_UP_SCRIPT = path.join(APPLIANCE_DIR, 'infra', 'cloudflared-up.sh');
+const LOGS_DIR              = path.join(VIBE_DIR, 'logs');
+const ENV_DIR               = path.join(VIBE_DIR, 'env');
 
 // Whitelist of log file basenames the admin tail endpoint will serve.
 // Restricting by name (rather than path) blocks ../ shenanigans up
@@ -896,6 +897,147 @@ app.post('/api/v1/admin/prune-images', requireAdmin, testRateLimit, async (_req,
 app.post('/api/v1/admin/refresh-host-ip', requireAdmin, testRateLimit, async (_req, res) => {
   const result = await refreshHostIp(true);
   res.json(result);
+});
+
+// --- Cloudflare Tunnel setup wizard backends -------------------------
+//
+// The Network-tab wizard reduces a nine-step flow (registrar nameserver
+// switch, two ID lookups, custom token creation, four-field paste, save,
+// SSH, run script) to one paste (the API token) and three button clicks
+// (Verify, Save, Provision). These three endpoints back the wizard;
+// they're additive — the manual SSH path via cloudflared-up.sh still
+// works for sysadmins who'd rather skip the UI.
+
+// Token validation + accessible accounts/zones discovery. Body:
+// { apiToken }. The token is NOT persisted by this call — it sits in the
+// request body and is forgotten when the response goes out. The wizard
+// caches the token in browser memory only until the operator hits Save,
+// at which point it goes through the standard settings-save flow.
+app.post('/api/v1/admin/cloudflare/discover', requireAdmin, testRateLimit, async (req, res) => {
+  const apiToken = (req.body && req.body.apiToken || '').trim();
+  if (!apiToken) {
+    return res.status(400).json({ ok: false, error: 'apiToken required in request body' });
+  }
+  // Token format: Cloudflare API tokens are 40 chars, [A-Za-z0-9_-]. Tighter
+  // than Cloudflare's actual constraint but catches obvious typos before
+  // we round-trip a useless API call.
+  if (!/^[A-Za-z0-9_-]{30,80}$/.test(apiToken)) {
+    return res.json({
+      ok: false,
+      error: 'apiToken does not look like a valid Cloudflare token (expected 30–80 chars of [A-Za-z0-9_-]). Double-check by copying from https://dash.cloudflare.com/profile/api-tokens.',
+    });
+  }
+
+  const cfHeaders = {
+    'Authorization': 'Bearer ' + apiToken,
+    'Content-Type':  'application/json',
+  };
+
+  // 1. Verify the token. Cloudflare returns success=true with status='active'
+  // when the token is valid; otherwise errors[] carries a code+message we
+  // can surface verbatim ("Cloudflare rejected: …").
+  const verify = await _testFetch('https://api.cloudflare.com/client/v4/user/tokens/verify', {
+    headers: cfHeaders,
+  });
+  if (verify.error || !verify.ok) {
+    return res.json({
+      ok: false,
+      error: 'Cloudflare API unreachable: ' + (verify.error || `HTTP ${verify.status}`),
+    });
+  }
+  let verifyJson = null;
+  try { verifyJson = JSON.parse(verify.body); } catch { /* fall through */ }
+  if (!verifyJson || !verifyJson.success) {
+    const errs = (verifyJson && verifyJson.errors) || [];
+    const msg  = errs.length ? errs.map(e => `${e.code}: ${e.message}`).join('; ') : 'token rejected';
+    return res.json({
+      ok:    false,
+      error: 'Cloudflare rejected the token (' + msg + '). Make sure it has Account.Cloudflare-Tunnel:Edit AND Zone.DNS:Edit scopes.',
+    });
+  }
+
+  // 2. List accessible accounts. The token's permissions filter this
+  // automatically — operators with a single Cloudflare account get one
+  // result; multi-account ops get a dropdown.
+  const accountsResp = await _testFetch('https://api.cloudflare.com/client/v4/accounts?per_page=50', {
+    headers: cfHeaders,
+  });
+  let accountsJson = null;
+  try { accountsJson = JSON.parse(accountsResp.body); } catch { /* ignore */ }
+  if (!accountsResp.ok || !accountsJson || !accountsJson.success) {
+    return res.json({
+      ok:    false,
+      error: 'Could not list accounts. Token may lack the Account:Read implicit permission. Re-create with Account.Cloudflare-Tunnel:Edit (which implies Account:Read) AND Zone.DNS:Edit.',
+    });
+  }
+  const accounts = (accountsJson.result || []).map(a => ({ id: a.id, name: a.name }));
+
+  // 3. List accessible zones. Same permission story.
+  const zonesResp = await _testFetch('https://api.cloudflare.com/client/v4/zones?per_page=200', {
+    headers: cfHeaders,
+  });
+  let zonesJson = null;
+  try { zonesJson = JSON.parse(zonesResp.body); } catch { /* ignore */ }
+  if (!zonesResp.ok || !zonesJson || !zonesJson.success) {
+    return res.json({
+      ok:    false,
+      error: 'Could not list zones. Token may lack Zone.DNS:Edit on the target zone, or lack Zone:Read across the account.',
+    });
+  }
+  const zones = (zonesJson.result || []).map(z => ({
+    id:         z.id,
+    name:       z.name,
+    account_id: z.account && z.account.id,
+  }));
+
+  return res.json({ ok: true, accounts, zones });
+});
+
+// One-click provision — wraps cloudflared-up.sh via the same runShell
+// pattern as prune-images. The script is idempotent and self-validates;
+// this endpoint is just an HTTP shell over it so the operator doesn't
+// have to SSH. Returns { exit_code, stdout, stderr } on completion.
+app.post('/api/v1/admin/cloudflare/provision', requireAdmin, testRateLimit, async (_req, res) => {
+  await runShell(res, [CLOUDFLARED_UP_SCRIPT], 'cloudflared-up');
+});
+
+// Current tunnel state — powers the wizard's "Tunnel currently up" /
+// "not running" badge at re-entry. Three signals:
+//   container_status — docker inspect of vibe-cloudflared
+//   token_present    — process.env.TUNNEL_TOKEN truthy = up.sh ran
+//   last_run_ts      — most recent ISO timestamp scraped from the log
+app.get('/api/v1/admin/cloudflare/status', requireAdmin, async (_req, res) => {
+  let containerStatus = 'unknown';
+  try {
+    const c = docker.getContainer('vibe-cloudflared');
+    const info = await c.inspect();
+    containerStatus = (info.State && info.State.Running) ? 'running' : 'stopped';
+  } catch {
+    containerStatus = 'not-found';
+  }
+
+  // Last-run timestamp from the JSONL log. Cheap: tail ~16 KB and look
+  // for the most recent {ts:...} entry. Failures (no log file yet) are
+  // benign — the wizard treats null as "never run".
+  let lastRunTs = null;
+  try {
+    const logPath = path.join(LOGS_DIR, 'cloudflared.log');
+    const buf = fs.readFileSync(logPath, 'utf8');
+    const tail = buf.slice(-16 * 1024);
+    const lines = tail.split('\n').filter(Boolean);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const entry = JSON.parse(lines[i]);
+        if (entry && entry.ts) { lastRunTs = entry.ts; break; }
+      } catch { /* skip malformed line */ }
+    }
+  } catch { /* no log file yet */ }
+
+  res.json({
+    container_status: containerStatus,
+    token_present:    !!(process.env.TUNNEL_TOKEN || '').trim(),
+    last_run_ts:      lastRunTs,
+  });
 });
 
 // Inline admin-password rotation. Persists a scrypt hash to the meta

@@ -680,6 +680,15 @@
     // of the full status grid so it doesn't add noise.
     if (cat === 'Network') {
       renderDdnsSection(panelEl);
+      // Cloudflare Tunnel setup wizard — only meaningful when the
+      // operator has flipped CLOUDFLARE_TUNNEL_ENABLED on. Renders a
+      // four-step guided flow (DNS verify, token verify+discover,
+      // save confirmation, provision) that ends with a tunnel up
+      // and no SSH required.
+      const cfEnabled = ((state.values.appliance.CLOUDFLARE_TUNNEL_ENABLED || {}).value || '') === 'true';
+      if (cfEnabled) {
+        renderCloudflareTunnelSection(panelEl);
+      }
     }
     updateConditionals();
   }
@@ -919,6 +928,553 @@
     if (s < 3600)      return Math.floor(s / 60) + 'm';
     if (s < 86400)     return Math.floor(s / 3600) + 'h';
     return Math.floor(s / 86400) + 'd';
+  }
+
+  // ---- Cloudflare Tunnel setup wizard ----------------------------------
+  //
+  // Four-step in-page wizard rendered below the four CLOUDFLARE_TUNNEL_*
+  // form fields when the operator toggles CLOUDFLARE_TUNNEL_ENABLED on.
+  //
+  // Step 1: DNS hosted at Cloudflare? — verifies via Cloudflare's
+  //         public DoH resolver (no creds, just NS lookup).
+  // Step 2: Verify token + auto-discover account/zone — POSTs the
+  //         pasted token to /api/v1/admin/cloudflare/discover; the
+  //         server proxies to Cloudflare and returns the operator's
+  //         accessible accounts and zones. Operator picks one of each.
+  // Step 3: Wizard programmatically marks the four CLOUDFLARE_TUNNEL_*
+  //         fields as dirty (api token, account id, zone id) — operator
+  //         clicks the existing "Save changes" save bar. Re-uses the
+  //         standard settings-save snapshot/write/restart/rollback flow.
+  // Step 4: Provision tunnel — calls /api/v1/admin/cloudflare/provision
+  //         which spawns infra/cloudflared-up.sh server-side. Output
+  //         streams to a <pre>; status badge flips green on exit 0.
+
+  // Module-level scratch state for the wizard. Holds discovered accounts
+  // and zones (so re-clicking Verify with the same token doesn't refetch),
+  // plus the DNS-verify result. Keyed off the section element so multiple
+  // tab switches don't trample each other.
+  const wizState = {
+    discovered: null,         // { token, accounts:[{id,name}], zones:[{id,name,account_id}] }
+    nsVerified: null,         // { ok, ns: [...], domain }
+  };
+
+  function renderCloudflareTunnelSection(host) {
+    const section = el('section', {
+      class: 'maintenance',
+      'aria-labelledby': 'cf-h',
+      'data-cf-section': '1',
+    });
+    section.appendChild(el('h2', { id: 'cf-h' }, ['Cloudflare Tunnel setup wizard']));
+
+    // Top-line status badge — populated by loadCfStatus() async after
+    // render. Tells the operator whether they're configuring fresh or
+    // re-entering after a successful provision.
+    const statusLine = el('p', { class: 'help', 'data-cf-status': '1' }, ['Loading current state…']);
+    section.appendChild(statusLine);
+
+    section.appendChild(el('p', { class: 'help' }, [
+      'One paste (your Cloudflare API token), three button clicks, no SSH. ' +
+      'The wizard fills the four Cloudflare-tunnel fields above for you and runs the provisioning ' +
+      'script via the admin endpoint when you reach Step 4.',
+    ]));
+
+    // Each step is a <div> with data-step="N" so we can update its
+    // state-indicator without rebuilding the DOM. Steps render in DOM
+    // order; later steps' inputs are disabled until earlier steps green-
+    // light them. State indicator chars: ☐ pending · ⋯ in-progress · ✓ done · ✗ failed.
+    section.appendChild(_cfStep1(section));
+    section.appendChild(_cfStep2(section));
+    section.appendChild(_cfStep3(section));
+    section.appendChild(_cfStep4(section));
+
+    host.appendChild(section);
+
+    // Async data loads.
+    loadCfStatus(section);
+    runCfStep1(section);    // auto-fire — non-destructive DoH lookup
+    refreshCfStep3(section);
+  }
+
+  // Render-time helper: produce a labeled step container with a state
+  // indicator that can be flipped later via section.querySelector.
+  function _cfStepShell(n, title) {
+    const head = el('div', {
+      'data-step': String(n),
+      style: 'margin-top:1rem;padding:0.6rem 0.8rem;border:1px solid var(--border);border-radius:4px;',
+    });
+    const heading = el('h3', { style: 'margin:0 0 0.4rem;font-size:0.95rem;' }, [
+      el('span', { 'data-step-state': '1', style: 'display:inline-block;width:1.3em;color:var(--text-muted);' }, ['☐']),
+      ' Step ' + n + ': ' + title,
+    ]);
+    head.appendChild(heading);
+    return head;
+  }
+
+  function _cfSetState(section, n, mark, color) {
+    const step = section.querySelector(`[data-step="${n}"]`);
+    if (!step) return;
+    const ind = step.querySelector('[data-step-state]');
+    if (!ind) return;
+    ind.textContent = mark;
+    ind.style.color = color || 'var(--text-muted)';
+  }
+
+  // ---- Step 1: DNS at Cloudflare? -------------------------------------
+
+  function _cfStep1(section) {
+    const step = _cfStepShell(1, 'DNS hosted at Cloudflare');
+    const body = el('div', { 'data-cf-step1-body': '1' }, [
+      el('p', { class: 'help' }, [
+        'The tunnel only routes for zones whose nameservers point at Cloudflare. ' +
+        'This check uses Cloudflare\'s public DoH resolver (no auth) to look up your ' +
+        'domain\'s NS records and confirm.',
+      ]),
+    ]);
+    step.appendChild(body);
+    return step;
+  }
+
+  async function runCfStep1(section) {
+    const body = section.querySelector('[data-cf-step1-body]');
+    body.innerHTML = '';
+    body.appendChild(el('p', { class: 'help' }, ['Checking nameservers…']));
+    _cfSetState(section, 1, '⋯', 'var(--text-muted)');
+
+    // Read the domain — prefer state.config.domain (canonical), fall back
+    // to the DDNS-mode domain field if the operator filled that instead.
+    const cfg = (state.values && state.values.appliance) || {};
+    const stateDomain = await _cfFetchDomain();
+    const domain = stateDomain
+      || ((cfg.NAMECHEAP_DDNS_DOMAIN || {}).value || '').trim();
+
+    if (!domain) {
+      _cfSetState(section, 1, '✗', 'var(--bad)');
+      body.innerHTML = '';
+      body.appendChild(el('p', { class: 'help', style: 'color:var(--bad);' }, [
+        'No domain in state.config.domain or NAMECHEAP_DDNS_DOMAIN. ' +
+        'Re-run bootstrap.sh with --mode domain --domain <yours>, then return to this wizard.',
+      ]));
+      return;
+    }
+
+    let ns = [];
+    let onCloudflare = false;
+    try {
+      const r = await fetch(
+        'https://cloudflare-dns.com/dns-query?name=' + encodeURIComponent(domain) + '&type=NS',
+        { headers: { 'accept': 'application/dns-json' } },
+      );
+      const data = await r.json();
+      ns = (data.Answer || []).map(a => (a.data || '').replace(/\.$/, '').toLowerCase());
+      onCloudflare = ns.some(host => /\.ns\.cloudflare\.com$/.test(host));
+    } catch (err) {
+      _cfSetState(section, 1, '✗', 'var(--bad)');
+      body.innerHTML = '';
+      body.appendChild(el('p', { class: 'help', style: 'color:var(--bad);' }, [
+        'DoH lookup failed: ' + err.message + '. Outbound HTTPS to cloudflare-dns.com may be blocked.',
+      ]));
+      return;
+    }
+
+    body.innerHTML = '';
+    if (onCloudflare) {
+      _cfSetState(section, 1, '✓', 'var(--good)');
+      body.appendChild(el('p', { class: 'help', style: 'color:var(--good);' }, [
+        '✓ ' + domain + ' is on Cloudflare nameservers (' + ns.join(', ') + ').',
+      ]));
+      wizState.nsVerified = { ok: true, ns, domain };
+    } else {
+      _cfSetState(section, 1, '✗', 'var(--warn)');
+      body.appendChild(el('p', { class: 'help', style: 'color:var(--warn);' }, [
+        '⚠ ' + domain + ' is NOT on Cloudflare nameservers. ' +
+        (ns.length ? 'Current NS: ' + ns.join(', ') + '. ' : '') +
+        'Tunnels won\'t route until you switch.',
+      ]));
+      body.appendChild(el('p', { class: 'help' }, [
+        'Steps to switch (one-time, doesn\'t change registration): ',
+        el('br'),
+        '1. Sign up at cloudflare.com (free), click ', el('strong', null, ['Add site']), ', enter ' + domain + '.',
+        el('br'),
+        '2. Cloudflare imports existing DNS records and gives you two nameservers like ', el('span', { class: 'mono' }, ['ns1.example.ns.cloudflare.com']), '.',
+        el('br'),
+        '3. At your registrar (e.g. Namecheap → Domain List → Manage → Domain → Nameservers), set ', el('strong', null, ['Custom DNS']), ' and paste the two values.',
+        el('br'),
+        '4. Wait 5–60 minutes for propagation. Click Re-check below.',
+      ]));
+      const reBtn = el('button', {
+        type: 'button', class: 'btn btn--ghost', style: 'margin-top:0.5rem;',
+        onclick: () => runCfStep1(section),
+      }, ['Re-check nameservers']);
+      body.appendChild(reBtn);
+    }
+  }
+
+  // Fetch state.config.domain via /api/v1/state. Returns '' on miss.
+  async function _cfFetchDomain() {
+    try {
+      const r = await fetch('/api/v1/state', { credentials: 'same-origin' });
+      if (!r.ok) return '';
+      const s = await r.json();
+      return ((s.config || {}).domain || '').trim();
+    } catch { return ''; }
+  }
+
+  // ---- Step 2: Verify API token, auto-discover account + zone --------
+
+  function _cfStep2(section) {
+    const step = _cfStepShell(2, 'API token: verify + auto-discover IDs');
+    const body = el('div', { 'data-cf-step2-body': '1' });
+    body.appendChild(el('p', { class: 'help' }, [
+      'Create a token at ',
+      el('a', {
+        href: 'https://dash.cloudflare.com/profile/api-tokens',
+        target: '_blank', rel: 'noopener noreferrer',
+      }, ['dash.cloudflare.com/profile/api-tokens']),
+      ' → Create Token → Custom token. Required scopes: ',
+      el('strong', null, ['Account → Cloudflare Tunnel → Edit']),
+      ' AND ',
+      el('strong', null, ['Zone → DNS → Edit']),
+      ' on the target zone. Paste it below — the wizard verifies it and lists your accounts/zones.',
+    ]));
+
+    const tokenInput = el('input', {
+      type: 'password',
+      placeholder: 'Cloudflare API token (40 chars, [A-Za-z0-9_-])',
+      autocomplete: 'off',
+      'data-cf-token': '1',
+      style: 'width:100%;max-width:36rem;padding:0.45rem 0.65rem;border:1px solid var(--border);border-radius:4px;font:inherit;background:var(--surface);',
+    });
+    body.appendChild(tokenInput);
+
+    const ctaRow = el('div', { class: 'cta-row', style: 'gap:0.5rem;align-items:center;margin-top:0.5rem;' });
+    const verifyBtn = el('button', {
+      type: 'button', class: 'btn',
+      onclick: () => runCfStep2(section),
+    }, ['Verify token']);
+    const verifyStatus = el('span', { class: 'help', 'data-cf-step2-status': '1' }, ['']);
+    ctaRow.appendChild(verifyBtn);
+    ctaRow.appendChild(verifyStatus);
+    body.appendChild(ctaRow);
+
+    // Discovery dropdowns appear after Verify succeeds.
+    body.appendChild(el('div', { 'data-cf-step2-picks': '1' }));
+    step.appendChild(body);
+    return step;
+  }
+
+  async function runCfStep2(section) {
+    const token = (section.querySelector('[data-cf-token]').value || '').trim();
+    const status = section.querySelector('[data-cf-step2-status]');
+    const picks = section.querySelector('[data-cf-step2-picks]');
+    picks.innerHTML = '';
+
+    if (!token) {
+      status.style.color = 'var(--bad)';
+      status.textContent = '✗ paste a token first';
+      return;
+    }
+
+    _cfSetState(section, 2, '⋯', 'var(--text-muted)');
+    status.style.color = 'var(--text-muted)';
+    status.textContent = 'Verifying with Cloudflare…';
+
+    let data = null;
+    try {
+      const r = await fetch('/api/v1/admin/cloudflare/discover', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiToken: token }),
+      });
+      data = await r.json().catch(() => ({}));
+    } catch (err) {
+      _cfSetState(section, 2, '✗', 'var(--bad)');
+      status.style.color = 'var(--bad)';
+      status.textContent = '✗ ' + err.message;
+      return;
+    }
+
+    if (!data || !data.ok) {
+      _cfSetState(section, 2, '✗', 'var(--bad)');
+      status.style.color = 'var(--bad)';
+      status.textContent = '✗ ' + (data && data.error || 'verification failed');
+      return;
+    }
+
+    wizState.discovered = { token, accounts: data.accounts || [], zones: data.zones || [] };
+    _cfSetState(section, 2, '✓', 'var(--good)');
+    status.style.color = 'var(--good)';
+    status.textContent = '✓ token valid — ' + data.accounts.length + ' account(s), ' + data.zones.length + ' zone(s)';
+
+    _cfRenderStep2Picks(section);
+  }
+
+  function _cfRenderStep2Picks(section) {
+    const picks = section.querySelector('[data-cf-step2-picks]');
+    picks.innerHTML = '';
+    if (!wizState.discovered) return;
+
+    const { accounts, zones } = wizState.discovered;
+
+    // Pre-select the operator's domain match (from Step 1) when present.
+    const domainMatch = wizState.nsVerified && wizState.nsVerified.ok
+      ? wizState.nsVerified.domain : '';
+    const matchingZone = zones.find(z => z.name === domainMatch);
+    const initialZoneId = matchingZone ? matchingZone.id
+                        : (zones[0] && zones[0].id) || '';
+    const initialAccountId = matchingZone ? matchingZone.account_id
+                           : (accounts[0] && accounts[0].id) || '';
+
+    const accSel = el('select', { 'data-cf-account': '1', style: 'width:100%;max-width:36rem;padding:0.45rem 0.65rem;border:1px solid var(--border);border-radius:4px;background:var(--surface);' },
+      accounts.map(a => el('option', { value: a.id }, [a.name + '  (' + a.id + ')']))
+    );
+    accSel.value = initialAccountId;
+
+    const zoneSel = el('select', { 'data-cf-zone': '1', style: 'width:100%;max-width:36rem;padding:0.45rem 0.65rem;border:1px solid var(--border);border-radius:4px;background:var(--surface);margin-top:0.5rem;' },
+      zones.map(z => el('option', { value: z.id }, [z.name + '  (' + z.id + ')']))
+    );
+    zoneSel.value = initialZoneId;
+
+    picks.appendChild(el('label', { style: 'display:block;font-weight:600;font-size:0.9em;margin-top:0.6rem;' }, ['Account']));
+    picks.appendChild(accSel);
+    picks.appendChild(el('label', { style: 'display:block;font-weight:600;font-size:0.9em;margin-top:0.6rem;' }, ['Zone (your domain)']));
+    picks.appendChild(zoneSel);
+
+    const applyBtn = el('button', {
+      type: 'button', class: 'btn',
+      style: 'margin-top:0.6rem;',
+      onclick: () => _cfApplyToDirty(section),
+    }, ['Use these values']);
+    const applyStatus = el('span', { class: 'help', style: 'margin-left:0.5rem;', 'data-cf-apply-status': '1' }, ['']);
+    picks.appendChild(applyBtn);
+    picks.appendChild(applyStatus);
+  }
+
+  function _cfApplyToDirty(section) {
+    const accSel  = section.querySelector('[data-cf-account]');
+    const zoneSel = section.querySelector('[data-cf-zone]');
+    const applyStatus = section.querySelector('[data-cf-apply-status]');
+    if (!wizState.discovered || !accSel || !zoneSel) return;
+
+    // Programmatically write the three discovered values into the
+    // existing dirty map at scope=appliance. The save bar then says
+    // "3 changes pending" and the existing Save button does the rest.
+    const writes = [
+      { key: 'CLOUDFLARE_TUNNEL_API_TOKEN', value: wizState.discovered.token, secret: true },
+      { key: 'CLOUDFLARE_ACCOUNT_ID',       value: accSel.value,              secret: false },
+      { key: 'CLOUDFLARE_ZONE_ID',          value: zoneSel.value,             secret: false },
+    ];
+    for (const w of writes) {
+      const f = (state.schema.appliance['Network'] || []).find(x => x.key === w.key);
+      state.dirty.set(dirtyKey('appliance', w.key), {
+        scope: 'appliance', key: w.key, value: w.value,
+        field: f || { key: w.key, secret: w.secret, label: w.key }, op: 'set',
+      });
+    }
+    updateSaveBar();
+
+    // Also update the corresponding form fields above so the operator
+    // sees the values populated (account/zone IDs as text, token stays
+    // blank because secret fields don't reveal). This is purely visual —
+    // the dirty map is the source of truth.
+    const accField  = panelEl.querySelector(`#f-CLOUDFLARE_ACCOUNT_ID`);
+    const zoneField = panelEl.querySelector(`#f-CLOUDFLARE_ZONE_ID`);
+    if (accField)  accField.value  = accSel.value;
+    if (zoneField) zoneField.value = zoneSel.value;
+
+    applyStatus.style.color = 'var(--good)';
+    applyStatus.textContent = '✓ queued — click "Save changes" in the bar at the bottom of the page.';
+  }
+
+  // ---- Step 3: Confirm Save landed in appliance.env -------------------
+
+  function _cfStep3(section) {
+    const step = _cfStepShell(3, 'Save settings to appliance.env');
+    step.appendChild(el('p', { class: 'help', 'data-cf-step3-status': '1' }, [
+      'Click "Save changes" in the bottom bar after Step 2. This step flips ✓ once the four Cloudflare-tunnel fields are persisted.',
+    ]));
+    return step;
+  }
+
+  async function refreshCfStep3(section) {
+    const note = section.querySelector('[data-cf-step3-status]');
+    if (!note) return;
+
+    // Re-fetch values from the server to avoid relying on browser-side
+    // state that might be stale after a save.
+    let appliance = (state.values && state.values.appliance) || {};
+    try {
+      const r = await fetch('/api/v1/settings/values', { credentials: 'same-origin' });
+      if (r.ok) {
+        const v = await r.json();
+        appliance = (v && v.appliance) || {};
+      }
+    } catch { /* fall through to in-memory copy */ }
+
+    const enabled = ((appliance.CLOUDFLARE_TUNNEL_ENABLED || {}).value || '') === 'true';
+    const token   = (appliance.CLOUDFLARE_TUNNEL_API_TOKEN || {}).value === '(set)';
+    const acc     = ((appliance.CLOUDFLARE_ACCOUNT_ID || {}).value || '').length === 32;
+    const zone    = ((appliance.CLOUDFLARE_ZONE_ID || {}).value || '').length === 32;
+
+    if (enabled && token && acc && zone) {
+      _cfSetState(section, 3, '✓', 'var(--good)');
+      note.style.color = 'var(--good)';
+      note.textContent = '✓ All four fields persisted in appliance.env. Step 4 is unlocked.';
+      // Auto-load Step 4 status — useful when re-entering the wizard
+      // after a successful save in a previous session.
+      loadCfStatus(section);
+    } else {
+      _cfSetState(section, 3, '☐', 'var(--text-muted)');
+      const missing = [];
+      if (!enabled) missing.push('CLOUDFLARE_TUNNEL_ENABLED=true');
+      if (!token)   missing.push('CLOUDFLARE_TUNNEL_API_TOKEN');
+      if (!acc)     missing.push('CLOUDFLARE_ACCOUNT_ID');
+      if (!zone)    missing.push('CLOUDFLARE_ZONE_ID');
+      note.style.color = 'var(--text-muted)';
+      note.textContent = 'Pending fields: ' + missing.join(', ') +
+        '. Use Step 2 to fill them, then click "Save changes" in the bottom bar.';
+    }
+  }
+
+  // ---- Step 4: Provision ---------------------------------------------
+
+  function _cfStep4(section) {
+    const step = _cfStepShell(4, 'Provision tunnel');
+    step.appendChild(el('p', { class: 'help' }, [
+      'Runs ', el('span', { class: 'mono' }, ['infra/cloudflared-up.sh']),
+      ' on the host. The script creates the tunnel object at Cloudflare, ' +
+      'builds the ingress config from your enabled apps, creates one CNAME ' +
+      'per published host, fetches the connector token, and starts the ' +
+      'cloudflared container. Idempotent — safe to re-run.',
+    ]));
+
+    const ctaRow = el('div', { class: 'cta-row', style: 'gap:0.5rem;align-items:center;margin-top:0.5rem;' });
+    const provBtn = el('button', {
+      type: 'button', class: 'btn',
+      'data-cf-provision': '1',
+      style: 'pointer-events:none;opacity:0.5;',
+      onclick: () => runCfStep4(section),
+    }, ['Provision tunnel now']);
+    const provStatus = el('span', { class: 'help', 'data-cf-step4-status': '1' }, [
+      'Complete Steps 1–3 first.',
+    ]);
+    ctaRow.appendChild(provBtn);
+    ctaRow.appendChild(provStatus);
+    step.appendChild(ctaRow);
+
+    step.appendChild(el('pre', {
+      class: 'maintenance__output', 'data-cf-step4-output': '1', hidden: '',
+    }));
+    return step;
+  }
+
+  async function runCfStep4(section) {
+    const ok = window.confirm(
+      'Provision Cloudflare Tunnel now?\n\n' +
+      'This will:\n' +
+      '  • Create (or reuse) a tunnel object at Cloudflare\n' +
+      '  • Create CNAMEs at your DNS for each published host\n' +
+      '  • Start the cloudflared container on this appliance\n\n' +
+      'Idempotent — safe to re-run. Continue?'
+    );
+    if (!ok) return;
+
+    const btn    = section.querySelector('[data-cf-provision]');
+    const status = section.querySelector('[data-cf-step4-status]');
+    const output = section.querySelector('[data-cf-step4-output]');
+    btn.disabled = true;
+    btn.style.pointerEvents = 'none';
+    status.style.color = 'var(--text-muted)';
+    status.textContent = 'Provisioning… (may take 15–30 seconds)';
+    _cfSetState(section, 4, '⋯', 'var(--text-muted)');
+    output.hidden = true;
+    output.textContent = '';
+
+    let data = null;
+    try {
+      const r = await fetch('/api/v1/admin/cloudflare/provision', {
+        method: 'POST', credentials: 'same-origin',
+      });
+      data = await r.json().catch(() => ({}));
+    } catch (err) {
+      _cfSetState(section, 4, '✗', 'var(--bad)');
+      status.style.color = 'var(--bad)';
+      status.textContent = '✗ ' + err.message;
+      btn.disabled = false;
+      btn.style.pointerEvents = '';
+      return;
+    }
+
+    const blob = [data.stdout, data.stderr].filter(Boolean).join('\n').trim();
+    if (blob) {
+      output.hidden = false;
+      output.textContent = blob;
+    }
+    if (data.exit_code === 0) {
+      _cfSetState(section, 4, '✓', 'var(--good)');
+      status.style.color = 'var(--good)';
+      status.textContent = '✓ tunnel provisioned. Verify from outside your LAN with curl.';
+      // Refresh status to flip "Tunnel currently up".
+      loadCfStatus(section);
+    } else {
+      _cfSetState(section, 4, '✗', 'var(--bad)');
+      status.style.color = 'var(--bad)';
+      status.textContent = '✗ exit ' + (data.exit_code != null ? data.exit_code : '?') + ' — see output below';
+    }
+    btn.disabled = false;
+    btn.style.pointerEvents = '';
+  }
+
+  async function loadCfStatus(section) {
+    const statusEl = section.querySelector('[data-cf-status]');
+    const btn = section.querySelector('[data-cf-provision]');
+    if (!statusEl) return;
+
+    try {
+      const r = await fetch('/api/v1/admin/cloudflare/status', { credentials: 'same-origin' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+
+      // If the four fields are persisted, light up the Provision button.
+      const cfg = (state.values && state.values.appliance) || {};
+      const persistOk =
+        ((cfg.CLOUDFLARE_TUNNEL_ENABLED || {}).value || '') === 'true' &&
+        (cfg.CLOUDFLARE_TUNNEL_API_TOKEN || {}).value === '(set)' &&
+        ((cfg.CLOUDFLARE_ACCOUNT_ID || {}).value || '').length === 32 &&
+        ((cfg.CLOUDFLARE_ZONE_ID || {}).value || '').length === 32;
+      if (btn && persistOk) {
+        btn.style.pointerEvents = '';
+        btn.style.opacity = '';
+        const s4 = section.querySelector('[data-cf-step4-status]');
+        if (s4 && s4.textContent === 'Complete Steps 1–3 first.') {
+          s4.textContent = data.token_present
+            ? 'Tunnel previously provisioned — click again to re-run idempotently.'
+            : 'Ready to provision.';
+        }
+      }
+
+      let text;
+      if (data.container_status === 'running' && data.token_present) {
+        text = '✓ Cloudflare Tunnel is currently up.';
+        if (data.last_run_ts) text += ' Last script run: ' + humanAge(data.last_run_ts) + ' ago.';
+        statusEl.style.color = 'var(--good)';
+        // If everything is up, mark all steps ✓ so re-entry shows
+        // accurate state without re-running each one.
+        _cfSetState(section, 4, '✓', 'var(--good)');
+      } else if (data.container_status === 'stopped') {
+        text = '⚠ cloudflared container stopped. Re-run Step 4 to bring it back up.';
+        statusEl.style.color = 'var(--warn)';
+      } else if (data.container_status === 'not-found') {
+        text = '— No cloudflared container yet. Complete Steps 1–4 to set up.';
+        statusEl.style.color = 'var(--text-muted)';
+      } else {
+        text = '— Tunnel state: ' + data.container_status;
+        statusEl.style.color = 'var(--text-muted)';
+      }
+      statusEl.textContent = text;
+    } catch (err) {
+      statusEl.style.color = 'var(--bad)';
+      statusEl.textContent = '✗ Could not load status: ' + err.message;
+    }
   }
 
   function renderBackupSection(host) {

@@ -219,6 +219,17 @@
         <div style="margin-top:0.8rem;line-height:1.55;">
           <p><strong>When to use:</strong> Public clients need to reach the appliance, but you can&rsquo;t (or won&rsquo;t) open ports 80/443. Common cases: home installs behind double-NAT or carrier-grade NAT, residential ISPs that block inbound TCP/80, datacenter VMs on internal networks, or adding Cloudflare&rsquo;s DDoS protection without changing infrastructure.</p>
 
+          <p style="background:rgba(184,114,46,0.10);border:1px solid var(--accent);padding:0.65rem 0.8rem;border-radius:4px;">
+            <strong>Easiest path: use the in-page wizard.</strong> Open
+            <a href="/admin/settings">Configuration &rarr; Network</a>, toggle
+            <em>Cloudflare Tunnel</em> ON, and the four-step wizard appears
+            below the form. Paste an API token; the wizard verifies it,
+            auto-detects your account &amp; zone IDs, programmatically writes
+            the four fields, and provisions the tunnel via an admin endpoint
+            &mdash; no SSH required. Steps below are the manual / power-user
+            path; both produce the same end-state.
+          </p>
+
           <p><strong>Prerequisites</strong></p>
           <ul>
             <li>Cloudflare account (free).</li>
@@ -226,7 +237,7 @@
             <li>Outbound TCP 7844 allowed from the host (virtually all ISPs and firewalls allow this).</li>
           </ul>
 
-          <p><strong>Steps</strong></p>
+          <p><strong>Steps (manual path &mdash; skip if using the wizard above)</strong></p>
           <ol>
             <li><strong>Move DNS to Cloudflare</strong> if you haven&rsquo;t already. Cloudflare&rsquo;s onboarding flow:
               <ul>
