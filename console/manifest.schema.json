@@ -336,6 +336,16 @@
           },
           "description": "Predicate keyed by FIELD_NAME → required value. Field hidden until predicate satisfied. Pass a string for exact match, or an array of strings for any-match (e.g. EMAIL_FROM should show for resend OR postmark OR emailit OR smtp)."
         },
+        "hideIf": {
+          "type": "object",
+          "additionalProperties": {
+            "anyOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+            ]
+          },
+          "description": "Inverse of showIf. Field is hidden when this predicate matches, regardless of showIf. Used for fields that become irrelevant once another setting is on — e.g. DNS_PROVIDER and its credentials become moot when CLOUDFLARE_TUNNEL_ENABLED is true (Caddy uses tls-internal then; no ACME challenge runs). Same value semantics as showIf: string for exact match, array for any-match."
+        },
         "postSaveJob": {
           "type": "string",
           "description": "Background job triggered after save. e.g. 'corpus-sync' for Tax-Research-Chat ENABLED_STATES."

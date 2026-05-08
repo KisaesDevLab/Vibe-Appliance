@@ -1446,6 +1446,7 @@ function _fieldDescriptor(envEntry, providingSlug) {
     validate:            ui.validate || null,
     testEndpoint:        ui.testEndpoint || null,
     showIf:              ui.showIf || null,
+    hideIf:              ui.hideIf || null,
     dependsOnFields:     ui.dependsOnFields || [],
     disabledImpacts:     ui.disabledImpacts || [],
     restartRequired:     ui.restartRequired !== false,

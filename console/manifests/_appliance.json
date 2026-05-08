@@ -57,7 +57,9 @@
           { "value": "cloudflare",      "label": "Cloudflare DNS-01 (wildcard; needs Cloudflare nameservers + custom Caddy build)" },
           { "value": "generic-dns-01",  "label": "Generic DNS-01 (Namecheap; wildcard; needs custom Caddy build)" }
         ],
-        "postSaveJob":     "dns-provider-switch"
+        "postSaveJob":     "dns-provider-switch",
+        "dependsOnFields": ["CLOUDFLARE_TUNNEL_ENABLED"],
+        "hideIf":          { "CLOUDFLARE_TUNNEL_ENABLED": "true" }
       }
     },
     {
@@ -72,8 +74,9 @@
         "input":           "password",
         "appliance":       "shared",
         "validate":        "non-empty",
-        "dependsOnFields": ["DNS_PROVIDER"],
-        "showIf":          { "DNS_PROVIDER": "cloudflare" }
+        "dependsOnFields": ["DNS_PROVIDER", "CLOUDFLARE_TUNNEL_ENABLED"],
+        "showIf":          { "DNS_PROVIDER": "cloudflare" },
+        "hideIf":          { "CLOUDFLARE_TUNNEL_ENABLED": "true" }
       }
     },
     {
@@ -87,8 +90,9 @@
         "input":           "text",
         "appliance":       "shared",
         "validate":        "non-empty",
-        "dependsOnFields": ["DNS_PROVIDER"],
-        "showIf":          { "DNS_PROVIDER": "generic-dns-01" }
+        "dependsOnFields": ["DNS_PROVIDER", "CLOUDFLARE_TUNNEL_ENABLED"],
+        "showIf":          { "DNS_PROVIDER": "generic-dns-01" },
+        "hideIf":          { "CLOUDFLARE_TUNNEL_ENABLED": "true" }
       }
     },
     {
@@ -103,8 +107,9 @@
         "input":           "password",
         "appliance":       "shared",
         "validate":        "non-empty",
-        "dependsOnFields": ["DNS_PROVIDER"],
-        "showIf":          { "DNS_PROVIDER": "generic-dns-01" }
+        "dependsOnFields": ["DNS_PROVIDER", "CLOUDFLARE_TUNNEL_ENABLED"],
+        "showIf":          { "DNS_PROVIDER": "generic-dns-01" },
+        "hideIf":          { "CLOUDFLARE_TUNNEL_ENABLED": "true" }
       }
     },
     {
@@ -118,8 +123,9 @@
         "input":           "text",
         "appliance":       "shared",
         "validate":        "non-empty",
-        "dependsOnFields": ["DNS_PROVIDER"],
-        "showIf":          { "DNS_PROVIDER": "generic-dns-01" }
+        "dependsOnFields": ["DNS_PROVIDER", "CLOUDFLARE_TUNNEL_ENABLED"],
+        "showIf":          { "DNS_PROVIDER": "generic-dns-01" },
+        "hideIf":          { "CLOUDFLARE_TUNNEL_ENABLED": "true" }
       }
     },
     {

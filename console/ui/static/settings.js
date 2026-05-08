@@ -14,7 +14,7 @@
 // operators can confirm in DevTools (F12 → Console) that the file
 // they're running is the version they expect, vs. a stale cached
 // copy. Compare against the server's /api/v1/version response.
-const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-4-zone-derived-accounts';
+const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-5-hideif-cert-fields';
 
 (function () {
   // eslint-disable-next-line no-console
@@ -577,21 +577,37 @@ const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-4-zone-derived-accounts';
       return g === String(expected);
     };
 
+    // Resolve a dependency value: dirty (this scope) wins, then saved
+    // (this scope), then saved at appliance scope (per-app fields can
+    // depend on appliance-level toggles like CLOUDFLARE_TUNNEL_ENABLED).
+    const depValue = (depKey) => {
+      const dirty = state.dirty.get(dirtyKey(scope, depKey));
+      if (dirty) return dirty.value;
+      const cur = valuesMap[depKey] || (state.values.appliance || {})[depKey];
+      return (cur && cur.value != null) ? cur.value : null;
+    };
+
     for (const f of fields) {
-      if (!f.showIf) continue;
+      if (!f.showIf && !f.hideIf) continue;
       const wrap = panelEl.querySelector(`[data-key="${CSS.escape(f.key)}"]`);
       if (!wrap) continue;
-      const ok = Object.entries(f.showIf).every(([depKey, depVal]) => {
-        // Same-scope dirty check first.
-        const dirty = state.dirty.get(dirtyKey(scope, depKey));
-        if (dirty) return showIfMatch(dirty.value, depVal);
-        // Fall back to the saved value for the active scope; if not
-        // present (e.g. a per-app showIf depending on an inherited
-        // appliance field), check appliance values too.
-        const cur = valuesMap[depKey] || (state.values.appliance || {})[depKey];
-        return cur != null && showIfMatch(cur.value, depVal);
+
+      // showIf: ALL predicates must match. No showIf → treat as visible.
+      const showOk = !f.showIf || Object.entries(f.showIf).every(([depKey, depVal]) => {
+        const got = depValue(depKey);
+        return got != null && showIfMatch(got, depVal);
       });
-      wrap.style.display = ok ? '' : 'none';
+
+      // hideIf: ANY predicate matching hides the field. The inverse
+      // semantic — showIf is "show only when X", hideIf is "hide
+      // whenever X". Used by DNS_PROVIDER + cert-challenge fields
+      // which are moot when CLOUDFLARE_TUNNEL_ENABLED is true.
+      const hidden = f.hideIf && Object.entries(f.hideIf).some(([depKey, depVal]) => {
+        const got = depValue(depKey);
+        return got != null && showIfMatch(got, depVal);
+      });
+
+      wrap.style.display = (showOk && !hidden) ? '' : 'none';
     }
   }
 
