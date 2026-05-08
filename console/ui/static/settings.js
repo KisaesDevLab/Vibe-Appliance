@@ -977,11 +977,22 @@
   // noticing the bottom-of-page Save bar.
 
   function renderCloudflareTunnelSection(host) {
-    const section = el('section', { class: 'maintenance', 'data-cf-section': '1' });
+    // Visually prominent section so it's the unmistakable primary
+    // action on the Network tab. The accent border + soft tinted
+    // background distinguish it from the plain .maintenance treatment
+    // (which DDNS uses below) and make it obvious where to start.
+    const section = el('section', {
+      class: 'maintenance',
+      'data-cf-section': '1',
+      style: 'border-left:4px solid var(--accent);background:rgba(184,114,46,0.04);padding-left:1rem;',
+    });
     host.appendChild(section);
 
     const wiz = {
-      screen:    'LOADING',
+      // Default to IDLE immediately — bootstrap() may upgrade to UP
+      // asynchronously, but the operator never sees a blank "loading"
+      // screen even if /cloudflare/status is slow or unreachable.
+      screen:    'IDLE',
       domain:    null,
       nsOk:      null,
       token:     '',
@@ -993,6 +1004,16 @@
       output:    '',
       lastRunTs: null,
       error:     '',
+      // dnsBypassed: operator clicked "Continue anyway" past the DNS
+      // check — we let them through even when DoH says NS aren't on
+      // Cloudflare, because some networks block DoH and the operator
+      // may know better than the probe.
+      dnsBypassed: false,
+      // bootstrapped: false until bootstrap() finishes its async
+      // fetches. Used by paintIdle so the first synchronous paint()
+      // doesn't flash "No domain in state.config.domain" before
+      // /api/v1/state has even responded.
+      bootstrapped: false,
     };
     let provInterval = null;
 
@@ -1013,16 +1034,23 @@
       }
     }
 
+    // bootstrap runs after the initial paint. Upgrades the screen from
+    // the default IDLE to UP when the tunnel is already running. Never
+    // downgrades — if the status check fails, we stay on IDLE so the
+    // operator at least sees the Set-up button.
     async function bootstrap() {
       wiz.domain = await fetchDomain();
       try {
         const r = await fetch('/api/v1/admin/cloudflare/status', { credentials: 'same-origin' });
         const data = await r.json();
         wiz.lastRunTs = data.last_run_ts;
-        wiz.screen = (data.container_status === 'running' && data.token_present) ? 'UP' : 'IDLE';
+        if (data.container_status === 'running' && data.token_present) {
+          wiz.screen = 'UP';
+        }
       } catch {
-        wiz.screen = 'IDLE';
+        // Stay on IDLE; the catch is just to keep paint() reachable.
       }
+      wiz.bootstrapped = true;
       paint();
     }
 
@@ -1038,15 +1066,27 @@
         'ports on your router. The appliance dials outbound to Cloudflare\'s edge; ' +
         'public requests arrive over that tunnel.',
       ]));
-      if (!wiz.domain) {
+
+      // Three states:
+      //   bootstrap not yet done → show the button optimistically with
+      //     a loading-domain placeholder. Don't flash a "no domain"
+      //     error before the fetch even returns.
+      //   bootstrap done, domain present → show domain + button.
+      //   bootstrap done, domain missing → show error + no button.
+      if (!wiz.bootstrapped) {
+        section.appendChild(el('p', { class: 'help muted' }, ['Loading appliance state…']));
+      } else if (!wiz.domain) {
         section.appendChild(el('p', { class: 'help', style: 'color:var(--bad);' }, [
-          'No domain in state.config.domain. Re-run bootstrap.sh with --mode domain --domain <yours> first.',
+          'state.config.domain is not set. Cloudflare Tunnel needs the apex domain so it can create CNAMEs. ',
+          'Re-run ', el('span', { class: 'mono' }, ['sudo bash /opt/vibe/appliance/bootstrap.sh --mode domain --domain <yours>']), ' first.',
         ]));
         return;
+      } else {
+        section.appendChild(el('p', { class: 'help' }, [
+          'Domain: ', el('span', { class: 'mono' }, [wiz.domain]),
+        ]));
       }
-      section.appendChild(el('p', { class: 'help' }, [
-        'Domain: ', el('span', { class: 'mono' }, [wiz.domain]),
-      ]));
+
       const cta = el('div', { class: 'cta-row', style: 'margin-top:0.6rem;' });
       cta.appendChild(el('button', {
         type: 'button', class: 'btn',
@@ -1127,6 +1167,13 @@
 
     function renderDnsRow(row) {
       row.innerHTML = '';
+      if (wiz.dnsBypassed) {
+        row.style.color = 'var(--text-muted)';
+        row.appendChild(el('span', { class: 'help' }, [
+          '— DNS check bypassed. Provision will fail if the domain isn\'t actually on Cloudflare nameservers.',
+        ]));
+        return;
+      }
       if (wiz.nsOk === null) {
         row.appendChild(el('span', { class: 'help' }, ['⋯ Checking nameservers…']));
       } else if (wiz.nsOk === true) {
@@ -1134,16 +1181,24 @@
         row.appendChild(el('span', null, ['✓ ' + wiz.domain + ' is on Cloudflare nameservers']));
       } else {
         row.style.color = 'var(--warn)';
-        row.appendChild(el('span', null, ['⚠ ' + wiz.domain + ' is NOT on Cloudflare nameservers.']));
+        row.appendChild(el('span', null, ['⚠ ' + wiz.domain + ' does not appear to be on Cloudflare nameservers (or DoH lookup blocked).']));
         row.appendChild(el('br'));
         row.appendChild(el('span', { class: 'help' }, [
-          'Sign up at cloudflare.com → Add site → enter ' + wiz.domain + '. Cloudflare gives you ' +
-          'two NS records; set them at your registrar (Namecheap → Manage → Custom DNS, etc.). ',
+          'If you haven\'t switched yet: sign up at cloudflare.com → Add site → enter ' + wiz.domain +
+          '. Cloudflare gives you two NS records; set them at your registrar (Namecheap → Manage → Custom DNS, etc.). ',
+          el('br'),
+          'If your network blocks the DoH probe (corporate filters, etc.) but the domain IS on Cloudflare, you can continue anyway — provision will surface the actual error if it isn\'t.',
         ]));
-        row.appendChild(el('button', {
-          type: 'button', class: 'btn btn--ghost', style: 'margin-left:0.5rem;',
+        const btnRow = el('div', { class: 'cta-row', style: 'gap:0.5rem;margin-top:0.4rem;' });
+        btnRow.appendChild(el('button', {
+          type: 'button', class: 'btn btn--ghost',
           onclick: () => checkDns(),
         }, ['Re-check']));
+        btnRow.appendChild(el('button', {
+          type: 'button', class: 'btn btn--ghost',
+          onclick: () => { wiz.dnsBypassed = true; renderDnsRow(row); },
+        }, ['Continue anyway']));
+        row.appendChild(btnRow);
       }
     }
 
@@ -1167,9 +1222,28 @@
     }
 
     function paintReady() {
+      // Defensive: should never happen because /cloudflare/discover
+      // already validates non-empty arrays, but if a future API change
+      // breaks that contract, we don't want operators clicking
+      // Provision against empty values.
+      if (!wiz.accounts.length || !wiz.zones.length) {
+        section.appendChild(el('p', { style: 'color:var(--bad);' }, [
+          '✗ Token verified but no ' + (wiz.zones.length ? 'accounts' : 'zones') + ' came back. ' +
+          'The token may be missing the broader scope. Re-paste a token at Step 2.',
+        ]));
+        const cta = el('div', { class: 'cta-row', style: 'gap:0.5rem;margin-top:0.5rem;' });
+        cta.appendChild(el('button', {
+          type: 'button', class: 'btn',
+          onclick: () => { wiz.screen = 'SETUP'; paint(); },
+        }, ['← Back to token paste']));
+        section.appendChild(cta);
+        return;
+      }
+
       section.appendChild(el('p', { class: 'help' }, ['Token verified. Confirm what to provision:']));
 
       const grid = el('div', { style: 'display:grid;gap:0.4rem;max-width:36rem;' });
+
       grid.appendChild(el('label', { style: 'font-weight:600;font-size:0.9em;' }, ['Account']));
       const accSel = el('select', {
         style: 'padding:0.45rem 0.65rem;border:1px solid var(--border);border-radius:4px;background:var(--surface);',
@@ -1181,10 +1255,34 @@
       grid.appendChild(el('label', { style: 'font-weight:600;font-size:0.9em;margin-top:0.3rem;' }, ['Zone (your domain)']));
       const zoneSel = el('select', {
         style: 'padding:0.45rem 0.65rem;border:1px solid var(--border);border-radius:4px;background:var(--surface);',
-        onchange: (e) => { wiz.zoneId = e.target.value; },
+        onchange: (e) => {
+          wiz.zoneId = e.target.value;
+          // Auto-pair the account with the chosen zone — in 95% of
+          // cases there's exactly one account matching, but explicit
+          // sync is safer than drift.
+          const z = wiz.zones.find(z => z.id === e.target.value);
+          if (z && z.account_id) {
+            wiz.accountId = z.account_id;
+            const a = section.querySelector('select');  // first select = account
+            if (a) a.value = z.account_id;
+          }
+        },
       }, wiz.zones.map(z => el('option', { value: z.id }, [z.name + '  (' + z.id.slice(0, 8) + '…)'])));
       zoneSel.value = wiz.zoneId;
       grid.appendChild(zoneSel);
+
+      grid.appendChild(el('label', { style: 'font-weight:600;font-size:0.9em;margin-top:0.3rem;' }, ['Tunnel name']));
+      const nameInput = el('input', {
+        type: 'text',
+        value: wiz.tunnelName,
+        style: 'padding:0.45rem 0.65rem;border:1px solid var(--border);border-radius:4px;background:var(--surface);font:inherit;',
+        oninput: (e) => { wiz.tunnelName = e.target.value.trim() || 'vibe-appliance'; },
+      });
+      grid.appendChild(nameInput);
+      grid.appendChild(el('p', { class: 'help', style: 'margin:0;' }, [
+        'Default is fine for single-appliance accounts. Use a different name only when running multiple appliances under one Cloudflare account.',
+      ]));
+
       section.appendChild(grid);
 
       section.appendChild(el('p', { class: 'help', style: 'margin-top:0.6rem;' }, [

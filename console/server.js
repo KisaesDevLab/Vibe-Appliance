@@ -718,10 +718,19 @@ app.get('/health', (_req, res) => {
   });
 });
 
-// Public: landing.
+// Public: landing. Static assets get no-cache + ETag so browser
+// always revalidates after a console rebuild — without this, the
+// browser would serve a stale settings.js for up to an hour after
+// a deploy and operators would see the previous wizard / no wizard
+// at all. ETag means revalidation is cheap (304 most of the time);
+// the full body only flows when settings.js / styles.css actually
+// changed.
 app.use('/static', express.static(path.join(__dirname, 'ui', 'static'), {
   fallthrough: true,
-  maxAge: '1h',
+  maxAge: 0,
+  setHeaders: (res) => {
+    res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+  },
 }));
 
 app.get('/', (_req, res) => {
@@ -991,6 +1000,26 @@ app.post('/api/v1/admin/cloudflare/discover', requireAdmin, testRateLimit, async
     account_id: z.account && z.account.id,
   }));
 
+  // Guard against the most common silently-broken case: token has
+  // Account.Cloudflare-Tunnel:Edit but lacks Zone.DNS:Edit on any
+  // zone, or the operator's Cloudflare account has no zones added
+  // yet. Either way, an empty zones list means there's nothing to
+  // CNAME → the wizard would render empty dropdowns and provision
+  // would fail at the DNS-record-create step. Bail with a hint
+  // instead.
+  if (zones.length === 0) {
+    return res.json({
+      ok: false,
+      error: 'Token verified but no zones are accessible. Either (a) the token is missing Zone.DNS:Edit, or (b) you haven\'t added any domains to this Cloudflare account yet. Re-create the token at https://dash.cloudflare.com/profile/api-tokens with both Account.Cloudflare-Tunnel:Edit AND Zone.DNS:Edit, and confirm at https://dash.cloudflare.com that the target domain is listed.',
+    });
+  }
+  if (accounts.length === 0) {
+    return res.json({
+      ok: false,
+      error: 'Token verified but no accounts are accessible. The token may need broader Account-level scope. Re-create at https://dash.cloudflare.com/profile/api-tokens.',
+    });
+  }
+
   return res.json({ ok: true, accounts, zones });
 });
 
@@ -1042,9 +1071,22 @@ app.get('/api/v1/admin/cloudflare/status', requireAdmin, async (_req, res) => {
     }
   } catch { /* no log file yet */ }
 
+  // Read TUNNEL_TOKEN from shared.env, NOT from process.env. The
+  // env var lands in shared.env when cloudflared-up.sh succeeds, but
+  // process.env in the running console is the boot-time snapshot —
+  // it doesn't pick up file edits without a container restart. Reading
+  // the file directly means /cloudflare/status correctly reports the
+  // tunnel as "up" immediately after a successful provision, no
+  // restart required.
+  let tokenPresent = false;
+  try {
+    const sharedEnv = parseEnvFile(path.join(ENV_DIR, 'shared.env'));
+    tokenPresent = !!(sharedEnv.TUNNEL_TOKEN || '').trim();
+  } catch { /* file missing → token absent → tunnel not up */ }
+
   res.json({
     container_status: containerStatus,
-    token_present:    !!(process.env.TUNNEL_TOKEN || '').trim(),
+    token_present:    tokenPresent,
     last_run_ts:      lastRunTs,
   });
 });
