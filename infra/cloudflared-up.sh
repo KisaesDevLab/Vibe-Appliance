@@ -272,12 +272,25 @@ sys.exit(1)
 PYEOF
 }
 
-# --- 1. Verify token + account ---------------------------------------
+# --- 1. Verify token is alive ----------------------------------------
+#
+# /user/tokens/verify only checks that the token is active — it doesn't
+# require any read scope on accounts or zones. Use it as the cheapest
+# possible "is the token usable" pre-flight; the actual tunnel/DNS
+# operations below will surface scope problems on their first call,
+# with the specific missing-permission code from Cloudflare.
+#
+# We deliberately DON'T do a GET /accounts/{id} probe here — that
+# requires the top-level Account:Read permission, which Cloudflare
+# does NOT grant by default to tokens scoped to specific account
+# resources (e.g. "Account.Cloudflare Tunnel:Edit on account X" works
+# fine for tunnel ops but returns 9109 Unauthorized on /accounts/X).
+# That bricked the script for operators with correctly-scoped tokens.
 
-log_step "validating Cloudflare API token + account access"
-account_check="$(cf_api GET "/accounts/$CF_ACCOUNT_ID")"
-cf_check_success "$account_check" "account fetch" \
-  || die "Cloudflare rejected the token for account $CF_ACCOUNT_ID. Most common causes: (a) token missing 'Account.Cloudflare Tunnel:Edit' scope, (b) account ID typo, (c) token revoked. Re-create the token at https://dash.cloudflare.com/profile/api-tokens with both 'Account.Cloudflare Tunnel:Edit' and 'Zone.DNS:Edit' on the target zone."
+log_step "validating Cloudflare API token is alive"
+verify_check="$(cf_api GET "/user/tokens/verify")"
+cf_check_success "$verify_check" "token verify" \
+  || die "Cloudflare rejected the token. Most common causes: (a) token revoked / expired, (b) token typo. Re-create at https://dash.cloudflare.com/profile/api-tokens with 'Account.Cloudflare Tunnel:Edit' AND 'Zone.DNS:Edit' on the target zone."
 
 # --- 2. Find or create the tunnel -------------------------------------
 
