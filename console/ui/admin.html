@@ -880,9 +880,6 @@ curl -sI https://tb.yourdomain.com/</pre>
             ${a.emergencyUrl ? `
             <dt>backup</dt><dd><a href="${escapeHtml(a.emergencyUrl)}">${escapeHtml(a.emergencyUrl)}</a>
               <span class="muted">(LAN / Tailscale only)</span></dd>` : ''}
-            ${a.username ? `
-            <dt>username</dt><dd><span class="mono">${escapeHtml(a.username)}</span>
-              <span class="muted">(default; password in First-login info)</span></dd>` : ''}
           </dl>
           ${imageHint}
           ${a.error ? '<div class="error-banner">' + escapeHtml(a.error) + '</div>' : ''}
@@ -892,9 +889,6 @@ curl -sI https://tb.yourdomain.com/</pre>
               ? '<button class="btn btn--ghost" data-action="disable" data-slug="' + escapeHtml(a.slug) + '">Disable</button>'
               : '<button class="btn"             data-action="enable"  data-slug="' + escapeHtml(a.slug) + '"' +
                   (enableDisabled ? ' disabled title="Image not published to GHCR yet"' : '') + '>Enable</button>'}
-            ${a.enabled
-              ? '<button class="btn btn--ghost" data-action="update"   data-slug="' + escapeHtml(a.slug) + '"' + (a.update_available ? '' : ' disabled') + '>Update</button>'
-              : ''}
             ${a.enabled && a.update_history && a.update_history.length
               ? '<button class="btn btn--ghost" data-action="rollback" data-slug="' + escapeHtml(a.slug) + '">Roll back</button>'
               : ''}
