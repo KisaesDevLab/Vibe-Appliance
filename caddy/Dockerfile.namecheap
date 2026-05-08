@@ -1,0 +1,64 @@
+# caddy/Dockerfile.namecheap — OPT-IN custom Caddy build with the
+# namecheap DNS plugin. Powers the "Generic DNS-01" option in the
+# admin Settings page when the appliance is configured against a
+# Namecheap-hosted domain. NOT used by the default install.
+#
+# Why this exists: the default install (caddy:2-alpine + HTTP-01)
+# requires inbound port 80 reachable from the public internet. Many
+# residential ISPs block :80, and even when they don't, HTTP-01 issues
+# one cert per subdomain — eight enabled apps means eight Let's Encrypt
+# round-trips, each its own potential failure point. DNS-01 sidesteps
+# both: Caddy proves ownership by writing a TXT record via Namecheap's
+# Domains API, and a single `*.firm.com` wildcard cert covers every
+# present and future subdomain.
+#
+# To opt in (run on the appliance host):
+#
+#   1. Build the image:
+#        sudo docker build -f /opt/vibe/appliance/caddy/Dockerfile.namecheap \
+#          -t vibe-appliance/caddy:namecheap /opt/vibe/appliance/caddy
+#
+#   2. Edit /opt/vibe/appliance/docker-compose.yml — change the caddy
+#      service `image:` from `caddy:2-alpine` to
+#      `vibe-appliance/caddy:namecheap`.
+#
+#   3. In the admin console, Settings → Network:
+#        - DNS provider           → "Generic DNS-01 (Namecheap)"
+#        - Namecheap API user     → your Namecheap username
+#        - Namecheap API key      → from https://ap.www.namecheap.com/Profile/Tools/ApiAccess/
+#        - Namecheap client IP    → the appliance's PUBLIC IP (must be
+#                                   added to the IP allowlist at the
+#                                   same API Access page — Namecheap
+#                                   rejects calls from non-allowlisted
+#                                   IPs by design)
+#
+#   4. Save. Caddy reloads, picks up the new acme_dns directive, and
+#      issues a wildcard cert on the next subdomain request.
+#
+# Build is fast (xcaddy fetches the listed module and statically links).
+# Image size lands ~50 MB.
+
+# ---- builder stage -----------------------------------------------------
+# `caddy:builder-alpine` is the canonical builder tag — it always
+# points at the latest stable Caddy with a version-coherent set of
+# Go module dependencies. Pinning Caddy to an *older* version while
+# letting Go modules resolve to latest produces broken builds when an
+# upstream module breaks API compatibility — same lesson learned in
+# Dockerfile.cloudflare. Trust the builder image's bundled version.
+FROM caddy:builder-alpine AS builder
+
+# Don't pin the Caddy binary version — let xcaddy use the builder
+# image's default (latest stable). The namecheap plugin's @latest
+# resolves at build time and tracks the same Caddy major.
+RUN xcaddy build \
+    --with github.com/caddy-dns/namecheap
+
+# ---- runtime stage -----------------------------------------------------
+# Replace /usr/bin/caddy in the official runtime image with our
+# xcaddy-built binary; the rest of the image (entrypoint, config
+# defaults, healthcheck) is unchanged. The xcaddy binary is statically
+# linked Go, so a minor version drift between builder and runtime is
+# harmless.
+FROM caddy:2-alpine
+
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy

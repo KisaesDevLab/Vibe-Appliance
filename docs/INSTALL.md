@@ -122,6 +122,91 @@ The appliance will issue per-subdomain certificates from Let's Encrypt
 on each app's first request. Slower than DNS-01 (one cert challenge
 per app) but works on any DNS host.
 
+### Option D: Generic DNS-01 (Namecheap)
+
+Use this if your domain stays on Namecheap's nameservers **and** any of
+the following is true:
+
+- Your ISP blocks inbound TCP/80 (HTTP-01 won't work then).
+- You want a single wildcard cert (`*.firm.com`) covering every present
+  and future subdomain instead of per-subdomain Let's Encrypt round-
+  trips.
+- You don't want to switch DNS hosting to Cloudflare.
+
+The label is "Generic DNS-01" in the admin Settings dropdown so we can
+add other DNS-01 providers under the same option later. Today it's
+backed by Namecheap's account-level Domains API.
+
+Setup:
+
+1. Build the custom Caddy image with the namecheap plugin baked in:
+
+   ```
+   sudo docker build \
+     -f /opt/vibe/appliance/caddy/Dockerfile.namecheap \
+     -t vibe-appliance/caddy:namecheap \
+     /opt/vibe/appliance/caddy
+   ```
+
+2. Edit `/opt/vibe/appliance/docker-compose.yml`. Change the caddy
+   service's `image:` line from `caddy:2-alpine` to
+   `vibe-appliance/caddy:namecheap`.
+
+3. At Namecheap, generate an account API key:
+   - Sign in → top-right username → **Profile** → **Tools** → **API
+     Access**.
+   - Toggle **API Access** on.
+   - Copy the **API Key** value.
+   - In the same panel, **add your appliance's public IP to the
+     Whitelisted IPs** box. Namecheap rejects every API call from a
+     non-allowlisted source IP — without this step every cert
+     issuance fails. (Find your current public IP at
+     `https://api.ipify.org`.)
+
+4. Apply the changes:
+
+   ```
+   cd /opt/vibe/appliance
+   sudo docker compose up -d caddy
+   ```
+
+5. In the admin console, **Configuration → Network**:
+   - **DNS / cert challenge** → `Generic DNS-01 (Namecheap; ...)`
+   - **Namecheap API user** → your Namecheap username
+   - **Namecheap API key** → the value from step 3
+   - **Namecheap client IP (allowlisted)** → your appliance's public IP
+   - Click **Test** — Namecheap should accept the credential probe.
+   - **Save**.
+
+6. The next request to any subdomain triggers wildcard cert issuance.
+   Caddy writes a TXT record at Namecheap, completes the ACME-DNS
+   challenge, drops `*.firm.com` into its cert store, and the cert
+   covers every current and future subdomain.
+
+What this gets you:
+- **Wildcard cert.** One cert covers every subdomain — adding apps no
+  longer triggers per-app cert issuance.
+- **No port-80 reachability requirement.** The DNS-01 challenge proves
+  ownership via DNS, not HTTP. Your ISP can block 80 freely.
+- **Compatible with Namecheap DDNS.** If your IP rotates, the DDNS
+  updater (Option C) keeps the A records current; the wildcard cert
+  doesn't care about IP changes since it covers any subdomain.
+
+Sharp edges:
+- **You still need A records** at Namecheap for the bare domain and
+  every subdomain you'll publish (or a wildcard `* → <ip>` record).
+  Cert issuance doesn't depend on A records, but DNS resolution does.
+- **IP allowlist drift.** If your public IP rotates and the new IP
+  isn't in Namecheap's allowlist, every cert renewal fails until you
+  update both the allowlist at Namecheap AND the
+  `NAMECHEAP_CLIENT_IP` field in Settings. Static-IP installs (DO
+  droplet, business-class connection) avoid this entirely.
+- **Two different Namecheap secrets.** If you also enable the DDNS
+  updater (Option C), you'll have *two* Namecheap secrets in Settings:
+  the per-domain DDNS password (DDNS protocol, Option C) and the
+  account API key (cert issuance + future Namecheap features, Option
+  D). They're separate scopes; both can be active at once.
+
 ### Option C: Namecheap Dynamic DNS (no static IP)
 
 Use this if your domain is registered with Namecheap **and** your

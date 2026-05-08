@@ -2359,9 +2359,56 @@ app.post('/api/v1/admin/test/dns', requireAdmin, testRateLimit, async (req, res)
       message: 'Cloudflare rejected the token: HTTP ' + result.status + ' — ' + (result.body || result.error || 'check token validity').slice(0, 200),
     });
   }
+  if (provider === 'generic-dns-01') {
+    // Currently backed by Namecheap's account-level Domains API. The
+    // dropdown label is "Generic DNS-01" so we can add other providers
+    // under the same option later without changing the persisted enum
+    // value (state files / audit log keep working).
+    const apiUser  = (b.NAMECHEAP_API_USER  || '').trim();
+    const apiKey   = (b.NAMECHEAP_API_KEY   || '').trim();
+    const clientIp = (b.NAMECHEAP_CLIENT_IP || '').trim();
+    if (!apiUser || !apiKey) {
+      return res.json({ ok: false, message: 'NAMECHEAP_API_USER and NAMECHEAP_API_KEY are required for Generic DNS-01.' });
+    }
+    if (!clientIp) {
+      return res.json({
+        ok: false,
+        message: 'NAMECHEAP_CLIENT_IP is required — Namecheap requires every API call to declare its source IP and the IP must already be on the account allowlist (https://ap.www.namecheap.com/Profile/Tools/ApiAccess/).',
+      });
+    }
+    // Validate creds with a no-side-effect read: namecheap.users.getBalances
+    // returns the account's balance and exercises auth + IP allowlist
+    // without touching DNS. If the IP isn't allowlisted, Namecheap
+    // returns "API Key is invalid or API access has not been enabled
+    // OR your IP is not whitelisted" inside the XML; surface that.
+    const u = new URL('https://api.namecheap.com/xml.response');
+    u.searchParams.set('ApiUser',  apiUser);
+    u.searchParams.set('ApiKey',   apiKey);
+    u.searchParams.set('UserName', apiUser);   // for sub-accounts these can differ; default to the same value
+    u.searchParams.set('ClientIp', clientIp);
+    u.searchParams.set('Command',  'namecheap.users.getBalances');
+    const result = await _testFetch(u.toString());
+    if (result.error) {
+      return res.json({ ok: false, message: 'Could not reach Namecheap API: ' + result.error });
+    }
+    if (/Status="OK"/i.test(result.body)) {
+      return res.json({
+        ok: true,
+        message: 'Namecheap API reachable; credentials and IP allowlist validated. Save these settings; on the next subdomain request Caddy will issue a wildcard cert via DNS-01.',
+      });
+    }
+    // Failure path — pull <Error> text out of the XML if we can.
+    const errMatch = result.body.match(/<Error[^>]*>([^<]+)<\/Error>/i);
+    const reason = errMatch ? errMatch[1].trim() : `HTTP ${result.status}: ${(result.body || '').slice(0, 250)}`;
+    let hint = '';
+    if (/whitelist|whitelisted|invalid/i.test(reason)) {
+      hint = ' Check that NAMECHEAP_CLIENT_IP matches the appliance\'s actual public IP and that this IP is in the Namecheap API allowlist.';
+    }
+    return res.json({ ok: false, message: 'Namecheap rejected: ' + reason + hint });
+  }
   return res.json({
     ok: false,
-    message: `Unknown DNS_PROVIDER "${provider}". Supported: http-01, cloudflare.`,
+    message: `Unknown DNS_PROVIDER "${provider}". Supported: http-01, cloudflare, generic-dns-01.`,
   });
 });
 

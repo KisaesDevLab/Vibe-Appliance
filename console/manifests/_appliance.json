@@ -42,19 +42,20 @@
     {
       "name":  "DNS_PROVIDER",
       "value": "http-01",
-      "doc":   "ACME challenge type. http-01 (default) needs port 80 reachable from the public internet; cloudflare uses DNS-01 wildcard certs and requires the custom Caddy build (caddy/Dockerfile.cloudflare) — see PLAN.md §4.1.",
+      "doc":   "ACME challenge type. http-01 (default) needs port 80 reachable from the public internet and issues one cert per subdomain. cloudflare uses DNS-01 wildcard certs through Cloudflare's nameservers (custom Caddy build via caddy/Dockerfile.cloudflare). generic-dns-01 currently routes through Namecheap's account API for operators who keep their domain on Namecheap nameservers (custom Caddy build via caddy/Dockerfile.namecheap); the label is forward-looking — additional providers can be added under the same option later.",
       "ui": {
         "tier":            1,
         "category":        "Network",
         "label":           "DNS / cert challenge",
-        "helpText":        "http-01 is the default and works with the stock caddy:2-alpine image. cloudflare requires the opt-in custom Caddy build with the Cloudflare DNS plugin baked in.",
+        "helpText":        "HTTP-01 is the default and works with the stock caddy:2-alpine image — needs inbound port 80 reachable. The DNS-01 options need an opt-in custom Caddy build (one Dockerfile per provider under caddy/) and don't need port 80 open; both can issue a single wildcard cert covering every subdomain.",
         "input":           "dropdown",
         "appliance":       "shared",
         "validate":        "enum",
         "testEndpoint":    "/api/v1/admin/test/dns",
         "options": [
-          { "value": "http-01",     "label": "HTTP-01 (default; per-subdomain certs)" },
-          { "value": "cloudflare",  "label": "Cloudflare DNS-01 (wildcard; needs custom Caddy build)" }
+          { "value": "http-01",         "label": "HTTP-01 (default; per-subdomain certs; needs port 80)" },
+          { "value": "cloudflare",      "label": "Cloudflare DNS-01 (wildcard; needs Cloudflare nameservers + custom Caddy build)" },
+          { "value": "generic-dns-01",  "label": "Generic DNS-01 (Namecheap; wildcard; needs custom Caddy build)" }
         ],
         "postSaveJob":     "dns-provider-switch"
       }
@@ -73,6 +74,52 @@
         "validate":        "non-empty",
         "dependsOnFields": ["DNS_PROVIDER"],
         "showIf":          { "DNS_PROVIDER": "cloudflare" }
+      }
+    },
+    {
+      "name": "NAMECHEAP_API_USER",
+      "doc":  "Namecheap account username — the value you log into namecheap.com with. Required for the Generic DNS-01 path. Distinct from the per-domain DDNS password — this is the account-level API auth (paired with NAMECHEAP_API_KEY).",
+      "ui": {
+        "tier":            1,
+        "category":        "Network",
+        "label":           "Namecheap API user",
+        "helpText":        "Same as your Namecheap account username. Find it at https://ap.www.namecheap.com/Profile/Tools/ApiAccess/.",
+        "input":           "text",
+        "appliance":       "shared",
+        "validate":        "non-empty",
+        "dependsOnFields": ["DNS_PROVIDER"],
+        "showIf":          { "DNS_PROVIDER": "generic-dns-01" }
+      }
+    },
+    {
+      "name":   "NAMECHEAP_API_KEY",
+      "secret": true,
+      "doc":    "Namecheap account API key. Generate at Profile → Tools → API Access. This is the account-wide API key, NOT the per-domain Dynamic DNS password used by the DDNS updater.",
+      "ui": {
+        "tier":            1,
+        "category":        "Network",
+        "label":           "Namecheap API key",
+        "helpText":        "Required when DNS provider is Generic DNS-01. Generate at https://ap.www.namecheap.com/Profile/Tools/ApiAccess/. Distinct from the per-domain Dynamic DNS password — different auth scope, different secret.",
+        "input":           "password",
+        "appliance":       "shared",
+        "validate":        "non-empty",
+        "dependsOnFields": ["DNS_PROVIDER"],
+        "showIf":          { "DNS_PROVIDER": "generic-dns-01" }
+      }
+    },
+    {
+      "name":  "NAMECHEAP_CLIENT_IP",
+      "doc":   "Public IP of the appliance — Namecheap requires every API call to declare its source IP, and that IP must already be in the account's API Access allowlist. Without this set, Caddy's ACME-DNS calls to Namecheap will return 'IP is not in the whitelist'.",
+      "ui": {
+        "tier":            1,
+        "category":        "Network",
+        "label":           "Namecheap client IP (allowlisted)",
+        "helpText":        "The appliance's public IP. Must already be added to Namecheap's API IP allowlist at https://ap.www.namecheap.com/Profile/Tools/ApiAccess/ — Namecheap rejects calls from any other source IP. Find the current value at https://api.ipify.org. If your IP rotates, you'll need to update both this field AND the Namecheap allowlist on rotation.",
+        "input":           "text",
+        "appliance":       "shared",
+        "validate":        "non-empty",
+        "dependsOnFields": ["DNS_PROVIDER"],
+        "showIf":          { "DNS_PROVIDER": "generic-dns-01" }
       }
     },
     {

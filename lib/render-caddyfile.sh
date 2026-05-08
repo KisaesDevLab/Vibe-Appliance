@@ -274,15 +274,51 @@ def render_path_handler(slug, manifest):
     return "\n".join(lines) + "\n"
 
 
+def _read_appliance_env(env_path):
+    """Tiny env-file parser. No deps. Returns {} on missing/permission
+    error so a fresh install (where appliance.env hasn't been rendered
+    yet) doesn't break Caddyfile rendering."""
+    out = {}
+    try:
+        with open(env_path) as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                eq = line.find("=")
+                if eq < 0:
+                    continue
+                k = line[:eq].strip()
+                v = line[eq + 1:]
+                if k:
+                    out[k] = v
+    except (OSError, IOError):
+        pass
+    return out
+
+
 def render_global_snippet(snippets_dir, mode, email):
     """Build the contents of @VIBE_GLOBAL_SNIPPET@.
 
-    Domain mode emits the ACME contact email; Caddy then issues per-
-    subdomain certs via HTTP-01 automatically (port 80 must be inbound-
-    reachable from the internet during issuance/renewal). Operators who
-    need DNS-01 wildcard certs opt into a custom build via
-    caddy/Dockerfile.cloudflare and add the `acme_dns cloudflare ...`
-    directive to their snippet manually.
+    Domain mode emits the ACME contact email and, when the operator has
+    selected a DNS-01 provider in Settings → Network, the matching
+    `acme_dns` directive so Caddy uses DNS-01 for cert issuance.
+
+    DNS-01 routing is conditional on DNS_PROVIDER from
+    /opt/vibe/env/appliance.env:
+
+      - http-01 (default) — no extra directive; Caddy uses HTTP-01.
+      - cloudflare        — emits `acme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}`
+                            (requires the Cloudflare custom Caddy build).
+      - generic-dns-01    — emits `acme_dns namecheap { ... }` block
+                            with api_key/user/client_ip env refs
+                            (requires the Namecheap custom Caddy build).
+
+    The env.X references are resolved by Caddy itself at runtime against
+    its own env, which mounts /opt/vibe/env/appliance.env via env_file.
+    A snippet that already contains `acme_dns` (operator hand-edited)
+    wins — we don't double-emit, which would produce a Caddyfile syntax
+    error.
     """
     snippet_path = os.path.join(snippets_dir, f"{mode}.conf")
     if os.path.exists(snippet_path):
@@ -292,6 +328,39 @@ def render_global_snippet(snippets_dir, mode, email):
         base = ""
 
     base = base.replace("@VIBE_ACME_EMAIL@", email or "admin@example.com")
+
+    # Only emit for domain mode — LAN / Tailscale modes don't issue
+    # public certs at all.
+    if mode != "domain":
+        return base
+
+    # Don't double-emit if the operator hand-edited the snippet to add
+    # acme_dns themselves (the historical pattern documented in
+    # caddy/Dockerfile.cloudflare).
+    if "acme_dns" in base:
+        return base
+
+    # /opt/vibe is the canonical install root; env_path could be made
+    # configurable, but this script always runs against the live
+    # appliance so the hardcode is correct.
+    env = _read_appliance_env("/opt/vibe/env/appliance.env")
+    dns_provider = (env.get("DNS_PROVIDER") or "http-01").strip().lower()
+
+    if dns_provider == "cloudflare":
+        base += "\tacme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}\n"
+    elif dns_provider == "generic-dns-01":
+        # Namecheap account API. Caddy substitutes {env.X} from its
+        # process env at request time, so the actual secret never lives
+        # in the rendered Caddyfile (mode 644, world-readable inside
+        # the caddy data volume).
+        base += (
+            "\tacme_dns namecheap {\n"
+            "\t\tapi_key {env.NAMECHEAP_API_KEY}\n"
+            "\t\tuser {env.NAMECHEAP_API_USER}\n"
+            "\t\tclient_ip {env.NAMECHEAP_CLIENT_IP}\n"
+            "\t}\n"
+        )
+
     return base
 
 
