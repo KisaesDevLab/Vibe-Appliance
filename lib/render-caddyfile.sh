@@ -388,13 +388,30 @@ def main():
         listen_addrs = ":80"
         tls_directive = ""
 
-    body = body.replace("@VIBE_GLOBAL_SNIPPET@", global_snippet.rstrip("\n"))
-    body = body.replace("@VIBE_VHOSTS@", vhost_blocks.rstrip("\n"))
-    body = body.replace("@VIBE_PATH_HANDLERS@", path_blocks.rstrip("\n"))
-    body = body.replace("@VIBE_LISTEN@", listen_addrs)
+    # Block-substitutions (the placeholder occupies its own line, possibly
+    # with leading whitespace). Anchored regex so a stray `@VIBE_VHOSTS@`
+    # token inside a comment line — `# spliced at @VIBE_VHOSTS@ from` —
+    # doesn't get globally replaced, which would shred the comment when
+    # the replacement is multi-line. This bug bricked phase 6 for
+    # operators with several apps enabled until the comment scrub +
+    # this anchor landed (commit fixing "encode parsed as site address").
+    def substitute_block(text, placeholder, replacement):
+        pattern = r'(?m)^[ \t]*' + re.escape(placeholder) + r'[ \t]*$'
+        return re.sub(pattern, lambda _m: replacement.rstrip("\n"), text)
+
+    body = substitute_block(body, "@VIBE_GLOBAL_SNIPPET@", global_snippet)
+    body = substitute_block(body, "@VIBE_VHOSTS@",         vhost_blocks)
+    body = substitute_block(body, "@VIBE_PATH_HANDLERS@",  path_blocks)
+
+    # Inline-substitutions (the placeholder is part of a directive line —
+    # `@VIBE_LISTEN@ {`, `email @VIBE_ACME_EMAIL@`, etc.). These are
+    # short single-token values that can't carry newlines, so a global
+    # replace is safe. We still avoid putting these tokens in template
+    # comments per the comment in caddy/Caddyfile.tmpl.
+    body = body.replace("@VIBE_LISTEN@",        listen_addrs)
     body = body.replace("@VIBE_TLS_DIRECTIVE@", tls_directive)
-    body = body.replace("@VIBE_ACME_EMAIL@", email or "admin@example.com")
-    body = body.replace("@VIBE_DOMAIN@", domain)
+    body = body.replace("@VIBE_ACME_EMAIL@",    email or "admin@example.com")
+    body = body.replace("@VIBE_DOMAIN@",        domain)
 
     with open(out_path, "w") as f:
         f.write(body)

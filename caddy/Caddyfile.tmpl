@@ -3,10 +3,17 @@
 # will be overwritten on the next bootstrap or app toggle.
 #
 # Phase 2 — only the catch-all console site is rendered.
-# Phase 3+ — per-app vhost blocks are spliced in at @VIBE_VHOSTS@ from
-#   /opt/vibe/state.json's enabled-apps list.
+# Phase 3+ — per-app vhost blocks are spliced in at the bottom of this
+#   file from /opt/vibe/state.json's enabled-apps list.
 # Phase 6 — global block (email/acme/etc.) is filled in by snippet
 #   selection (caddy/snippets/{domain,lan,tailscale}.conf).
+#
+# IMPORTANT: do not reference placeholder tokens like the V-I-B-E one
+# verbatim in comments. The renderer's substitution is global — a
+# comment "spliced at <placeholder> from" will get its placeholder
+# expanded too, and a multi-line replacement (e.g. when several apps
+# are enabled) corrupts the comment and shifts directives outside
+# their site blocks. Refer to the placeholders descriptively instead.
 
 {
 	# Admin API stays on the default localhost:2019 binding (inside the
@@ -34,9 +41,10 @@
 # unknown hostnames; in LAN and Tailscale modes it's where every
 # request lands and per-app traffic is split off by path prefix.
 #
-# Once a domain is configured (Phase 3 onward), per-app named vhosts at
-# @VIBE_VHOSTS@ below take precedence; this site stays as the safety
-# net for direct-IP hits and the catch-all that surfaces the console.
+# Once a domain is configured (Phase 3 onward), the per-app named
+# vhosts emitted at the bottom of this file take precedence; this
+# site stays as the safety net for direct-IP hits and the catch-all
+# that surfaces the console.
 @VIBE_LISTEN@ {
 @VIBE_TLS_DIRECTIVE@
 	encode gzip zstd
@@ -50,7 +58,8 @@
 
 	# Per-app path-prefix handlers — only populated in LAN and Tailscale
 	# modes. In domain mode this marker resolves to a comment because
-	# the apps live at their own subdomains under @VIBE_VHOSTS@.
+	# the apps live at their own subdomains in the per-app vhost blocks
+	# at the bottom of this file.
 @VIBE_PATH_HANDLERS@
 
 	# Default — everything not matched above proxies to the console.
