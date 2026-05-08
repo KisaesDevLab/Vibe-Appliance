@@ -409,8 +409,17 @@ PYEOF
   if _caddy_can_validate; then
     if ! _caddy_validate "$tmp"; then
       log_warn "rendered Caddyfile failed validation; aborting install" tmp="$tmp"
+      # Persist the failed render to a stable, predictable path so the
+      # operator can paste it back when reporting the bug. The previous
+      # behavior removed $tmp here, leaving "cat $tmp" with No such file
+      # — exactly when we need the file most.
+      local failed_path="${VIBE_CADDY_DIR}/Caddyfile.failed"
+      cp "$tmp" "$failed_path" 2>/dev/null || true
       rm -f "$tmp"
-      die "Caddyfile rendered to $tmp but didn't validate. Live config unchanged."
+      log_error "Failed render kept at: $failed_path"
+      log_error "Inspect with: sudo cat $failed_path"
+      log_error "Validation error is in this log a few lines above (look for 'Error: adapting config')"
+      die "Caddyfile rendered to $failed_path but didn't validate. Live config unchanged."
     fi
     log_info "Caddyfile validated"
   else
