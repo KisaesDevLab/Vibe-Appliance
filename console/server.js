@@ -38,10 +38,11 @@ const ENABLE_SCRIPT  = path.join(APPLIANCE_DIR, 'lib', 'enable-app.sh');
 const DISABLE_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'disable-app.sh');
 const DOCTOR_SCRIPT  = path.join(APPLIANCE_DIR, 'doctor.sh');
 const UPDATE_SCRIPT  = path.join(APPLIANCE_DIR, 'update.sh');
-const PRUNE_SCRIPT          = path.join(APPLIANCE_DIR, 'prune-images.sh');
-const CLOUDFLARED_UP_SCRIPT = path.join(APPLIANCE_DIR, 'infra', 'cloudflared-up.sh');
-const LOGS_DIR              = path.join(VIBE_DIR, 'logs');
-const ENV_DIR               = path.join(VIBE_DIR, 'env');
+const PRUNE_SCRIPT             = path.join(APPLIANCE_DIR, 'prune-images.sh');
+const CLOUDFLARED_UP_SCRIPT    = path.join(APPLIANCE_DIR, 'infra', 'cloudflared-up.sh');
+const CLOUDFLARED_DOWN_SCRIPT  = path.join(APPLIANCE_DIR, 'infra', 'cloudflared-down.sh');
+const LOGS_DIR                 = path.join(VIBE_DIR, 'logs');
+const ENV_DIR                  = path.join(VIBE_DIR, 'env');
 
 // Whitelist of log file basenames the admin tail endpoint will serve.
 // Restricting by name (rather than path) blocks ../ shenanigans up
@@ -999,6 +1000,14 @@ app.post('/api/v1/admin/cloudflare/discover', requireAdmin, testRateLimit, async
 // have to SSH. Returns { exit_code, stdout, stderr } on completion.
 app.post('/api/v1/admin/cloudflare/provision', requireAdmin, testRateLimit, async (_req, res) => {
   await runShell(res, [CLOUDFLARED_UP_SCRIPT], 'cloudflared-up');
+});
+
+// Tear-down — wraps cloudflared-down.sh. Stops the container, deletes
+// the CNAMEs that point at this tunnel, deletes the tunnel object at
+// Cloudflare, strips TUNNEL_TOKEN from shared.env. Same idempotent
+// runShell pattern.
+app.post('/api/v1/admin/cloudflare/teardown', requireAdmin, testRateLimit, async (_req, res) => {
+  await runShell(res, [CLOUDFLARED_DOWN_SCRIPT], 'cloudflared-down');
 });
 
 // Current tunnel state — powers the wizard's "Tunnel currently up" /
