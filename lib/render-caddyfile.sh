@@ -90,11 +90,22 @@ def list_enabled_apps(state, manifests_dir):
     return out
 
 
-def render_vhost(slug, manifest, mode, domain):
+def render_vhost(slug, manifest, mode, domain, tls_internal=False):
     """
     Emit a single Caddy site block for the app under domain mode at
     `<subdomain>.<domain>`. Returns empty for non-domain modes — those
     use path-prefix handlers via render_path_handler() instead.
+
+    tls_internal=True makes Caddy use its embedded local CA for the
+    cert (self-signed). Required when the appliance is fronted by
+    Cloudflare Tunnel: port 80 isn't reachable from the public
+    internet (it's all going through outbound TCP 7844), so Let's
+    Encrypt's HTTP-01 challenge can't validate. Caddy keeps trying,
+    fails, has no cert, returns 'TLS internal error' to cloudflared
+    on every request, and the public sees 502. With tls internal,
+    Caddy issues a self-signed cert immediately; cloudflared's
+    ingress noTLSVerify=true accepts it; Cloudflare's edge handles
+    the real public TLS to the user.
     """
     if mode != "domain" or not domain:
         return ""
@@ -107,6 +118,8 @@ def render_vhost(slug, manifest, mode, domain):
     default_upstream = routing["default_upstream"]
 
     lines = [f"{host} {{"]
+    if tls_internal:
+        lines.append("    tls internal")
     lines.append("    encode gzip zstd")
     lines.append("    log {")
     lines.append("        output stdout")
@@ -175,7 +188,7 @@ INFRA_SERVICES = [
 ]
 
 
-def render_apex_vhost(domain):
+def render_apex_vhost(domain, tls_internal=False):
     """Render the apex site block for domain mode.
 
     Without this, requests to https://<domain>/ have no matching site
@@ -189,11 +202,18 @@ def render_apex_vhost(domain):
     console (which serves the public landing page at / and the admin
     UI at /admin). www.<domain> is included as a comma-separated alias
     so `www.firm.com` works too.
+
+    tls_internal: same rationale as render_vhost — when the tunnel is
+    in front of Caddy, Let's Encrypt issuance can't complete (port 80
+    not reachable), so use Caddy's local CA and let Cloudflare's edge
+    do the public TLS.
     """
     if not domain:
         return ""
+    tls_line = "    tls internal\n" if tls_internal else ""
     return (
         f"{domain}, www.{domain} {{\n"
+        f"{tls_line}"
         f"    encode gzip zstd\n"
         f"    log {{\n"
         f"        output stdout\n"
@@ -213,7 +233,7 @@ def render_apex_vhost(domain):
     )
 
 
-def render_infra_vhost(svc, mode, domain):
+def render_infra_vhost(svc, mode, domain, tls_internal=False):
     """Render a domain-mode site block for an infra service."""
     if mode != "domain" or not domain:
         return ""
@@ -222,6 +242,8 @@ def render_infra_vhost(svc, mode, domain):
     scheme = svc.get("scheme", "http")
     proxy_target = f"{scheme}://{upstream}" if scheme == "https" else upstream
     lines = [f"{host} {{"]
+    if tls_internal:
+        lines.append("    tls internal")
     lines.append("    encode gzip zstd")
     lines.append("    log {")
     lines.append("        output stdout")
@@ -374,10 +396,30 @@ def main():
     domain = config.get("domain", "")
     email = config.get("email", "")
 
+    # Tunnel detection — when CLOUDFLARE_TUNNEL_ENABLED=true is in
+    # appliance.env, all per-host site blocks switch to `tls internal`
+    # so Caddy uses its local CA instead of attempting Let's Encrypt
+    # HTTP-01 (which can't complete because port 80 isn't reachable
+    # from the public internet — Cloudflare's edge is the only public
+    # ingress, and it's already terminating TLS for the user). Without
+    # this switch, every request through the tunnel gets a 502 with
+    # "TLS internal error" because Caddy keeps failing issuance.
+    appliance_env = _read_appliance_env("/opt/vibe/env/appliance.env")
+    tunnel_active = (appliance_env.get("CLOUDFLARE_TUNNEL_ENABLED", "")
+                     .strip().lower() == "true")
+
     with open(tmpl_path) as f:
         body = f.read()
 
     global_snippet = render_global_snippet(snippets_dir, mode, email)
+
+    # Tunnel mode: also disable Caddy's global auto_https so it stops
+    # background-issuing (and failing) certs. Append to the global
+    # snippet — the snippet is what fills the global block in the
+    # template, so adding `auto_https off` here lands it inside the
+    # outer `{ ... }`.
+    if tunnel_active and mode == "domain":
+        global_snippet = global_snippet.rstrip("\n") + "\n\tauto_https off\n"
 
     enabled = list_enabled_apps(state, manifests_dir)
 
@@ -389,18 +431,21 @@ def main():
         # in domain mode regardless of whether the tunnel is active —
         # the apex is also the canonical landing page in plain
         # port-forwarded domain mode.
-        vhost_pieces = [render_apex_vhost(domain)]
+        vhost_pieces = [render_apex_vhost(domain, tls_internal=tunnel_active)]
         # Per-app vhosts (only when there are enabled apps).
         if enabled:
             vhost_pieces.append("\n".join(
-                render_vhost(slug, m, mode, domain)
+                render_vhost(slug, m, mode, domain, tls_internal=tunnel_active)
                 for slug, m in enabled
             ))
         else:
             vhost_pieces.append("# (no apps enabled yet)\n")
         vhost_blocks = "\n".join(p for p in vhost_pieces if p.strip())
         # Infra-service vhosts always emitted in domain mode.
-        infra_vhosts = "\n".join(render_infra_vhost(s, mode, domain) for s in INFRA_SERVICES)
+        infra_vhosts = "\n".join(
+            render_infra_vhost(s, mode, domain, tls_internal=tunnel_active)
+            for s in INFRA_SERVICES
+        )
         if infra_vhosts.strip():
             vhost_blocks = vhost_blocks.rstrip("\n") + "\n\n" + infra_vhosts
         path_blocks = "\t# (domain mode: apps and infra live at their own subdomains)"
