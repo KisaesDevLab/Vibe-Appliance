@@ -612,19 +612,47 @@ _seed_app_data_dirs() {
     fi
   fi
 
+  # Pre-create every bind-mount source path declared in the overlay
+  # under /opt/vibe/data/apps/<slug>/. Without this, docker auto-
+  # creates the missing host paths as root:root at compose-up time;
+  # the chown -R below only walks what already exists, so the
+  # auto-created subdirs stay root-owned and the non-root container
+  # user crashes with EACCES on first mkdir inside the volume
+  # (originally surfaced via vibe-tx-converter PDF upload).
+  mkdir -p "$data_dir"
+  local sub
+  while IFS= read -r sub; do
+    [[ -n "$sub" ]] && mkdir -p "$sub"
+  done < <(_collect_bind_mount_sources "$slug")
+
   local uid_gid
   uid_gid="$(_image_uid_gid "$image")"
   if [[ -z "$uid_gid" || "$uid_gid" == "0:0" ]]; then
     log_info "image runs as root; no chown needed" slug="$slug" image="$image"
-    mkdir -p "$data_dir"
     return 0
   fi
 
   log_step "ensuring $data_dir is owned by $uid_gid (image $image)"
-  mkdir -p "$data_dir"
   chown -R "$uid_gid" "$data_dir" \
     || { log_warn "chown failed on $data_dir" uid_gid="$uid_gid"; return 1; }
   return 0
+}
+
+# Enumerate bind-mount source paths under /opt/vibe/data/apps/<slug>/
+# from the app's overlay file. Used by _seed_app_data_dirs to pre-create
+# subdirs before chown -R, so docker doesn't auto-create them as
+# root:root at compose-up time.
+#
+# Emits one absolute host path per line on stdout. Matches volume
+# entries shaped like "  - /opt/vibe/data/apps/<slug>/<sub>:<...>"
+# and ignores comment lines.
+_collect_bind_mount_sources() {
+  local slug="$1"
+  local overlay="${APPLIANCE_DIR}/apps/${slug}.yml"
+  [[ -f "$overlay" ]] || return 0
+  grep -E "^[[:space:]]*-[[:space:]]+${VIBE_DIR}/data/apps/${slug}/[^:[:space:]]+:" "$overlay" \
+    | sed -E "s|^[[:space:]]*-[[:space:]]+(${VIBE_DIR}/data/apps/${slug}/[^:[:space:]]+):.*$|\1|" \
+    | sort -u
 }
 
 # Resolve the runtime UID:GID for a Docker image.
