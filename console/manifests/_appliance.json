@@ -47,7 +47,7 @@
         "tier":            1,
         "category":        "Network",
         "label":           "DNS / cert challenge",
-        "helpText":        "HTTP-01 is the default and works with the stock caddy:2-alpine image — needs inbound port 80 reachable. The DNS-01 options need an opt-in custom Caddy build (one Dockerfile per provider under caddy/) and don't need port 80 open; both can issue a single wildcard cert covering every subdomain.",
+        "helpText":        "HTTP-01 is the default and works with the stock caddy:2-alpine image — needs inbound port 80 reachable. The DNS-01 options need an opt-in custom Caddy build (one Dockerfile per provider under caddy/) and don't need port 80 open; both can issue a single wildcard cert covering every subdomain. NOTE: when Cloudflare Tunnel is enabled, this setting is informational — Caddy uses internal self-signed certs and Cloudflare's edge handles public TLS. The credential fields below stay hidden in that mode because they aren't used.",
         "input":           "dropdown",
         "appliance":       "shared",
         "validate":        "enum",
@@ -57,9 +57,7 @@
           { "value": "cloudflare",      "label": "Cloudflare DNS-01 (wildcard; needs Cloudflare nameservers + custom Caddy build)" },
           { "value": "generic-dns-01",  "label": "Generic DNS-01 (Namecheap; wildcard; needs custom Caddy build)" }
         ],
-        "postSaveJob":     "dns-provider-switch",
-        "dependsOnFields": ["CLOUDFLARE_TUNNEL_ENABLED"],
-        "hideIf":          { "CLOUDFLARE_TUNNEL_ENABLED": "true" }
+        "postSaveJob":     "dns-provider-switch"
       }
     },
     {
