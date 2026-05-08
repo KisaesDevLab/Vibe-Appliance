@@ -175,6 +175,44 @@ INFRA_SERVICES = [
 ]
 
 
+def render_apex_vhost(domain):
+    """Render the apex site block for domain mode.
+
+    Without this, requests to https://<domain>/ have no matching site
+    on Caddy's :443 listener — the per-subdomain blocks (tb., mybooks.,
+    etc.) only match their specific FQDN. Caddy returns no response,
+    and any upstream fronted by Cloudflare Tunnel (which forwards to
+    https://caddy:443) translates the connection failure into a 502
+    Bad Gateway at the public edge.
+
+    The apex site mirrors the :80 catch-all: routes everything to the
+    console (which serves the public landing page at / and the admin
+    UI at /admin). www.<domain> is included as a comma-separated alias
+    so `www.firm.com` works too.
+    """
+    if not domain:
+        return ""
+    return (
+        f"{domain}, www.{domain} {{\n"
+        f"    encode gzip zstd\n"
+        f"    log {{\n"
+        f"        output stdout\n"
+        f"        format console\n"
+        f"    }}\n"
+        f"\n"
+        f"    handle /caddy-health {{\n"
+        f"        respond \"ok\" 200\n"
+        f"    }}\n"
+        f"\n"
+        f"    handle {{\n"
+        f"        reverse_proxy console:3000 {{\n"
+        f"            header_up X-Real-IP {{remote_host}}\n"
+        f"        }}\n"
+        f"    }}\n"
+        f"}}\n"
+    )
+
+
 def render_infra_vhost(svc, mode, domain):
     """Render a domain-mode site block for an infra service."""
     if mode != "domain" or not domain:
@@ -344,14 +382,23 @@ def main():
     enabled = list_enabled_apps(state, manifests_dir)
 
     if mode == "domain" and domain:
+        # Apex site — handles https://<domain>/ and www.<domain>. Without
+        # this, Cloudflare Tunnel ingress for the apex hostname forwards
+        # to caddy:443 with no matching site, Caddy returns no response,
+        # cloudflared translates that into 502 Bad Gateway. Always emit
+        # in domain mode regardless of whether the tunnel is active —
+        # the apex is also the canonical landing page in plain
+        # port-forwarded domain mode.
+        vhost_pieces = [render_apex_vhost(domain)]
         # Per-app vhosts (only when there are enabled apps).
         if enabled:
-            vhost_blocks = "\n".join(
+            vhost_pieces.append("\n".join(
                 render_vhost(slug, m, mode, domain)
                 for slug, m in enabled
-            )
+            ))
         else:
-            vhost_blocks = "# (no apps enabled yet)\n"
+            vhost_pieces.append("# (no apps enabled yet)\n")
+        vhost_blocks = "\n".join(p for p in vhost_pieces if p.strip())
         # Infra-service vhosts always emitted in domain mode.
         infra_vhosts = "\n".join(render_infra_vhost(s, mode, domain) for s in INFRA_SERVICES)
         if infra_vhosts.strip():
