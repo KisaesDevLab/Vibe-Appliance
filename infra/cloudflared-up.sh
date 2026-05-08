@@ -32,6 +32,44 @@
 
 set -uo pipefail
 
+# --- Flag parsing ------------------------------------------------------
+# Single optional flag for now: --auto-enable forces
+# CLOUDFLARE_TUNNEL_ENABLED=true to be written to appliance.env if it
+# isn't already there. Useful when the admin Settings save flow has
+# rolled back a change and the operator is sure they want the tunnel
+# on. All four other Cloudflare creds still need to be present in
+# appliance.env — this flag only flips the toggle, never invents the
+# token.
+AUTO_ENABLE=0
+for arg in "$@"; do
+  case "$arg" in
+    --auto-enable) AUTO_ENABLE=1 ;;
+    -h|--help)
+      cat <<'HELP'
+infra/cloudflared-up.sh — provision and start the Cloudflare Tunnel.
+
+Usage:
+  sudo bash /opt/vibe/appliance/infra/cloudflared-up.sh [--auto-enable]
+
+Flags:
+  --auto-enable   Force CLOUDFLARE_TUNNEL_ENABLED=true in appliance.env
+                  if it isn't already. The four Cloudflare API fields
+                  must still be filled in via Settings → Network or
+                  by hand-editing appliance.env.
+
+Reads from /opt/vibe/env/appliance.env:
+  CLOUDFLARE_TUNNEL_ENABLED, CLOUDFLARE_TUNNEL_API_TOKEN,
+  CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_ZONE_ID, CLOUDFLARE_TUNNEL_NAME
+
+Reverse: infra/cloudflared-down.sh.
+HELP
+      exit 0 ;;
+    *)
+      echo "unknown flag: $arg (try --help)" >&2
+      exit 2 ;;
+  esac
+done
+
 # --- Self-locate, source helpers ---------------------------------------
 
 _self="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -70,15 +108,91 @@ CF_ZONE_ID="$(_get_env_value CLOUDFLARE_ZONE_ID)"
 CF_TUNNEL_NAME="$(_get_env_value CLOUDFLARE_TUNNEL_NAME)"
 CF_TUNNEL_NAME="${CF_TUNNEL_NAME:-vibe-appliance}"
 
-if [[ "$CF_TUNNEL_ENABLED" != "true" ]]; then
-  die "CLOUDFLARE_TUNNEL_ENABLED is not 'true'. Toggle it on in the admin Settings → Network → Cloudflare Tunnel, save, then re-run this script. Or hand-edit ${VIBE_ENV_APPLIANCE} (mode 600 root-owned) directly."
-fi
-[[ -n "$CF_TUNNEL_API_TOKEN" ]] || die "CLOUDFLARE_TUNNEL_API_TOKEN missing from $VIBE_ENV_APPLIANCE — fill it in via Settings → Network."
-[[ -n "$CF_ACCOUNT_ID"       ]] || die "CLOUDFLARE_ACCOUNT_ID missing from $VIBE_ENV_APPLIANCE — fill it in via Settings → Network."
-[[ -n "$CF_ZONE_ID"          ]] || die "CLOUDFLARE_ZONE_ID missing from $VIBE_ENV_APPLIANCE — fill it in via Settings → Network."
+# Trim quotes/whitespace from values that might have been hand-edited
+# with surrounding quotes ("true" vs true). settings-save.sh writes
+# unquoted, but a tolerant reader is friendlier.
+_strip_value() { local v="$1"; v="${v#\"}"; v="${v%\"}"; v="${v#\'}"; v="${v%\'}"; v="${v## }"; v="${v%% }"; printf '%s' "$v"; }
+CF_TUNNEL_ENABLED="$(_strip_value "$CF_TUNNEL_ENABLED")"
 
-# Read domain from state.json — the script needs the apex to construct
-# FQDNs for the CNAMEs.
+# --- Diagnostic for the most common first-run failure ----------------
+# If the toggle isn't 'true', tell the operator exactly what was found
+# and how to recover. This is the error that bit operators because the
+# original message just said "Toggle it in Settings" without revealing
+# whether the file existed, what value it actually had, or how to
+# inspect it.
+
+_pre_flight_help() {
+  cat <<HELP
+
+  Diagnose what's in the file:
+    sudo grep '^CLOUDFLARE_' $VIBE_ENV_APPLIANCE
+    sudo cat $VIBE_ENV_APPLIANCE   # full contents (mode 600 root)
+
+  Recovery options (any one):
+    1. UI:   open the admin Configuration → Network tab, toggle
+             "Cloudflare Tunnel" ON, fill in the four API fields,
+             click Save (watch for a "Saved" or "Rolled back" banner).
+    2. Hand-edit $VIBE_ENV_APPLIANCE (root-only) and add:
+             CLOUDFLARE_TUNNEL_ENABLED=true
+       and the four other CLOUDFLARE_* fields documented in INSTALL.md
+       Option E.
+    3. Re-run this script with --auto-enable to flip just the toggle:
+             sudo bash $0 --auto-enable
+       (the four API creds must already be present.)
+HELP
+}
+
+if [[ "$CF_TUNNEL_ENABLED" != "true" ]]; then
+  if [[ "$AUTO_ENABLE" == "1" ]]; then
+    log_warn "CLOUDFLARE_TUNNEL_ENABLED was '${CF_TUNNEL_ENABLED:-(unset)}'; --auto-enable forcing it to 'true' in $VIBE_ENV_APPLIANCE"
+    # Atomic update: filter out any prior line, append the new one,
+    # rename. mode 600 preserved.
+    tmp="${VIBE_ENV_APPLIANCE}.tmp.$$"
+    {
+      [[ -f "$VIBE_ENV_APPLIANCE" ]] && grep -v '^CLOUDFLARE_TUNNEL_ENABLED=' "$VIBE_ENV_APPLIANCE" || true
+      printf 'CLOUDFLARE_TUNNEL_ENABLED=true\n'
+    } > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$VIBE_ENV_APPLIANCE"
+    CF_TUNNEL_ENABLED="true"
+  else
+    case "$CF_TUNNEL_ENABLED" in
+      "")
+        msg="CLOUDFLARE_TUNNEL_ENABLED is NOT SET in $VIBE_ENV_APPLIANCE. The toggle in Settings → Network → Cloudflare Tunnel was never saved (or the file was hand-edited)."
+        ;;
+      "false")
+        msg="CLOUDFLARE_TUNNEL_ENABLED=false in $VIBE_ENV_APPLIANCE — the toggle is OFF."
+        ;;
+      *)
+        msg="CLOUDFLARE_TUNNEL_ENABLED has unexpected value '${CF_TUNNEL_ENABLED}' in $VIBE_ENV_APPLIANCE — expected 'true' or 'false'."
+        ;;
+    esac
+    log_error "$msg"
+    _pre_flight_help >&2
+    die "Cloudflare Tunnel cannot start until CLOUDFLARE_TUNNEL_ENABLED=true."
+  fi
+fi
+
+# --- Required API creds ----------------------------------------------
+# At this point ENABLED=true. The other four fields must be present
+# and non-empty regardless of how we got here. Diagnose missing keys
+# specifically so the operator knows which one to fix.
+_missing=()
+[[ -n "$CF_TUNNEL_API_TOKEN" ]] || _missing+=("CLOUDFLARE_TUNNEL_API_TOKEN")
+[[ -n "$CF_ACCOUNT_ID"       ]] || _missing+=("CLOUDFLARE_ACCOUNT_ID")
+[[ -n "$CF_ZONE_ID"          ]] || _missing+=("CLOUDFLARE_ZONE_ID")
+if (( ${#_missing[@]} > 0 )); then
+  log_error "Cloudflare API fields missing from $VIBE_ENV_APPLIANCE: ${_missing[*]}"
+  _pre_flight_help >&2
+  die "fill the missing field(s) and re-run."
+fi
+
+# Read domain + mode from state.json. We need the apex to construct
+# FQDNs for the CNAMEs and the mode to validate that Caddy is
+# actually listening on :443 (the tunnel forwards to caddy:443 with
+# noTLSVerify; if Caddy's mode-driven Caddyfile only emits a :80
+# listener — LAN mode — the tunnel comes up but hits a "connection
+# refused" inside vibe_net and every public request 502s).
 DOMAIN="$(python3 -c "
 import json, sys
 try:
@@ -87,10 +201,38 @@ try:
 except Exception:
   pass
 " 2>/dev/null || true)"
+MODE="$(python3 -c "
+import json, sys
+try:
+  s = json.load(open('$VIBE_STATE_FILE'))
+  print((s.get('config') or {}).get('mode', '') or '')
+except Exception:
+  pass
+" 2>/dev/null || true)"
 
 if [[ -z "$DOMAIN" ]]; then
   die "state.config.domain not set in $VIBE_STATE_FILE. Cloudflare Tunnel needs to know the apex domain. Re-run bootstrap.sh with --mode domain --domain <yours> first."
 fi
+
+# Caddy listens on :443 in domain mode and tailscale mode. LAN mode is
+# :80-only, which means the tunnel's https://caddy:443 ingress target
+# won't have anything answering. Soft-warn for LAN mode rather than
+# fail — an operator who's deliberately tweaked the Caddyfile by hand
+# might know what they're doing. Anything other than the three known
+# modes is unrecognised and worth a hard failure.
+case "$MODE" in
+  domain|tailscale)
+    : ;;
+  lan)
+    log_warn "state.config.mode is 'lan' — Caddy only listens on :80, but the tunnel forwards to https://caddy:443. Public requests through the tunnel will 502. Re-run bootstrap.sh with --mode domain --domain $DOMAIN before running this script, or hand-edit the Caddyfile to add a :443 listener."
+    ;;
+  "")
+    die "state.config.mode is empty — bootstrap.sh has not been run, or state.json was wiped. Run bootstrap.sh --mode domain --domain $DOMAIN first."
+    ;;
+  *)
+    log_warn "state.config.mode='$MODE' is not one of domain/tailscale/lan — proceeding, but verify Caddy is listening on :443."
+    ;;
+esac
 
 # --- Cloudflare API helpers --------------------------------------------
 

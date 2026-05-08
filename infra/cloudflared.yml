@@ -34,10 +34,12 @@ services:
     restart: unless-stopped
     # `tunnel run` in connector-token mode. The token comes from the
     # TUNNEL_TOKEN env var (set in shared.env by cloudflared-up.sh
-    # after the Cloudflare API returns it). --no-autoupdate keeps the
-    # binary version locked to whatever's in the image — safer for
-    # reproducibility, and updates land via image pulls instead.
-    command: tunnel --no-autoupdate run
+    # after the Cloudflare API returns it). --no-autoupdate is already
+    # in the image's ENTRYPOINT (`cloudflared --no-autoupdate`), so we
+    # don't repeat it here — duplicating it produced argv:
+    #   cloudflared --no-autoupdate tunnel --no-autoupdate run
+    # which trips cloudflared's flag parser at the subcommand level.
+    command: tunnel run
     env_file:
       # Provides TUNNEL_TOKEN. shared.env already mounts mode 600
       # root-owned per the appliance secrets convention; the token is
