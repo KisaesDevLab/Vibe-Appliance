@@ -988,23 +988,30 @@ app.post('/api/v1/admin/cloudflare/discover', requireAdmin, testRateLimit, async
     });
   }
 
-  // 2. List accessible accounts. The token's permissions filter this
-  // automatically — operators with a single Cloudflare account get one
-  // result; multi-account ops get a dropdown.
-  const accountsResp = await _testFetch('https://api.cloudflare.com/client/v4/accounts?per_page=50', {
-    headers: cfHeaders,
-  });
-  let accountsJson = null;
-  try { accountsJson = JSON.parse(accountsResp.body); } catch { /* ignore */ }
-  if (!accountsResp.ok || !accountsJson || !accountsJson.success) {
-    return res.json({
-      ok:    false,
-      error: 'Could not list accounts. Token may lack the Account:Read implicit permission. Re-create with Account.Cloudflare-Tunnel:Edit (which implies Account:Read) AND Zone.DNS:Edit.',
-    });
-  }
-  const accounts = (accountsJson.result || []).map(a => ({ id: a.id, name: a.name }));
+  // 2. List accessible accounts. BEST EFFORT — we don't bail when this
+  // returns empty, because Cloudflare's token model for narrow scopes
+  // (e.g. Zone.DNS:Edit + Account.Cloudflare-Tunnel:Edit on a specific
+  // account) sometimes excludes the token from the top-level /accounts
+  // listing even though it has full per-resource access. Every zone
+  // object in the /zones response includes its parent account.id and
+  // account.name — we derive the account list from there if /accounts
+  // comes back empty.
+  let accounts = [];
+  try {
+    const accountsResp = await _testFetch(
+      'https://api.cloudflare.com/client/v4/accounts?per_page=50',
+      { headers: cfHeaders },
+    );
+    if (accountsResp.ok) {
+      const accountsJson = JSON.parse(accountsResp.body);
+      if (accountsJson && accountsJson.success && Array.isArray(accountsJson.result)) {
+        accounts = accountsJson.result.map(a => ({ id: a.id, name: a.name }));
+      }
+    }
+  } catch { /* fall through — derive from zones below */ }
 
-  // 3. List accessible zones. Same permission story.
+  // 3. List accessible zones. Required — without zones the wizard has
+  // no CNAME targets and the tunnel has nowhere to route to.
   const zonesResp = await _testFetch('https://api.cloudflare.com/client/v4/zones?per_page=200', {
     headers: cfHeaders,
   });
@@ -1017,28 +1024,44 @@ app.post('/api/v1/admin/cloudflare/discover', requireAdmin, testRateLimit, async
     });
   }
   const zones = (zonesJson.result || []).map(z => ({
-    id:         z.id,
-    name:       z.name,
-    account_id: z.account && z.account.id,
+    id:           z.id,
+    name:         z.name,
+    account_id:   z.account && z.account.id,
+    account_name: z.account && z.account.name,
   }));
 
-  // Guard against the most common silently-broken case: token has
-  // Account.Cloudflare-Tunnel:Edit but lacks Zone.DNS:Edit on any
-  // zone, or the operator's Cloudflare account has no zones added
-  // yet. Either way, an empty zones list means there's nothing to
-  // CNAME → the wizard would render empty dropdowns and provision
-  // would fail at the DNS-record-create step. Bail with a hint
-  // instead.
   if (zones.length === 0) {
     return res.json({
       ok: false,
       error: 'Token verified but no zones are accessible. Either (a) the token is missing Zone.DNS:Edit, or (b) you haven\'t added any domains to this Cloudflare account yet. Re-create the token at https://dash.cloudflare.com/profile/api-tokens with both Account.Cloudflare-Tunnel:Edit AND Zone.DNS:Edit, and confirm at https://dash.cloudflare.com that the target domain is listed.',
     });
   }
+
+  // Derive accounts from zones[].account when /accounts came back empty.
+  // Tokens scoped narrowly (Account.Cloudflare-Tunnel:Edit on a
+  // SPECIFIC account + Zone.DNS:Edit on a SPECIFIC zone) commonly hit
+  // this — the token has full permission to do tunnel + DNS work, just
+  // not to enumerate the parent account. The zone list always includes
+  // the parent account info, so we have everything we need.
   if (accounts.length === 0) {
+    const seen = new Set();
+    for (const z of zones) {
+      if (z.account_id && !seen.has(z.account_id)) {
+        seen.add(z.account_id);
+        accounts.push({
+          id:   z.account_id,
+          name: z.account_name || z.account_id,
+        });
+      }
+    }
+  }
+
+  if (accounts.length === 0) {
+    // Both /accounts AND /zones[].account are empty — token genuinely
+    // can't reach any account. This is the bail-here case.
     return res.json({
       ok: false,
-      error: 'Token verified but no accounts are accessible. The token may need broader Account-level scope. Re-create at https://dash.cloudflare.com/profile/api-tokens.',
+      error: 'Token verified but neither /accounts nor /zones returned any account context. The token must have Account.Cloudflare-Tunnel:Edit on at least one account AND Zone.DNS:Edit on at least one zone. Re-create at https://dash.cloudflare.com/profile/api-tokens.',
     });
   }
 

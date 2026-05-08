@@ -14,7 +14,7 @@
 // operators can confirm in DevTools (F12 → Console) that the file
 // they're running is the version they expect, vs. a stale cached
 // copy. Compare against the server's /api/v1/version response.
-const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-3';
+const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-4-zone-derived-accounts';
 
 (function () {
   // eslint-disable-next-line no-console
