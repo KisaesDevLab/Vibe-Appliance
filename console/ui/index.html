@@ -80,13 +80,6 @@
           <dd><a href="${escapeHtml(a.emergencyUrl)}">${escapeHtml(a.emergencyUrl)}</a>
             <span class="muted">(LAN/Tailscale only)</span></dd>` : '';
 
-        // Default admin username — surfaced so end users see what
-        // account to log in with. Password is deliberately NOT shown
-        // here; operators get it via /admin only.
-        const userRow = a.username ? `
-          <dt>username</dt>
-          <dd><span class="mono">${escapeHtml(a.username)}</span></dd>` : '';
-
         return `
         <article class="app-card">
           <header class="app-card__head">
@@ -96,7 +89,6 @@
           <dl class="kv app-card__kv">
             <dt>primary</dt><dd>${primaryUrl}</dd>
             ${emergencyRow}
-            ${userRow}
           </dl>
           <div class="app-card__actions">
             <a class="btn" href="${escapeHtml(a.url)}" target="_blank" rel="noopener noreferrer">Open</a>

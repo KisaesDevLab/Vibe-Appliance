@@ -794,10 +794,6 @@ app.get('/api/v1/public/apps', (_req, res) => {
       // sidecar on the LAN. Null when host_ip or emergencyPort missing.
       emergencyUrl:  appEmergencyUrl(m, config),
       emergencyNote: m.emergencyNote || null,
-      // Default admin username from the manifest. Password is
-      // deliberately NOT exposed on the public endpoint — operators
-      // see it only behind admin auth via /api/v1/first-login.
-      username:    m.firstLogin && m.firstLogin.username || null,
     }))
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
   res.json({ apps: items });
