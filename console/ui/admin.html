@@ -215,31 +215,37 @@
       </details>
 
       <details style="margin-top:0.8rem;border:1px solid #0f172a1a;border-radius:6px;padding:0.6rem 0.8rem;">
-        <summary style="cursor:pointer;font-weight:600;">Cloudflare Tunnel &mdash; no port forwarding, no public IP</summary>
+        <summary style="cursor:pointer;font-weight:600;">Cloudflare Tunnel &mdash; publish selected apps without port forwarding</summary>
         <div style="margin-top:0.8rem;line-height:1.55;">
-          <p><strong>When to use:</strong> Public clients need to reach the appliance, but you can&rsquo;t (or won&rsquo;t) open ports 80/443. Common cases: home installs behind double-NAT or carrier-grade NAT, residential ISPs that block inbound TCP/80, datacenter VMs on internal networks, or adding Cloudflare&rsquo;s DDoS protection without changing infrastructure.</p>
+          <p><strong>When to use:</strong> Some of your apps need to be reachable from the public internet (typically Vibe-Connect&rsquo;s client portal), but you can&rsquo;t (or won&rsquo;t) open ports 80/443. Common cases: home installs behind double-NAT or carrier-grade NAT, residential ISPs that block inbound TCP/80, datacenter VMs on internal networks, or adding Cloudflare&rsquo;s DDoS protection.</p>
 
           <p style="background:rgba(184,114,46,0.10);border:1px solid var(--accent);padding:0.65rem 0.8rem;border-radius:4px;">
-            <strong>Easiest path: use the in-page wizard.</strong> Open
-            <a href="/admin/settings">Configuration &rarr; Network</a>, toggle
-            <em>Cloudflare Tunnel</em> ON, and the four-step wizard appears
-            below the form. Paste an API token; the wizard verifies it,
-            auto-detects your account &amp; zone IDs, programmatically writes
-            the four fields, and provisions the tunnel via an admin endpoint
-            &mdash; no SSH required. Steps below are the manual / power-user
-            path; both produce the same end-state.
+            <strong>Use the in-page wizard. It&rsquo;s the supported path.</strong> Open
+            <a href="/admin/settings">Configuration &rarr; Network</a>; the
+            <em>Cloudflare Tunnel</em> wizard is the first section. Paste an API
+            token; the wizard verifies it, auto-detects your account &amp; zone IDs,
+            shows checkboxes for the apps you can publish (apex/admin/cockpit/
+            portainer/backup are deliberately excluded), and provisions the
+            tunnel &mdash; no SSH. The steps below are reference / fallback only.
+          </p>
+
+          <p style="background:#fef3c7;border:1px solid #f59e0b;padding:0.65rem 0.8rem;border-radius:4px;">
+            <strong>Scope.</strong> The tunnel publishes only the apps you tick on the wizard&rsquo;s
+            <em>Apps to publish</em> list. Apex/admin/<span class="mono">cockpit.</span>/<span class="mono">portainer.</span>/<span class="mono">backup.</span>
+            are never tunnelled by design &mdash; they stay LAN/Tailscale-only. For off-LAN admin access, use Tailscale (section above).
           </p>
 
           <p><strong>Prerequisites</strong></p>
           <ul>
             <li>Cloudflare account (free).</li>
             <li>Your domain&rsquo;s DNS hosted on Cloudflare&rsquo;s nameservers. The domain&rsquo;s registration can stay anywhere (Namecheap, GoDaddy, etc.) &mdash; only the NS records change. The switch is free, doesn&rsquo;t touch registration, and propagates in minutes.</li>
+            <li>At least one Vibe app enabled (Apps tab) so the wizard&rsquo;s publish list isn&rsquo;t empty.</li>
             <li>Outbound TCP 7844 allowed from the host (virtually all ISPs and firewalls allow this).</li>
           </ul>
 
-          <p><strong>Steps (manual path &mdash; skip if using the wizard above)</strong></p>
+          <p><strong>Recommended path: the wizard</strong></p>
           <ol>
-            <li><strong>Move DNS to Cloudflare</strong> if you haven&rsquo;t already. Cloudflare&rsquo;s onboarding flow:
+            <li><strong>Move DNS to Cloudflare</strong> if you haven&rsquo;t already.
               <ul>
                 <li>Sign up at <span class="mono">cloudflare.com</span>, click <em>Add site</em>, enter your domain.</li>
                 <li>Cloudflare imports your existing DNS records and gives you two nameservers.</li>
@@ -248,48 +254,28 @@
               </ul>
             </li>
 
-            <li><strong>Create a Cloudflare API token</strong> at <span class="mono">dash.cloudflare.com/profile/api-tokens</span> → <em>Create Token</em> → <em>Custom token</em>. Set permissions:
+            <li><strong>Create a Cloudflare API token</strong> at <span class="mono">dash.cloudflare.com/profile/api-tokens</span> → <em>Create Token</em> → <em>Custom token</em>. Required permissions:
               <ul>
-                <li><strong>Account &rarr; Cloudflare Tunnel &rarr; Edit</strong> (lets the script create + manage the tunnel)</li>
-                <li><strong>Zone &rarr; DNS &rarr; Edit</strong> (lets the script create CNAMEs for each subdomain)</li>
+                <li><strong>Account &rarr; Cloudflare Tunnel &rarr; Edit</strong> (lets the wizard create + manage the tunnel)</li>
+                <li><strong>Zone &rarr; DNS &rarr; Edit</strong> (lets the wizard create CNAMEs for each ticked app)</li>
               </ul>
-              Account Resources → <em>Include &rarr; Specific account &rarr; &lt;your account&gt;</em>. Zone Resources → <em>Include &rarr; Specific zone &rarr; &lt;your domain&gt;</em>. Save the token value somewhere &mdash; Cloudflare won&rsquo;t show it again.
+              Account Resources → <em>Include &rarr; Specific account &rarr; &lt;your account&gt;</em>. Zone Resources → <em>Include &rarr; Specific zone &rarr; &lt;your domain&gt;</em>. Save the token value &mdash; Cloudflare won&rsquo;t show it again.
             </li>
 
-            <li><strong>Find your Account ID and Zone ID.</strong>
+            <li><strong>Run the wizard.</strong> Open <a href="/admin/settings">Configuration &rarr; Network</a>. The Cloudflare Tunnel section is at the top:
               <ul>
-                <li><strong>Account ID:</strong> visible at the top of any Account-level page (Account Home, Workers &amp; Pages sidebar). Or copy it out of the URL: <span class="mono">dash.cloudflare.com/&lt;account-id&gt;/...</span></li>
-                <li><strong>Zone ID:</strong> bottom-right of the Overview page for the specific domain.</li>
+                <li>Click <em>Set up Cloudflare Tunnel</em>. The wizard verifies that your domain is on Cloudflare nameservers (DoH lookup) and prompts for the API token.</li>
+                <li>Paste the token, click <em>Verify and continue</em>. The wizard auto-fills your account ID, zone ID, and tunnel name.</li>
+                <li>Tick each app you want published under <em>Apps to publish</em>. The wizard shows the FQDN preview (e.g. <span class="mono">connect.firm.com</span>) so you see exactly what&rsquo;s about to go public.</li>
+                <li>Click <em>Provision tunnel</em>. ~15&ndash;30 seconds; the wizard surfaces the script&rsquo;s output if anything fails.</li>
               </ul>
-            </li>
-
-            <li><strong>Save the four values in the appliance.</strong> Open <a href="/admin/settings">Configuration</a> &rarr; <em>Network</em> tab and:
-              <ul>
-                <li>Toggle <em>Cloudflare Tunnel</em> &rarr; <strong>Enabled</strong>.</li>
-                <li>Paste the API token, account ID, and zone ID into the fields that appear.</li>
-                <li>Leave <em>Cloudflare tunnel name</em> at <span class="mono">vibe-appliance</span> unless you&rsquo;re running multiple appliances under one Cloudflare account.</li>
-                <li>Click <strong>Save</strong>. The values land in <span class="mono">/opt/vibe/env/appliance.env</span> (mode 600, root-owned).</li>
-              </ul>
-            </li>
-
-            <li><strong>Run the setup script on the host.</strong> SSH in, then:
-              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">sudo bash /opt/vibe/appliance/infra/cloudflared-up.sh</pre>
-              The script is idempotent &mdash; safe to re-run. It does, in order:
-              <ol>
-                <li>Validates your API token via a no-side-effect account fetch.</li>
-                <li>Looks up the tunnel by name; creates it if missing.</li>
-                <li>Builds the ingress config from <span class="mono">state.apps</span> + manifests &mdash; one rule per enabled app&rsquo;s subdomain plus apex, www, and the infra subdomains (<span class="mono">cockpit</span>, <span class="mono">portainer</span>, <span class="mono">backup</span>).</li>
-                <li>PUTs the ingress to Cloudflare; creates or updates one CNAME per published host pointing at <span class="mono">&lt;tunnel-id&gt;.cfargotunnel.com</span>.</li>
-                <li>Fetches the connector token and writes it to <span class="mono">/opt/vibe/env/shared.env</span> as <span class="mono">TUNNEL_TOKEN</span>.</li>
-                <li>Runs <span class="mono">docker compose ... up -d cloudflared</span> &mdash; the tunnel container connects to Cloudflare&rsquo;s edge over outbound TCP 7844.</li>
-              </ol>
             </li>
 
             <li><strong>Verify from outside your LAN</strong> (cellular tether is easiest):
-              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">curl -sI https://yourdomain.com/admin
-curl -sI https://tb.yourdomain.com/</pre>
+              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">curl -sI https://connect.yourdomain.com/</pre>
               200 / 302 / 401 responses mean the tunnel is working. Connection refused or timeout means the connector isn&rsquo;t connected &mdash; check the container logs:
               <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">sudo docker logs vibe-cloudflared --tail 30</pre>
+              Note: <span class="mono">https://yourdomain.com/admin</span> will <strong>not</strong> load over the tunnel &mdash; that&rsquo;s by design. Use Tailscale or your LAN to reach the admin UI.
             </li>
 
             <li><strong>(Optional) Tighten the firewall</strong> &mdash; the public internet no longer needs to reach 80/443:
@@ -298,26 +284,44 @@ curl -sI https://tb.yourdomain.com/</pre>
             </li>
           </ol>
 
-          <p><strong>Adding apps later</strong></p>
-          <p>The script reads <span class="mono">state.apps[*].enabled</span> fresh each run. To publish a new app: enable it from the <em>Apps</em> tab, then re-run the up-script:</p>
-          <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">sudo bash /opt/vibe/appliance/infra/cloudflared-up.sh</pre>
-          <p>The script picks up the new subdomain, creates the CNAME, and pushes the updated ingress config. ~5 second round-trip; no container restart needed.</p>
+          <p><strong>Adding/removing apps later</strong></p>
+          <p>Re-open the wizard. The <em>Apps to publish</em> checkboxes are pre-ticked to match the live tunnel; toggle them, click <em>Save &amp; re-provision</em>. Idempotent &mdash; ~5 second round-trip; no container restart.</p>
 
-          <p><strong>To remove</strong></p>
-          <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">sudo bash /opt/vibe/appliance/infra/cloudflared-down.sh</pre>
-          <p>Stops the container, deletes <em>only</em> the CNAMEs that point at this tunnel, deletes the tunnel object at Cloudflare, strips <span class="mono">TUNNEL_TOKEN</span> from <span class="mono">shared.env</span>. Operator-added CNAMEs pointing elsewhere are never touched.</p>
+          <p><strong>To remove the tunnel entirely</strong></p>
+          <p>In the wizard, click <em>Tear down</em>. That stops the cloudflared container, deletes only the CNAMEs that point at this tunnel, deletes the tunnel object at Cloudflare, and clears <span class="mono">TUNNEL_TOKEN</span> from <span class="mono">shared.env</span>. Operator-added CNAMEs pointing elsewhere are never touched. Equivalent SSH command if the wizard is unreachable: <span class="mono">sudo bash /opt/vibe/appliance/infra/cloudflared-down.sh</span>.</p>
+
+          <p><strong>Manual / fallback path (when the wizard is broken)</strong></p>
+          <ol>
+            <li>Hand-edit <span class="mono">/opt/vibe/env/appliance.env</span> (mode 600, root-only). Add or update:
+              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">CLOUDFLARE_TUNNEL_ENABLED=true
+CLOUDFLARE_TUNNEL_API_TOKEN=&lt;your-token&gt;
+CLOUDFLARE_ACCOUNT_ID=&lt;32-char-hex&gt;
+CLOUDFLARE_ZONE_ID=&lt;32-char-hex&gt;
+CLOUDFLARE_TUNNEL_NAME=vibe-appliance
+CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
+              <span class="mono">CLOUDFLARE_TUNNEL_PUBLISH</span> is comma-separated app slugs (matches the manifest filenames in <span class="mono">console/manifests/</span>); empty = nothing published, script bails.
+            </li>
+            <li>Run the up script:
+              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">sudo bash /opt/vibe/appliance/infra/cloudflared-up.sh</pre>
+              Idempotent. Same as the wizard&rsquo;s Provision step minus the UI.
+            </li>
+            <li>To tear down:
+              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">sudo bash /opt/vibe/appliance/infra/cloudflared-down.sh</pre>
+            </li>
+          </ol>
 
           <p><strong>Verification</strong></p>
           <ul>
             <li><span class="mono">sudo docker logs vibe-cloudflared --tail 30</span> shows lines like <em>&ldquo;Connection registered with location &lt;X&gt;&rdquo;</em> &mdash; that&rsquo;s the connector successfully dialing Cloudflare&rsquo;s edge.</li>
             <li>Cloudflare dashboard &rarr; <em>Zero Trust</em> &rarr; <em>Networks</em> &rarr; <em>Tunnels</em>: your tunnel shows <em>Healthy</em> with at least one active connector.</li>
-            <li>From outside the LAN, <span class="mono">https://yourdomain.com/admin</span> loads, served with a Cloudflare-issued cert.</li>
+            <li>From outside the LAN, each ticked app&rsquo;s subdomain loads, served with a Cloudflare-issued cert.</li>
           </ul>
 
           <p><strong>Gotchas</strong></p>
           <ul>
-            <li><strong>Two distinct Cloudflare API tokens.</strong> The token you create here (<em>Account.Cloudflare Tunnel:Edit</em> + <em>Zone.DNS:Edit</em>) is for tunnel automation. The separate <span class="mono">CLOUDFLARE_API_TOKEN</span> field used for ACME-DNS cert issuance has a narrower scope (<em>Zone.DNS:Edit</em> only). Both can coexist; don&rsquo;t reuse the same token unless you scope it broadly enough for both jobs.</li>
-            <li><strong>Caddy&rsquo;s cert situation becomes mostly moot.</strong> Cloudflare&rsquo;s edge does TLS to the real client; the tunnel forwards to <span class="mono">https://caddy:443</span> with <span class="mono">noTLSVerify</span>. Caddy still needs <em>some</em> cert to handshake on 443 internally &mdash; its self-signed default works fine.</li>
+            <li><strong>Two distinct Cloudflare API tokens.</strong> The token the wizard takes (<em>Account.Cloudflare Tunnel:Edit</em> + <em>Zone.DNS:Edit</em>) is for tunnel automation. The separate <span class="mono">CLOUDFLARE_API_TOKEN</span> field used for ACME-DNS cert issuance has a narrower scope (<em>Zone.DNS:Edit</em> only). Both can coexist; don&rsquo;t reuse the same token unless you scope it broadly enough for both jobs.</li>
+            <li><strong>Caddy&rsquo;s cert situation becomes mostly moot.</strong> Cloudflare&rsquo;s edge does TLS to the real client; the tunnel forwards to <span class="mono">https://caddy:443</span> with <span class="mono">noTLSVerify</span>. Caddy still needs <em>some</em> cert to handshake on 443 internally &mdash; its self-signed default works fine, and the appliance switches to <span class="mono">tls internal</span> automatically when the tunnel is on.</li>
+            <li><strong>Admin and infra subdomains are LAN/Tailscale-only.</strong> If you need the admin UI off-LAN, run Tailscale alongside the tunnel &mdash; the appliance supports both at once. Don&rsquo;t hand-add CNAMEs for apex/cockpit/portainer/backup: <span class="mono">cloudflared-down.sh</span> wouldn&rsquo;t clean them up, and the script intentionally never publishes them.</li>
             <li><strong>Tunnel adds ~50&ndash;100ms latency</strong> vs a direct connection. Fine for normal browser use; may be noticeable for real-time features.</li>
             <li><strong>Some apps&rsquo; OAuth callback URLs</strong> need to be set to the public Cloudflare-served domain. Adjust app-side configs accordingly when migrating from a direct-domain setup.</li>
             <li><strong>Emergency fallback ports (5171&ndash;5198) stay LAN-only</strong> by design &mdash; we don&rsquo;t add tunnel ingress rules for them. The whole point of the emergency proxy is to be reachable when the primary path (Cloudflare-Caddy-app) is broken; routing it through Cloudflare too defeats that.</li>

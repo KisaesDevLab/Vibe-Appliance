@@ -1079,9 +1079,60 @@ app.post('/api/v1/admin/cloudflare/discover', requireAdmin, testRateLimit, async
 // pattern as prune-images. The script is idempotent and self-validates;
 // this endpoint is just an HTTP shell over it so the operator doesn't
 // have to SSH. Returns { exit_code, stdout, stderr } on completion.
-app.post('/api/v1/admin/cloudflare/provision', requireAdmin, testRateLimit, async (_req, res) => {
+//
+// Body (optional): { publishSlugs: string[] }. When provided, the endpoint
+// atomically writes CLOUDFLARE_TUNNEL_PUBLISH=<csv> to appliance.env
+// before invoking the script. Empty/missing body re-uses whatever value
+// is already in appliance.env (re-provision flow). The script itself
+// validates that each slug names a real, ENABLED app — invalid slugs
+// surface as warnings in stdout/stderr and are skipped.
+app.post('/api/v1/admin/cloudflare/provision', requireAdmin, testRateLimit, async (req, res) => {
+  const body = req.body || {};
+  if (Array.isArray(body.publishSlugs)) {
+    // Validate slug format up front. The script does its own
+    // "is this a real manifest" + "is it enabled" checks; we just
+    // refuse anything that obviously can't be a slug (path traversal,
+    // shell metacharacters, etc.) before persisting it.
+    for (const s of body.publishSlugs) {
+      if (typeof s !== 'string' || !SLUG_RE.test(s)) {
+        return res.status(400).json({ error: 'invalid slug in publishSlugs: ' + JSON.stringify(s) });
+      }
+    }
+    // De-dupe + canonicalise. Script tolerates duplicates but a clean
+    // env-file is friendlier when the operator inspects it manually.
+    const seen = new Set();
+    const ordered = [];
+    for (const s of body.publishSlugs) {
+      if (!seen.has(s)) { seen.add(s); ordered.push(s); }
+    }
+    try {
+      writeEnvKey(path.join(ENV_DIR, 'appliance.env'), 'CLOUDFLARE_TUNNEL_PUBLISH', ordered.join(','));
+    } catch (err) {
+      log('error', 'writing CLOUDFLARE_TUNNEL_PUBLISH failed', { err: err.message });
+      return res.status(500).json({ error: 'persisting publish list failed: ' + err.message });
+    }
+  }
   await runShell(res, [CLOUDFLARED_UP_SCRIPT], 'cloudflared-up');
 });
+
+// writeEnvKey — atomic single-key update of an env file. Filters out
+// any prior line for the key, appends the new value, renames into place
+// at mode 600. Mirrors the bash idiom used in lib/secrets.sh and
+// cloudflared-up.sh's --auto-enable path. Throws on write failure.
+function writeEnvKey(filePath, key, value) {
+  const tmpPath = filePath + '.tmp.' + Date.now() + '.' + crypto.randomBytes(4).toString('hex');
+  let prior = '';
+  try { prior = fs.readFileSync(filePath, 'utf8'); } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+  const filtered = prior.split('\n')
+    .filter(line => !line.startsWith(key + '='))
+    .join('\n');
+  const trimmed = filtered.endsWith('\n') ? filtered : filtered + (filtered ? '\n' : '');
+  const next = trimmed + key + '=' + value + '\n';
+  fs.writeFileSync(tmpPath, next, { mode: 0o600 });
+  fs.renameSync(tmpPath, filePath);
+}
 
 // Tear-down — wraps cloudflared-down.sh. Stops the container, deletes
 // the CNAMEs that point at this tunnel, deletes the tunnel object at
@@ -1136,10 +1187,30 @@ app.get('/api/v1/admin/cloudflare/status', requireAdmin, async (_req, res) => {
     tokenPresent = !!(sharedEnv.TUNNEL_TOKEN || '').trim();
   } catch { /* file missing → token absent → tunnel not up */ }
 
+  // Published slug list — wizard reads this to pre-tick checkboxes on
+  // re-entry. Comma-separated in appliance.env, normalised to an array
+  // here so the client doesn't re-implement the parser. Filtered to
+  // slugs that have a real manifest (typo guard) AND are enabled in
+  // state.json (publishing a disabled app is a no-op at the script
+  // level, but the UI shouldn't pretend it's published).
+  let publishedSlugs = [];
+  try {
+    const applianceEnv = parseEnvFile(path.join(ENV_DIR, 'appliance.env'));
+    const csv = (applianceEnv.CLOUDFLARE_TUNNEL_PUBLISH || '').trim();
+    if (csv) {
+      const state = readState();
+      const stateApps = state.apps || {};
+      publishedSlugs = csv.split(',')
+        .map(s => s.trim())
+        .filter(s => s && SLUG_RE.test(s) && MANIFESTS[s] && (stateApps[s] || {}).enabled);
+    }
+  } catch { /* file missing → empty list */ }
+
   res.json({
     container_status: containerStatus,
     token_present:    tokenPresent,
     last_run_ts:      lastRunTs,
+    published_slugs:  publishedSlugs,
   });
 });
 

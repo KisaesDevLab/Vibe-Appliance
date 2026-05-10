@@ -17,18 +17,31 @@
 #   CLOUDFLARE_ACCOUNT_ID           target Cloudflare account
 #   CLOUDFLARE_ZONE_ID              the appliance domain's zone ID
 #   CLOUDFLARE_TUNNEL_NAME          tunnel object name; default vibe-appliance
+#   CLOUDFLARE_TUNNEL_PUBLISH       comma-separated slug list of enabled
+#                                   apps to expose over the tunnel.
+#                                   Required and must be non-empty —
+#                                   apex/admin and infra subdomains
+#                                   (cockpit/portainer/backup) are NEVER
+#                                   tunnelled and stay LAN/Tailscale-only.
 #
 # Reads enabled apps + the operator's domain from /opt/vibe/state.json.
 # Walks /opt/vibe/appliance/console/manifests/*.json to map each
-# enabled app's slug → subdomain.
+# selected slug → subdomain.
 #
 # Side effects:
 #   - one tunnel object created in Cloudflare (idempotent: looked up by name)
-#   - one CNAME per published host (apex, www, cockpit, portainer, backup,
-#     plus every enabled app's subdomain) pointing at <tunnel-id>.cfargotunnel.com
+#   - one CNAME per app subdomain in CLOUDFLARE_TUNNEL_PUBLISH that is
+#     also state.apps[slug].enabled, pointing at <tunnel-id>.cfargotunnel.com
 #   - TUNNEL_TOKEN written to /opt/vibe/env/shared.env (mode 600)
 #   - vibe-cloudflared container brought up via the infra/cloudflared.yml
 #     compose extension
+#
+# Hosts NEVER tunnelled (by design):
+#   - apex (@) and www — landing page + /admin live there; admin auth
+#     belongs on LAN/Tailscale only.
+#   - cockpit, portainer, backup — host management, container management,
+#     and Duplicati are administrative surfaces. Reach them on the LAN
+#     or via Tailscale.
 
 set -uo pipefail
 
@@ -107,12 +120,14 @@ CF_ACCOUNT_ID="$(_get_env_value CLOUDFLARE_ACCOUNT_ID)"
 CF_ZONE_ID="$(_get_env_value CLOUDFLARE_ZONE_ID)"
 CF_TUNNEL_NAME="$(_get_env_value CLOUDFLARE_TUNNEL_NAME)"
 CF_TUNNEL_NAME="${CF_TUNNEL_NAME:-vibe-appliance}"
+CF_TUNNEL_PUBLISH="$(_get_env_value CLOUDFLARE_TUNNEL_PUBLISH)"
 
 # Trim quotes/whitespace from values that might have been hand-edited
 # with surrounding quotes ("true" vs true). settings-save.sh writes
 # unquoted, but a tolerant reader is friendlier.
 _strip_value() { local v="$1"; v="${v#\"}"; v="${v%\"}"; v="${v#\'}"; v="${v%\'}"; v="${v## }"; v="${v%% }"; printf '%s' "$v"; }
 CF_TUNNEL_ENABLED="$(_strip_value "$CF_TUNNEL_ENABLED")"
+CF_TUNNEL_PUBLISH="$(_strip_value "$CF_TUNNEL_PUBLISH")"
 
 # --- Diagnostic for the most common first-run failure ----------------
 # If the toggle isn't 'true', tell the operator exactly what was found
@@ -185,6 +200,25 @@ if (( ${#_missing[@]} > 0 )); then
   log_error "Cloudflare API fields missing from $VIBE_ENV_APPLIANCE: ${_missing[*]}"
   _pre_flight_help >&2
   die "fill the missing field(s) and re-run."
+fi
+
+# --- Publish list (which apps go public) ------------------------------
+# Empty publish list = abort. No "default to all enabled" fallback —
+# that's how landing/admin/infra surfaces leaked publicly before.
+if [[ -z "$CF_TUNNEL_PUBLISH" ]]; then
+  log_error "CLOUDFLARE_TUNNEL_PUBLISH is empty in $VIBE_ENV_APPLIANCE — no apps selected to publish."
+  cat >&2 <<HELP
+
+  Recovery options (any one):
+    1. UI:   open Configuration → Network → Cloudflare Tunnel wizard,
+             tick at least one app under "Apps to publish", click
+             Provision tunnel.
+    2. Hand-edit $VIBE_ENV_APPLIANCE (root-only) and add a line like:
+             CLOUDFLARE_TUNNEL_PUBLISH=tb,connect
+       Use comma-separated app slugs. Each slug must match a manifest
+       in $APPLIANCE_DIR/console/manifests/ AND be enabled in state.json.
+HELP
+  die "fill CLOUDFLARE_TUNNEL_PUBLISH with at least one app slug and re-run."
 fi
 
 # Read domain + mode from state.json. We need the apex to construct
@@ -327,10 +361,10 @@ TARGET_CONTENT="${TUNNEL_ID}.cfargotunnel.com"
 
 # --- 3. Build ingress config from enabled apps + manifests ------------
 
-log_step "building ingress config from enabled apps"
-INGRESS_JSON="$(python3 - "$VIBE_STATE_FILE" "$APPLIANCE_DIR/console/manifests" "$DOMAIN" <<'PYEOF'
+log_step "building ingress config from publish list"
+INGRESS_JSON="$(python3 - "$VIBE_STATE_FILE" "$APPLIANCE_DIR/console/manifests" "$DOMAIN" "$CF_TUNNEL_PUBLISH" <<'PYEOF'
 import json, os, sys
-state_file, manifests_dir, domain = sys.argv[1], sys.argv[2], sys.argv[3]
+state_file, manifests_dir, domain, publish_csv = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
 try:
   state = json.load(open(state_file))
@@ -352,18 +386,41 @@ for f in sorted(os.listdir(manifests_dir)):
   if slug and sub:
     slug_to_sub[slug] = sub
 
-# Hosts we publish to Cloudflare:
-#   - apex (@) and www so the operator can hit the root
-#   - infra subdomains (cockpit/portainer/backup) — these always exist
-#     on the appliance regardless of which apps are enabled
-#   - one subdomain per ENABLED app (state.apps.<slug>.enabled === true)
-hosts = ["@", "www", "cockpit", "portainer", "backup"]
-for slug, app in apps.items():
-  if (app or {}).get("enabled") and slug in slug_to_sub:
-    hosts.append(slug_to_sub[slug])
+# Parse the operator-supplied publish list. Whitespace-tolerant; empty
+# tokens (trailing commas, double commas) are dropped silently. The
+# pre-flight in the calling shell already rejected an empty list.
+requested = [s.strip() for s in publish_csv.split(",")]
+requested = [s for s in requested if s]
 
-# Dedupe, preserve order — a manifest accidentally claiming 'www' as
-# its subdomain (unlikely but possible) shouldn't blow up the API call.
+# Validate each requested slug:
+#   - must exist as a manifest (typo guard)
+#   - must be enabled in state.apps[slug].enabled (publishing a disabled
+#     app would create a dangling CNAME that 502s)
+# Skipped slugs go to stderr as warnings; the script continues so a
+# typo on slug N doesn't kill an otherwise-correct provision of N-1
+# valid slugs.
+hosts = []
+for slug in requested:
+  if slug not in slug_to_sub:
+    print(f"[cloudflared-up] WARN: slug '{slug}' has no manifest under {manifests_dir} — skipping",
+          file=sys.stderr)
+    continue
+  if not (apps.get(slug) or {}).get("enabled"):
+    print(f"[cloudflared-up] WARN: slug '{slug}' is not enabled in state.json — skipping. "
+          f"Enable the app from the admin UI first, then re-run this script.",
+          file=sys.stderr)
+    continue
+  hosts.append(slug_to_sub[slug])
+
+if not hosts:
+  print("[cloudflared-up] ERROR: publish list resolved to zero valid hosts. "
+        "Check that each slug in CLOUDFLARE_TUNNEL_PUBLISH names a real, ENABLED app.",
+        file=sys.stderr)
+  sys.exit(2)
+
+# Dedupe, preserve order. Two manifests claiming the same subdomain
+# would otherwise produce duplicate ingress rules; Cloudflare rejects
+# that with a 400.
 seen, ordered = set(), []
 for h in hosts:
   if h not in seen:
@@ -375,9 +432,14 @@ for h in hosts:
 # self-signed, doesn't matter — Cloudflare's edge does TLS to the
 # real client). The catch-all 404 at the end is required by Cloudflare
 # Tunnel — without it the tunnel rejects the config.
+#
+# Apex (@) and www are NOT included — landing page + admin UI live there
+# and stay LAN/Tailscale-only. Infra subdomains (cockpit/portainer/
+# backup) are also excluded for the same reason. See the script header
+# for the full rationale.
 ingress = []
 for host in ordered:
-  fqdn = domain if host == "@" else f"{host}.{domain}"
+  fqdn = f"{host}.{domain}"
   ingress.append({
     "hostname": fqdn,
     "service":  "https://caddy:443",
@@ -388,6 +450,11 @@ ingress.append({ "service": "http_status:404" })
 print(json.dumps({ "config": { "ingress": ingress } }))
 PYEOF
 )"
+# python3 exited non-zero (e.g. publish list resolved to zero valid hosts)
+# — bail with a clear message rather than pushing an empty config.
+if [[ -z "$INGRESS_JSON" ]]; then
+  die "ingress build failed; see the WARN/ERROR lines above."
+fi
 
 # --- 4. Push ingress config to the tunnel -----------------------------
 
@@ -402,14 +469,11 @@ cf_check_success "$config_resp" "tunnel configurations PUT" \
 
 # create_or_update_cname host  →  ensure a proxied CNAME exists at
 # <host>.<domain> pointing at <tunnel-id>.cfargotunnel.com.
+# `host` is always a non-empty subdomain token; the apex (@) and www
+# are deliberately excluded from this script — see header.
 create_or_update_cname() {
   local host="$1"
-  local fqdn
-  if [[ "$host" == "@" ]]; then
-    fqdn="$DOMAIN"
-  else
-    fqdn="${host}.${DOMAIN}"
-  fi
+  local fqdn="${host}.${DOMAIN}"
 
   local search
   search="$(cf_api GET "/zones/$CF_ZONE_ID/dns_records?type=CNAME&name=$fqdn")"
@@ -458,9 +522,9 @@ print(json.dumps({
 }
 
 log_step "ensuring DNS CNAMEs point at the tunnel"
-# Walk the ingress hosts (skip the catch-all). Convert FQDN back to
-# the host token (apex → @, sub.domain → sub) so create_or_update_cname
-# can build the right zone-side path.
+# Walk the ingress hosts (skip the catch-all). Strip the trailing
+# .DOMAIN to get the host token. Apex/www are excluded by construction
+# in the python builder above — every ingress hostname is sub.DOMAIN.
 for fqdn in $(python3 -c "
 import json, sys
 d = json.loads(sys.argv[1])
@@ -469,12 +533,7 @@ for e in d['config']['ingress']:
   if h:
     print(h)
 " "$INGRESS_JSON"); do
-  if [[ "$fqdn" == "$DOMAIN" ]]; then
-    create_or_update_cname "@"
-  else
-    # Strip the trailing .DOMAIN to get the host token.
-    create_or_update_cname "${fqdn%.${DOMAIN}}"
-  fi
+  create_or_update_cname "${fqdn%.${DOMAIN}}"
 done
 
 # --- 6. Fetch the connector token, persist to shared.env --------------
@@ -510,13 +569,34 @@ log_step "bringing up cloudflared container"
   || die "compose up cloudflared failed; see $VIBE_LOG_FILE"
 
 log_ok "Cloudflare Tunnel is up" tunnel_id="$TUNNEL_ID" tunnel_name="$CF_TUNNEL_NAME"
+
+# Pretty list of the published FQDNs for the operator's confirmation.
+PUBLISHED_FQDNS="$(python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+out = [e['hostname'] for e in d['config']['ingress'] if e.get('hostname')]
+print('\n  '.join(out))
+" "$INGRESS_JSON" 2>/dev/null || true)"
+FIRST_FQDN="$(printf '%s\n' "$PUBLISHED_FQDNS" | head -n1 | sed 's/^[[:space:]]*//')"
+
 printf '\n'
 printf 'Cloudflare Tunnel "%s" is up.\n' "$CF_TUNNEL_NAME"
 printf '  Tunnel ID:    %s\n' "$TUNNEL_ID"
 printf '  CNAME target: %s\n' "$TARGET_CONTENT"
 printf '  Container:    docker logs vibe-cloudflared --tail 30\n'
 printf '\n'
-printf 'Verify the tunnel from a network OUTSIDE your LAN (e.g. cellular):\n'
-printf '  curl -sI https://%s/ — should succeed without your router forwarding 80/443.\n' "$DOMAIN"
-printf '  If 5xx errors come back, the container started but the cert handshake at caddy:443 is\n'
-printf '  failing — check `docker logs vibe-cloudflared`.\n'
+printf 'Published over the tunnel (public on the internet):\n'
+printf '  %s\n' "$PUBLISHED_FQDNS"
+printf '\n'
+printf 'NOT published (LAN/Tailscale-only by design):\n'
+printf '  %s, www.%s, cockpit.%s, portainer.%s, backup.%s\n' \
+  "$DOMAIN" "$DOMAIN" "$DOMAIN" "$DOMAIN" "$DOMAIN"
+printf '\n'
+printf 'Verify from a network OUTSIDE your LAN (e.g. cellular):\n'
+if [[ -n "$FIRST_FQDN" ]]; then
+  printf '  curl -sI https://%s/ — 200/302/401 means the tunnel is working.\n' "$FIRST_FQDN"
+else
+  printf '  (no published apps; nothing external to test)\n'
+fi
+printf '  5xx responses usually mean Caddy:443 is unreachable inside vibe_net —\n'
+printf '  check `docker logs vibe-cloudflared --tail 30` for the connector handshake.\n'

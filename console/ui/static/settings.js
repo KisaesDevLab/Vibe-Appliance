@@ -14,7 +14,7 @@
 // operators can confirm in DevTools (F12 → Console) that the file
 // they're running is the version they expect, vs. a stale cached
 // copy. Compare against the server's /api/v1/version response.
-const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-6-show-dns-dropdown';
+const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-7-publish-list';
 
 (function () {
   // eslint-disable-next-line no-console
@@ -1013,10 +1013,16 @@ const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-6-show-dns-dropdown';
     });
     host.appendChild(section);
 
+    // Default screen=IDLE so the first synchronous paint() shows the
+    // Set-up button even if /cloudflare/status is slow. bootstrap()
+    // upgrades to UP when the tunnel is already running.
+    // selectedSlugs vs publishedSlugs: the former is the operator's
+    // working set (READY pre-Provision, UP mid-edit); the latter
+    // mirrors appliance.env's CLOUDFLARE_TUNNEL_PUBLISH. The diff is
+    // what makes the UP screen's button label "Save & re-provision".
+    // dnsBypassed: lets the operator continue past a failed NS probe
+    // (corporate DNS sometimes blocks DoH).
     const wiz = {
-      // Default to IDLE immediately — bootstrap() may upgrade to UP
-      // asynchronously, but the operator never sees a blank "loading"
-      // screen even if /cloudflare/status is slow or unreachable.
       screen:    'IDLE',
       domain:    null,
       nsOk:      null,
@@ -1029,15 +1035,10 @@ const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-6-show-dns-dropdown';
       output:    '',
       lastRunTs: null,
       error:     '',
-      // dnsBypassed: operator clicked "Continue anyway" past the DNS
-      // check — we let them through even when DoH says NS aren't on
-      // Cloudflare, because some networks block DoH and the operator
-      // may know better than the probe.
-      dnsBypassed: false,
-      // bootstrapped: false until bootstrap() finishes its async
-      // fetches. Used by paintIdle so the first synchronous paint()
-      // doesn't flash "No domain in state.config.domain" before
-      // /api/v1/state has even responded.
+      enabledApps:    [],
+      selectedSlugs:  [],
+      publishedSlugs: [],
+      dnsBypassed:  false,
       bootstrapped: false,
     };
     let provInterval = null;
@@ -1071,21 +1072,37 @@ const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-6-show-dns-dropdown';
       }
     }
 
-    // bootstrap runs after the initial paint. Upgrades the screen from
-    // the default IDLE to UP when the tunnel is already running. Never
-    // downgrades — if the status check fails, we stay on IDLE so the
-    // operator at least sees the Set-up button.
+    // Upgrades the wizard from the default IDLE to UP when the tunnel
+    // is already running, and populates the publish-list state from
+    // /api/v1/apps + status. Never downgrades — a failed status check
+    // leaves the operator on IDLE with the Set-up button visible.
     async function bootstrap() {
-      wiz.domain = await fetchDomain();
-      try {
-        const r = await fetch('/api/v1/admin/cloudflare/status', { credentials: 'same-origin' });
-        const data = await r.json();
-        wiz.lastRunTs = data.last_run_ts;
-        if (data.container_status === 'running' && data.token_present) {
-          wiz.screen = 'UP';
-        }
-      } catch {
-        // Stay on IDLE; the catch is just to keep paint() reachable.
+      const [domain, appsResp, statusResp] = await Promise.all([
+        fetchDomain(),
+        fetch('/api/v1/apps', { credentials: 'same-origin' }).catch(() => null),
+        fetch('/api/v1/admin/cloudflare/status', { credentials: 'same-origin' }).catch(() => null),
+      ]);
+      wiz.domain = domain;
+
+      if (appsResp && appsResp.ok) {
+        try {
+          const data = await appsResp.json();
+          wiz.enabledApps = (data.apps || [])
+            .filter(a => a.enabled)
+            .map(a => ({ slug: a.slug, displayName: a.displayName, subdomain: a.subdomain }));
+        } catch { /* leave empty; READY screen surfaces the issue */ }
+      }
+
+      if (statusResp && statusResp.ok) {
+        try {
+          const data = await statusResp.json();
+          wiz.lastRunTs = data.last_run_ts;
+          wiz.publishedSlugs = Array.isArray(data.published_slugs) ? data.published_slugs : [];
+          wiz.selectedSlugs  = wiz.publishedSlugs.slice();
+          if (data.container_status === 'running' && data.token_present) {
+            wiz.screen = 'UP';
+          }
+        } catch { /* stay on IDLE */ }
       }
       wiz.bootstrapped = true;
       paint();
@@ -1099,9 +1116,15 @@ const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-6-show-dns-dropdown';
 
     function paintIdle() {
       section.appendChild(el('p', { class: 'help' }, [
-        'Make this appliance reachable from the public internet without forwarding ' +
-        'ports on your router. The appliance dials outbound to Cloudflare\'s edge; ' +
-        'public requests arrive over that tunnel.',
+        'Make selected client-facing apps reachable from the public internet ' +
+        'without forwarding ports on your router. The appliance dials outbound ' +
+        'to Cloudflare\'s edge; public requests for the apps you choose arrive ' +
+        'over that tunnel.',
+      ]));
+      section.appendChild(el('p', { class: 'help', style: 'margin-top:0.4rem;' }, [
+        el('strong', null, ['Stays LAN/Tailscale-only by design:']),
+        ' the public landing page, the admin UI, Cockpit (host), Portainer (containers), ' +
+        'and Duplicati (backup). The tunnel never publishes them, even if you turn it on.',
       ]));
 
       // Three states:
@@ -1322,25 +1345,118 @@ const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-6-show-dns-dropdown';
 
       section.appendChild(grid);
 
+      // Publish-list checkboxes — one row per enabled app, default OFF.
+      // The wizard never auto-selects; the operator opts each app in
+      // explicitly so the surface area is always a deliberate decision.
+      section.appendChild(el('h3', {
+        style: 'margin:1.2rem 0 0.3rem;font-size:0.95rem;text-transform:uppercase;letter-spacing:0.1em;',
+      }, ['Apps to publish']));
+      section.appendChild(el('p', { class: 'help', style: 'margin:0 0 0.4rem;' }, [
+        'Tick each app you want reachable from the public internet through this tunnel. ',
+        el('strong', null, ['At least one is required.']),
+        ' Apex/admin/cockpit/portainer/backup are never published, even if you tick everything below.',
+      ]));
+      section.appendChild(renderPublishList());
+
+      // Live FQDN preview — what the operator is about to expose. Updates
+      // as checkboxes change via repaintPreview().
+      const preview = el('p', {
+        class: 'help', 'data-cf-preview': '1',
+        style: 'margin-top:0.3rem;',
+      });
+      section.appendChild(preview);
+      repaintPreview(preview);
+
       section.appendChild(el('p', { class: 'help', style: 'margin-top:0.6rem;' }, [
         'Provision saves these values to appliance.env, creates the tunnel + CNAMEs at ' +
-        'Cloudflare, and starts the cloudflared container. Idempotent — safe to re-run.',
+        'Cloudflare for the ticked apps only, and starts the cloudflared container. Idempotent — safe to re-run.',
       ]));
 
       const cta = el('div', { class: 'cta-row', style: 'gap:0.5rem;margin-top:0.5rem;' });
-      cta.appendChild(el('button', {
+      const provisionBtn = el('button', {
         type: 'button', class: 'btn',
         onclick: () => provision(),
-      }, ['Provision tunnel']));
+      }, ['Provision tunnel']);
+      cta.appendChild(provisionBtn);
       cta.appendChild(el('button', {
         type: 'button', class: 'btn btn--ghost',
         onclick: () => { wiz.screen = 'SETUP'; paint(); },
       }, ['← Back']));
       section.appendChild(cta);
 
+      // Disable Provision while the publish list is empty — prevents
+      // the obvious failure where the script bails on an empty
+      // CLOUDFLARE_TUNNEL_PUBLISH. Checkbox toggles call paint(), so
+      // this expression re-runs on every list change.
+      provisionBtn.disabled = wiz.selectedSlugs.length === 0;
+
       if (wiz.error) {
         section.appendChild(el('p', { class: 'help', style: 'color:var(--bad);margin-top:0.5rem;' }, ['✗ ' + wiz.error]));
       }
+    }
+
+    // renderPublishList — checkbox per enabled app. Used by both READY
+    // (initial publish-list pick) and UP (edit live publish list).
+    // Mutates wiz.selectedSlugs in place; the onchange handler triggers
+    // paint() so all dependent UI (FQDN preview, button labels, button
+    // disabled state) refreshes from the new list.
+    function renderPublishList() {
+      if (!wiz.enabledApps.length) {
+        return el('p', { class: 'help', style: 'color:var(--warn);' }, [
+          '⚠ No apps are enabled yet. Enable an app from the ',
+          el('a', { href: '/admin' }, ['admin page']),
+          ', then come back and the publish list will populate.',
+        ]);
+      }
+      const wrap = el('div', { style: 'display:grid;gap:0.25rem;max-width:36rem;' });
+      for (const a of wiz.enabledApps) {
+        const id = 'cf-pub-' + a.slug;
+        const checked = wiz.selectedSlugs.includes(a.slug);
+        const row = el('label', {
+          style: 'display:flex;gap:0.5rem;align-items:baseline;cursor:pointer;padding:0.2rem 0;',
+        });
+        const cb = el('input', {
+          type: 'checkbox', id,
+          'data-cf-slug': a.slug,
+          onchange: (e) => {
+            const slug = e.target.getAttribute('data-cf-slug');
+            const ix = wiz.selectedSlugs.indexOf(slug);
+            if (e.target.checked && ix < 0) wiz.selectedSlugs.push(slug);
+            if (!e.target.checked && ix >= 0) wiz.selectedSlugs.splice(ix, 1);
+            // Full re-paint keeps the FQDN preview, the
+            // disable-on-empty button state, and the UP screen's
+            // "Save & re-provision" vs "Re-provision (no changes)"
+            // label all in sync without per-element fiddling.
+            paint();
+          },
+        });
+        if (checked) cb.setAttribute('checked', '');
+        row.appendChild(cb);
+        row.appendChild(el('span', null, [
+          el('span', { style: 'font-weight:600;' }, [a.displayName]),
+          ' — ', el('span', { class: 'mono' }, [a.subdomain + '.' + (wiz.domain || 'firm.com')]),
+        ]));
+        wrap.appendChild(row);
+      }
+      return wrap;
+    }
+
+    // repaintPreview — write the currently-selected FQDN list into the
+    // preview <p>. Cheap; called on every checkbox toggle.
+    function repaintPreview(node) {
+      node.innerHTML = '';
+      if (!wiz.selectedSlugs.length) {
+        node.style.color = 'var(--text-muted)';
+        node.appendChild(el('em', null, ['No apps selected. Tick at least one above.']));
+        return;
+      }
+      const fqdns = wiz.selectedSlugs
+        .map(slug => (wiz.enabledApps.find(a => a.slug === slug) || {}).subdomain)
+        .filter(Boolean)
+        .map(sub => sub + '.' + (wiz.domain || 'firm.com'));
+      node.style.color = 'var(--text)';
+      node.appendChild(el('strong', null, ['Will publish: ']));
+      node.appendChild(document.createTextNode(fqdns.join(', ')));
     }
 
     function paintProvisioning() {
@@ -1349,26 +1465,34 @@ const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-6-show-dns-dropdown';
       ]));
       section.appendChild(el('p', { class: 'help' }, [
         'Typical run is 15–30 seconds. The script:',
-        el('br'), '1. Saves the four CLOUDFLARE_TUNNEL_* values to appliance.env.',
+        el('br'), '1. Saves the five CLOUDFLARE_TUNNEL_* values plus the publish list to appliance.env.',
         el('br'), '2. Creates (or reuses) a tunnel at Cloudflare named "', wiz.tunnelName, '".',
-        el('br'), '3. Creates one CNAME per published host at the zone.',
+        el('br'), '3. Creates one CNAME per ticked app at the zone (apex/admin/infra never get CNAMEs).',
         el('br'), '4. Fetches the connector token, writes it to shared.env.',
         el('br'), '5. Starts the cloudflared container on this appliance.',
       ]));
     }
 
     async function provision() {
+      // Bail before transitioning if the operator somehow clicked
+      // Provision with an empty publish list (e.g. via DevTools).
+      // The button is disabled in that state, but defense in depth is
+      // free — and the script-side error message is opaque.
+      if (!wiz.selectedSlugs.length) {
+        wiz.error = 'Tick at least one app under "Apps to publish" before provisioning.';
+        paint();
+        return;
+      }
+
       wiz.error = '';
       wiz.screen = 'PROVISIONING';
       paint();
-      const start = Date.now();
-      provInterval = setInterval(() => {
-        const sec = Math.floor((Date.now() - start) / 1000);
-        const elNode = section.querySelector('[data-cf-prov]');
-        if (elNode) elNode.textContent = '⋯ Provisioning… (' + sec + ' s)';
-      }, 800);
+      startSpinner('Provisioning');
 
       // 1. Save the five CLOUDFLARE_TUNNEL_* values via settings-save.
+      // The publish list is sent separately to the provision endpoint
+      // because it isn't a manifest-declared setting (settings-save's
+      // strict-scope-match check would reject it).
       const saveBody = {
         changes: [
           { scope: 'appliance', key: 'CLOUDFLARE_TUNNEL_ENABLED',   value: 'true',         category: 'Network', secret: false, op: 'set' },
@@ -1397,11 +1521,15 @@ const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-6-show-dns-dropdown';
         return;
       }
 
-      // 2. Run cloudflared-up.sh.
+      // 2. Run cloudflared-up.sh with the publish list. The endpoint
+      // writes CLOUDFLARE_TUNNEL_PUBLISH=<csv> to appliance.env before
+      // invoking the script.
       let provData;
       try {
         const r = await fetch('/api/v1/admin/cloudflare/provision', {
           method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ publishSlugs: wiz.selectedSlugs }),
         });
         provData = await r.json().catch(() => ({}));
       } catch (err) {
@@ -1412,6 +1540,7 @@ const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-6-show-dns-dropdown';
       wiz.output = [provData.stdout, provData.stderr].filter(Boolean).join('\n').trim();
       if (provData.exit_code === 0) {
         wiz.lastRunTs = new Date().toISOString();
+        wiz.publishedSlugs = wiz.selectedSlugs.slice();
         finishProv('UP');
       } else {
         wiz.error = 'cloudflared-up.sh exit ' + (provData.exit_code != null ? provData.exit_code : '?');
@@ -1425,29 +1554,94 @@ const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-6-show-dns-dropdown';
       paint();
     }
 
+    // Starts the wizard's elapsed-seconds spinner. Caller is responsible
+    // for transitioning to the PROVISIONING screen and calling paint()
+    // before this — the [data-cf-prov] node only exists on that screen.
+    function startSpinner(label) {
+      const start = Date.now();
+      provInterval = setInterval(() => {
+        const sec = Math.floor((Date.now() - start) / 1000);
+        const node = section.querySelector('[data-cf-prov]');
+        if (node) node.textContent = '⋯ ' + label + '… (' + sec + ' s)';
+      }, 800);
+    }
+
     function paintUp() {
       const ageStr = wiz.lastRunTs ? ' (last script run ' + humanAge(wiz.lastRunTs) + ' ago)' : '';
       section.appendChild(el('p', null, [
         el('span', { style: 'color:var(--good);font-weight:600;' }, ['✓ Tunnel is up']),
         el('span', { class: 'help' }, [ageStr]),
       ]));
-      section.appendChild(el('p', { class: 'help' }, [
-        'Domain: ', el('span', { class: 'mono' }, [wiz.domain || '(unknown)']),
-        el('br'),
-        'Verify from outside your LAN: ',
-        el('span', { class: 'mono' }, ['curl -sI https://' + (wiz.domain || 'firm.com') + '/admin']),
+
+      // Currently published list — what's actually publicly reachable
+      // right now. Pulled from /cloudflare/status's published_slugs and
+      // pre-filled into selectedSlugs on bootstrap; rendered live.
+      const publishedFqdns = wiz.publishedSlugs
+        .map(slug => (wiz.enabledApps.find(a => a.slug === slug) || {}))
+        .filter(a => a.subdomain)
+        .map(a => a.subdomain + '.' + (wiz.domain || 'firm.com'));
+
+      if (publishedFqdns.length) {
+        section.appendChild(el('p', { class: 'help' }, [
+          el('strong', null, ['Currently public: ']),
+          el('span', { class: 'mono' }, [publishedFqdns.join(', ')]),
+        ]));
+        section.appendChild(el('p', { class: 'help', style: 'margin-top:0.2rem;' }, [
+          'Verify from outside your LAN (cellular tether is easiest): ',
+          el('span', { class: 'mono' }, ['curl -sI https://' + publishedFqdns[0] + '/']),
+        ]));
+      } else {
+        section.appendChild(el('p', { class: 'help', style: 'color:var(--warn);' }, [
+          '⚠ No apps are currently published. Pick at least one below and click Save & re-provision.',
+        ]));
+      }
+      section.appendChild(el('p', { class: 'help', style: 'margin-top:0.2rem;' }, [
+        el('strong', null, ['Not published (LAN/Tailscale-only): ']),
+        wiz.domain || 'firm.com', ', www.', wiz.domain || 'firm.com',
+        ', cockpit, portainer, backup',
       ]));
 
+      // Inline edit of the publish list. The same checkbox UI as the
+      // READY screen, but the button is "Save & re-provision" instead
+      // of "Provision tunnel" so the operator can adjust without
+      // tearing down. Clicking it skips the token-paste flow because
+      // appliance.env already has the four creds.
+      section.appendChild(el('h3', {
+        style: 'margin:1.2rem 0 0.3rem;font-size:0.95rem;text-transform:uppercase;letter-spacing:0.1em;',
+      }, ['Apps to publish']));
+      section.appendChild(renderPublishList());
+
+      const preview = el('p', {
+        class: 'help', 'data-cf-preview': '1',
+        style: 'margin-top:0.3rem;',
+      });
+      section.appendChild(preview);
+      repaintPreview(preview);
+
+      const dirty = !arraysEqual(wiz.selectedSlugs, wiz.publishedSlugs);
+
       const cta = el('div', { class: 'cta-row', style: 'gap:0.5rem;margin-top:0.5rem;flex-wrap:wrap;' });
-      cta.appendChild(el('button', {
-        type: 'button', class: 'btn btn--ghost',
+      const saveBtn = el('button', {
+        type: 'button',
+        class: dirty ? 'btn' : 'btn btn--ghost',
         onclick: () => reprovision(),
-      }, ['Re-provision']));
+      }, [dirty ? 'Save & re-provision' : 'Re-provision (no changes)']);
+      saveBtn.disabled = wiz.selectedSlugs.length === 0;
+      cta.appendChild(saveBtn);
       cta.appendChild(el('button', {
         type: 'button', class: 'btn btn--ghost',
         onclick: () => teardown(),
       }, ['Tear down']));
+      cta.appendChild(el('a', {
+        class: 'btn btn--ghost',
+        href: 'https://one.dash.cloudflare.com/' + (wiz.accountId || '') + '/networks/tunnels',
+        target: '_blank', rel: 'noopener noreferrer',
+      }, ['Manage at Cloudflare ↗']));
       section.appendChild(cta);
+
+      if (wiz.error) {
+        section.appendChild(el('p', { class: 'help', style: 'color:var(--bad);margin-top:0.5rem;' }, ['✗ ' + wiz.error]));
+      }
 
       if (wiz.output) {
         const det = el('details', { style: 'margin-top:0.6rem;' });
@@ -1457,22 +1651,40 @@ const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-6-show-dns-dropdown';
       }
     }
 
+    function arraysEqual(a, b) {
+      if (a.length !== b.length) return false;
+      const sa = a.slice().sort();
+      const sb = b.slice().sort();
+      for (let i = 0; i < sa.length; i++) if (sa[i] !== sb[i]) return false;
+      return true;
+    }
+
     async function reprovision() {
-      if (!confirm('Re-run cloudflared-up.sh? Idempotent — picks up newly enabled apps and refreshes the tunnel config without disruption.')) return;
+      if (!wiz.selectedSlugs.length) {
+        wiz.error = 'Tick at least one app before re-provisioning.';
+        paint();
+        return;
+      }
+      wiz.error = '';
       wiz.screen = 'PROVISIONING';
       paint();
-      const start = Date.now();
-      provInterval = setInterval(() => {
-        const sec = Math.floor((Date.now() - start) / 1000);
-        const elNode = section.querySelector('[data-cf-prov]');
-        if (elNode) elNode.textContent = '⋯ Re-provisioning… (' + sec + ' s)';
-      }, 800);
+      startSpinner('Re-provisioning');
       try {
-        const r = await fetch('/api/v1/admin/cloudflare/provision', { method: 'POST', credentials: 'same-origin' });
+        const r = await fetch('/api/v1/admin/cloudflare/provision', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ publishSlugs: wiz.selectedSlugs }),
+        });
         const data = await r.json().catch(() => ({}));
         wiz.output = [data.stdout, data.stderr].filter(Boolean).join('\n').trim();
-        if (data.exit_code === 0) { wiz.lastRunTs = new Date().toISOString(); finishProv('UP'); }
-        else { wiz.error = 'cloudflared-up.sh exit ' + data.exit_code; finishProv('FAILED'); }
+        if (data.exit_code === 0) {
+          wiz.lastRunTs = new Date().toISOString();
+          wiz.publishedSlugs = wiz.selectedSlugs.slice();
+          finishProv('UP');
+        } else {
+          wiz.error = 'cloudflared-up.sh exit ' + data.exit_code;
+          finishProv('FAILED');
+        }
       } catch (err) { wiz.error = err.message; finishProv('FAILED'); }
     }
 
@@ -1480,18 +1692,22 @@ const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-6-show-dns-dropdown';
       if (!confirm('Tear down the tunnel? This stops the cloudflared container, deletes the CNAMEs that point at this tunnel, deletes the tunnel object at Cloudflare, and clears TUNNEL_TOKEN from shared.env. Re-runnable.')) return;
       wiz.screen = 'PROVISIONING';
       paint();
-      const start = Date.now();
-      provInterval = setInterval(() => {
-        const sec = Math.floor((Date.now() - start) / 1000);
-        const elNode = section.querySelector('[data-cf-prov]');
-        if (elNode) elNode.textContent = '⋯ Tearing down… (' + sec + ' s)';
-      }, 800);
+      startSpinner('Tearing down');
       try {
         const r = await fetch('/api/v1/admin/cloudflare/teardown', { method: 'POST', credentials: 'same-origin' });
         const data = await r.json().catch(() => ({}));
         wiz.output = [data.stdout, data.stderr].filter(Boolean).join('\n').trim();
-        if (data.exit_code === 0) { wiz.token = ''; wiz.accounts = []; wiz.zones = []; finishProv('IDLE'); }
-        else { wiz.error = 'teardown exit ' + data.exit_code; finishProv('FAILED'); }
+        if (data.exit_code === 0) {
+          wiz.token = '';
+          wiz.accounts = [];
+          wiz.zones = [];
+          wiz.publishedSlugs = [];
+          wiz.selectedSlugs = [];
+          finishProv('IDLE');
+        } else {
+          wiz.error = 'teardown exit ' + data.exit_code;
+          finishProv('FAILED');
+        }
       } catch (err) { wiz.error = err.message; finishProv('FAILED'); }
     }
 
