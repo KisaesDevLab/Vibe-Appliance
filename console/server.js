@@ -1214,6 +1214,134 @@ app.get('/api/v1/admin/cloudflare/status', requireAdmin, async (_req, res) => {
   });
 });
 
+// --- Tailscale admin endpoints ----------------------------------------
+//
+// Two pieces the form-driven TAILSCALE_ENABLED toggle can't deliver on
+// its own:
+//   1. First-time install of the tailscale CLI + daemon on the host.
+//      The console runs in a container; apt-install only works against
+//      the HOST. We use a privileged nsenter pod to run the canonical
+//      infra/tailscale-up.sh inside the host's namespaces.
+//   2. Live status read-out for the panel. The host's tailscaled is
+//      reachable from the console container via its unix socket; we
+//      use the tailscale/tailscale image with --network=host and a
+//      bind-mount of the socket to query state without needing the
+//      CLI inside the console image.
+
+const TAILSCALE_SOCK = '/var/run/tailscale/tailscaled.sock';
+
+// One-click install of the tailscale CLI + daemon ON THE HOST. Spawns
+// a privileged alpine pod that joins the host's PID/network/mount
+// namespaces (via nsenter) and runs the canonical install script. The
+// script is idempotent — clicking Install on a host that already has
+// tailscale is a ~2-second no-op.
+//
+// SKIP_BRING_UP=1 — install + daemon-enable only. Auth happens when
+// the operator pastes a TAILSCALE_AUTHKEY in the form and Saves; the
+// settings-save tailscale-toggle post-save job runs `tailscale up`.
+app.post('/api/v1/admin/tailscale/install', requireAdmin, testRateLimit, async (_req, res) => {
+  const args = [
+    'run', '--rm',
+    '--privileged', '--pid=host', '--network=host',
+    'alpine:latest',
+    'sh', '-c',
+    // Install util-linux for nsenter, then step into the host's
+    // namespaces and run the canonical install script. SKIP_BRING_UP=1
+    // is exported BEFORE nsenter so the chrooted bash sees it.
+    'apk add --no-cache util-linux >/dev/null 2>&1 && ' +
+    'SKIP_BRING_UP=1 nsenter --target 1 --mount --uts --ipc --net --pid ' +
+    '  env SKIP_BRING_UP=1 bash /opt/vibe/appliance/infra/tailscale-up.sh',
+  ];
+
+  log('info', 'spawn tailscale install', {});
+  const child = spawn('docker', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = ''; let stderr = '';
+  child.stdout.on('data', d => { stdout += d.toString(); });
+  child.stderr.on('data', d => { stderr += d.toString(); });
+  child.on('error', err => {
+    log('error', 'tailscale install spawn failed', { err: err.message });
+    if (!res.headersSent) res.status(500).json({ error: 'spawn failed', detail: err.message });
+  });
+  child.on('exit', code => {
+    log('info', 'tailscale install finished', { code });
+    res.status(code === 0 ? 200 : 500).json({
+      action: 'tailscale-install',
+      exit_code: code,
+      stdout: trim(stdout),
+      stderr: trim(stderr),
+    });
+  });
+});
+
+// Read tailscale state from the host's tailscaled. Cheap (~200ms);
+// reachable as long as the daemon's unix socket exists. When tailscale
+// isn't installed on the host, the bind-mount fails with "no such
+// file or directory" and we surface cli_installed=false so the panel
+// renders the Install button.
+app.get('/api/v1/admin/tailscale/status', requireAdmin, async (_req, res) => {
+  const out = {
+    cli_installed:       false,
+    daemon_state:        null,   // "Running" / "NeedsLogin" / "Stopped" / null
+    tailnet_hostname:    null,   // host.tailnet.ts.net (no trailing dot)
+    magicdns_url:        null,   // https://<hostname>
+    key_expiry_iso:      null,
+    key_expires_in_days: null,
+    error:               null,
+  };
+
+  // --mount type=bind fails fast with "source path does not exist"
+  // when tailscaled isn't installed (vs --volume which silently
+  // creates an empty dir at the source — a footgun on the host FS).
+  const probe = await new Promise((resolve) => {
+    const child = spawn('docker', [
+      'run', '--rm', '--network=host',
+      '--mount', `type=bind,source=${TAILSCALE_SOCK},target=${TAILSCALE_SOCK}`,
+      'tailscale/tailscale',
+      'tailscale', 'status', '--json',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = ''; let stderr = '';
+    child.stdout.on('data', d => { stdout += d.toString(); });
+    child.stderr.on('data', d => { stderr += d.toString(); });
+    child.on('exit', code => resolve({ code, stdout, stderr }));
+    child.on('error', () => resolve({ code: -1, stdout: '', stderr: 'docker spawn failed' }));
+  });
+
+  if (probe.code === 0) {
+    out.cli_installed = true;
+    try {
+      const s = JSON.parse(probe.stdout);
+      out.daemon_state = (s.BackendState || '').trim() || null;
+      const dns = (s.Self && s.Self.DNSName ? String(s.Self.DNSName) : '').replace(/\.$/, '');
+      out.tailnet_hostname = dns || null;
+      if (dns) out.magicdns_url = 'https://' + dns;
+      const expiry = s.Self && s.Self.KeyExpiry;
+      if (expiry) {
+        const ms = Date.parse(expiry);
+        if (Number.isFinite(ms)) {
+          out.key_expiry_iso = new Date(ms).toISOString();
+          out.key_expires_in_days = Math.floor((ms - Date.now()) / 86400000);
+        }
+      }
+    } catch (err) {
+      out.error = 'malformed status JSON: ' + err.message;
+    }
+  } else {
+    const combined = (probe.stderr + probe.stdout).toLowerCase();
+    // "bind source path does not exist" — daemon socket isn't there,
+    // i.e. tailscale isn't installed on the host. Anything else is
+    // surfaced as-is so the panel can show diagnostic detail.
+    if (combined.includes('source path does not exist') ||
+        combined.includes('no such file or directory')) {
+      out.cli_installed = false;
+    } else {
+      out.cli_installed = false;
+      out.error = trim(probe.stderr || probe.stdout, 512);
+    }
+  }
+
+  res.json(out);
+});
+
 // Inline admin-password rotation. Persists a scrypt hash to the meta
 // table and updates the in-memory comparator immediately, so the next
 // request re-prompts for basic auth and the new password is the one

@@ -14,7 +14,7 @@
 // operators can confirm in DevTools (F12 → Console) that the file
 // they're running is the version they expect, vs. a stale cached
 // copy. Compare against the server's /api/v1/version response.
-const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-7-publish-list';
+const SETTINGS_JS_VERSION = '2026-05-10-tailscale-panel';
 
 (function () {
   // eslint-disable-next-line no-console
@@ -726,6 +726,7 @@ const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-7-publish-list';
     // form) so it leads the tab; DDNS goes after.
     if (cat === 'Network') {
       renderDdnsSection(panelEl);
+      renderTailscaleSection(panelEl);
     }
     updateConditionals();
   }
@@ -1737,6 +1738,179 @@ const SETTINGS_JS_VERSION = '2026-05-08-cf-wizard-7-publish-list';
         const s = await r.json();
         return ((s.config || {}).domain || '').trim();
       } catch { return ''; }
+    }
+  }
+
+  // Tailscale status panel — lives under DDNS on the Network tab.
+  // Read-only view of the host's tailscale state plus an Install
+  // button for first-time setup. The on/off control is the existing
+  // TAILSCALE_ENABLED toggle + TAILSCALE_AUTHKEY field in the form
+  // below; this panel reflects the result and unblocks the install
+  // step that the form alone can't deliver.
+  function renderTailscaleSection(host) {
+    const section = el('section', {
+      class: 'maintenance',
+      'data-ts-section': '1',
+    });
+    section.appendChild(el('h2', null, ['Tailscale']));
+    const body = el('div', { 'data-ts-body': '1' });
+    body.appendChild(el('p', { class: 'help' }, ['Loading…']));
+    section.appendChild(body);
+    host.appendChild(section);
+    loadTailscale(section);
+  }
+
+  async function loadTailscale(section) {
+    const body = section.querySelector('[data-ts-body]');
+    body.innerHTML = '';
+
+    let data;
+    try {
+      const r = await fetch('/api/v1/admin/tailscale/status', { credentials: 'same-origin' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      data = await r.json();
+    } catch (err) {
+      body.appendChild(el('p', { class: 'help', style: 'color:var(--bad);' }, [
+        '✗ Could not load Tailscale status: ' + err.message,
+      ]));
+      return;
+    }
+
+    // Three high-level states drive the layout.
+    if (!data.cli_installed) {
+      body.appendChild(el('p', { class: 'help' }, [
+        'Tailscale gives this appliance a private, encrypted hostname (https://<host>.<tailnet>.ts.net) ',
+        'that staff can reach from anywhere without forwarding ports or buying a static IP.',
+      ]));
+      body.appendChild(el('p', { class: 'help', style: 'color:var(--warn);margin-top:0.4rem;' }, [
+        '⚠ Tailscale is not installed on the host yet.',
+      ]));
+      if (data.error) {
+        body.appendChild(el('details', { style: 'margin-top:0.3rem;' }, [
+          el('summary', { class: 'help', style: 'cursor:pointer;' }, ['Diagnostic']),
+          el('pre', { class: 'maintenance__output' }, [data.error]),
+        ]));
+      }
+      const cta = el('div', { class: 'cta-row', style: 'gap:0.5rem;margin-top:0.6rem;' });
+      const installBtn = el('button', {
+        type: 'button', class: 'btn',
+        onclick: () => doTailscaleInstall(section, installBtn),
+      }, ['Install Tailscale on host']);
+      cta.appendChild(installBtn);
+      body.appendChild(cta);
+      body.appendChild(el('p', { class: 'help', style: 'margin-top:0.4rem;color:var(--text-muted);' }, [
+        'Runs ', el('span', { class: 'mono' }, ['infra/tailscale-up.sh']),
+        ' inside a privileged docker pod that joins the host\'s namespaces ',
+        '(takes ~30–60 seconds; apt-fetch from pkgs.tailscale.com). After install, ',
+        'paste a Tailscale auth key into the form below and click Save to bring the tailnet up.',
+      ]));
+      return;
+    }
+
+    // CLI is on the host. Show daemon state and act accordingly.
+    if (data.daemon_state === 'Running') {
+      body.appendChild(el('p', null, [
+        el('span', { style: 'color:var(--good);font-weight:600;' }, ['✓ Tailnet connected']),
+      ]));
+      const url = data.magicdns_url;
+      if (url) {
+        const urlRow = el('p', { class: 'help', style: 'margin-top:0.2rem;' });
+        urlRow.appendChild(el('strong', null, ['Reach this appliance at: ']));
+        urlRow.appendChild(el('span', { class: 'mono' }, [url]));
+        urlRow.appendChild(document.createTextNode(' '));
+        urlRow.appendChild(el('button', {
+          type: 'button', class: 'btn btn--ghost',
+          style: 'padding:0.15rem 0.5rem;font-size:0.85em;',
+          onclick: async (e) => {
+            try {
+              await navigator.clipboard.writeText(url);
+              e.target.textContent = 'Copied';
+              setTimeout(() => { e.target.textContent = 'Copy'; }, 1500);
+            } catch { e.target.textContent = 'Copy failed'; }
+          },
+        }, ['Copy']));
+        body.appendChild(urlRow);
+      }
+
+      // Key-expiry surface. Tailscale auth keys typically have a 90-day
+      // expiry; the node's KeyExpiry shows when the current node-key
+      // (re-issued on every `tailscale up`) goes stale. <14 days is
+      // the right time to nudge the operator to rotate.
+      if (Number.isFinite(data.key_expires_in_days)) {
+        const d = data.key_expires_in_days;
+        if (d < 0) {
+          body.appendChild(el('p', { class: 'help', style: 'color:var(--bad);margin-top:0.3rem;' }, [
+            '⚠ Tailscale node key has expired. Generate a new auth key at ',
+            el('a', { href: 'https://login.tailscale.com/admin/settings/keys', target: '_blank', rel: 'noopener noreferrer' },
+              ['login.tailscale.com/admin/settings/keys']),
+            ', paste into the TAILSCALE_AUTHKEY field below, and Save to re-authenticate.',
+          ]));
+        } else if (d < 14) {
+          body.appendChild(el('p', { class: 'help', style: 'color:var(--warn);margin-top:0.3rem;' }, [
+            '⚠ Tailscale node key expires in ' + d + ' day' + (d === 1 ? '' : 's') + '. ',
+            'Generate a new auth key at ',
+            el('a', { href: 'https://login.tailscale.com/admin/settings/keys', target: '_blank', rel: 'noopener noreferrer' },
+              ['login.tailscale.com/admin/settings/keys']),
+            ' and re-Save before then to avoid drop-off.',
+          ]));
+        }
+      }
+
+      body.appendChild(el('p', { class: 'help', style: 'margin-top:0.3rem;color:var(--text-muted);' }, [
+        'To disconnect: toggle ', el('strong', null, ['Tailscale']), ' OFF in the form below and Save.',
+      ]));
+      return;
+    }
+
+    // CLI present, daemon not Running (NeedsLogin / Stopped / unknown).
+    body.appendChild(el('p', null, [
+      el('span', { style: 'color:var(--warn);font-weight:600;' }, ['⚠ Tailscale installed but not connected']),
+    ]));
+    body.appendChild(el('p', { class: 'help', style: 'margin-top:0.2rem;' }, [
+      'Backend state: ', el('span', { class: 'mono' }, [data.daemon_state || 'unknown']),
+    ]));
+    body.appendChild(el('p', { class: 'help', style: 'margin-top:0.4rem;' }, [
+      'Bring the tailnet up: tick the ', el('strong', null, ['Tailscale']),
+      ' toggle in the form below, paste a fresh auth key into ',
+      el('strong', null, ['Tailscale auth key']), ', and click Save. ',
+      'Auth keys live at ',
+      el('a', { href: 'https://login.tailscale.com/admin/settings/keys', target: '_blank', rel: 'noopener noreferrer' },
+        ['login.tailscale.com/admin/settings/keys']),
+      ' (use reusable, non-ephemeral).',
+    ]));
+  }
+
+  async function doTailscaleInstall(section, btn) {
+    btn.disabled = true;
+    btn.textContent = 'Installing… (~30–60 s)';
+    let data;
+    try {
+      const r = await fetch('/api/v1/admin/tailscale/install', {
+        method: 'POST', credentials: 'same-origin',
+      });
+      data = await r.json().catch(() => ({}));
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = 'Install Tailscale on host';
+      const body = section.querySelector('[data-ts-body]');
+      body.appendChild(el('p', { class: 'help', style: 'color:var(--bad);' }, [
+        '✗ Install failed: ' + err.message,
+      ]));
+      return;
+    }
+    if (data.exit_code === 0) {
+      loadTailscale(section);
+    } else {
+      btn.disabled = false;
+      btn.textContent = 'Install Tailscale on host';
+      const body = section.querySelector('[data-ts-body]');
+      const errBox = el('details', { style: 'margin-top:0.5rem;', open: '' }, [
+        el('summary', { class: 'help', style: 'cursor:pointer;color:var(--bad);' },
+          ['✗ Install exited ' + data.exit_code + ' — show output']),
+        el('pre', { class: 'maintenance__output' },
+          [(data.stdout || '') + (data.stderr ? '\n' + data.stderr : '')]),
+      ]);
+      body.appendChild(errBox);
     }
   }
 

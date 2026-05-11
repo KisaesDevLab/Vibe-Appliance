@@ -178,38 +178,37 @@
       <details style="margin-top:0.8rem;border:1px solid #0f172a1a;border-radius:6px;padding:0.6rem 0.8rem;">
         <summary style="cursor:pointer;font-weight:600;">Tailscale &mdash; private mesh, no public IP needed</summary>
         <div style="margin-top:0.8rem;line-height:1.55;">
-          <p><strong>When to use:</strong> Private deployment &mdash; only your team accesses the appliance, no public exposure needed. Or your host has no public IP at all.</p>
+          <p><strong>When to use:</strong> Off-LAN access for staff (admin UI, Cockpit, internal-only apps) without opening any ports or buying a static IP. Tailscale is the recommended path to reach <span class="mono">/admin</span> from outside the LAN when Cloudflare Tunnel is in use (the tunnel deliberately doesn't expose admin/landing/infra).</p>
+
+          <p style="background:rgba(184,114,46,0.10);border:1px solid var(--accent);padding:0.65rem 0.8rem;border-radius:4px;">
+            <strong>Use the in-page panel.</strong> Open
+            <a href="/admin/settings">Configuration &rarr; Network</a> &rarr; <em>Tailscale</em> section.
+            If the host doesn&rsquo;t have Tailscale installed, click <em>Install Tailscale on host</em>;
+            the appliance runs the canonical install script inside a privileged docker pod that joins the
+            host&rsquo;s namespaces. After install, paste an auth key into the <em>Tailscale auth key</em>
+            field below, toggle <em>Tailscale</em> ON, and Save.
+          </p>
 
           <p><strong>Prerequisites</strong></p>
           <ul>
             <li>Tailscale account (free for up to 100 devices)</li>
-            <li>Auth key from your Tailscale admin console</li>
+            <li>An auth key from <span class="mono">https://login.tailscale.com/admin/settings/keys</span> &mdash; recommended: reusable, non-ephemeral.</li>
           </ul>
-
-          <p><strong>Steps</strong></p>
-          <ol>
-            <li>Generate an auth key at <span class="mono">https://login.tailscale.com/admin/settings/keys</span>. Recommended: reusable, no expiry &mdash; otherwise the appliance will go offline silently when the key expires.</li>
-            <li>Switch the appliance to Tailscale mode:
-              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">sudo /opt/vibe/appliance/bootstrap.sh \
-  --mode tailscale \
-  --tailscale-authkey tskey-auth-...</pre>
-            </li>
-            <li>Wait a minute or two for the tailnet hostname to propagate. Verify on the host:
-              <pre class="app-card__output" style="max-height:none;margin:0.4rem 0;">tailscale status</pre>
-            </li>
-          </ol>
 
           <p><strong>Verification</strong></p>
           <ul>
-            <li>From any tailnet member: <span class="mono">https://&lt;hostname&gt;.&lt;your-tailnet&gt;.ts.net/admin</span> loads with a valid Tailscale-CA cert</li>
-            <li>Cockpit: <span class="mono">https://&lt;hostname&gt;.&lt;your-tailnet&gt;.ts.net:9090</span></li>
+            <li>The Tailscale panel shows <em>✓ Tailnet connected</em> with a clickable/copyable <span class="mono">https://&lt;host&gt;.&lt;your-tailnet&gt;.ts.net</span>.</li>
+            <li>From any tailnet member: that URL loads <span class="mono">/admin</span> with a valid Tailscale-CA cert.</li>
+            <li>Cockpit on the tailnet: <span class="mono">https://&lt;host&gt;.&lt;your-tailnet&gt;.ts.net:9090</span>.</li>
           </ul>
 
           <p><strong>Gotchas</strong></p>
           <ul>
             <li>Every user accessing the appliance needs Tailscale on their own device.</li>
             <li>Tailscale&rsquo;s MagicDNS auto-issues certs from Tailscale&rsquo;s own CA &mdash; no Let&rsquo;s Encrypt, no port 80 requirement.</li>
-            <li>Vibe-Connect&rsquo;s client-portal magic-links won&rsquo;t work if your CLIENTS aren&rsquo;t on Tailscale (they almost certainly aren&rsquo;t). For external client traffic, you need Custom DNS or Cloudflare Tunnel; Tailscale is staff-only.</li>
+            <li>Vibe-Connect&rsquo;s client-portal magic-links won&rsquo;t work if your <em>clients</em> aren&rsquo;t on Tailscale (they almost certainly aren&rsquo;t). For client traffic, use Cloudflare Tunnel; Tailscale is staff-only.</li>
+            <li>The auth key has an expiry (default 90 days). The panel warns when the node key is within 14 days of expiry &mdash; generate a new key and re-Save before then to avoid silent drop-off.</li>
+            <li>Want the appliance&rsquo;s <em>primary</em> mode to be Tailscale-only (no LAN/domain coexistence)? That switch is heavier &mdash; run <span class="mono">sudo /opt/vibe/appliance/bootstrap.sh --mode tailscale --tailscale-authkey ...</span> on the host. The in-page toggle runs Tailscale <em>alongside</em> the primary mode, which is what most installs want.</li>
           </ul>
         </div>
       </details>

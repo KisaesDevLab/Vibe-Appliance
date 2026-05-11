@@ -34,9 +34,15 @@ fi
 
 VIBE_DIR="${VIBE_DIR:-/opt/vibe}"
 
-# Authkey via env, or read from CONFIG_TAILSCALE_AUTHKEY (which bootstrap
-# exports from the flag).
+# Authkey via env (bootstrap's flag path exports CONFIG_TAILSCALE_AUTHKEY),
+# falling back to TAILSCALE_AUTHKEY in /opt/vibe/env/appliance.env (the
+# admin panel's "Install Tailscale" button path). The fallback lets the
+# script run unattended from the panel without the caller having to
+# wire env vars through nsenter.
 AUTHKEY="${CONFIG_TAILSCALE_AUTHKEY:-${TAILSCALE_AUTHKEY:-}}"
+if [[ -z "$AUTHKEY" && -f /opt/vibe/env/appliance.env ]]; then
+  AUTHKEY="$(grep -m1 '^TAILSCALE_AUTHKEY=' /opt/vibe/env/appliance.env 2>/dev/null | cut -d= -f2- || true)"
+fi
 
 tailscale_install() {
   if command -v tailscale >/dev/null 2>&1; then
@@ -149,5 +155,15 @@ print("https://"+n)' 2>/dev/null || true)"
 }
 
 tailscale_install
+
+# SKIP_BRING_UP=1 — install the CLI + daemon, then exit. The admin
+# panel's "Install Tailscale on host" button uses this so the operator
+# can paste an authkey via the form afterward (settings-save's
+# tailscale-toggle runs `tailscale up` once the toggle is saved).
+if [[ "${SKIP_BRING_UP:-0}" == "1" ]]; then
+  log_ok "tailscale CLI installed; bring-up skipped (SKIP_BRING_UP=1)"
+  exit 0
+fi
+
 tailscale_bring_up
 tailscale_configure_serve

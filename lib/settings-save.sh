@@ -319,25 +319,21 @@ _post_save_tailscale_toggle() {
   authkey="$(secrets_get_appliance TAILSCALE_AUTHKEY)"
 
   if [[ "$enabled" == "true" ]]; then
-    if ! command -v tailscale >/dev/null 2>&1; then
-      # The settings ALREADY wrote TAILSCALE_ENABLED=true to appliance.env
-      # at this point — but Tailscale itself isn't installed, so the
-      # toggle is effectively a no-op for now. Surface a loud warning
-      # with concrete recovery steps, but don't try to apt-install
-      # inline (the install path needs `infra/tailscale-up.sh` which
-      # also handles the apt repo + signing key). Operator runs that
-      # script (or re-runs bootstrap --tailscale) and re-saves.
-      log_warn "TAILSCALE_ENABLED=true but Tailscale CLI is not installed on this host" \
-        "diagnose:command -v tailscale; ls /etc/apt/sources.list.d/tailscale.list" \
-        "fix:Install via the canonical path: sudo bash /opt/vibe/appliance/infra/tailscale-up.sh" \
-        "fix:Or run: sudo /opt/vibe/appliance/bootstrap.sh --tailscale --tailscale-authkey <key>" \
+    # CLI presence is detected via the host-namespace probe in
+    # lib/tailscale-host.sh — `command -v tailscale` would always
+    # miss here because settings-save runs inside the console
+    # container.
+    if ! ts_host_installed; then
+      log_warn "TAILSCALE_ENABLED=true but Tailscale is not installed on the host" \
+        "diagnose:open Configuration → Network → Tailscale status panel" \
+        "fix:Click 'Install Tailscale on host' in the panel (privileged docker-run), then re-Save." \
+        "fix:Or SSH and run: sudo bash /opt/vibe/appliance/infra/tailscale-up.sh" \
         "fix:After installing, re-save in Settings to trigger 'tailscale up'. Your TAILSCALE_ENABLED flag is preserved."
       return 1
     fi
     if [[ -z "$authkey" ]]; then
-      # Already authenticated? Check status.
       local state
-      state="$(tailscale status --json 2>/dev/null | python3 -c '
+      state="$(ts_host status --json 2>/dev/null | python3 -c '
 import json, sys
 try: print(json.load(sys.stdin).get("BackendState",""))
 except Exception: pass' 2>/dev/null || echo)"
@@ -351,20 +347,20 @@ except Exception: pass' 2>/dev/null || echo)"
       return 1
     fi
     log_step "running: tailscale up --authkey=<redacted>"
-    if ! tailscale up --authkey="$authkey" >>"$VIBE_LOG_FILE" 2>&1; then
+    if ! ts_host up --authkey="$authkey" >>"$VIBE_LOG_FILE" 2>&1; then
       log_warn "tailscale up failed" \
-        "diagnose:tailscale status" \
+        "diagnose:open Configuration → Network → Tailscale status panel" \
         "fix:Generate a new auth key at https://login.tailscale.com/admin/settings/keys"
       return 1
     fi
-    # Best practice — burn the key after successful auth.
+    # Burn the key after successful auth.
     secrets_set_kv_appliance TAILSCALE_AUTHKEY ""
     state_set_config_kv tailscale "true"
     log_ok "tailscale enabled"
   else
-    if command -v tailscale >/dev/null 2>&1; then
+    if ts_host_installed; then
       log_step "running: tailscale down"
-      tailscale down >>"$VIBE_LOG_FILE" 2>&1 || log_warn "tailscale down returned non-zero"
+      ts_host down >>"$VIBE_LOG_FILE" 2>&1 || log_warn "tailscale down returned non-zero"
     fi
     state_set_config_kv tailscale "false"
     log_ok "tailscale disabled"
@@ -661,6 +657,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   . "${APPLIANCE_DIR}/lib/log.sh"
   # shellcheck source=/dev/null
   . "${APPLIANCE_DIR}/lib/secrets.sh"
+  # shellcheck source=/dev/null
+  . "${APPLIANCE_DIR}/lib/state.sh"
+  # shellcheck source=/dev/null
+  . "${APPLIANCE_DIR}/lib/tailscale-host.sh"
   log_init
   log_set_phase "settings-save"
 
