@@ -260,9 +260,11 @@ settings_save_apply() {
 }
 
 # Internal: identify which post-save jobs the payload triggers, then
-# dispatch each. Today: tailscale-toggle (TAILSCALE_ENABLED or AUTHKEY
-# changed), dns-provider-switch (DNS_PROVIDER changed), corpus-sync
-# (Tax-Research ENABLED_STATES changed).
+# dispatch each. Today: dns-provider-switch (DNS_PROVIDER changed),
+# corpus-sync (Tax-Research ENABLED_STATES changed). TAILSCALE_* used
+# to dispatch a tailscale-toggle job; the form now filters those keys
+# out (the Tailscale panel owns Install/Connect/Disconnect), so no
+# post-save handling is needed.
 _settings_run_post_save_jobs() {
   local payload_file="$1"
   local jobs
@@ -272,8 +274,6 @@ with open(sys.argv[1]) as f:
     p = json.load(f)
 keys = {c.get("key") for c in p.get("changes", [])}
 out = []
-if "TAILSCALE_ENABLED" in keys or "TAILSCALE_AUTHKEY" in keys:
-    out.append("tailscale-toggle")
 if "DNS_PROVIDER" in keys:
     out.append("dns-provider-switch")
 for c in p.get("changes", []):
@@ -291,9 +291,6 @@ PYEOF
     [[ -z "$job" ]] && continue
     log_step "post-save dispatch" job="$job"
     case "$job" in
-      tailscale-toggle)
-        _post_save_tailscale_toggle || rc=1
-        ;;
       dns-provider-switch)
         _post_save_dns_provider_switch || rc=1
         ;;
@@ -306,65 +303,6 @@ PYEOF
     esac
   done <<<"$jobs"
   return "$rc"
-}
-
-# Tailscale enable/disable per addendum §11.2. Reads the resulting
-# value from appliance.env (already written by the standard flow) and
-# runs `tailscale up` or `tailscale down` accordingly. Auth key is
-# cleared from appliance.env after successful auth — best practice
-# (the key is only useful once; keeping it around is needless exposure).
-_post_save_tailscale_toggle() {
-  local enabled authkey
-  enabled="$(secrets_get_appliance TAILSCALE_ENABLED)"
-  authkey="$(secrets_get_appliance TAILSCALE_AUTHKEY)"
-
-  if [[ "$enabled" == "true" ]]; then
-    # CLI presence is detected via the host-namespace probe in
-    # lib/tailscale-host.sh — `command -v tailscale` would always
-    # miss here because settings-save runs inside the console
-    # container.
-    if ! ts_host_installed; then
-      log_warn "TAILSCALE_ENABLED=true but Tailscale is not installed on the host" \
-        "diagnose:open Configuration → Network → Tailscale status panel" \
-        "fix:Click 'Install Tailscale on host' in the panel (privileged docker-run), then re-Save." \
-        "fix:Or SSH and run: sudo bash /opt/vibe/appliance/infra/tailscale-up.sh" \
-        "fix:After installing, re-save in Settings to trigger 'tailscale up'. Your TAILSCALE_ENABLED flag is preserved."
-      return 1
-    fi
-    if [[ -z "$authkey" ]]; then
-      local state
-      state="$(ts_host status --json 2>/dev/null | python3 -c '
-import json, sys
-try: print(json.load(sys.stdin).get("BackendState",""))
-except Exception: pass' 2>/dev/null || echo)"
-      if [[ "$state" == "Running" ]]; then
-        log_ok "tailscale already up; no authkey needed"
-        state_set_config_kv tailscale "true"
-        return 0
-      fi
-      log_warn "TAILSCALE_ENABLED=true but TAILSCALE_AUTHKEY empty and Tailscale not running" \
-        "fix:Set TAILSCALE_AUTHKEY in Settings → Network and Save again."
-      return 1
-    fi
-    log_step "running: tailscale up --authkey=<redacted>"
-    if ! ts_host up --authkey="$authkey" >>"$VIBE_LOG_FILE" 2>&1; then
-      log_warn "tailscale up failed" \
-        "diagnose:open Configuration → Network → Tailscale status panel" \
-        "fix:Generate a new auth key at https://login.tailscale.com/admin/settings/keys"
-      return 1
-    fi
-    # Burn the key after successful auth.
-    secrets_set_kv_appliance TAILSCALE_AUTHKEY ""
-    state_set_config_kv tailscale "true"
-    log_ok "tailscale enabled"
-  else
-    if ts_host_installed; then
-      log_step "running: tailscale down"
-      ts_host down >>"$VIBE_LOG_FILE" 2>&1 || log_warn "tailscale down returned non-zero"
-    fi
-    state_set_config_kv tailscale "false"
-    log_ok "tailscale disabled"
-  fi
 }
 
 # DNS provider switch per addendum §11.4. The standard flow already
@@ -657,10 +595,6 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   . "${APPLIANCE_DIR}/lib/log.sh"
   # shellcheck source=/dev/null
   . "${APPLIANCE_DIR}/lib/secrets.sh"
-  # shellcheck source=/dev/null
-  . "${APPLIANCE_DIR}/lib/state.sh"
-  # shellcheck source=/dev/null
-  . "${APPLIANCE_DIR}/lib/tailscale-host.sh"
   log_init
   log_set_phase "settings-save"
 

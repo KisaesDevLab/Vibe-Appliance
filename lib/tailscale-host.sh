@@ -35,12 +35,18 @@ _TS_SOCK="${_TS_SOCK:-/var/run/tailscale/tailscaled.sock}"
 # Uses --mount type=bind so the call fails fast with "source does
 # not exist" when tailscaled isn't installed on the host (instead
 # of docker silently creating an empty directory at the socket path).
+#
+# --entrypoint=/usr/local/bin/tailscale bypasses the image's default
+# ENTRYPOINT (containerboot) which would otherwise ignore the CLI
+# args and run as a tailscaled sidecar — the bug that made every
+# previous ts_host call a silent no-op.
 ts_host() {
   docker run --rm \
     --network=host \
     --mount "type=bind,source=${_TS_SOCK},target=${_TS_SOCK}" \
+    --entrypoint=/usr/local/bin/tailscale \
     "$_TS_IMAGE" \
-    tailscale "$@"
+    "$@"
 }
 
 # ts_host_installed — exit 0 if the host has tailscaled installed,

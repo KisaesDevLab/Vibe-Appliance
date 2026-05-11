@@ -14,7 +14,7 @@
 // operators can confirm in DevTools (F12 → Console) that the file
 // they're running is the version they expect, vs. a stale cached
 // copy. Compare against the server's /api/v1/version response.
-const SETTINGS_JS_VERSION = '2026-05-10-tailscale-panel';
+const SETTINGS_JS_VERSION = '2026-05-10-tailscale-full-management';
 
 (function () {
   // eslint-disable-next-line no-console
@@ -684,13 +684,16 @@ const SETTINGS_JS_VERSION = '2026-05-10-tailscale-panel';
       // as inputs as well would duplicate the surface area for no win.
       let renderedFields = fields;
       if (cat === 'Network') {
+        renderNetworkModeSection(panelEl);
         renderCloudflareTunnelSection(panelEl);
         renderedFields = fields.filter(f =>
           f.key !== 'CLOUDFLARE_TUNNEL_ENABLED' &&
           f.key !== 'CLOUDFLARE_TUNNEL_API_TOKEN' &&
           f.key !== 'CLOUDFLARE_ACCOUNT_ID' &&
           f.key !== 'CLOUDFLARE_ZONE_ID' &&
-          f.key !== 'CLOUDFLARE_TUNNEL_NAME'
+          f.key !== 'CLOUDFLARE_TUNNEL_NAME' &&
+          f.key !== 'TAILSCALE_ENABLED' &&
+          f.key !== 'TAILSCALE_AUTHKEY'
         );
       }
       const form = el('form', { class: 'settings-form', onsubmit: e => { e.preventDefault(); saveAll(); } });
@@ -1001,6 +1004,279 @@ const SETTINGS_JS_VERSION = '2026-05-10-tailscale-panel';
   // to /api/v1/settings/save with the five CLOUDFLARE_TUNNEL_* keys, then
   // to /api/v1/admin/cloudflare/provision. No reliance on the operator
   // noticing the bottom-of-page Save bar.
+
+  // Network mode section — leads the Network tab. Lets the operator
+  // switch state.config.mode between lan/domain/tailscale without
+  // SSH'ing for `sudo bootstrap.sh --mode <new>`. Each transition
+  // has its own prereq check + confirm dialog because the
+  // consequences (Let's Encrypt cert issuance, public-access loss,
+  // tailnet-only access requirements) are operator-visible.
+  function renderNetworkModeSection(host) {
+    const section = el('section', {
+      class: 'maintenance',
+      'data-mode-section': '1',
+      style: 'border-left:4px solid var(--accent);background:rgba(184,114,46,0.04);padding-left:1rem;',
+    });
+    section.appendChild(el('h2', { style: 'margin:0 0 0.4rem;' }, ['Network mode']));
+    const body = el('div', { 'data-mode-body': '1' });
+    body.appendChild(el('p', { class: 'help' }, ['Loading…']));
+    section.appendChild(body);
+    host.appendChild(section);
+    loadNetworkMode(section);
+  }
+
+  async function loadNetworkMode(section) {
+    const body = section.querySelector('[data-mode-body]');
+    body.innerHTML = '';
+
+    let state, tsStatus;
+    try {
+      const [stateR, tsR] = await Promise.all([
+        fetch('/api/v1/state',                       { credentials: 'same-origin' }),
+        fetch('/api/v1/admin/tailscale/status',      { credentials: 'same-origin' }),
+      ]);
+      if (!stateR.ok) throw new Error('state: HTTP ' + stateR.status);
+      state = await stateR.json();
+      tsStatus = tsR.ok ? await tsR.json() : { daemon_state: null };
+    } catch (err) {
+      body.appendChild(el('p', { class: 'help', style: 'color:var(--bad);' }, [
+        '✗ Could not load network state: ' + err.message,
+      ]));
+      return;
+    }
+
+    const cfg = state.config || {};
+    const currentMode = cfg.mode || 'lan';
+    const currentDomain = cfg.domain || '';
+    const currentEmail  = cfg.email  || '';
+
+    body.appendChild(el('p', { class: 'help' }, [
+      'Currently: ',
+      el('strong', null, [_modeLabel(currentMode)]),
+      currentMode === 'domain' && currentDomain ? ' (' + currentDomain + ')' : '',
+    ]));
+
+    // Radio list. Selecting a different mode reveals its prereq UI +
+    // Switch button below.
+    const selWrap = el('div', {
+      style: 'display:grid;gap:0.7rem;margin-top:0.6rem;max-width:42rem;',
+    });
+
+    const sel = { mode: currentMode, domain: currentDomain, email: currentEmail };
+
+    const repaint = () => renderModeOptions(selWrap, sel, currentMode, tsStatus, section, repaint);
+    body.appendChild(selWrap);
+    repaint();
+  }
+
+  function _modeLabel(m) {
+    return m === 'lan'       ? 'LAN-only'
+         : m === 'domain'    ? 'Public domain'
+         : m === 'tailscale' ? 'Tailscale-only'
+         : m;
+  }
+
+  function renderModeOptions(wrap, sel, currentMode, tsStatus, section, repaint) {
+    wrap.innerHTML = '';
+    const modes = [
+      {
+        key: 'lan',
+        title: 'LAN-only',
+        body:  'Apps reachable on the LAN via http(s)://<host-IP>. No public access; no domain or auth key required.',
+      },
+      {
+        key: 'domain',
+        title: 'Public domain',
+        body:  "Apps at https://<app>.<domain>. Cert issuance via Let's Encrypt (requires port 80 + 443 reachable from the public internet).",
+      },
+      {
+        key: 'tailscale',
+        title: 'Tailscale-only',
+        body:  'Apps reachable only via https://<host>.<tailnet>.ts.net/<app>. Clients without Tailscale lose access.',
+      },
+    ];
+
+    for (const m of modes) {
+      const row = el('label', {
+        style: 'display:block;padding:0.5rem 0.7rem;border:1px solid var(--border);border-radius:4px;cursor:pointer;' +
+               (sel.mode === m.key ? 'background:rgba(184,114,46,0.06);border-color:var(--accent);' : ''),
+      });
+      const head = el('div', { style: 'display:flex;gap:0.5rem;align-items:baseline;' });
+      const radio = el('input', {
+        type: 'radio', name: 'cf-network-mode', value: m.key,
+        onchange: () => { sel.mode = m.key; repaint(); },
+      });
+      if (sel.mode === m.key) radio.setAttribute('checked', '');
+      head.appendChild(radio);
+      head.appendChild(el('strong', null, [m.title]));
+      if (m.key === currentMode) {
+        head.appendChild(el('span', { class: 'help', style: 'margin-left:0.4rem;color:var(--text-muted);' },
+          ['(current)']));
+      }
+      row.appendChild(head);
+      row.appendChild(el('p', { class: 'help', style: 'margin:0.25rem 0 0 1.4rem;' }, [m.body]));
+      wrap.appendChild(row);
+    }
+
+    if (sel.mode === currentMode) {
+      // No-op — nothing to switch to.
+      wrap.appendChild(el('p', { class: 'help', style: 'margin-top:0.3rem;color:var(--text-muted);' }, [
+        'Pick a different mode to see the switch dialog.',
+      ]));
+      return;
+    }
+
+    // Per-mode prereq UI.
+    if (sel.mode === 'domain') {
+      const grid = el('div', { style: 'display:grid;gap:0.3rem;max-width:32rem;margin-top:0.4rem;' });
+      grid.appendChild(el('label', { style: 'font-weight:600;font-size:0.9em;' }, ['Domain']));
+      const dInput = el('input', {
+        type: 'text', value: sel.domain || '',
+        placeholder: 'firm.com',
+        style: 'padding:0.4rem 0.6rem;border:1px solid var(--border);border-radius:4px;background:var(--surface);font:inherit;',
+        oninput: (e) => { sel.domain = e.target.value.trim().toLowerCase(); _refreshSwitchBtn(wrap, sel, currentMode, tsStatus, section); },
+      });
+      grid.appendChild(dInput);
+      grid.appendChild(el('label', { style: 'font-weight:600;font-size:0.9em;margin-top:0.2rem;' }, ['ACME contact email']));
+      const eInput = el('input', {
+        type: 'email', value: sel.email || '',
+        placeholder: 'admin@firm.com',
+        style: 'padding:0.4rem 0.6rem;border:1px solid var(--border);border-radius:4px;background:var(--surface);font:inherit;',
+        oninput: (e) => { sel.email = e.target.value.trim(); _refreshSwitchBtn(wrap, sel, currentMode, tsStatus, section); },
+      });
+      grid.appendChild(eInput);
+      wrap.appendChild(grid);
+    } else if (sel.mode === 'tailscale') {
+      const tsRunning = tsStatus.daemon_state === 'Running';
+      const note = el('p', { class: 'help', style: 'margin-top:0.4rem;' });
+      if (tsRunning) {
+        note.style.color = 'var(--good)';
+        note.appendChild(document.createTextNode('✓ Tailscale daemon is Running — prerequisites satisfied.'));
+      } else {
+        note.style.color = 'var(--warn)';
+        note.appendChild(document.createTextNode('⚠ Tailscale daemon must be Running (currently: ' + (tsStatus.daemon_state || 'unreachable') + '). Connect Tailscale in the Tailscale section below first.'));
+      }
+      wrap.appendChild(note);
+    }
+
+    const cta = el('div', {
+      class: 'cta-row', 'data-mode-cta': '1',
+      style: 'gap:0.5rem;margin-top:0.5rem;',
+    });
+    wrap.appendChild(cta);
+    _refreshSwitchBtn(wrap, sel, currentMode, tsStatus, section);
+  }
+
+  function _refreshSwitchBtn(wrap, sel, currentMode, tsStatus, section) {
+    const cta = wrap.querySelector('[data-mode-cta]');
+    if (!cta) return;
+    cta.innerHTML = '';
+
+    let disabled = false;
+    let blockReason = '';
+    if (sel.mode === 'domain') {
+      if (!sel.domain || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i.test(sel.domain)) {
+        disabled = true; blockReason = 'Enter a valid domain.';
+      } else if (!sel.email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(sel.email)) {
+        disabled = true; blockReason = 'Enter a valid ACME contact email.';
+      }
+    } else if (sel.mode === 'tailscale' && tsStatus.daemon_state !== 'Running') {
+      disabled = true; blockReason = 'Connect Tailscale first.';
+    }
+
+    const btn = el('button', {
+      type: 'button', class: 'btn',
+      onclick: () => doModeSwitch(sel, currentMode, section),
+    }, ['Switch to ' + _modeLabel(sel.mode)]);
+    btn.disabled = disabled;
+    cta.appendChild(btn);
+    if (disabled && blockReason) {
+      cta.appendChild(el('span', { class: 'help', style: 'color:var(--text-muted);' },
+        [blockReason]));
+    }
+  }
+
+  const _MODE_SWITCH_COPY = {
+    'lan->domain':       "Apps will become reachable at https://<app>.{domain}. Requires ports 80 + 443 reachable from the public internet for Let's Encrypt cert issuance. Continue?",
+    'lan->tailscale':    'Apps will be reachable only via https://<host>.<tailnet>.ts.net/<app>. Clients without Tailscale lose access. The public landing page stays on the LAN. Continue?',
+    'domain->lan':       "Public domain access stops. Apps reachable only on LAN IP. Connect's client portal breaks for non-LAN clients. The Let's Encrypt certs go stale (harmless). Continue?",
+    'domain->tailscale': "Public domain access stops. Apps reachable only via the tailnet. Connect's client portal breaks for non-Tailscale clients. Continue?",
+    'tailscale->lan':    'Tailnet URLs continue to work as long as Tailscale stays connected, but Caddy stops listening on :443. Apps reachable on the LAN IP. Continue?',
+    'tailscale->domain': "Apps will become reachable at https://<app>.{domain}. Requires ports 80 + 443 reachable for cert issuance. Tailnet URLs continue to work in parallel. Continue?",
+  };
+
+  async function doModeSwitch(sel, currentMode, section) {
+    const copyKey = currentMode + '->' + sel.mode;
+    const tmpl = _MODE_SWITCH_COPY[copyKey] || 'Switch to ' + _modeLabel(sel.mode) + '?';
+    const msg  = tmpl.replace('{domain}', sel.domain || '<domain>');
+    if (!confirm(msg)) return;
+
+    const body = section.querySelector('[data-mode-body]');
+    body.innerHTML = '';
+    body.appendChild(el('p', { class: 'help' }, ['Switching mode… (Caddyfile rerender + reload, ~5–10s)']));
+
+    let data;
+    try {
+      const r = await fetch('/api/v1/admin/network-mode/switch', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: sel.mode,
+          domain: sel.mode === 'domain' ? sel.domain : undefined,
+          email:  sel.mode === 'domain' ? sel.email  : undefined,
+        }),
+      });
+      data = await r.json().catch(() => ({}));
+      data._http = r.status;
+    } catch (err) {
+      body.innerHTML = '';
+      body.appendChild(el('p', { class: 'help', style: 'color:var(--bad);' }, [
+        '✗ Switch failed: ' + err.message,
+      ]));
+      // Re-render fresh so the operator can retry.
+      setTimeout(() => loadNetworkMode(section), 1500);
+      return;
+    }
+
+    if (data.ok) {
+      body.innerHTML = '';
+      body.appendChild(el('p', null, [
+        el('span', { style: 'color:var(--good);font-weight:600;' }, [
+          '✓ Switched to ' + _modeLabel(data.to),
+        ]),
+      ]));
+      if (data.warnings && data.warnings.length) {
+        const ul = el('ul', { class: 'help', style: 'margin-top:0.3rem;' });
+        for (const w of data.warnings) ul.appendChild(el('li', null, [w]));
+        body.appendChild(ul);
+      }
+      // Refresh in place so the new "Currently:" line shows.
+      setTimeout(() => loadNetworkMode(section), 2000);
+      return;
+    }
+
+    body.innerHTML = '';
+    body.appendChild(el('p', null, [
+      el('span', { style: 'color:var(--bad);font-weight:600;' }, ['✗ Switch failed']),
+    ]));
+    if (data.degraded) {
+      body.appendChild(el('p', { class: 'help', style: 'color:var(--bad);margin-top:0.3rem;' }, [
+        'DEGRADED — both the switch and the rollback failed. Manual recovery required.',
+      ]));
+      if (data.recovery) {
+        body.appendChild(el('pre', { class: 'maintenance__output' }, [data.recovery]));
+      }
+    } else {
+      body.appendChild(el('p', { class: 'help', style: 'margin-top:0.3rem;' }, [
+        'Rolled back. Live state unchanged. Diagnostic below.',
+      ]));
+    }
+    body.appendChild(el('details', { style: 'margin-top:0.3rem;', open: '' }, [
+      el('summary', { class: 'help', style: 'cursor:pointer;color:var(--bad);' }, ['Show error']),
+      el('pre', { class: 'maintenance__output' }, [data.error || JSON.stringify(data, null, 2)]),
+    ]));
+    setTimeout(() => loadNetworkMode(section), 3000);
+  }
 
   function renderCloudflareTunnelSection(host) {
     // Visually prominent section so it's the unmistakable primary
@@ -1741,18 +2017,25 @@ const SETTINGS_JS_VERSION = '2026-05-10-tailscale-panel';
     }
   }
 
-  // Tailscale status panel — lives under DDNS on the Network tab.
-  // Read-only view of the host's tailscale state plus an Install
-  // button for first-time setup. The on/off control is the existing
-  // TAILSCALE_ENABLED toggle + TAILSCALE_AUTHKEY field in the form
-  // below; this panel reflects the result and unblocks the install
-  // step that the form alone can't deliver.
+  // Tailscale section — full management surface for the host's
+  // tailscaled. The single source of truth for Install / Connect /
+  // Disconnect / Restart / Logs / Update / Uninstall / hostname.
+  // No form fallback; TAILSCALE_ENABLED + TAILSCALE_AUTHKEY are
+  // filtered out of the Network form so this section owns them.
   function renderTailscaleSection(host) {
     const section = el('section', {
       class: 'maintenance',
       'data-ts-section': '1',
     });
-    section.appendChild(el('h2', null, ['Tailscale']));
+    const head = el('div', {
+      style: 'display:flex;align-items:baseline;justify-content:space-between;gap:0.5rem;',
+    });
+    head.appendChild(el('h2', { style: 'margin:0;' }, ['Tailscale']));
+    head.appendChild(el('a', {
+      href: '#', class: 'help', style: 'font-size:0.85em;',
+      onclick: (e) => { e.preventDefault(); loadTailscale(section); },
+    }, ['Refresh']));
+    section.appendChild(head);
     const body = el('div', { 'data-ts-body': '1' });
     body.appendChild(el('p', { class: 'help' }, ['Loading…']));
     section.appendChild(body);
@@ -1776,7 +2059,7 @@ const SETTINGS_JS_VERSION = '2026-05-10-tailscale-panel';
       return;
     }
 
-    // Three high-level states drive the layout.
+    // ---- not installed ----
     if (!data.cli_installed) {
       body.appendChild(el('p', { class: 'help' }, [
         'Tailscale gives this appliance a private, encrypted hostname (https://<host>.<tailnet>.ts.net) ',
@@ -1794,26 +2077,30 @@ const SETTINGS_JS_VERSION = '2026-05-10-tailscale-panel';
       const cta = el('div', { class: 'cta-row', style: 'gap:0.5rem;margin-top:0.6rem;' });
       const installBtn = el('button', {
         type: 'button', class: 'btn',
-        onclick: () => doTailscaleInstall(section, installBtn),
+        onclick: () => tsAction(section, installBtn, {
+          label: 'Install',
+          working: 'Installing… (~30–60 s)',
+          url: '/api/v1/admin/tailscale/install',
+          method: 'POST',
+        }),
       }, ['Install Tailscale on host']);
       cta.appendChild(installBtn);
       body.appendChild(cta);
       body.appendChild(el('p', { class: 'help', style: 'margin-top:0.4rem;color:var(--text-muted);' }, [
         'Runs ', el('span', { class: 'mono' }, ['infra/tailscale-up.sh']),
-        ' inside a privileged docker pod that joins the host\'s namespaces ',
-        '(takes ~30–60 seconds; apt-fetch from pkgs.tailscale.com). After install, ',
-        'paste a Tailscale auth key into the form below and click Save to bring the tailnet up.',
+        ' inside a privileged docker pod that joins the host\'s namespaces. ',
+        '~30–60 seconds (apt-fetch from pkgs.tailscale.com).',
       ]));
       return;
     }
 
-    // CLI is on the host. Show daemon state and act accordingly.
+    // ---- header (status + URL + key expiry, common to all installed states) ----
     if (data.daemon_state === 'Running') {
       body.appendChild(el('p', null, [
         el('span', { style: 'color:var(--good);font-weight:600;' }, ['✓ Tailnet connected']),
       ]));
-      const url = data.magicdns_url;
-      if (url) {
+      if (data.magicdns_url) {
+        const url = data.magicdns_url;
         const urlRow = el('p', { class: 'help', style: 'margin-top:0.2rem;' });
         urlRow.appendChild(el('strong', null, ['Reach this appliance at: ']));
         urlRow.appendChild(el('span', { class: 'mono' }, [url]));
@@ -1831,87 +2118,284 @@ const SETTINGS_JS_VERSION = '2026-05-10-tailscale-panel';
         }, ['Copy']));
         body.appendChild(urlRow);
       }
-
-      // Key-expiry surface. Tailscale auth keys typically have a 90-day
-      // expiry; the node's KeyExpiry shows when the current node-key
-      // (re-issued on every `tailscale up`) goes stale. <14 days is
-      // the right time to nudge the operator to rotate.
-      if (Number.isFinite(data.key_expires_in_days)) {
-        const d = data.key_expires_in_days;
-        if (d < 0) {
-          body.appendChild(el('p', { class: 'help', style: 'color:var(--bad);margin-top:0.3rem;' }, [
-            '⚠ Tailscale node key has expired. Generate a new auth key at ',
-            el('a', { href: 'https://login.tailscale.com/admin/settings/keys', target: '_blank', rel: 'noopener noreferrer' },
-              ['login.tailscale.com/admin/settings/keys']),
-            ', paste into the TAILSCALE_AUTHKEY field below, and Save to re-authenticate.',
-          ]));
-        } else if (d < 14) {
-          body.appendChild(el('p', { class: 'help', style: 'color:var(--warn);margin-top:0.3rem;' }, [
-            '⚠ Tailscale node key expires in ' + d + ' day' + (d === 1 ? '' : 's') + '. ',
-            'Generate a new auth key at ',
-            el('a', { href: 'https://login.tailscale.com/admin/settings/keys', target: '_blank', rel: 'noopener noreferrer' },
-              ['login.tailscale.com/admin/settings/keys']),
-            ' and re-Save before then to avoid drop-off.',
-          ]));
-        }
-      }
-
-      body.appendChild(el('p', { class: 'help', style: 'margin-top:0.3rem;color:var(--text-muted);' }, [
-        'To disconnect: toggle ', el('strong', null, ['Tailscale']), ' OFF in the form below and Save.',
+    } else {
+      body.appendChild(el('p', null, [
+        el('span', { style: 'color:var(--warn);font-weight:600;' },
+          ['⚠ Tailscale installed but not connected']),
+        el('span', { class: 'help', style: 'margin-left:0.5rem;' },
+          ['(backend: ', el('span', { class: 'mono' }, [data.daemon_state || 'unknown']), ')']),
       ]));
-      return;
     }
 
-    // CLI present, daemon not Running (NeedsLogin / Stopped / unknown).
-    body.appendChild(el('p', null, [
-      el('span', { style: 'color:var(--warn);font-weight:600;' }, ['⚠ Tailscale installed but not connected']),
-    ]));
-    body.appendChild(el('p', { class: 'help', style: 'margin-top:0.2rem;' }, [
-      'Backend state: ', el('span', { class: 'mono' }, [data.daemon_state || 'unknown']),
-    ]));
-    body.appendChild(el('p', { class: 'help', style: 'margin-top:0.4rem;' }, [
-      'Bring the tailnet up: tick the ', el('strong', null, ['Tailscale']),
-      ' toggle in the form below, paste a fresh auth key into ',
-      el('strong', null, ['Tailscale auth key']), ', and click Save. ',
-      'Auth keys live at ',
-      el('a', { href: 'https://login.tailscale.com/admin/settings/keys', target: '_blank', rel: 'noopener noreferrer' },
-        ['login.tailscale.com/admin/settings/keys']),
-      ' (use reusable, non-ephemeral).',
-    ]));
+    if (Number.isFinite(data.key_expires_in_days)) {
+      const d = data.key_expires_in_days;
+      if (d < 0) {
+        body.appendChild(el('p', { class: 'help', style: 'color:var(--bad);margin-top:0.3rem;' }, [
+          '⚠ Tailscale node key has expired. Paste a new auth key in the Connect form below.',
+        ]));
+      } else if (d < 14) {
+        body.appendChild(el('p', { class: 'help', style: 'color:var(--warn);margin-top:0.3rem;' }, [
+          '⚠ Tailscale node key expires in ' + d + ' day' + (d === 1 ? '' : 's') + '. Generate a new key and re-Connect to avoid drop-off.',
+        ]));
+      }
+    }
+
+    // ---- primary action ----
+    if (data.daemon_state === 'Running') {
+      const cta = el('div', { class: 'cta-row', style: 'gap:0.5rem;margin-top:0.5rem;' });
+      const disconnectBtn = el('button', {
+        type: 'button', class: 'btn btn--ghost',
+        onclick: () => tsAction(section, disconnectBtn, {
+          label: 'Disconnect',
+          working: 'Disconnecting…',
+          url: '/api/v1/admin/tailscale/disconnect',
+          method: 'POST',
+        }),
+      }, ['Disconnect']);
+      cta.appendChild(disconnectBtn);
+      body.appendChild(cta);
+    } else {
+      // NeedsLogin / Stopped / unknown — show authkey paste + Connect.
+      body.appendChild(renderTailscaleConnectForm(section, data));
+    }
+
+    // ---- config (hostname) — only when Running ----
+    if (data.daemon_state === 'Running') {
+      body.appendChild(renderTailscaleHostnameForm(section, data));
+    }
+
+    // ---- troubleshooting (restart + logs) ----
+    body.appendChild(renderTailscaleTroubleshooting(section));
+
+    // ---- update available ----
+    if (data.daemon_version && data.apt_available_version &&
+        data.daemon_version !== data.apt_available_version) {
+      body.appendChild(renderTailscaleUpdate(section, data));
+    } else if (data.daemon_version) {
+      body.appendChild(el('p', { class: 'help', style: 'margin-top:0.6rem;color:var(--text-muted);' }, [
+        'tailscale ', data.daemon_version,
+        data.apt_available_version ? ' (up to date)' : '',
+      ]));
+    }
+
+    // ---- danger zone ----
+    body.appendChild(renderTailscaleDangerZone(section));
   }
 
-  async function doTailscaleInstall(section, btn) {
+  // Connect form — auth-key paste + Connect button. Rendered when
+  // daemon_state ≠ Running and CLI is installed.
+  function renderTailscaleConnectForm(section, data) {
+    const wrap = el('div', { style: 'margin-top:0.6rem;' });
+    wrap.appendChild(el('p', { class: 'help' }, [
+      'Generate an auth key at ',
+      el('a', {
+        href: 'https://login.tailscale.com/admin/settings/keys',
+        target: '_blank', rel: 'noopener noreferrer',
+      }, ['login.tailscale.com/admin/settings/keys']),
+      ' (recommended: reusable, non-ephemeral, 90-day expiry).',
+    ]));
+    const placeholder = data.authkey_pending
+      ? 'auth key set in appliance.env — paste a new one to override, or click Connect to retry'
+      : 'tskey-auth-... or tskey-client-...';
+    const input = el('input', {
+      type: 'password',
+      placeholder,
+      autocomplete: 'off',
+      style: 'width:100%;max-width:36rem;padding:0.45rem 0.65rem;border:1px solid var(--border);border-radius:4px;font:inherit;background:var(--surface);',
+    });
+    wrap.appendChild(input);
+    const cta = el('div', { class: 'cta-row', style: 'gap:0.5rem;margin-top:0.5rem;' });
+    const connectBtn = el('button', {
+      type: 'button', class: 'btn',
+      onclick: () => tsAction(section, connectBtn, {
+        label: 'Connect',
+        working: 'Connecting…',
+        url: '/api/v1/admin/tailscale/connect',
+        method: 'POST',
+        body: { authKey: input.value.trim() },
+      }),
+    }, ['Connect']);
+    cta.appendChild(connectBtn);
+    wrap.appendChild(cta);
+    return wrap;
+  }
+
+  // Hostname edit form — only rendered when daemon is Running.
+  function renderTailscaleHostnameForm(section, data) {
+    const wrap = el('div', { style: 'margin-top:0.8rem;' });
+    wrap.appendChild(el('h3', {
+      style: 'margin:0 0 0.3rem;font-size:0.85rem;text-transform:uppercase;letter-spacing:0.1em;color:var(--text-muted);',
+    }, ['Hostname']));
+    const row = el('div', { style: 'display:flex;gap:0.4rem;align-items:center;flex-wrap:wrap;' });
+    const input = el('input', {
+      type: 'text',
+      value: data.current_hostname || '',
+      style: 'padding:0.35rem 0.6rem;border:1px solid var(--border);border-radius:4px;font:inherit;background:var(--surface);min-width:14rem;',
+    });
+    row.appendChild(input);
+    const saveBtn = el('button', {
+      type: 'button', class: 'btn btn--ghost',
+      onclick: () => {
+        const next = input.value.trim().toLowerCase();
+        if (next === (data.current_hostname || '')) return;
+        tsAction(section, saveBtn, {
+          label: 'Save',
+          working: 'Saving…',
+          url: '/api/v1/admin/tailscale/hostname',
+          method: 'POST',
+          body: { hostname: next },
+        });
+      },
+    }, ['Save']);
+    row.appendChild(saveBtn);
+    wrap.appendChild(row);
+    wrap.appendChild(el('p', { class: 'help', style: 'margin-top:0.2rem;color:var(--text-muted);' }, [
+      'Changes the tailnet URL. Lowercase letters, digits, hyphens; max 63 chars.',
+    ]));
+    return wrap;
+  }
+
+  // Troubleshooting subsection — Restart daemon + View logs.
+  function renderTailscaleTroubleshooting(section) {
+    const details = el('details', { style: 'margin-top:0.8rem;' });
+    details.appendChild(el('summary', {
+      class: 'help', style: 'cursor:pointer;font-weight:600;',
+    }, ['Troubleshooting']));
+    const cta = el('div', { class: 'cta-row', style: 'gap:0.5rem;margin-top:0.4rem;flex-wrap:wrap;' });
+    const restartBtn = el('button', {
+      type: 'button', class: 'btn btn--ghost',
+      onclick: () => tsAction(section, restartBtn, {
+        label: 'Restart daemon',
+        working: 'Restarting…',
+        url: '/api/v1/admin/tailscale/restart',
+        method: 'POST',
+      }),
+    }, ['Restart daemon']);
+    cta.appendChild(restartBtn);
+    const logsBtn = el('button', {
+      type: 'button', class: 'btn btn--ghost',
+      onclick: async () => {
+        logsBtn.disabled = true;
+        logsBtn.textContent = 'Loading logs…';
+        try {
+          const r = await fetch('/api/v1/admin/tailscale/logs', { credentials: 'same-origin' });
+          const data = await r.json().catch(() => ({}));
+          // Replace the existing logs block if present.
+          const old = details.querySelector('[data-ts-logs]');
+          if (old) old.remove();
+          const out = el('pre', {
+            'data-ts-logs': '1', class: 'maintenance__output',
+            style: 'margin-top:0.4rem;max-height:24rem;',
+          }, [data.output || data.stderr || '(no output)']);
+          details.appendChild(out);
+        } catch (err) {
+          alert('Could not load logs: ' + err.message);
+        } finally {
+          logsBtn.disabled = false;
+          logsBtn.textContent = 'View daemon logs';
+        }
+      },
+    }, ['View daemon logs']);
+    cta.appendChild(logsBtn);
+    details.appendChild(cta);
+    return details;
+  }
+
+  // Update card — only rendered when apt-cache shows a newer version.
+  function renderTailscaleUpdate(section, data) {
+    const wrap = el('div', {
+      style: 'margin-top:0.8rem;padding:0.5rem 0.75rem;background:rgba(184,114,46,0.08);border:1px solid var(--accent);border-radius:4px;',
+    });
+    wrap.appendChild(el('p', { style: 'margin:0;' }, [
+      el('strong', null, ['Update available: ']),
+      el('span', { class: 'mono' }, [data.daemon_version + ' → ' + data.apt_available_version]),
+    ]));
+    const cta = el('div', { class: 'cta-row', style: 'gap:0.5rem;margin-top:0.4rem;' });
+    const updateBtn = el('button', {
+      type: 'button', class: 'btn',
+      onclick: () => tsAction(section, updateBtn, {
+        label: 'Update tailscale',
+        working: 'Updating…',
+        url: '/api/v1/admin/tailscale/update',
+        method: 'POST',
+      }),
+    }, ['Update tailscale']);
+    cta.appendChild(updateBtn);
+    wrap.appendChild(cta);
+    return wrap;
+  }
+
+  // Danger zone — destructive uninstall behind a collapsible + confirm.
+  function renderTailscaleDangerZone(section) {
+    const details = el('details', { style: 'margin-top:1rem;' });
+    details.appendChild(el('summary', {
+      class: 'help', style: 'cursor:pointer;font-weight:600;color:var(--bad);',
+    }, ['Danger zone']));
+    details.appendChild(el('p', { class: 'help', style: 'margin-top:0.3rem;' }, [
+      'Uninstall removes the Tailscale package and apt source from this host. ',
+      'Reversible by clicking Install again later (re-downloads the package).',
+    ]));
+    const cta = el('div', { class: 'cta-row', style: 'gap:0.5rem;margin-top:0.3rem;' });
+    const uninstallBtn = el('button', {
+      type: 'button', class: 'btn btn--ghost',
+      style: 'color:var(--bad);border-color:var(--bad);',
+      onclick: () => {
+        if (!confirm('Uninstall removes Tailscale from this host. The CLI, apt source, and keyring are deleted; appliance.env is cleared. Continue?')) return;
+        tsAction(section, uninstallBtn, {
+          label: 'Uninstall',
+          working: 'Uninstalling…',
+          url: '/api/v1/admin/tailscale/uninstall',
+          method: 'POST',
+        });
+      },
+    }, ['Uninstall Tailscale entirely']);
+    cta.appendChild(uninstallBtn);
+    details.appendChild(cta);
+    return details;
+  }
+
+  // Common request handler for every Tailscale panel button. Disables
+  // the button + shows the working label; on success refreshes the
+  // panel; on failure surfaces the server's stderr in an open
+  // <details>.
+  async function tsAction(section, btn, { label, working, url, method, body }) {
+    const origLabel = btn.textContent;
     btn.disabled = true;
-    btn.textContent = 'Installing… (~30–60 s)';
-    let data;
+    btn.textContent = working;
+    let resp, data;
     try {
-      const r = await fetch('/api/v1/admin/tailscale/install', {
-        method: 'POST', credentials: 'same-origin',
-      });
-      data = await r.json().catch(() => ({}));
+      const init = { method, credentials: 'same-origin' };
+      if (body) {
+        init.headers = { 'Content-Type': 'application/json' };
+        init.body = JSON.stringify(body);
+      }
+      resp = await fetch(url, init);
+      data = await resp.json().catch(() => ({}));
     } catch (err) {
       btn.disabled = false;
-      btn.textContent = 'Install Tailscale on host';
-      const body = section.querySelector('[data-ts-body]');
-      body.appendChild(el('p', { class: 'help', style: 'color:var(--bad);' }, [
-        '✗ Install failed: ' + err.message,
-      ]));
+      btn.textContent = origLabel;
+      section.querySelector('[data-ts-body]').appendChild(
+        el('p', { class: 'help', style: 'color:var(--bad);' },
+          ['✗ ' + label + ' failed: ' + err.message]));
       return;
     }
-    if (data.exit_code === 0) {
+
+    if (resp.ok) {
       loadTailscale(section);
-    } else {
-      btn.disabled = false;
-      btn.textContent = 'Install Tailscale on host';
-      const body = section.querySelector('[data-ts-body]');
-      const errBox = el('details', { style: 'margin-top:0.5rem;', open: '' }, [
-        el('summary', { class: 'help', style: 'cursor:pointer;color:var(--bad);' },
-          ['✗ Install exited ' + data.exit_code + ' — show output']),
-        el('pre', { class: 'maintenance__output' },
-          [(data.stdout || '') + (data.stderr ? '\n' + data.stderr : '')]),
-      ]);
-      body.appendChild(errBox);
+      return;
     }
+
+    btn.disabled = false;
+    btn.textContent = origLabel;
+    const errBox = el('details', { style: 'margin-top:0.5rem;', open: '' }, [
+      el('summary', { class: 'help', style: 'cursor:pointer;color:var(--bad);' },
+        ['✗ ' + label + ' failed' + (data.exit_code != null ? ' (exit ' + data.exit_code + ')' : '') + ' — show output']),
+      el('pre', { class: 'maintenance__output' },
+        [(data.error || '') +
+         (data.stdout ? '\n--- stdout ---\n' + data.stdout : '') +
+         (data.stderr ? '\n--- stderr ---\n' + data.stderr : '') || '(no output)']),
+    ]);
+    section.querySelector('[data-ts-body]').appendChild(errBox);
   }
 
   function renderBackupSection(host) {

@@ -1106,7 +1106,7 @@ app.post('/api/v1/admin/cloudflare/provision', requireAdmin, testRateLimit, asyn
       if (!seen.has(s)) { seen.add(s); ordered.push(s); }
     }
     try {
-      writeEnvKey(path.join(ENV_DIR, 'appliance.env'), 'CLOUDFLARE_TUNNEL_PUBLISH', ordered.join(','));
+      setApplianceEnv('CLOUDFLARE_TUNNEL_PUBLISH', ordered.join(','));
     } catch (err) {
       log('error', 'writing CLOUDFLARE_TUNNEL_PUBLISH failed', { err: err.message });
       return res.status(500).json({ error: 'persisting publish list failed: ' + err.message });
@@ -1230,46 +1230,340 @@ app.get('/api/v1/admin/cloudflare/status', requireAdmin, async (_req, res) => {
 
 const TAILSCALE_SOCK = '/var/run/tailscale/tailscaled.sock';
 
-// One-click install of the tailscale CLI + daemon ON THE HOST. Spawns
-// a privileged alpine pod that joins the host's PID/network/mount
-// namespaces (via nsenter) and runs the canonical install script. The
-// script is idempotent — clicking Install on a host that already has
-// tailscale is a ~2-second no-op.
+// runOnHost — execute a shell command in the host's namespaces from
+// inside the console container. Used by every Tailscale admin
+// endpoint that needs to install packages, talk to systemd, or read
+// host-side files that aren't bind-mounted into the console.
 //
-// SKIP_BRING_UP=1 — install + daemon-enable only. Auth happens when
-// the operator pastes a TAILSCALE_AUTHKEY in the form and Saves; the
-// settings-save tailscale-toggle post-save job runs `tailscale up`.
-app.post('/api/v1/admin/tailscale/install', requireAdmin, testRateLimit, async (_req, res) => {
-  const args = [
-    'run', '--rm',
-    '--privileged', '--pid=host', '--network=host',
-    'alpine:latest',
-    'sh', '-c',
-    // Install util-linux for nsenter, then step into the host's
-    // namespaces and run the canonical install script. SKIP_BRING_UP=1
-    // is exported BEFORE nsenter so the chrooted bash sees it.
-    'apk add --no-cache util-linux >/dev/null 2>&1 && ' +
-    'SKIP_BRING_UP=1 nsenter --target 1 --mount --uts --ipc --net --pid ' +
-    '  env SKIP_BRING_UP=1 bash /opt/vibe/appliance/infra/tailscale-up.sh',
-  ];
-
-  log('info', 'spawn tailscale install', {});
-  const child = spawn('docker', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-  let stdout = ''; let stderr = '';
-  child.stdout.on('data', d => { stdout += d.toString(); });
-  child.stderr.on('data', d => { stderr += d.toString(); });
-  child.on('error', err => {
-    log('error', 'tailscale install spawn failed', { err: err.message });
-    if (!res.headersSent) res.status(500).json({ error: 'spawn failed', detail: err.message });
+// Mechanics: privileged alpine pod with --pid=host + --network=host,
+// install util-linux for nsenter, then `nsenter --target 1
+// --mount --uts --ipc --net --pid sh -c "<command>"` so the command
+// runs in the host's namespaces. Stdout/stderr are returned in
+// resolved object; never streamed (the operations we run finish in
+// under a minute).
+//
+// Returns: Promise<{ code, stdout, stderr }>. Never throws; spawn
+// errors land as { code: -1, stderr: 'spawn failed: ...' }.
+function runOnHost(shellCommand) {
+  return new Promise((resolve) => {
+    const child = spawn('docker', [
+      'run', '--rm',
+      '--privileged', '--pid=host', '--network=host',
+      'alpine:latest',
+      'sh', '-c',
+      'apk add --no-cache util-linux >/dev/null 2>&1 && ' +
+      'nsenter --target 1 --mount --uts --ipc --net --pid sh -c ' +
+      JSON.stringify(shellCommand),
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = ''; let stderr = '';
+    child.stdout.on('data', d => { stdout += d.toString(); });
+    child.stderr.on('data', d => { stderr += d.toString(); });
+    child.on('exit', code => resolve({ code, stdout, stderr }));
+    child.on('error', err => resolve({ code: -1, stdout: '', stderr: 'spawn failed: ' + err.message }));
   });
-  child.on('exit', code => {
-    log('info', 'tailscale install finished', { code });
-    res.status(code === 0 ? 200 : 500).json({
-      action: 'tailscale-install',
-      exit_code: code,
-      stdout: trim(stdout),
-      stderr: trim(stderr),
+}
+
+// 5-minute in-memory cache for apt-cache policy probes. The Update
+// card on the Tailscale panel only needs the available version once;
+// without a cache, every panel refresh (Connect/Disconnect/Restart/…)
+// spawns a fresh apt-cache probe on the host. Invalidated implicitly
+// by /tailscale/update, /tailscale/install, /tailscale/uninstall.
+const _APT_CACHE_TTL_MS = 5 * 60 * 1000;
+let _aptCache = { value: null, ts: 0 };
+
+async function _cachedAptAvailable() {
+  if (Date.now() - _aptCache.ts < _APT_CACHE_TTL_MS) {
+    return _aptCache.value;
+  }
+  const result = await runOnHost(
+    "apt-cache policy tailscale 2>/dev/null | awk '/Candidate:/ {print $2; exit}' || true"
+  );
+  _aptCache = { value: result, ts: Date.now() };
+  return result;
+}
+
+function _invalidateAptCache() { _aptCache = { value: null, ts: 0 }; }
+
+// _respondHostResult — common reply path for endpoints that wrap
+// runOnHost. Maps exit 0 → 200, anything else → 500. trim() caps
+// stdout/stderr at ~16KB so a runaway script can't blow the response.
+function _respondHostResult(res, action, result) {
+  log('info', 'host-action finished', { action, code: result.code });
+  res.status(result.code === 0 ? 200 : 500).json({
+    action,
+    exit_code: result.code,
+    stdout: trim(result.stdout),
+    stderr: trim(result.stderr),
+  });
+}
+
+// One-click install of the tailscale CLI + daemon ON THE HOST. Runs
+// the canonical infra/tailscale-up.sh inside the host's namespaces.
+// SKIP_BRING_UP=1 — install + daemon-enable only; auth happens via
+// the Connect button (POST /tailscale/connect) once the operator
+// pastes a Tailscale auth key.
+app.post('/api/v1/admin/tailscale/install', requireAdmin, testRateLimit, async (_req, res) => {
+  log('info', 'spawn tailscale install', {});
+  const result = await runOnHost(
+    'env SKIP_BRING_UP=1 bash /opt/vibe/appliance/infra/tailscale-up.sh'
+  );
+  _invalidateAptCache();
+  _respondHostResult(res, 'tailscale-install', result);
+});
+
+// tsHost — JS mirror of lib/tailscale-host.sh's ts_host. Drives the
+// host's tailscaled via the official tailscale image; --entrypoint
+// bypasses the image's containerboot ENTRYPOINT which otherwise
+// silently ignores positional args.
+//
+// Returns Promise<{ code, stdout, stderr }>. Never throws. Useful
+// distinction from runOnHost: this hits the daemon (socket bind);
+// runOnHost runs arbitrary commands in the host's namespaces.
+function tsHost(...args) {
+  return new Promise((resolve) => {
+    const child = spawn('docker', [
+      'run', '--rm', '--network=host',
+      '--mount', `type=bind,source=${TAILSCALE_SOCK},target=${TAILSCALE_SOCK}`,
+      '--entrypoint=/usr/local/bin/tailscale',
+      'tailscale/tailscale',
+      ...args,
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = ''; let stderr = '';
+    child.stdout.on('data', d => { stdout += d.toString(); });
+    child.stderr.on('data', d => { stderr += d.toString(); });
+    child.on('exit', code => resolve({ code, stdout, stderr }));
+    child.on('error', err => resolve({ code: -1, stdout: '', stderr: 'spawn failed: ' + err.message }));
+  });
+}
+
+// setStateConfigKey — atomic update of a single key under
+// state.config in /opt/vibe/state.json. Mirrors lib/state.sh's
+// state_set_config_kv.
+function setStateConfigKey(key, value) {
+  let state;
+  try {
+    state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+  } catch (err) {
+    if (err.code === 'ENOENT') state = {};
+    else throw err;
+  }
+  state.config = state.config || {};
+  state.config[key] = value;
+  const tmp = STATE_PATH + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+  fs.renameSync(tmp, STATE_PATH);
+}
+
+// setApplianceEnv — convenience wrapper around writeEnvKey for the
+// most-mutated env file. Closes over the path so endpoints don't
+// repeat path.join(ENV_DIR, 'appliance.env') at every call site.
+function setApplianceEnv(key, value) {
+  writeEnvKey(path.join(ENV_DIR, 'appliance.env'), key, value);
+}
+
+// Allowed values for state.config.mode. Used by /network-mode/switch
+// validation and exposed for the UI to keep its radio buttons in sync.
+const NETWORK_MODES = Object.freeze(['lan', 'domain', 'tailscale']);
+const NETWORK_MODES_SET = new Set(NETWORK_MODES);
+
+// Bring the tailnet up. Body: { authKey: string }. Writes the key to
+// appliance.env + sets TAILSCALE_ENABLED=true BEFORE invoking tsHost
+// so a partial failure (auth succeeds but serve-config fails) still
+// leaves the state consistent for a panel refresh. On exit 0, also
+// runs `tailscale serve --bg --https=443 http://127.0.0.1:80` (the
+// same idempotent re-apply infra/tailscale-up.sh does) and burns
+// the auth key.
+const TAILSCALE_AUTHKEY_RE = /^tskey-(auth|client)-[A-Za-z0-9-]{10,200}$/;
+
+app.post('/api/v1/admin/tailscale/connect', requireAdmin, testRateLimit, async (req, res) => {
+  const body = req.body || {};
+  const authKey = typeof body.authKey === 'string' ? body.authKey.trim() : '';
+  // Empty body = "use the AUTHKEY already in appliance.env" (retry path).
+  let effectiveKey = authKey;
+  if (!effectiveKey) {
+    const env = parseEnvFile(path.join(ENV_DIR, 'appliance.env'));
+    effectiveKey = (env.TAILSCALE_AUTHKEY || '').trim();
+  }
+  if (!effectiveKey) {
+    return res.status(400).json({ ok: false, error: 'authKey required (or set TAILSCALE_AUTHKEY in appliance.env first)' });
+  }
+  if (!TAILSCALE_AUTHKEY_RE.test(effectiveKey)) {
+    return res.status(400).json({ ok: false, error: 'authKey must start with tskey-auth- or tskey-client-' });
+  }
+
+  try {
+    setApplianceEnv('TAILSCALE_AUTHKEY', effectiveKey);
+    setApplianceEnv('TAILSCALE_ENABLED', 'true');
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: 'persisting authkey failed: ' + err.message });
+  }
+
+  // Hostname: prefer Self.HostName from a status probe so we don't
+  // clobber any operator-set tailnet hostname. Fall back to the
+  // node's hostname via os.hostname() (the container's, but in
+  // --network=host mode the daemon sees the host's hostname).
+  const status = await tsHost('status', '--json');
+  let hostname = '';
+  if (status.code === 0) {
+    try {
+      const s = JSON.parse(status.stdout);
+      hostname = (s.Self && s.Self.HostName) || '';
+    } catch { /* leave empty; CLI will default */ }
+  }
+
+  const upArgs = ['up', '--authkey=' + effectiveKey];
+  if (hostname) upArgs.push('--hostname=' + hostname);
+  log('info', 'tailscale up (panel)', { hostname: hostname || '(default)' });
+  const up = await tsHost(...upArgs);
+
+  if (up.code !== 0) {
+    return res.status(500).json({
+      ok: false,
+      action: 'tailscale-connect',
+      exit_code: up.code,
+      stdout: trim(up.stdout),
+      stderr: trim(up.stderr),
     });
+  }
+
+  // Re-apply serve config; idempotent. Failures here are warnings,
+  // not fatal — auth succeeded, the tailnet URL just won't terminate
+  // TLS automatically.
+  const serveReset = await tsHost('serve', 'reset');
+  const serve      = await tsHost('serve', '--bg', '--https=443', 'http://127.0.0.1:80');
+
+  // Burn the authkey from appliance.env now that we're connected.
+  try { setApplianceEnv('TAILSCALE_AUTHKEY', ''); }
+  catch (err) { log('warn', 'authkey burn failed', { err: err.message }); }
+  try { setStateConfigKey('tailscale', 'true'); }
+  catch (err) { log('warn', 'state.config.tailscale write failed', { err: err.message }); }
+
+  res.json({
+    ok: true,
+    action: 'tailscale-connect',
+    exit_code: 0,
+    serve_ok: serve.code === 0,
+    stdout: trim(up.stdout + (serve.code !== 0 ? '\n[serve] ' + serve.stderr : '')),
+    stderr: trim(up.stderr),
+  });
+});
+
+// Disconnect from the tailnet. No body.
+app.post('/api/v1/admin/tailscale/disconnect', requireAdmin, testRateLimit, async (_req, res) => {
+  log('info', 'tailscale logout (panel)', {});
+  const result = await tsHost('logout');
+  // tailscale logout exits non-zero when not logged in — treat as
+  // success so the panel can recover from any state.
+  const ok = result.code === 0 || /not logged in/i.test(result.stderr);
+
+  // Always converge appliance.env + state.json to "off", regardless of
+  // logout's exit code. The CLI may have refused because we were
+  // already logged out; our local state still needs to reflect off.
+  try {
+    setApplianceEnv('TAILSCALE_ENABLED', 'false');
+    setApplianceEnv('TAILSCALE_AUTHKEY', '');
+  } catch (err) { log('warn', 'appliance.env converge-off failed', { err: err.message }); }
+  try { setStateConfigKey('tailscale', 'false'); }
+  catch (err) { log('warn', 'state.config.tailscale write failed', { err: err.message }); }
+
+  res.status(ok ? 200 : 500).json({
+    ok,
+    action: 'tailscale-disconnect',
+    exit_code: result.code,
+    stdout: trim(result.stdout),
+    stderr: trim(result.stderr),
+  });
+});
+
+// Restart the host's tailscaled. Useful when the daemon's wedged
+// (rare). Waits up to ~5s for the socket to materialize after the
+// restart so the panel's immediate-next status call doesn't race.
+app.post('/api/v1/admin/tailscale/restart', requireAdmin, testRateLimit, async (_req, res) => {
+  const result = await runOnHost(
+    'systemctl restart tailscaled && ' +
+    'for _ in 1 2 3 4 5 6 7 8 9 10; do ' +
+    '  [ -S /var/run/tailscale/tailscaled.sock ] && break; sleep 0.5; ' +
+    'done'
+  );
+  _respondHostResult(res, 'tailscale-restart', result);
+});
+
+// Last 50 lines of tailscaled's systemd journal. Operator opens this
+// from a <details> in the troubleshooting section when Connect fails
+// and the CLI stderr isn't enough.
+app.get('/api/v1/admin/tailscale/logs', requireAdmin, testRateLimit, async (_req, res) => {
+  const result = await runOnHost('journalctl -u tailscaled --no-pager -n 50');
+  res.status(result.code === 0 ? 200 : 500).json({
+    ok: result.code === 0,
+    action: 'tailscale-logs',
+    output: trim(result.stdout, 64 * 1024),
+    stderr: trim(result.stderr),
+  });
+});
+
+// In-place upgrade of the tailscale package. The daemon bounces
+// briefly; the node-key in /var/lib/tailscale persists so re-auth
+// is automatic.
+app.post('/api/v1/admin/tailscale/update', requireAdmin, testRateLimit, async (_req, res) => {
+  const result = await runOnHost(
+    'DEBIAN_FRONTEND=noninteractive apt-get update -qq && ' +
+    'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --only-upgrade tailscale'
+  );
+  _invalidateAptCache();
+  _respondHostResult(res, 'tailscale-update', result);
+});
+
+// Full uninstall: logout, reset serve, stop+disable daemon, apt-remove
+// package, remove apt source + keyring, clear appliance.env keys, flip
+// state.config.tailscale=false. Reversible by clicking Install again.
+app.post('/api/v1/admin/tailscale/uninstall', requireAdmin, testRateLimit, async (_req, res) => {
+  // First the docker-image-driven logout + serve reset (the daemon is
+  // still running at this point, so we use the host's tailscale via
+  // the socket — same path as /disconnect).
+  await tsHost('logout');       // best-effort; ignore exit code
+  await tsHost('serve', 'reset'); // best-effort
+
+  // Then the host-side teardown. Use `|| true` on each step so a
+  // partial state (daemon not running, package half-installed) still
+  // reaches the file cleanup at the end.
+  const teardown = await runOnHost(
+    'systemctl disable --now tailscaled >/dev/null 2>&1 || true; ' +
+    'DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq tailscale || true; ' +
+    'rm -f /etc/apt/sources.list.d/tailscale.list ' +
+    '      /usr/share/keyrings/tailscale-archive-keyring.gpg; ' +
+    'echo done'
+  );
+
+  try {
+    setApplianceEnv('TAILSCALE_ENABLED', 'false');
+    setApplianceEnv('TAILSCALE_AUTHKEY', '');
+  } catch (err) { log('warn', 'uninstall appliance.env clear failed', { err: err.message }); }
+  try { setStateConfigKey('tailscale', 'false'); }
+  catch (err) { log('warn', 'uninstall state.config.tailscale flip failed', { err: err.message }); }
+
+  _invalidateAptCache();
+  _respondHostResult(res, 'tailscale-uninstall', teardown);
+});
+
+// Change the appliance's tailnet hostname. Body: { hostname }.
+// `tailscale set --hostname=` is non-disruptive; the tailnet URL
+// updates immediately at Tailscale's edge.
+const TAILSCALE_HOSTNAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+app.post('/api/v1/admin/tailscale/hostname', requireAdmin, testRateLimit, async (req, res) => {
+  const body = req.body || {};
+  const hostname = typeof body.hostname === 'string' ? body.hostname.trim().toLowerCase() : '';
+  if (!hostname || !TAILSCALE_HOSTNAME_RE.test(hostname)) {
+    return res.status(400).json({ ok: false, error: 'hostname must be 1-63 chars of [a-z0-9-], no leading/trailing hyphen' });
+  }
+  const result = await tsHost('set', '--hostname=' + hostname);
+  res.status(result.code === 0 ? 200 : 500).json({
+    ok: result.code === 0,
+    action: 'tailscale-hostname',
+    exit_code: result.code,
+    hostname,
+    stdout: trim(result.stdout),
+    stderr: trim(result.stderr),
   });
 });
 
@@ -1284,27 +1578,24 @@ app.get('/api/v1/admin/tailscale/status', requireAdmin, async (_req, res) => {
     daemon_state:        null,   // "Running" / "NeedsLogin" / "Stopped" / null
     tailnet_hostname:    null,   // host.tailnet.ts.net (no trailing dot)
     magicdns_url:        null,   // https://<hostname>
+    current_hostname:    null,   // Self.HostName — what the hostname-edit field shows
     key_expiry_iso:      null,
     key_expires_in_days: null,
+    daemon_version:      null,
+    apt_available_version: null, // null when probe failed (apt-cache offline, etc.)
+    authkey_pending:     false,  // TAILSCALE_AUTHKEY is set in appliance.env (retry-eligible)
     error:               null,
   };
 
-  // --mount type=bind fails fast with "source path does not exist"
-  // when tailscaled isn't installed (vs --volume which silently
-  // creates an empty dir at the source — a footgun on the host FS).
-  const probe = await new Promise((resolve) => {
-    const child = spawn('docker', [
-      'run', '--rm', '--network=host',
-      '--mount', `type=bind,source=${TAILSCALE_SOCK},target=${TAILSCALE_SOCK}`,
-      'tailscale/tailscale',
-      'tailscale', 'status', '--json',
-    ], { stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = ''; let stderr = '';
-    child.stdout.on('data', d => { stdout += d.toString(); });
-    child.stderr.on('data', d => { stderr += d.toString(); });
-    child.on('exit', code => resolve({ code, stdout, stderr }));
-    child.on('error', () => resolve({ code: -1, stdout: '', stderr: 'docker spawn failed' }));
-  });
+  // status + version run on every call; apt-cache is bounded by a
+  // 5-minute in-memory cache. The Update card only needs to surface
+  // a newer version once; refreshing it every status read (which
+  // happens after every panel action) hammers apt for no gain.
+  const [probe, verResult, aptResult] = await Promise.all([
+    tsHost('status', '--json'),
+    runOnHost('tailscale version 2>/dev/null | head -1 || true'),
+    _cachedAptAvailable(),
+  ]);
 
   if (probe.code === 0) {
     out.cli_installed = true;
@@ -1314,6 +1605,7 @@ app.get('/api/v1/admin/tailscale/status', requireAdmin, async (_req, res) => {
       const dns = (s.Self && s.Self.DNSName ? String(s.Self.DNSName) : '').replace(/\.$/, '');
       out.tailnet_hostname = dns || null;
       if (dns) out.magicdns_url = 'https://' + dns;
+      out.current_hostname = (s.Self && s.Self.HostName) ? String(s.Self.HostName) : null;
       const expiry = s.Self && s.Self.KeyExpiry;
       if (expiry) {
         const ms = Date.parse(expiry);
@@ -1339,7 +1631,203 @@ app.get('/api/v1/admin/tailscale/status', requireAdmin, async (_req, res) => {
     }
   }
 
+  // Parse `tailscale version` top-line: just the version number.
+  if (verResult.code === 0) {
+    const m = (verResult.stdout || '').trim().match(/^([0-9]+\.[0-9]+\.[0-9]+)/);
+    if (m) out.daemon_version = m[1];
+  }
+
+  // Parse `apt-cache policy tailscale | awk Candidate`: a version like
+  // "1.76.2" or "1.76.2-noble" — keep only the numeric prefix so
+  // version comparison is straightforward client-side.
+  if (aptResult.code === 0) {
+    const m = (aptResult.stdout || '').trim().match(/^([0-9]+\.[0-9]+\.[0-9]+)/);
+    if (m) out.apt_available_version = m[1];
+  }
+
+  // authkey_pending: when appliance.env has a non-empty TAILSCALE_AUTHKEY,
+  // the panel shows "(set)" placeholder in the auth-key field so the
+  // operator can retry without re-pasting. Burned to empty on successful
+  // Connect.
+  try {
+    const env = parseEnvFile(path.join(ENV_DIR, 'appliance.env'));
+    out.authkey_pending = !!(env.TAILSCALE_AUTHKEY || '').trim();
+  } catch { /* leave false */ }
+
   res.json(out);
+});
+
+// --- Network mode switching --------------------------------------
+//
+// Switches state.config.mode between lan / domain / tailscale plus
+// re-renders the Caddyfile and reloads Caddy. Bootstrap.sh's
+// --mode flag remains the canonical first-time setup; this endpoint
+// handles the routine "switch modes after install" case.
+//
+// Atomicity: state.json + Caddyfile both snapshotted to .bak.<ts>
+// before any write. On render-validate or reload failure, both are
+// restored from snapshot and Caddy is reloaded with the old config.
+// If THAT reload also fails, the response surfaces "DEGRADED" with
+// the exact recovery commands.
+
+const DOMAIN_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i;
+const EMAIL_RE  = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, async (req, res) => {
+  const body  = req.body || {};
+  const mode  = typeof body.mode === 'string' ? body.mode : '';
+  const domain = typeof body.domain === 'string' ? body.domain.trim().toLowerCase() : '';
+  const email  = typeof body.email  === 'string' ? body.email.trim()  : '';
+
+  if (!NETWORK_MODES_SET.has(mode)) {
+    return res.status(400).json({ ok: false, error: 'mode must be one of: lan, domain, tailscale' });
+  }
+  if (mode === 'domain') {
+    if (!domain || !DOMAIN_RE.test(domain)) {
+      return res.status(400).json({ ok: false, error: 'domain required and must look like an FQDN (e.g. firm.com)' });
+    }
+    if (!email || !EMAIL_RE.test(email)) {
+      return res.status(400).json({ ok: false, error: 'email required for ACME contact (e.g. admin@firm.com)' });
+    }
+  }
+  if (mode === 'tailscale') {
+    // Prereq: tailnet must be Running. Mirror the status endpoint's
+    // probe — if BackendState != Running, refuse with a hint.
+    const probe = await tsHost('status', '--json');
+    let backendState = '';
+    if (probe.code === 0) {
+      try { backendState = (JSON.parse(probe.stdout).BackendState || '').trim(); }
+      catch { /* leave empty */ }
+    }
+    if (backendState !== 'Running') {
+      return res.status(400).json({
+        ok: false,
+        error: `mode=tailscale requires Tailscale daemon Running (currently: ${backendState || 'unreachable'}). Connect Tailscale in the panel below first.`,
+      });
+    }
+  }
+
+  // Snapshot state.json + Caddyfile so we have a clean rollback path.
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const stateBak    = STATE_PATH + '.bak.' + ts;
+  const caddyfile   = '/opt/vibe/data/caddy/Caddyfile';
+  const caddyBak    = caddyfile + '.bak.' + ts;
+  try {
+    fs.copyFileSync(STATE_PATH, stateBak);
+    if (fs.existsSync(caddyfile)) fs.copyFileSync(caddyfile, caddyBak);
+  } catch (err) {
+    log('error', 'mode-switch snapshot failed', { err: err.message });
+    return res.status(500).json({ ok: false, error: 'snapshot failed: ' + err.message });
+  }
+
+  // Read state, write new mode + optionally domain/email. Switch-away-
+  // from-domain clears domain + email (otherwise stale values keep
+  // tripping Caddy's auto_https on the next render).
+  let state;
+  try { state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8')); }
+  catch (err) { return res.status(500).json({ ok: false, error: 'state.json unreadable: ' + err.message }); }
+  state.config = state.config || {};
+  const prevMode = state.config.mode || null;
+  state.config.mode = mode;
+  if (mode === 'domain') {
+    state.config.domain = domain;
+    state.config.email  = email;
+  } else {
+    state.config.domain = '';
+    state.config.email  = '';
+  }
+  try {
+    const tmp = STATE_PATH + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+    fs.renameSync(tmp, STATE_PATH);
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: 'state.json write failed: ' + err.message });
+  }
+
+  // Re-render + reload via the canonical lib functions. The script
+  // self-validates via `caddy validate` (when the image is local) and
+  // aborts the install if invalid, leaving the live file untouched.
+  // If render_caddyfile errors, we still own the rollback for state.json.
+  const renderArgs = [
+    '-c',
+    [
+      'set -euo pipefail',
+      'export APPLIANCE_DIR=/opt/vibe/appliance',
+      '. "$APPLIANCE_DIR/lib/log.sh"',
+      '. "$APPLIANCE_DIR/lib/state.sh"',
+      '. "$APPLIANCE_DIR/lib/render-caddyfile.sh"',
+      'log_init',
+      'log_set_phase "network-mode-switch"',
+      'render_caddyfile',
+      'reload_caddyfile',
+    ].join('; '),
+  ];
+
+  const render = await new Promise((resolve) => {
+    const child = spawn('/bin/bash', renderArgs, {
+      env: { ...process.env, APPLIANCE_DIR, VIBE_DIR, NO_COLOR: '1' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = ''; let stderr = '';
+    child.stdout.on('data', d => { stdout += d.toString(); });
+    child.stderr.on('data', d => { stderr += d.toString(); });
+    child.on('exit', code => resolve({ code, stdout, stderr }));
+    child.on('error', err => resolve({ code: -1, stdout: '', stderr: 'spawn failed: ' + err.message }));
+  });
+
+  if (render.code === 0) {
+    log('info', 'network mode switched', { from: prevMode, to: mode, domain });
+    const warnings = [];
+    if (mode === 'domain') {
+      warnings.push('On the first request to each subdomain Caddy will spend 10–30s issuing a Let\'s Encrypt cert. Subsequent requests are instant.');
+      warnings.push('If port 80 isn\'t reachable from the public internet, cert issuance will fail. Use Cloudflare Tunnel or fix DNS first.');
+    }
+    if (prevMode === 'domain' && mode !== 'domain') {
+      warnings.push('Public domain access has stopped. Apps that need a public URL (Connect\'s client portal) won\'t work for external clients.');
+    }
+    warnings.push('Apps may need a Disable → Enable from the Apps tab to refresh per-app env (ALLOWED_ORIGIN, etc.).');
+
+    return res.json({
+      ok: true,
+      action:   'network-mode-switch',
+      from:     prevMode,
+      to:       mode,
+      domain:   mode === 'domain' ? domain : null,
+      warnings,
+      snapshot: { state: stateBak, caddyfile: caddyBak },
+    });
+  }
+
+  // Rollback. Restore state.json + Caddyfile from the snapshot and
+  // tell Caddy to load the old config again.
+  log('error', 'network mode switch failed; rolling back', { code: render.code });
+  let rollbackErr = null;
+  try {
+    fs.copyFileSync(stateBak, STATE_PATH);
+    if (fs.existsSync(caddyBak)) fs.copyFileSync(caddyBak, caddyfile);
+  } catch (err) { rollbackErr = 'restore failed: ' + err.message; }
+
+  const rollbackReload = await new Promise((resolve) => {
+    const child = spawn('docker', ['exec', 'vibe-caddy', 'caddy', 'reload', '--config', '/etc/caddy/Caddyfile'],
+      { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    child.stderr.on('data', d => { stderr += d.toString(); });
+    child.on('exit', code => resolve({ code, stderr }));
+    child.on('error', err => resolve({ code: -1, stderr: 'spawn failed: ' + err.message }));
+  });
+
+  const degraded = !!rollbackErr || rollbackReload.code !== 0;
+  res.status(500).json({
+    ok: false,
+    action: 'network-mode-switch',
+    error: 'mode switch failed: ' + trim(render.stderr || render.stdout, 1024),
+    rollback: rollbackErr ? { failed: true, error: rollbackErr } : { ok: rollbackReload.code === 0 },
+    degraded,
+    snapshot: { state: stateBak, caddyfile: caddyBak },
+    recovery: degraded
+      ? `Manual recovery required. Run: sudo cp ${stateBak} ${STATE_PATH} && sudo cp ${caddyBak} ${caddyfile} && sudo docker exec vibe-caddy caddy reload --config /etc/caddy/Caddyfile`
+      : null,
+  });
 });
 
 // Inline admin-password rotation. Persists a scrypt hash to the meta

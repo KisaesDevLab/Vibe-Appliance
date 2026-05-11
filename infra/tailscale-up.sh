@@ -157,10 +157,20 @@ print("https://"+n)' 2>/dev/null || true)"
 tailscale_install
 
 # SKIP_BRING_UP=1 — install the CLI + daemon, then exit. The admin
-# panel's "Install Tailscale on host" button uses this so the operator
-# can paste an authkey via the form afterward (settings-save's
-# tailscale-toggle runs `tailscale up` once the toggle is saved).
+# panel's "Install Tailscale on host" button uses this; the panel's
+# Connect button then drives `tailscale up`. Explicit systemctl
+# enable here because the apt postinst's systemctl call can silently
+# no-op when running under nsenter from a privileged container —
+# leaving the package installed but the daemon dead. The socket-wait
+# loop avoids racing the immediate-next /tailscale/status call.
 if [[ "${SKIP_BRING_UP:-0}" == "1" ]]; then
+  log_step "enabling tailscaled (skipping authentication)"
+  systemctl enable --now tailscaled >>"$VIBE_LOG_FILE" 2>&1 || \
+    log_warn "systemctl enable --now tailscaled returned non-zero — daemon may need manual start"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [[ -S /var/run/tailscale/tailscaled.sock ]] && break
+    sleep 0.5
+  done
   log_ok "tailscale CLI installed; bring-up skipped (SKIP_BRING_UP=1)"
   exit 0
 fi

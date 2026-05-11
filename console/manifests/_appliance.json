@@ -7,36 +7,32 @@
     {
       "name":  "TAILSCALE_ENABLED",
       "value": "false",
-      "doc":   "Whether Tailscale is enabled on the host. Read-only mirror of state.config.tailscale; toggle here triggers the Tailscale up/down postSaveJob (v1.2 special-case flow).",
+      "doc":   "Panel-managed. Mirrors state.config.tailscale; the Configuration → Network → Tailscale panel writes this when the operator clicks Connect/Disconnect. The form input is filtered out by settings.js so the panel is the single source of truth.",
       "ui": {
         "tier":            1,
         "category":        "Network",
         "label":           "Tailscale",
-        "helpText":        "Enables tailnet-only HTTPS access (https://<host>.<tailnet>.ts.net) alongside the primary mode. Toggle ON requires a Tailscale auth key.",
+        "helpText":        "Panel-managed — use the Tailscale section in Configuration → Network. The form input is hidden because the panel owns Install/Connect/Disconnect/Restart/Update/Uninstall.",
         "input":           "toggle",
         "appliance":       "shared",
         "validate":        "enum",
         "options": [
           { "value": "true",  "label": "Enabled"  },
           { "value": "false", "label": "Disabled" }
-        ],
-        "postSaveJob":     "tailscale-toggle"
+        ]
       }
     },
     {
       "name":  "TAILSCALE_AUTHKEY",
       "secret": true,
-      "doc":   "Tailscale auth key for unattended `tailscale up`. Required when TAILSCALE_ENABLED transitions false→true. Cleared after successful authentication.",
+      "doc":   "Panel-managed. The Tailscale panel's Connect button writes this to appliance.env before running `tailscale up`, then burns it on success. Form input is filtered out by settings.js.",
       "ui": {
         "tier":            1,
         "category":        "Network",
         "label":           "Tailscale auth key",
-        "helpText":        "Generate at https://login.tailscale.com/admin/settings/keys (reusable, ephemeral=false).",
+        "helpText":        "Panel-managed. Paste auth keys via the Connect button in the Tailscale section, not via this field.",
         "input":           "password",
-        "appliance":       "shared",
-        "dependsOnFields": ["TAILSCALE_ENABLED"],
-        "showIf":          { "TAILSCALE_ENABLED": "true" },
-        "testEndpoint":    "/api/v1/admin/test/tailscale"
+        "appliance":       "shared"
       }
     },
     {

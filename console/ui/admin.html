@@ -183,10 +183,10 @@
           <p style="background:rgba(184,114,46,0.10);border:1px solid var(--accent);padding:0.65rem 0.8rem;border-radius:4px;">
             <strong>Use the in-page panel.</strong> Open
             <a href="/admin/settings">Configuration &rarr; Network</a> &rarr; <em>Tailscale</em> section.
-            If the host doesn&rsquo;t have Tailscale installed, click <em>Install Tailscale on host</em>;
-            the appliance runs the canonical install script inside a privileged docker pod that joins the
-            host&rsquo;s namespaces. After install, paste an auth key into the <em>Tailscale auth key</em>
-            field below, toggle <em>Tailscale</em> ON, and Save.
+            The panel owns Install, Connect (paste auth key), Disconnect, Restart daemon,
+            View daemon logs, Update tailscale, Change hostname, and Uninstall. No SSH required for
+            any of these. To switch the appliance&rsquo;s primary network mode to Tailscale-only, use
+            the <em>Network mode</em> section at the top of the same tab.
           </p>
 
           <p><strong>Prerequisites</strong></p>
@@ -207,8 +207,8 @@
             <li>Every user accessing the appliance needs Tailscale on their own device.</li>
             <li>Tailscale&rsquo;s MagicDNS auto-issues certs from Tailscale&rsquo;s own CA &mdash; no Let&rsquo;s Encrypt, no port 80 requirement.</li>
             <li>Vibe-Connect&rsquo;s client-portal magic-links won&rsquo;t work if your <em>clients</em> aren&rsquo;t on Tailscale (they almost certainly aren&rsquo;t). For client traffic, use Cloudflare Tunnel; Tailscale is staff-only.</li>
-            <li>The auth key has an expiry (default 90 days). The panel warns when the node key is within 14 days of expiry &mdash; generate a new key and re-Save before then to avoid silent drop-off.</li>
-            <li>Want the appliance&rsquo;s <em>primary</em> mode to be Tailscale-only (no LAN/domain coexistence)? That switch is heavier &mdash; run <span class="mono">sudo /opt/vibe/appliance/bootstrap.sh --mode tailscale --tailscale-authkey ...</span> on the host. The in-page toggle runs Tailscale <em>alongside</em> the primary mode, which is what most installs want.</li>
+            <li>The auth key has an expiry (default 90 days). The panel warns when the node key is within 14 days of expiry &mdash; generate a new key and Connect again before then to avoid silent drop-off.</li>
+            <li>Want the appliance&rsquo;s <em>primary</em> mode to be Tailscale-only (no LAN/domain coexistence)? Use the <em>Network mode</em> section at the top of the Network tab — radio for Tailscale-only, click Switch. (Requires Tailscale already Connected.) Bootstrap&rsquo;s <span class="mono">--mode tailscale</span> flag remains the canonical first-time setup but is no longer required for routine switching.</li>
           </ul>
         </div>
       </details>
