@@ -922,16 +922,60 @@ app.post('/api/v1/admin/refresh-host-ip', requireAdmin, testRateLimit, async (_r
 
 // Build / version visibility — solves "did my deploy actually take?"
 // Returns mtimes of the live settings.js and server.js inside the
-// running container. If the operator's wizard says "build X" but
-// /api/v1/version says the settings.js mtime is way old, they know
-// the console image hasn't been rebuilt since the change. No auth —
-// non-sensitive metadata, useful from a curl.
+// running container, plus the appliance's current git commit. The
+// console image doesn't bundle git (~5MB it doesn't need), so we
+// read .git/HEAD and .git/logs/HEAD directly via fs from the bind-
+// mounted appliance dir. No auth — non-sensitive metadata, useful
+// from a curl.
+let _gitInfoCache = null;
+function _readGitInfo() {
+  if (_gitInfoCache) return _gitInfoCache;
+  const gitDir = path.join(APPLIANCE_DIR, '.git');
+  const out = { sha: null, branch: null, commit_date: null };
+  try {
+    const head = fs.readFileSync(path.join(gitDir, 'HEAD'), 'utf8').trim();
+    let sha;
+    if (head.startsWith('ref: ')) {
+      const ref = head.slice(5);
+      out.branch = ref.replace(/^refs\/heads\//, '');
+      try {
+        sha = fs.readFileSync(path.join(gitDir, ref), 'utf8').trim();
+      } catch {
+        // Packed refs fallback — read packed-refs and find the line for
+        // this ref. Common after `git gc` or a fresh clone.
+        try {
+          const packed = fs.readFileSync(path.join(gitDir, 'packed-refs'), 'utf8');
+          const m = packed.split('\n').find(l => l.endsWith(' ' + ref));
+          if (m) sha = m.split(' ')[0];
+        } catch { /* leave null */ }
+      }
+    } else {
+      out.branch = 'detached';
+      sha = head;
+    }
+    if (sha) out.sha = sha.slice(0, 7);
+    // Commit timestamp from .git/logs/HEAD's last reflog line — the
+    // unix timestamp sits between the committer email and the tab
+    // before the action description: "<old> <new> <name> <email> <ts> <tz>\t<action>".
+    try {
+      const log = fs.readFileSync(path.join(gitDir, 'logs', 'HEAD'), 'utf8');
+      const lines = log.split('\n').filter(Boolean);
+      const last = lines[lines.length - 1];
+      const m = last && last.match(/>\s+(\d+)\s+[+-]\d{4}\t/);
+      if (m) out.commit_date = new Date(parseInt(m[1], 10) * 1000).toISOString();
+    } catch { /* leave null */ }
+  } catch { /* .git absent (rare); leave defaults */ }
+  _gitInfoCache = out;
+  return out;
+}
+
 app.get('/api/v1/version', (_req, res) => {
   const out = {
     settings_js: null,
     server_js:   null,
     started_at:  new Date(Date.now() - process.uptime() * 1000).toISOString(),
     uptime_s:    Math.floor(process.uptime()),
+    git:         _readGitInfo(),
   };
   try {
     out.settings_js = fs.statSync(path.join(__dirname, 'ui', 'static', 'settings.js')).mtime.toISOString();
