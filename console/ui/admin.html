@@ -413,7 +413,7 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
         renderApps(apps.apps || []);
         renderInfra((infra && infra.infra) || []);
         renderFirstLogin((firstLogin && firstLogin.first_login) || []);
-        renderSetupBanners(settingsValues, status.state && status.state.config || {});
+        renderSetupBanners(settingsValues, status.state && status.state.config || {}, status.tailscale_live || null);
         renderHostServices((hostServices && hostServices.host_services) || []);
         renderEmergency(
           apps.apps || [],
@@ -435,7 +435,7 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
     // BACKUP_DESTINATION_TYPE / TAILSCALE banners surface when those
     // settings are declared in a manifest (v1.2 / when DUPLICATI_DEST setting
     // lands).
-    function renderSetupBanners(settings, config) {
+    function renderSetupBanners(settings, config, tsLive) {
       const wrap = document.getElementById('setup-banners');
       if (!settings) { wrap.hidden = true; return; }
       const banners = [];
@@ -451,9 +451,16 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
         });
       }
 
-      // Tailscale: not in settings registry today (config.tailscale lives
-      // in state.config). Surface as informational reminder when off.
-      if (config.tailscale !== 'true' && config.mode !== 'tailscale') {
+      // Tailscale: prefer the live daemon probe (same source the
+      // Tailscale panel uses). state.config.tailscale drifts —
+      // bootstrap clobbers, panel writes are async, daemon can be
+      // disconnected out-of-band — so trust the actual BackendState
+      // when the server reports it. Fall back to the persisted flag
+      // only when the live probe is missing.
+      const tailnetUp = tsLive
+        ? tsLive.state === 'Running'
+        : config.tailscale === 'true';
+      if (!tailnetUp && config.mode !== 'tailscale') {
         banners.push({
           severity: 'info',
           msg: 'Tailscale not configured. Recommended for emergency access from outside the LAN.',

@@ -807,9 +807,13 @@ app.get('/api/v1/public/apps', (_req, res) => {
 
 // --- Apps registry & toggle endpoints ---------------------------------
 
-app.get('/api/v1/apps', requireAdmin, (_req, res) => {
+app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
   const state = readState();
   const stateApps = state.apps || {};
+  // Live tailscale state (cached 10s) — feeds appTailnetUrl + the
+  // mode=tailscale branch of appPublicUrl so app cards reflect
+  // daemon reality, not the bootstrap-set state.config.tailscale.
+  const live = await _liveTailscaleState();
   const items = Object.values(MANIFESTS)
     .map((m) => {
       const s = stateApps[m.slug] || {};
@@ -842,15 +846,16 @@ app.get('/api/v1/apps', requireAdmin, (_req, res) => {
         description: m.description,
         subdomain: m.subdomain,
         defaultTag: m.image && m.image.defaultTag,
-        url: appPublicUrl(m, state.config || {}),
+        url: appPublicUrl(m, state.config || {}, live),
         // LAN-fallback URL (http://<host_ip>/<slug>/ via Caddy) — what
         // the app card's "backup" row uses. Caddy-routed; works when
         // mDNS / vibe.local is the failure point.
         lanFallbackUrl: appLanFallbackUrl(m, state.config || {}),
-        // Tailnet URL — only when daemon is up + hostname recorded
-        // + primary mode supports path-prefix routing. Null in
-        // Domain mode (per-app paths over tailnet hit catch-all).
-        tailnetUrl:    appTailnetUrl(m, state.config || {}),
+        // Tailnet URL — only when the live daemon probe shows
+        // BackendState=Running + hostname is known + mode supports
+        // path-prefix routing. Null in Domain mode (per-app paths
+        // over tailnet hit catch-all).
+        tailnetUrl:    appTailnetUrl(m, state.config || {}, live),
         // HAProxy emergency-port URL — Emergency Access panel only.
         // Bypasses Caddy entirely; for the "Caddy is down" failure
         // mode. Has known SPA blank-page limitations per
@@ -1311,6 +1316,39 @@ function runOnHost(shellCommand) {
   });
 }
 
+// 10-second in-memory cache for tailscale daemon state. Used by
+// /apps + /admin/status to ground app-card tailnet URLs and the
+// "Tailscale not configured" status banner in the actual daemon
+// state rather than the cached `state.config.tailscale` flag (which
+// drifts: bootstrap clobbers, panel writes asynchronously, daemon
+// can be disconnected out-of-band). TTL is short because panel
+// refreshes hit /admin/status every 15s and we want < one probe
+// cost per refresh cycle while keeping the value fresh.
+const _DAEMON_TTL_MS = 10 * 1000;
+let _daemonCache = { value: { backendState: null, hostname: null }, ts: 0 };
+
+async function _liveTailscaleState() {
+  if (Date.now() - _daemonCache.ts < _DAEMON_TTL_MS) {
+    return _daemonCache.value;
+  }
+  const probe = await tsHost('status', '--json');
+  const out = { backendState: null, hostname: null };
+  if (probe.code === 0) {
+    try {
+      const s = JSON.parse(probe.stdout);
+      out.backendState = (s.BackendState || '').trim() || null;
+      const dns = (s.Self && s.Self.DNSName ? String(s.Self.DNSName) : '').replace(/\.$/, '');
+      out.hostname = dns || null;
+    } catch { /* leave nulls */ }
+  }
+  _daemonCache = { value: out, ts: Date.now() };
+  return out;
+}
+
+function _invalidateDaemonCache() {
+  _daemonCache = { value: { backendState: null, hostname: null }, ts: 0 };
+}
+
 // 5-minute in-memory cache for apt-cache policy probes. The Update
 // card on the Tailscale panel only needs the available version once;
 // without a cache, every panel refresh (Connect/Disconnect/Restart/…)
@@ -1356,6 +1394,7 @@ app.post('/api/v1/admin/tailscale/install', requireAdmin, testRateLimit, async (
     'env SKIP_BRING_UP=1 bash /opt/vibe/appliance/infra/tailscale-up.sh'
   );
   _invalidateAptCache();
+  _invalidateDaemonCache();
   _respondHostResult(res, 'tailscale-install', result);
 });
 
@@ -1485,6 +1524,7 @@ app.post('/api/v1/admin/tailscale/connect', requireAdmin, testRateLimit, async (
   catch (err) { log('warn', 'authkey burn failed', { err: err.message }); }
   try { setStateConfigKey('tailscale', 'true'); }
   catch (err) { log('warn', 'state.config.tailscale write failed', { err: err.message }); }
+  _invalidateDaemonCache();
 
   res.json({
     ok: true,
@@ -1513,6 +1553,7 @@ app.post('/api/v1/admin/tailscale/disconnect', requireAdmin, testRateLimit, asyn
   } catch (err) { log('warn', 'appliance.env converge-off failed', { err: err.message }); }
   try { setStateConfigKey('tailscale', 'false'); }
   catch (err) { log('warn', 'state.config.tailscale write failed', { err: err.message }); }
+  _invalidateDaemonCache();
 
   res.status(ok ? 200 : 500).json({
     ok,
@@ -1558,6 +1599,7 @@ app.post('/api/v1/admin/tailscale/update', requireAdmin, testRateLimit, async (_
     'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --only-upgrade tailscale'
   );
   _invalidateAptCache();
+  _invalidateDaemonCache();
   _respondHostResult(res, 'tailscale-update', result);
 });
 
@@ -1590,6 +1632,7 @@ app.post('/api/v1/admin/tailscale/uninstall', requireAdmin, testRateLimit, async
   catch (err) { log('warn', 'uninstall state.config.tailscale flip failed', { err: err.message }); }
 
   _invalidateAptCache();
+  _invalidateDaemonCache();
   _respondHostResult(res, 'tailscale-uninstall', teardown);
 });
 
@@ -3887,21 +3930,21 @@ function appLanFallbackUrl(manifest, config) {
   return `http://${ip}/${manifest.slug}/`;
 }
 
-// Tailnet URL for an app. Only returned when the daemon is up
-// (state.config.tailscale==='true'), the bootstrap probe recorded the
-// hostname, AND the current primary mode actually routes per-app
-// paths over the tailnet (lan or tailscale; NOT domain — Caddy in
-// domain mode emits per-subdomain vhosts only, so /<slug>/ on the
-// tailnet falls to the catch-all console).
-function appTailnetUrl(manifest, config) {
-  if (config.tailscale !== 'true') return null;
-  const host = (config.tailscale_hostname || '').replace(/\.$/, '');
-  if (!host) return null;
+// Tailnet URL for an app. Only returned when the LIVE daemon probe
+// shows BackendState===Running and reports a hostname. Mirrors what
+// the Tailscale panel itself uses (the source of truth), so the
+// card stays in sync with daemon reality even when state.config.
+// tailscale or state.config.tailscale_hostname drift.
+function appTailnetUrl(manifest, config, live) {
+  if (!live || live.backendState !== 'Running' || !live.hostname) return null;
+  // Domain mode: Caddy emits per-subdomain vhosts only; /<slug>/ on
+  // the tailnet falls to the catch-all console. Don't render a
+  // misleading row.
   if (config.mode === 'domain') return null;
-  return `https://${host}/${manifest.slug}/`;
+  return `https://${live.hostname}/${manifest.slug}/`;
 }
 
-function appPublicUrl(manifest, config) {
+function appPublicUrl(manifest, config, live) {
   // Domain mode → real per-app subdomain.
   if (config.mode === 'domain' && config.domain) {
     return `https://${manifest.subdomain}.${config.domain}/`;
@@ -3916,13 +3959,14 @@ function appPublicUrl(manifest, config) {
   }
 
   // Tailscale-primary mode → the tailnet URL is the canonical access
-  // path. Read from state.config.tailscale_hostname (populated by
-  // bootstrap.sh's tailscale phase from `tailscale status --json`).
+  // path. Prefer the live probe (always fresh); fall back to the
+  // bootstrap-cached state.config.tailscale_hostname if the daemon
+  // is currently unreachable. Final fallback to LAN-IP so the card
+  // renders something usable.
   if (config.mode === 'tailscale') {
-    const host = (config.tailscale_hostname || '').replace(/\.$/, '');
+    const host = (live && live.hostname) ||
+                 (config.tailscale_hostname || '').replace(/\.$/, '');
     if (host) return `https://${host}/${manifest.slug}/`;
-    // Hostname not yet recorded (Connect didn't run, or state wiped).
-    // Fall back to LAN-IP path style so the card renders something.
     if (config.host_ip) return `http://${config.host_ip}/${manifest.slug}/`;
     return `(tailscale mode without a recorded tailnet hostname — re-Connect from the Tailscale panel)`;
   }
@@ -4096,6 +4140,12 @@ async function collectStatus() {
     disk = { path: VIBE_DIR, error: err.code || err.message };
   }
 
+  // Live tailscale daemon state — cached 10s; refreshed on
+  // panel-driven Connect/Disconnect/Install/Uninstall. The admin
+  // page's "Tailscale not configured" banner reads from this rather
+  // than state.config.tailscale (which can drift).
+  const tsLive = await _liveTailscaleState();
+
   return {
     docker: {
       version:  dockerInfo.ServerVersion,
@@ -4110,6 +4160,10 @@ async function collectStatus() {
     disk,
     containers: containerList,
     state: readState(),
+    tailscale_live: {
+      state:    tsLive.backendState,
+      hostname: tsLive.hostname,
+    },
     now: new Date().toISOString(),
   };
 }
