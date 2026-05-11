@@ -847,6 +847,10 @@ app.get('/api/v1/apps', requireAdmin, (_req, res) => {
         // the app card's "backup" row uses. Caddy-routed; works when
         // mDNS / vibe.local is the failure point.
         lanFallbackUrl: appLanFallbackUrl(m, state.config || {}),
+        // Tailnet URL — only when daemon is up + hostname recorded
+        // + primary mode supports path-prefix routing. Null in
+        // Domain mode (per-app paths over tailnet hit catch-all).
+        tailnetUrl:    appTailnetUrl(m, state.config || {}),
         // HAProxy emergency-port URL — Emergency Access panel only.
         // Bypasses Caddy entirely; for the "Caddy is down" failure
         // mode. Has known SPA blank-page limitations per
@@ -3839,6 +3843,20 @@ function appLanFallbackUrl(manifest, config) {
   return `http://${ip}/${manifest.slug}/`;
 }
 
+// Tailnet URL for an app. Only returned when the daemon is up
+// (state.config.tailscale==='true'), the bootstrap probe recorded the
+// hostname, AND the current primary mode actually routes per-app
+// paths over the tailnet (lan or tailscale; NOT domain — Caddy in
+// domain mode emits per-subdomain vhosts only, so /<slug>/ on the
+// tailnet falls to the catch-all console).
+function appTailnetUrl(manifest, config) {
+  if (config.tailscale !== 'true') return null;
+  const host = (config.tailscale_hostname || '').replace(/\.$/, '');
+  if (!host) return null;
+  if (config.mode === 'domain') return null;
+  return `https://${host}/${manifest.slug}/`;
+}
+
 function appPublicUrl(manifest, config) {
   // Domain mode → real per-app subdomain.
   if (config.mode === 'domain' && config.domain) {
@@ -3846,27 +3864,23 @@ function appPublicUrl(manifest, config) {
   }
 
   // LAN mode → http://<hostname>.local/<slug>/ via mDNS + Caddy
-  // path-prefix routing (Phase 6). state.config.hostname isn't set,
-  // so we fall back to whatever os.hostname() reports inside this
-  // container. That's the host's hostname because we set
-  // extra_hosts: host-gateway, and node:bookworm-slim inherits the
-  // container's hostname which compose sets to the service name. So
-  // we read the host hostname from /etc/hostname (the host bind-
-  // mounts /opt/vibe but not /etc, so we approximate via the
-  // VIBE_HOST_HOSTNAME env var the operator can set, or the
-  // container's hostname which is wrong but at least non-empty).
+  // path-prefix routing. VIBE_HOST_HOSTNAME (set by bootstrap from
+  // /etc/hostname) is the host's hostname; falls back to 'vibe'.
   if (config.mode === 'lan') {
     const host = process.env.VIBE_HOST_HOSTNAME || 'vibe';
     return `http://${host}.local/${manifest.slug}/`;
   }
 
-  // Tailscale mode → https://<tailnet-host>/<slug>/. The tailnet
-  // hostname isn't recorded in state today (Phase 6 deferral); we
-  // surface a placeholder the operator can complete by hand. Worth
-  // upgrading once `tailscale status` is shelled out from the
-  // console to capture the actual DNS name.
+  // Tailscale-primary mode → the tailnet URL is the canonical access
+  // path. Read from state.config.tailscale_hostname (populated by
+  // bootstrap.sh's tailscale phase from `tailscale status --json`).
   if (config.mode === 'tailscale') {
-    return `https://<tailnet-host>/${manifest.slug}/`;
+    const host = (config.tailscale_hostname || '').replace(/\.$/, '');
+    if (host) return `https://${host}/${manifest.slug}/`;
+    // Hostname not yet recorded (Connect didn't run, or state wiped).
+    // Fall back to LAN-IP path style so the card renders something.
+    if (config.host_ip) return `http://${config.host_ip}/${manifest.slug}/`;
+    return `(tailscale mode without a recorded tailnet hostname — re-Connect from the Tailscale panel)`;
   }
 
   // Combo or unknown mode — best effort.

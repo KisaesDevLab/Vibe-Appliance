@@ -894,6 +894,9 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
             ${a.lanFallbackUrl ? `
             <dt>backup</dt><dd><a href="${escapeHtml(a.lanFallbackUrl)}">${escapeHtml(a.lanFallbackUrl)}</a>
               <span class="muted">(LAN / Tailscale only)</span></dd>` : ''}
+            ${a.tailnetUrl ? `
+            <dt>tailnet</dt><dd><a href="${escapeHtml(a.tailnetUrl)}">${escapeHtml(a.tailnetUrl)}</a>
+              <span class="muted">(via Tailscale)</span></dd>` : ''}
           </dl>
           ${imageHint}
           ${a.error ? '<div class="error-banner">' + escapeHtml(a.error) + '</div>' : ''}
