@@ -180,6 +180,8 @@
         <div style="margin-top:0.8rem;line-height:1.55;">
           <p><strong>When to use:</strong> Off-LAN access for staff (admin UI, Cockpit, internal-only apps) without opening any ports or buying a static IP. Tailscale is the recommended path to reach <span class="mono">/admin</span> from outside the LAN when Cloudflare Tunnel is in use (the tunnel deliberately doesn't expose admin/landing/infra).</p>
 
+          <p><strong>Tailscale is additive.</strong> It runs <em>alongside</em> the primary network mode (LAN or Domain) &mdash; you don&rsquo;t have to choose between Domain access and Tailscale. Switching primary mode (LAN ↔ Domain) leaves a connected tailnet untouched; only switching <em>to</em> Tailscale-only closes off the public/LAN paths.</p>
+
           <p style="background:rgba(184,114,46,0.10);border:1px solid var(--accent);padding:0.65rem 0.8rem;border-radius:4px;">
             <strong>Use the in-page panel.</strong> Open
             <a href="/admin/settings">Configuration &rarr; Network</a> &rarr; <em>Tailscale</em> section.
@@ -208,7 +210,8 @@
             <li>Tailscale&rsquo;s MagicDNS auto-issues certs from Tailscale&rsquo;s own CA &mdash; no Let&rsquo;s Encrypt, no port 80 requirement.</li>
             <li>Vibe-Connect&rsquo;s client-portal magic-links won&rsquo;t work if your <em>clients</em> aren&rsquo;t on Tailscale (they almost certainly aren&rsquo;t). For client traffic, use Cloudflare Tunnel; Tailscale is staff-only.</li>
             <li>The auth key has an expiry (default 90 days). The panel warns when the node key is within 14 days of expiry &mdash; generate a new key and Connect again before then to avoid silent drop-off.</li>
-            <li>Want the appliance&rsquo;s <em>primary</em> mode to be Tailscale-only (no LAN/domain coexistence)? Use the <em>Network mode</em> section at the top of the Network tab — radio for Tailscale-only, click Switch. (Requires Tailscale already Connected.) Bootstrap&rsquo;s <span class="mono">--mode tailscale</span> flag remains the canonical first-time setup but is no longer required for routine switching.</li>
+            <li><strong>Domain-mode tailnet limitation.</strong> When primary mode is <em>Domain</em>, the tailnet URL (<span class="mono">https://&lt;host&gt;.&lt;tailnet&gt;.ts.net</span>) reaches admin/console only &mdash; per-app subdomains stay on the public domain. To get apps over the tailnet in addition to a public path, either run primary mode <em>LAN</em> (apps reachable at both <span class="mono">&lt;LAN-IP&gt;/&lt;app&gt;/</span> and <span class="mono">&lt;tailnet-url&gt;/&lt;app&gt;/</span>) or publish those apps via Cloudflare Tunnel.</li>
+            <li>Want the appliance&rsquo;s <em>primary</em> mode to be Tailscale-only (no LAN/domain coexistence)? Use the <em>Primary network access</em> section at the top of the Network tab — radio for Tailscale-only, click Switch. (Requires Tailscale already Connected.) Bootstrap&rsquo;s <span class="mono">--mode tailscale</span> flag remains the canonical first-time setup but is no longer required for routine switching.</li>
           </ul>
         </div>
       </details>

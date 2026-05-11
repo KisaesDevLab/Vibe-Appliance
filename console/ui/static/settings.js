@@ -1017,7 +1017,7 @@ const SETTINGS_JS_VERSION = '2026-05-10-tailscale-full-management';
       'data-mode-section': '1',
       style: 'border-left:4px solid var(--accent);background:rgba(184,114,46,0.04);padding-left:1rem;',
     });
-    section.appendChild(el('h2', { style: 'margin:0 0 0.4rem;' }, ['Network mode']));
+    section.appendChild(el('h2', { style: 'margin:0 0 0.4rem;' }, ['Primary network access']));
     const body = el('div', { 'data-mode-body': '1' });
     body.appendChild(el('p', { class: 'help' }, ['Loading…']));
     section.appendChild(body);
@@ -1055,6 +1055,12 @@ const SETTINGS_JS_VERSION = '2026-05-10-tailscale-full-management';
       el('strong', null, [_modeLabel(currentMode)]),
       currentMode === 'domain' && currentDomain ? ' (' + currentDomain + ')' : '',
     ]));
+    body.appendChild(el('p', { class: 'help', style: 'margin-top:0.3rem;' }, [
+      'Picks how Caddy serves apps to the network. ',
+      el('strong', null, ['Tailscale']), ' (below) and ',
+      el('strong', null, ['Cloudflare Tunnel']),
+      ' (above) are additive — they layer on top of any choice here, giving the appliance multiple access paths simultaneously.',
+    ]));
 
     // Radio list. Selecting a different mode reveals its prereq UI +
     // Switch button below.
@@ -1076,23 +1082,40 @@ const SETTINGS_JS_VERSION = '2026-05-10-tailscale-full-management';
          : m;
   }
 
+  // Describes how a Running tailscale daemon interacts with the
+  // current primary access mode. Surfaced as a subtitle on the
+  // Tailscale panel so the operator knows what the tailnet URL
+  // actually reaches.
+  function _tailscaleAlongsideText(primaryMode) {
+    if (primaryMode === 'lan') {
+      return 'Running alongside LAN mode — apps reachable on the tailnet at <tailnet-url>/<app>/.';
+    }
+    if (primaryMode === 'domain') {
+      return 'Running alongside Domain mode — tailnet reaches admin/console only; per-app subdomains stay on the public domain.';
+    }
+    if (primaryMode === 'tailscale') {
+      return 'Primary access mode — Caddy serves only via the tailnet.';
+    }
+    return '';
+  }
+
   function renderModeOptions(wrap, sel, currentMode, tsStatus, section, repaint) {
     wrap.innerHTML = '';
     const modes = [
       {
         key: 'lan',
         title: 'LAN-only',
-        body:  'Apps reachable on the LAN via http(s)://<host-IP>. No public access; no domain or auth key required.',
+        body:  'Apps reachable on the LAN via http(s)://<host-IP>/<app>. Tailscale alongside adds a private tailnet URL with the same per-app routes. Most flexible primary choice.',
       },
       {
         key: 'domain',
         title: 'Public domain',
-        body:  "Apps at https://<app>.<domain>. Cert issuance via Let's Encrypt (requires port 80 + 443 reachable from the public internet).",
+        body:  "Apps at https://<app>.<domain> via Let's Encrypt (requires port 80 + 443 reachable). Tailscale alongside adds tailnet access — admin/console reachable via the tailnet; per-app subdomains stay on the public domain.",
       },
       {
         key: 'tailscale',
-        title: 'Tailscale-only',
-        body:  'Apps reachable only via https://<host>.<tailnet>.ts.net/<app>. Clients without Tailscale lose access.',
+        title: 'Tailscale-only (no LAN/public access)',
+        body:  'Caddy listens only on :80, intended for the tailnet. Apps reachable via https://<host>.<tailnet>.ts.net/<app>. Clients without Tailscale lose access. Requires Tailscale already Connected.',
       },
     ];
 
@@ -1186,7 +1209,7 @@ const SETTINGS_JS_VERSION = '2026-05-10-tailscale-full-management';
 
     const btn = el('button', {
       type: 'button', class: 'btn',
-      onclick: () => doModeSwitch(sel, currentMode, section),
+      onclick: () => doModeSwitch(sel, currentMode, section, tsStatus),
     }, ['Switch to ' + _modeLabel(sel.mode)]);
     btn.disabled = disabled;
     cta.appendChild(btn);
@@ -1205,10 +1228,17 @@ const SETTINGS_JS_VERSION = '2026-05-10-tailscale-full-management';
     'tailscale->domain': "Apps will become reachable at https://<app>.{domain}. Requires ports 80 + 443 reachable for cert issuance. Tailnet URLs continue to work in parallel. Continue?",
   };
 
-  async function doModeSwitch(sel, currentMode, section) {
+  async function doModeSwitch(sel, currentMode, section, tsStatus) {
     const copyKey = currentMode + '->' + sel.mode;
     const tmpl = _MODE_SWITCH_COPY[copyKey] || 'Switch to ' + _modeLabel(sel.mode) + '?';
-    const msg  = tmpl.replace('{domain}', sel.domain || '<domain>');
+    let msg = tmpl.replace('{domain}', sel.domain || '<domain>');
+    // When Tailscale is running and the transition doesn't already
+    // mention it (lan↔domain), reassure the operator that the
+    // tailnet URL survives the switch.
+    const tsRunning = tsStatus && tsStatus.daemon_state === 'Running';
+    if (tsRunning && (copyKey === 'lan->domain' || copyKey === 'domain->lan')) {
+      msg += '\n\nTailscale stays up alongside the new primary.';
+    }
     if (!confirm(msg)) return;
 
     const body = section.querySelector('[data-mode-body]');
@@ -2047,17 +2077,22 @@ const SETTINGS_JS_VERSION = '2026-05-10-tailscale-full-management';
     const body = section.querySelector('[data-ts-body]');
     body.innerHTML = '';
 
-    let data;
+    let data, stateData;
     try {
-      const r = await fetch('/api/v1/admin/tailscale/status', { credentials: 'same-origin' });
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      data = await r.json();
+      const [statusR, stateR] = await Promise.all([
+        fetch('/api/v1/admin/tailscale/status', { credentials: 'same-origin' }),
+        fetch('/api/v1/state',                  { credentials: 'same-origin' }),
+      ]);
+      if (!statusR.ok) throw new Error('HTTP ' + statusR.status);
+      data = await statusR.json();
+      stateData = stateR.ok ? await stateR.json() : { config: {} };
     } catch (err) {
       body.appendChild(el('p', { class: 'help', style: 'color:var(--bad);' }, [
         '✗ Could not load Tailscale status: ' + err.message,
       ]));
       return;
     }
+    const primaryMode = (stateData.config || {}).mode || 'lan';
 
     // ---- not installed ----
     if (!data.cli_installed) {
@@ -2098,6 +2133,9 @@ const SETTINGS_JS_VERSION = '2026-05-10-tailscale-full-management';
     if (data.daemon_state === 'Running') {
       body.appendChild(el('p', null, [
         el('span', { style: 'color:var(--good);font-weight:600;' }, ['✓ Tailnet connected']),
+      ]));
+      body.appendChild(el('p', { class: 'help', style: 'color:var(--text-muted);margin-top:0.15rem;' }, [
+        _tailscaleAlongsideText(primaryMode),
       ]));
       if (data.magicdns_url) {
         const url = data.magicdns_url;
