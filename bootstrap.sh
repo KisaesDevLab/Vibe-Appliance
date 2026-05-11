@@ -57,6 +57,12 @@ CONFIG_DOMAIN=""
 CONFIG_EMAIL=""
 CONFIG_TAILSCALE="false"
 CONFIG_TAILSCALE_AUTHKEY=""
+# Tracks whether the operator explicitly opted into Tailscale this
+# invocation (--tailscale or --tailscale-authkey). The persisted
+# state.config.tailscale flag is only overwritten when this is true —
+# otherwise a re-bootstrap clobbers panel-driven Tailscale setup
+# back to "false" on every run, which broke the admin status banner.
+CONFIG_TAILSCALE_EXPLICIT="false"
 CONFIG_RESET_ENV="false"
 CONFIG_FORCE="false"
 # Whether to install Cockpit on the host. Default true; can be turned
@@ -147,9 +153,9 @@ parse_flags() {
       --domain=*)        CONFIG_DOMAIN="${1#*=}"; shift ;;
       --email)           CONFIG_EMAIL="${2:?--email requires a value}"; shift 2 ;;
       --email=*)         CONFIG_EMAIL="${1#*=}"; shift ;;
-      --tailscale)       CONFIG_TAILSCALE="true"; shift ;;
-      --tailscale-authkey)        CONFIG_TAILSCALE_AUTHKEY="${2:?--tailscale-authkey requires a value}"; CONFIG_TAILSCALE="true"; shift 2 ;;
-      --tailscale-authkey=*)      CONFIG_TAILSCALE_AUTHKEY="${1#*=}"; CONFIG_TAILSCALE="true"; shift ;;
+      --tailscale)       CONFIG_TAILSCALE="true"; CONFIG_TAILSCALE_EXPLICIT="true"; shift ;;
+      --tailscale-authkey)        CONFIG_TAILSCALE_AUTHKEY="${2:?--tailscale-authkey requires a value}"; CONFIG_TAILSCALE="true"; CONFIG_TAILSCALE_EXPLICIT="true"; shift 2 ;;
+      --tailscale-authkey=*)      CONFIG_TAILSCALE_AUTHKEY="${1#*=}"; CONFIG_TAILSCALE="true"; CONFIG_TAILSCALE_EXPLICIT="true"; shift ;;
       --cloudflare-api-token)     CONFIG_CLOUDFLARE_API_TOKEN="${2:?--cloudflare-api-token requires a value}"; shift 2 ;;
       --cloudflare-api-token=*)   CONFIG_CLOUDFLARE_API_TOKEN="${1#*=}"; shift ;;
       --reset-env)       CONFIG_RESET_ENV="true"; shift ;;
@@ -991,7 +997,15 @@ main() {
   state_set_config_kv mode               "$CONFIG_MODE"
   state_set_config_kv domain             "$CONFIG_DOMAIN"
   state_set_config_kv email              "$CONFIG_EMAIL"
-  state_set_config_kv tailscale          "$CONFIG_TAILSCALE"
+  # Only persist the Tailscale flag when the operator explicitly
+  # passed --tailscale or --tailscale-authkey this run. A bare
+  # `sudo bash bootstrap.sh` re-run otherwise clobbers
+  # state.config.tailscale="true" (set by the admin panel's Connect
+  # button) back to "false", which makes the admin status banner
+  # show "Tailscale not configured" even while the daemon is up.
+  if [[ "$CONFIG_TAILSCALE_EXPLICIT" == "true" ]]; then
+    state_set_config_kv tailscale        "$CONFIG_TAILSCALE"
+  fi
   state_set_config_kv reset_env          "$CONFIG_RESET_ENV"
   state_set_config_kv appliance_dir      "$APPLIANCE_DIR"
   state_set_config_kv repo_url           "$VIBE_APPLIANCE_REPO"
