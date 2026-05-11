@@ -204,9 +204,10 @@ cockpit_add_tailscale_serve() {
   if ! command -v tailscale >/dev/null 2>&1; then
     return 0
   fi
-  # Only add if tailscale is actually authenticated.
+  local ts_status_json
+  ts_status_json="$(tailscale status --json 2>/dev/null || echo '{}')"
   local ts_state
-  ts_state="$(tailscale status --json 2>/dev/null | python3 -c '
+  ts_state="$(echo "$ts_status_json" | python3 -c '
 import json, sys
 try:
     print(json.load(sys.stdin).get("BackendState", "unknown"))
@@ -216,12 +217,36 @@ except Exception:
     return 0
   fi
 
+  # `tailscale serve --https=…` blocks indefinitely on cert acquisition
+  # when the tailnet doesn't have HTTPS certificates enabled. The
+  # CertDomains array in status JSON is non-empty when the operator
+  # has flipped that on at https://login.tailscale.com/admin/dns.
+  # Skip the serve rule with a clear hint rather than hang bootstrap.
+  local has_https
+  has_https="$(echo "$ts_status_json" | python3 -c '
+import json, sys
+try:
+    print("yes" if json.load(sys.stdin).get("CertDomains") else "no")
+except Exception:
+    print("no")' 2>/dev/null || echo no)"
+  if [[ "$has_https" != "yes" ]]; then
+    log_warn "skipping tailscale serve rule for cockpit (:9090)" \
+      "cause:Tailnet HTTPS certificates are not enabled" \
+      "diagnose:visit https://login.tailscale.com/admin/dns and enable HTTPS Certificates" \
+      "fix:after enabling, re-run: sudo tailscale serve --bg --https=9090 https+insecure://localhost:9090"
+    return 0
+  fi
+
   log_step "adding tailscale serve rule for cockpit (:9090)"
-  if ! tailscale serve --bg --https=9090 https+insecure://localhost:9090 \
+  # Time-bound the call defensively — `--bg` should return immediately,
+  # but old tailscale versions or transient control-plane issues have
+  # been observed to block here for minutes. Better to warn than hang
+  # bootstrap forever.
+  if ! timeout 30 tailscale serve --bg --https=9090 https+insecure://localhost:9090 \
        >>"$VIBE_LOG_FILE" 2>&1; then
-    log_warn "tailscale serve rule for :9090 failed; cockpit not reachable on tailnet" \
-      "diagnose:tailscale serve status" \
-      "fix:sudo tailscale serve --bg --https=9090 https+insecure://localhost:9090"
+    log_warn "tailscale serve rule for :9090 failed or timed out; cockpit not reachable on tailnet" \
+      "diagnose:tailscale serve status; tailscale status --json | grep CertDomains" \
+      "fix:sudo timeout 30 tailscale serve --bg --https=9090 https+insecure://localhost:9090"
     return 0
   fi
   log_ok "tailscale :9090 → cockpit configured"

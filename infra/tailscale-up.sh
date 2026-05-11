@@ -116,12 +116,35 @@ tailscale_configure_serve() {
   # Wipe any prior serve config (idempotent).
   tailscale serve reset >>"$VIBE_LOG_FILE" 2>&1 || true
 
-  # Modern syntax (Tailscale ≥1.62): `tailscale serve --bg --https=443`.
-  # The trailing argument is the local target.
-  if ! tailscale serve --bg --https=443 http://127.0.0.1:80 >>"$VIBE_LOG_FILE" 2>&1; then
-    log_warn "tailscale serve failed; the tailnet URL won't terminate TLS until this is fixed" \
-      "Diagnose: tailscale serve status; tailscale version" \
-      "Fix:      tailscale serve --bg --https=443 http://127.0.0.1:80"
+  # `tailscale serve --https=…` blocks indefinitely on cert acquisition
+  # when the tailnet doesn't have HTTPS certificates enabled. Probe
+  # status JSON for CertDomains; if empty, skip all serve rules and
+  # surface a clear hint instead of hanging bootstrap.
+  local ts_status_json
+  ts_status_json="$(tailscale status --json 2>/dev/null || echo '{}')"
+  local has_https
+  has_https="$(echo "$ts_status_json" | python3 -c '
+import json, sys
+try:
+    print("yes" if json.load(sys.stdin).get("CertDomains") else "no")
+except Exception:
+    print("no")' 2>/dev/null || echo no)"
+
+  if [[ "$has_https" != "yes" ]]; then
+    log_warn "skipping tailscale serve rules — HTTPS certificates not enabled in the tailnet" \
+      "diagnose:visit https://login.tailscale.com/admin/dns and enable HTTPS Certificates" \
+      "fix:after enabling, re-run: sudo bash /opt/vibe/appliance/infra/tailscale-up.sh"
+    log_info "tailnet membership is up; HTTPS termination needs the admin-side toggle"
+    return 0
+  fi
+
+  # `--bg` is supposed to return immediately, but old tailscale versions
+  # and transient control-plane issues have hung this for minutes.
+  # 30s is well past the expected ~1-2s for --bg to register the rule.
+  if ! timeout 30 tailscale serve --bg --https=443 http://127.0.0.1:80 >>"$VIBE_LOG_FILE" 2>&1; then
+    log_warn "tailscale serve failed or timed out; the tailnet URL won't terminate TLS until this is fixed" \
+      "diagnose:tailscale serve status; tailscale version" \
+      "fix:sudo timeout 30 tailscale serve --bg --https=443 http://127.0.0.1:80"
     return 0
   fi
   log_ok "tailscale serve configured"
@@ -129,16 +152,14 @@ tailscale_configure_serve() {
   # Phase 8.5 Workstream A — Cockpit access via tailnet on :9090.
   # Tailscale's CA issues a valid HTTPS cert for the tailnet hostname on
   # any port, so https://<host>.<tailnet>.ts.net:9090 just works. Only
-  # add the rule when Cockpit is actually installed; a stranded serve
-  # config pointing at a non-existent localhost:9090 is harmless but
-  # noisy in `tailscale serve status`.
+  # add the rule when Cockpit is actually installed.
   if dpkg -s cockpit >/dev/null 2>&1; then
     log_step "adding tailscale serve rule for cockpit (:9090)"
-    if ! tailscale serve --bg --https=9090 https+insecure://localhost:9090 \
+    if ! timeout 30 tailscale serve --bg --https=9090 https+insecure://localhost:9090 \
          >>"$VIBE_LOG_FILE" 2>&1; then
-      log_warn "tailscale serve rule for :9090 failed; cockpit will not be reachable on the tailnet" \
+      log_warn "tailscale serve rule for :9090 failed or timed out; cockpit not reachable on the tailnet" \
         "diagnose:tailscale serve status" \
-        "fix:tailscale serve --bg --https=9090 https+insecure://localhost:9090"
+        "fix:sudo timeout 30 tailscale serve --bg --https=9090 https+insecure://localhost:9090"
     else
       log_ok "tailscale :9090 → cockpit configured"
     fi
