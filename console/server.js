@@ -4594,22 +4594,21 @@ function appEmergencyUrl(manifest, config) {
 }
 
 // LAN fallback URL — http://<host_ip>/<slug>/. Goes through Caddy on
-// :80 with the same path-prefix routing as the primary vibe.local URL,
-// so it benefits from prefix stripping and per-route splitting (api/* →
-// server tier, default → client tier). The right fallback when the
-// primary failure is mDNS / DNS — devices that can't resolve
-// vibe.local can still reach the appliance by IP.
+// :80 with the same path-prefix routing as the primary URL, so it
+// benefits from prefix stripping and per-route splitting (api/* →
+// server tier, default → client tier).
 //
-// Distinct from appEmergencyUrl, which uses the HAProxy emergency
-// sidecar and bypasses Caddy entirely. That's the right URL for "Caddy
-// itself is down" but produces blank pages for SPA apps because no
-// prefix stripping happens (see docs/addenda/emergency-access.md §9.1).
+// Works in ALL modes since commit 60f4e8d: in domain mode the :80
+// catch-all now emits the same path handlers wrapped in a `@lan`
+// remote_ip matcher, so direct LAN access from RFC1918 / Tailscale
+// CGNAT sources reaches the app without round-tripping through
+// Cloudflare. Public traffic still hits the @lan miss path (default
+// handle → console) so HTTPS isn't bypassed.
 //
-// Domain mode returns null — the catch-all on :80 doesn't carry the
-// per-app path handlers in domain mode (apps live at their subdomains).
-// LAN and Tailscale modes return the IP-with-path form.
+// Returns null only when host_ip isn't cached in state — that happens
+// on a fresh install before bootstrap's host-IP detector runs, or on
+// hosts where the detector couldn't pick a sensible primary IP.
 function appLanFallbackUrl(manifest, config) {
-  if (config.mode === 'domain') return null;
   const ip = config.host_ip;
   if (!ip) return null;
   return `http://${ip}/${manifest.slug}/`;
@@ -4621,10 +4620,9 @@ function appLanFallbackUrl(manifest, config) {
 // stays encrypted inside the WireGuard tunnel.
 function appTailnetUrl(manifest, config, live) {
   if (!live || live.backendState !== 'Running' || !live.ip) return null;
-  // Domain mode: Caddy emits per-subdomain vhosts only; /<slug>/ on
-  // the tailnet IP falls to the catch-all console. Don't render a
-  // misleading row.
-  if (config.mode === 'domain') return null;
+  // Works in domain mode too since commit 60f4e8d: the :80 catch-all's
+  // @lan matcher includes 100.64.0.0/10 (Tailscale CGNAT), so /<slug>/
+  // path-routes from a tailnet client without falling to the console.
   return `http://${live.ip}/${manifest.slug}/`;
 }
 
@@ -4635,7 +4633,6 @@ function appTailnetUrl(manifest, config, live) {
 // configured rules.
 function appTailnetHostnameUrl(manifest, config, live) {
   if (!live || live.backendState !== 'Running' || !live.hostname) return null;
-  if (config.mode === 'domain') return null;
   if (!live.serve_configured) return null;
   return `https://${live.hostname}/${manifest.slug}/`;
 }
