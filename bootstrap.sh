@@ -55,6 +55,15 @@ export VIBE_STATE_FILE="${VIBE_DIR}/state.json"
 CONFIG_MODE="lan"
 CONFIG_DOMAIN=""
 CONFIG_EMAIL=""
+# In domain mode every app serves from a single hostname under
+# `${TUNNEL_SUBDOMAIN}.${DOMAIN}` with path-prefix routing (mirroring
+# LAN mode). Default subdomain label is "vibe" — operators can override
+# via --tunnel-subdomain. Per-app subdomains were the prior model;
+# they broke login flows because the bundled SPAs are built with
+# `base: '/<slug>/'` and any per-host mount required a catch-all 302
+# that downgraded POST→GET (RFC 7231 §6.4.3). See commits 3a6ffee /
+# 4907588 for the history.
+CONFIG_TUNNEL_SUBDOMAIN="vibe"
 CONFIG_TAILSCALE="false"
 CONFIG_TAILSCALE_AUTHKEY=""
 # Tracks whether the operator explicitly opted into Tailscale this
@@ -110,6 +119,11 @@ USAGE
 FLAGS
   --mode {domain,lan,tailscale}   Deployment mode. Default: lan.
   --domain DOMAIN                 Required for --mode domain.
+  --tunnel-subdomain SUB          Single subdomain label that fronts every app
+                                  in --mode domain. Default: vibe. The full
+                                  host is ${SUB}.${DOMAIN}; apps live at
+                                  /${slug}/ underneath it (mirroring LAN
+                                  mode). Must be a single DNS label.
   --email  EMAIL                  ACME contact email for --mode domain.
   --tailscale                     Also install Tailscale (any mode).
   --tailscale-authkey KEY         Pre-shared authkey for unattended Tailscale up.
@@ -151,6 +165,8 @@ parse_flags() {
       --mode=*)          CONFIG_MODE="${1#*=}"; shift ;;
       --domain)          CONFIG_DOMAIN="${2:?--domain requires a value}"; shift 2 ;;
       --domain=*)        CONFIG_DOMAIN="${1#*=}"; shift ;;
+      --tunnel-subdomain)   CONFIG_TUNNEL_SUBDOMAIN="${2:?--tunnel-subdomain requires a value}"; shift 2 ;;
+      --tunnel-subdomain=*) CONFIG_TUNNEL_SUBDOMAIN="${1#*=}"; shift ;;
       --email)           CONFIG_EMAIL="${2:?--email requires a value}"; shift 2 ;;
       --email=*)         CONFIG_EMAIL="${1#*=}"; shift ;;
       --tailscale)       CONFIG_TAILSCALE="true"; CONFIG_TAILSCALE_EXPLICIT="true"; shift ;;
@@ -177,6 +193,17 @@ parse_flags() {
     domain|lan|tailscale) ;;
     *) _pre_die "--mode must be one of: domain, lan, tailscale (got '$CONFIG_MODE')" ;;
   esac
+
+  # Validate the tunnel subdomain label. RFC 1035: 1-63 chars, [a-z0-9],
+  # may contain '-' but not at the ends. Reject dots so the operator
+  # can't accidentally pass an FQDN here and end up with
+  # "sub.example.com.example.com".
+  if [[ -z "$CONFIG_TUNNEL_SUBDOMAIN" ]]; then
+    _pre_die "--tunnel-subdomain must be a non-empty DNS label (got empty)"
+  fi
+  if ! [[ "$CONFIG_TUNNEL_SUBDOMAIN" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+    _pre_die "--tunnel-subdomain must be a single DNS label (a-z, 0-9, '-' allowed; no dots, no underscores; got '$CONFIG_TUNNEL_SUBDOMAIN')"
+  fi
 }
 
 # ----------------------------------------------------------------------
@@ -904,7 +931,7 @@ _install_vibe_cli() {
 # nothing in the appliance itself depends on the result.
 _resolve_server_url() {
   if [[ "$CONFIG_MODE" == "domain" && -n "$CONFIG_DOMAIN" ]]; then
-    printf 'https://%s' "$CONFIG_DOMAIN"
+    printf 'https://%s.%s' "${CONFIG_TUNNEL_SUBDOMAIN:-vibe}" "$CONFIG_DOMAIN"
     return 0
   fi
 
@@ -996,6 +1023,7 @@ main() {
   # Persist user-supplied config so phase 2 (Phase 2 of build) can read it.
   state_set_config_kv mode               "$CONFIG_MODE"
   state_set_config_kv domain             "$CONFIG_DOMAIN"
+  state_set_config_kv tunnel_subdomain   "$CONFIG_TUNNEL_SUBDOMAIN"
   state_set_config_kv email              "$CONFIG_EMAIL"
   # Only persist the Tailscale flag when the operator explicitly
   # passed --tailscale or --tailscale-authkey this run. A bare
@@ -1041,8 +1069,8 @@ main() {
 
   printf '\n  state:  %s\n'      "$VIBE_STATE_FILE" >&2
   printf '  log:    %s\n'        "$VIBE_LOG_FILE"   >&2
-  printf '  config: mode=%s domain=%s tailscale=%s\n' \
-    "$CONFIG_MODE" "${CONFIG_DOMAIN:-<unset>}" "$CONFIG_TAILSCALE" >&2
+  printf '  config: mode=%s domain=%s tunnel_subdomain=%s tailscale=%s\n' \
+    "$CONFIG_MODE" "${CONFIG_DOMAIN:-<unset>}" "${CONFIG_TUNNEL_SUBDOMAIN:-vibe}" "$CONFIG_TAILSCALE" >&2
 }
 
 main "$@"

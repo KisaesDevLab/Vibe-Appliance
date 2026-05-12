@@ -205,29 +205,44 @@ INFRA_SERVICES = [
 ]
 
 
-def render_apex_vhost(domain, tls_internal=False):
+def render_apex_vhost(domain, tunnel_subdomain="", tls_internal=False):
     """Render the apex site block for domain mode.
 
-    Without this, requests to https://<domain>/ have no matching site
-    on Caddy's :443 listener — the per-subdomain blocks (tb., mybooks.,
-    etc.) only match their specific FQDN. Caddy returns no response,
-    and any upstream fronted by Cloudflare Tunnel (which forwards to
-    https://caddy:443) translates the connection failure into a 502
-    Bad Gateway at the public edge.
+    In the single-hostname routing model every app — and the console —
+    lives under `${tunnel_subdomain}.${domain}`. The apex itself isn't
+    tunnelled; this block only catches the case where the operator (or
+    someone on their LAN with split DNS) lands on the bare apex by
+    accident. We redirect there so a typo on `firm.com` doesn't return
+    nothing, while `vibe.firm.com` stays the canonical surface.
 
-    The apex site mirrors the :80 catch-all: routes everything to the
-    console (which serves the public landing page at / and the admin
-    UI at /admin). www.<domain> is included as a comma-separated alias
-    so `www.firm.com` works too.
+    When `tunnel_subdomain` is empty (legacy callers, or a pre-migration
+    state.json with no `tunnel_subdomain` set), fall back to proxying
+    the console at the apex — preserves the old "apex serves the landing
+    page" behavior so an in-place upgrade doesn't black out the apex.
 
-    tls_internal: same rationale as render_vhost — when the tunnel is
-    in front of Caddy, Let's Encrypt issuance can't complete (port 80
-    not reachable), so use Caddy's local CA and let Cloudflare's edge
-    do the public TLS.
+    tls_internal: when Cloudflare Tunnel is the only public ingress, Let's
+    Encrypt's HTTP-01 challenge can't reach port 80 on the host. We use
+    Caddy's local CA; cloudflared's ingress is configured with
+    noTLSVerify so the self-signed cert is accepted.
     """
     if not domain:
         return ""
     tls_line = "    tls internal\n" if tls_internal else ""
+    if tunnel_subdomain:
+        # Redirect every request to the single-hostname surface. We use
+        # 308 (RFC 7538) instead of 301/302/`permanent` because 301/302
+        # downgrade POST→GET per RFC 7231 §6.4.{2,3} — the exact failure
+        # mode that motivated this routing change in the first place
+        # (commits 4907588 / 3a6ffee). 308 is method-preserving and is
+        # supported by every modern HTTP client / browser.
+        return (
+            f"{domain}, www.{domain} {{\n"
+            f"{tls_line}"
+            f"    redir https://{tunnel_subdomain}.{domain}{{uri}} 308\n"
+            f"}}\n"
+        )
+    # Legacy: no tunnel_subdomain configured, keep the old apex→console
+    # behavior so we don't break appliances mid-upgrade.
     return (
         f"{domain}, www.{domain} {{\n"
         f"{tls_line}"
@@ -248,6 +263,65 @@ def render_apex_vhost(domain, tls_internal=False):
         f"    }}\n"
         f"}}\n"
     )
+
+
+def render_domain_app_vhost(domain, tunnel_subdomain, enabled, tls_internal=False):
+    """Single TLS vhost serving every app under one hostname.
+
+    Replaces the per-app subdomain layout (`tb.example.com`,
+    `mybooks.example.com`, …) with a single hostname where each app is
+    mounted at `/${slug}/`. This is exactly the structure LAN mode uses
+    today — render_path_handler builds the per-app blocks identically.
+    One hostname means one TLS cert, one Cloudflare ingress rule, one
+    CNAME, one `ALLOWED_ORIGIN` per app.
+
+    The default `handle` at the bottom forwards to the console, so the
+    landing page and admin UI both live at the root of this host
+    (e.g. `https://vibe.example.com/` → console;
+    `https://vibe.example.com/admin` → admin UI).
+
+    Infra surfaces (Portainer, Duplicati, Cockpit) are deliberately NOT
+    folded in here. They're admin tooling — putting them at
+    /portainer/ on the tunnel-fronted hostname would make them public
+    on the internet, which is exactly what the original "LAN/Tailscale-
+    only" design intent forbids. They keep their own subdomain vhosts
+    (cockpit.<domain>, portainer.<domain>, backup.<domain>) which are
+    served by Caddy:443 but never registered with the tunnel ingress —
+    reachable from LAN (split DNS to the host IP) or Tailscale only.
+
+    tls_internal: see render_apex_vhost.
+    """
+    if not domain or not tunnel_subdomain:
+        return ""
+    host = f"{tunnel_subdomain}.{domain}"
+
+    lines = [f"{host} {{"]
+    if tls_internal:
+        lines.append("\ttls internal")
+    lines.append("\tencode gzip zstd")
+    lines.append("\tlog {")
+    lines.append("\t\toutput stdout")
+    lines.append("\t\tformat console")
+    lines.append("\t}")
+    lines.append("")
+    lines.append("\thandle /caddy-health {")
+    lines.append("\t\trespond \"ok\" 200")
+    lines.append("\t}")
+    lines.append("")
+
+    # Splice in per-app path handlers (tab-indented to match this block).
+    for slug, manifest in enabled:
+        lines.append(render_path_handler(slug, manifest).rstrip("\n"))
+        lines.append("")
+
+    # Default → console (landing + admin UI).
+    lines.append("\thandle {")
+    lines.append("\t\treverse_proxy console:3000 {")
+    lines.append("\t\t\theader_up X-Real-IP {remote_host}")
+    lines.append("\t\t}")
+    lines.append("\t}")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
 
 
 def render_infra_vhost(svc, mode, domain, tls_internal=False):
@@ -308,9 +382,14 @@ def _matcher_id(slug, name):
 def render_path_handler(slug, manifest):
     """
     Emit a `handle /<slug>/*` block (with internal `uri strip_prefix`)
-    so apps are reachable at `<host-or-tailnet>/<slug>/...` in LAN and
-    Tailscale modes. Sub-path matchers (api, mcp, chat, etc.) live
-    inside the route block.
+    so apps are reachable at `<host>/<slug>/...`. Used in LAN, Tailscale,
+    AND domain modes — domain mode now serves every app from a single
+    `${tunnel_subdomain}.${domain}` vhost with the same path-prefix
+    routing as LAN, rather than per-app subdomains. (Per-app subdomains
+    forced the bundled SPAs to be mounted at /<slug>/ via a catch-all
+    302 that downgraded login POSTs to GET — see commits 3a6ffee /
+    4907588.) Sub-path matchers (api, mcp, chat, etc.) live inside the
+    route block.
 
     The bare `/<slug>` path (no trailing slash) gets a redirect to
     `/<slug>/` so SPAs find their root.
@@ -412,6 +491,9 @@ def main():
     mode = config.get("mode", "lan")
     domain = config.get("domain", "")
     email = config.get("email", "")
+    # Single subdomain that fronts every app in domain mode. Default
+    # 'vibe' for state.json files written before this field existed.
+    tunnel_subdomain = (config.get("tunnel_subdomain") or "vibe").strip()
 
     # Tunnel detection — when CLOUDFLARE_TUNNEL_ENABLED=true is in
     # appliance.env, all per-host site blocks switch to `tls internal`
@@ -452,31 +534,39 @@ def main():
     enabled = list_enabled_apps(state, manifests_dir)
 
     if mode == "domain" and domain:
-        # Apex site — handles https://<domain>/ and www.<domain>. Without
-        # this, Cloudflare Tunnel ingress for the apex hostname forwards
-        # to caddy:443 with no matching site, Caddy returns no response,
-        # cloudflared translates that into 502 Bad Gateway. Always emit
-        # in domain mode regardless of whether the tunnel is active —
-        # the apex is also the canonical landing page in plain
-        # port-forwarded domain mode.
-        vhost_pieces = [render_apex_vhost(domain, tls_internal=tunnel_active)]
-        # Per-app vhosts (only when there are enabled apps).
-        if enabled:
-            vhost_pieces.append("\n".join(
-                render_vhost(slug, m, mode, domain, tls_internal=tunnel_active)
-                for slug, m in enabled
-            ))
-        else:
-            vhost_pieces.append("# (no apps enabled yet)\n")
-        vhost_blocks = "\n".join(p for p in vhost_pieces if p.strip())
-        # Infra-service vhosts always emitted in domain mode.
+        # Single-hostname routing: every app + the console live under
+        # `${tunnel_subdomain}.${domain}` with path-prefix routing
+        # (mirroring LAN mode). The apex (and www) redirects to the
+        # tunnel subdomain so a typo on the bare domain still lands
+        # somewhere useful.
+        #
+        # Per-app subdomains were the prior model (commit 4907588 and
+        # before); they broke login flows because the bundled SPAs are
+        # built with `base: '/<slug>/'` and any per-host mount required
+        # a catch-all 302 that downgraded login POSTs to GET (RFC 7231
+        # §6.4.3). One hostname with path routing avoids both the
+        # `base` mismatch and the catch-all redirect entirely.
+        vhost_pieces = [
+            render_apex_vhost(domain, tunnel_subdomain=tunnel_subdomain,
+                              tls_internal=tunnel_active),
+            render_domain_app_vhost(domain, tunnel_subdomain, enabled,
+                                    tls_internal=tunnel_active),
+        ]
+        # Infra services (Cockpit, Portainer, Duplicati) keep their own
+        # subdomain vhosts. They're admin tooling — putting them on the
+        # tunnel-fronted hostname would expose them to the public
+        # internet. The cloudflared ingress only routes the tunnel
+        # subdomain, so these vhosts are reachable from LAN (operator
+        # adds DNS or /etc/hosts pointing the infra subdomain at the
+        # host's LAN IP) or Tailscale only — same as the prior design.
         infra_vhosts = "\n".join(
             render_infra_vhost(s, mode, domain, tls_internal=tunnel_active)
             for s in INFRA_SERVICES
         )
         if infra_vhosts.strip():
-            vhost_blocks = vhost_blocks.rstrip("\n") + "\n\n" + infra_vhosts
-        path_blocks = "\t# (domain mode: apps and infra live at their own subdomains)"
+            vhost_pieces.append(infra_vhosts)
+        vhost_blocks = "\n".join(p for p in vhost_pieces if p.strip())
+        path_blocks = "\t# (domain mode: apps and infra live under the single tunnel subdomain vhost above)"
     elif mode in ("lan", "tailscale"):
         app_path_blocks = "\n".join(
             render_path_handler(slug, m) for slug, m in enabled

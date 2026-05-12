@@ -570,17 +570,16 @@ async function ddnsUpdateCycle(force = false) {
     return;
   }
 
-  // Host list: bare domain + www + every enabled app's subdomain. The
-  // Set dedupes if a manifest accidentally declared 'www' as its
-  // subdomain — Namecheap rejects duplicates in a tight cycle.
-  const hosts = new Set(['@', 'www']);
+  // Host list: bare apex + www + the single tunnel subdomain + the
+  // three infra subdomains (cockpit/portainer/backup keep their own
+  // subdomains for LAN admin access). Apps no longer get per-subdomain
+  // DNS — they all live at /<slug>/ under the tunnel hostname.
+  // Set dedupes if the operator chose 'www' or 'cockpit' as their
+  // tunnel_subdomain (unusual but valid).
+  const hosts = new Set(['@', 'www', 'cockpit', 'portainer', 'backup']);
   const state = readState();
-  for (const slug of Object.keys(state.apps || {})) {
-    const app = state.apps[slug];
-    if (!app || !app.enabled) continue;
-    const m = MANIFESTS[slug];
-    if (m && m.subdomain) hosts.add(m.subdomain);
-  }
+  const tunnelSub = (state.config && state.config.tunnel_subdomain) || 'vibe';
+  hosts.add(tunnelSub);
 
   const results = {};
   for (const host of hosts) {
@@ -2357,12 +2356,20 @@ app.get('/api/v1/admin/tailscale/status', requireAdmin, async (_req, res) => {
 
 const DOMAIN_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i;
 const EMAIL_RE  = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Single DNS label — same rule bootstrap.sh enforces for --tunnel-subdomain.
+const DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, async (req, res) => {
   const body  = req.body || {};
   const mode  = typeof body.mode === 'string' ? body.mode : '';
   const domain = typeof body.domain === 'string' ? body.domain.trim().toLowerCase() : '';
   const email  = typeof body.email  === 'string' ? body.email.trim()  : '';
+  // Single subdomain that fronts every app in domain mode. Default
+  // 'vibe' — every app lives at https://vibe.<domain>/<slug>/. Reject
+  // empty + multi-label values.
+  const tunnelSub = typeof body.tunnel_subdomain === 'string'
+    ? body.tunnel_subdomain.trim().toLowerCase()
+    : '';
 
   if (!NETWORK_MODES_SET.has(mode)) {
     return res.status(400).json({ ok: false, error: 'mode must be one of: lan, domain, tailscale' });
@@ -2373,6 +2380,9 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, async
     }
     if (!email || !EMAIL_RE.test(email)) {
       return res.status(400).json({ ok: false, error: 'email required for ACME contact (e.g. admin@firm.com)' });
+    }
+    if (tunnelSub && !DNS_LABEL_RE.test(tunnelSub)) {
+      return res.status(400).json({ ok: false, error: 'tunnel_subdomain must be a single DNS label (a-z, 0-9, "-"; no dots)' });
     }
   }
   if (mode === 'tailscale') {
@@ -2413,13 +2423,18 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, async
   catch (err) { return res.status(500).json({ ok: false, error: 'state.json unreadable: ' + err.message }); }
   state.config = state.config || {};
   const prevMode = state.config.mode || null;
+  const prevDomain = state.config.domain || '';
+  const prevTunnelSub = state.config.tunnel_subdomain || 'vibe';
   state.config.mode = mode;
   if (mode === 'domain') {
     state.config.domain = domain;
     state.config.email  = email;
+    state.config.tunnel_subdomain = tunnelSub || prevTunnelSub || 'vibe';
   } else {
     state.config.domain = '';
     state.config.email  = '';
+    // Keep tunnel_subdomain across mode flips so flipping LAN→domain
+    // remembers the operator's last choice.
   }
   try {
     const tmp = STATE_PATH + '.tmp';
@@ -2462,15 +2477,61 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, async
 
   if (render.code === 0) {
     log('info', 'network mode switched', { from: prevMode, to: mode, domain });
+
+    // Per-app env re-render. ALLOWED_ORIGIN and VITE_BASE_PATH both
+    // change shape when mode/domain/tunnel_subdomain change; without
+    // this, every enabled app keeps the prior values baked in and login
+    // breaks (Origin mismatch from the backend, asset 404s from the
+    // SPA). enable_app is idempotent: it re-renders the env file,
+    // bounces containers, and re-renders Caddy. The earlier render
+    // already wrote the new Caddyfile shape; this loop fixes per-app
+    // env drift. Documented manually in docs/addenda/mode-change-env-rerender.md
+    // — promoting from manual to automatic.
+    const enabledSlugs = Object.entries(state.apps || {})
+      .filter(([, e]) => e && e.enabled && e.status !== 'failed')
+      .map(([slug]) => slug);
+    const newTunnelSub = state.config.tunnel_subdomain || 'vibe';
+    const configChanged = prevMode !== mode
+                       || prevDomain !== (state.config.domain || '')
+                       || prevTunnelSub !== newTunnelSub;
+    const rerender = { ran: false, total: 0, ok: [], failed: [] };
+    if (configChanged && enabledSlugs.length > 0) {
+      rerender.ran = true;
+      rerender.total = enabledSlugs.length;
+      for (const slug of enabledSlugs) {
+        const r = await new Promise((resolve) => {
+          const child = spawn('/bin/bash',
+            [path.join(APPLIANCE_DIR, 'lib', 'enable-app.sh'), slug],
+            {
+              env: { ...process.env, APPLIANCE_DIR, VIBE_DIR, NO_COLOR: '1' },
+              stdio: ['ignore', 'pipe', 'pipe'],
+            });
+          let stderr = '';
+          child.stderr.on('data', d => { stderr += d.toString(); });
+          child.on('exit', code => resolve({ code, stderr }));
+          child.on('error', err => resolve({ code: -1, stderr: 'spawn failed: ' + err.message }));
+        });
+        if (r.code === 0) {
+          rerender.ok.push(slug);
+        } else {
+          rerender.failed.push({ slug, error: trim(r.stderr, 512) });
+          log('warn', 'per-app rerender failed during mode switch', { slug, code: r.code });
+        }
+      }
+    }
+
     const warnings = [];
     if (mode === 'domain') {
-      warnings.push('On the first request to each subdomain Caddy will spend 10–30s issuing a Let\'s Encrypt cert. Subsequent requests are instant.');
+      warnings.push(`Apps live at https://${newTunnelSub}.${domain}/<slug>/. The bare apex (https://${domain}) redirects to that host.`);
+      warnings.push('On the first request Caddy will spend 10–30s issuing a Let\'s Encrypt cert. Subsequent requests are instant.');
       warnings.push('If port 80 isn\'t reachable from the public internet, cert issuance will fail. Use Cloudflare Tunnel or fix DNS first.');
     }
     if (prevMode === 'domain' && mode !== 'domain') {
       warnings.push('Public domain access has stopped. Apps that need a public URL (Connect\'s client portal) won\'t work for external clients.');
     }
-    warnings.push('Apps may need a Disable → Enable from the Apps tab to refresh per-app env (ALLOWED_ORIGIN, etc.).');
+    if (rerender.failed.length > 0) {
+      warnings.push(`${rerender.failed.length} app(s) failed to re-render their env after the mode switch — see rerender.failed in this response. Retry by clicking Disable → Enable on the Apps tab.`);
+    }
 
     return res.json({
       ok: true,
@@ -2478,6 +2539,8 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, async
       from:     prevMode,
       to:       mode,
       domain:   mode === 'domain' ? domain : null,
+      tunnel_subdomain: mode === 'domain' ? newTunnelSub : null,
+      rerender,
       warnings,
       snapshot: { state: stateBak, caddyfile: caddyBak },
     });
@@ -4198,7 +4261,7 @@ app.post('/api/v1/admin/test/ddns', requireAdmin, testRateLimit, async (req, res
   if (result.ok) {
     return res.json({
       ok: true,
-      message: `Namecheap accepted update: ${domain} A → ${ip}. Save these settings; the appliance will keep this and every enabled app's subdomain current going forward. Make sure A records exist at Namecheap for every host you'll publish (@, www, plus each enabled app's subdomain) — DDNS only updates existing records.`,
+      message: `Namecheap accepted update: ${domain} A → ${ip}. Save these settings; the appliance will keep the apex, www, the tunnel subdomain, and the three infra subdomains (cockpit/portainer/backup) current going forward. Make sure A records exist at Namecheap for each (@, www, <tunnel_subdomain>, cockpit, portainer, backup) — DDNS only updates existing records.`,
     });
   }
   // Surface Namecheap's <Err1> string + a recovery hint when we have
@@ -4356,8 +4419,12 @@ app.get('/api/v1/first-login', requireAdmin, async (_req, res) => {
   // status from a docker inspect. Same shape as app items so the UI
   // renderer doesn't need a second code path.
   const config = state.config || {};
-  const infraDomainBase = (config.mode === 'domain' && config.domain)
-    ? `https://${config.domain}` : null;
+  // Infra surfaces (Duplicati, Portainer) live at their own subdomains
+  // in domain mode (backup.<domain>, portainer.<domain>) — never path-
+  // routed off the tunnel hostname, since they're admin tooling and
+  // path-routing them would make them tunnel-public.
+  const infraDomainHost = (config.mode === 'domain' && config.domain)
+    ? config.domain : null;
   const infraLanBase = config.host_ip ? `http://${config.host_ip}` : null;
   const infraExtras = [];
 
@@ -4371,7 +4438,7 @@ app.get('/api/v1/first-login', requireAdmin, async (_req, res) => {
       type:     'default-credentials-passive',
       username: 'admin',
       password: dupWebPw,
-      login_url: infraDomainBase ? `${infraDomainBase}/backup/`
+      login_url: infraDomainHost ? `https://backup.${infraDomainHost}/`
                : infraLanBase ? `${infraLanBase}:5198/`
                : '/backup/',
       enabled:  true,
@@ -4404,7 +4471,7 @@ app.get('/api/v1/first-login', requireAdmin, async (_req, res) => {
       type:     'default-credentials-passive',
       username: 'admin',
       password: portainerPw,
-      login_url: infraDomainBase ? `${infraDomainBase}/portainer/`
+      login_url: infraDomainHost ? `https://portainer.${infraDomainHost}/`
                : infraLanBase ? `${infraLanBase}:5197/`
                : '/portainer/',
       enabled:  true,
@@ -4574,9 +4641,14 @@ function appTailnetHostnameUrl(manifest, config, live) {
 }
 
 function appPublicUrl(manifest, config, live) {
-  // Domain mode → real per-app subdomain.
+  // Domain mode → single tunnel subdomain, path per slug. Mirrors
+  // LAN routing (vibe.local/<slug>/) so the bundled SPA's
+  // base: '/<slug>/' resolves without a host-level redirect. Per-app
+  // subdomains used to live here but broke login flows — see
+  // commits 4907588 / 3a6ffee for the history.
   if (config.mode === 'domain' && config.domain) {
-    return `https://${manifest.subdomain}.${config.domain}/`;
+    const sub = config.tunnel_subdomain || 'vibe';
+    return `https://${sub}.${config.domain}/${manifest.slug}/`;
   }
 
   // LAN mode → http://<hostname>.local/<slug>/ via mDNS + Caddy

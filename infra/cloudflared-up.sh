@@ -24,24 +24,28 @@
 #                                   (cockpit/portainer/backup) are NEVER
 #                                   tunnelled and stay LAN/Tailscale-only.
 #
-# Reads enabled apps + the operator's domain from /opt/vibe/state.json.
-# Walks /opt/vibe/appliance/console/manifests/*.json to map each
-# selected slug → subdomain.
+# Reads domain + tunnel_subdomain + enabled apps from /opt/vibe/state.json.
+# CLOUDFLARE_TUNNEL_PUBLISH is informational only in the single-hostname
+# model — every enabled app is reachable under the one tunnel hostname,
+# Caddy splits paths per slug. The list is still validated to surface
+# typos and to print a per-app reachability summary.
 #
 # Side effects:
 #   - one tunnel object created in Cloudflare (idempotent: looked up by name)
-#   - one CNAME per app subdomain in CLOUDFLARE_TUNNEL_PUBLISH that is
-#     also state.apps[slug].enabled, pointing at <tunnel-id>.cfargotunnel.com
+#   - ONE CNAME at `${tunnel_subdomain}.${domain}` pointing at
+#     <tunnel-id>.cfargotunnel.com. Stale per-app CNAMEs left over from
+#     the prior subdomain-per-app model are auto-pruned in section 5b.
 #   - TUNNEL_TOKEN written to /opt/vibe/env/shared.env (mode 600)
 #   - vibe-cloudflared container brought up via the infra/cloudflared.yml
 #     compose extension
 #
 # Hosts NEVER tunnelled (by design):
-#   - apex (@) and www — landing page + /admin live there; admin auth
-#     belongs on LAN/Tailscale only.
-#   - cockpit, portainer, backup — host management, container management,
-#     and Duplicati are administrative surfaces. Reach them on the LAN
-#     or via Tailscale.
+#   - apex (@) and www — separate; the apex Caddyfile redirects to the
+#     tunnel subdomain for accidental hits.
+#   - cockpit.<domain>, portainer.<domain>, backup.<domain> — admin
+#     surfaces. They're served by Caddy:443 but never registered with
+#     the tunnel ingress. Reach via split DNS to the host LAN IP or
+#     via Tailscale.
 
 set -uo pipefail
 
@@ -249,12 +253,12 @@ HELP
   die "fill CLOUDFLARE_TUNNEL_PUBLISH with at least one app slug and re-run."
 fi
 
-# Read domain + mode from state.json. We need the apex to construct
-# FQDNs for the CNAMEs and the mode to validate that Caddy is
-# actually listening on :443 (the tunnel forwards to caddy:443 with
-# noTLSVerify; if Caddy's mode-driven Caddyfile only emits a :80
-# listener — LAN mode — the tunnel comes up but hits a "connection
-# refused" inside vibe_net and every public request 502s).
+# Read domain + mode + tunnel_subdomain from state.json. The tunnel
+# routes traffic for one hostname: `${TUNNEL_SUBDOMAIN}.${DOMAIN}`.
+# Apps live at /<slug>/ under that host (mirroring LAN routing);
+# Caddy splits paths per app. One ingress rule, one CNAME, one TLS
+# cert — replaces the prior per-app subdomain model that broke login
+# flows (commit 4907588 / revert 3a6ffee).
 DOMAIN="$(python3 -c "
 import json, sys
 try:
@@ -271,10 +275,23 @@ try:
 except Exception:
   pass
 " 2>/dev/null || true)"
+TUNNEL_SUBDOMAIN="$(python3 -c "
+import json, sys
+try:
+  s = json.load(open('$VIBE_STATE_FILE'))
+  print((s.get('config') or {}).get('tunnel_subdomain', '') or 'vibe')
+except Exception:
+  print('vibe')
+" 2>/dev/null || echo 'vibe')"
 
 if [[ -z "$DOMAIN" ]]; then
   die "state.config.domain not set in $VIBE_STATE_FILE. Cloudflare Tunnel needs to know the apex domain. Re-run bootstrap.sh with --mode domain --domain <yours> first."
 fi
+if [[ -z "$TUNNEL_SUBDOMAIN" ]]; then
+  die "state.config.tunnel_subdomain is empty in $VIBE_STATE_FILE. The tunnel needs a single subdomain to route. Re-run bootstrap.sh with --mode domain --tunnel-subdomain <label>."
+fi
+
+TUNNEL_FQDN="${TUNNEL_SUBDOMAIN}.${DOMAIN}"
 
 # Caddy listens on :443 in domain mode and tailscale mode. LAN mode is
 # :80-only, which means the tunnel's https://caddy:443 ingress target
@@ -417,12 +434,20 @@ fi
 
 TARGET_CONTENT="${TUNNEL_ID}.cfargotunnel.com"
 
-# --- 3. Build ingress config from enabled apps + manifests ------------
+# --- 3. Sanity-check the publish list, then build single-host ingress -
 
-log_step "building ingress config from publish list"
-INGRESS_JSON="$(python3 - "$VIBE_STATE_FILE" "$APPLIANCE_DIR/console/manifests" "$DOMAIN" "$CF_TUNNEL_PUBLISH" <<'PYEOF'
+# Single-hostname routing model: the tunnel routes one FQDN
+# (`${TUNNEL_SUBDOMAIN}.${DOMAIN}`) and Caddy splits paths per app
+# behind it. CLOUDFLARE_TUNNEL_PUBLISH used to control which apps
+# got their own subdomain; in the new model the publish list is
+# informational only — every app enabled in state.json is reachable
+# under the single hostname. We still validate that each slug names
+# a real, enabled app to surface typos and to print a "what's
+# reachable" summary at the end.
+log_step "validating publish list (informational; routing is path-based now)"
+PUBLISHED_SLUGS_JSON="$(python3 - "$VIBE_STATE_FILE" "$APPLIANCE_DIR/console/manifests" "$CF_TUNNEL_PUBLISH" <<'PYEOF'
 import json, os, sys
-state_file, manifests_dir, domain, publish_csv = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+state_file, manifests_dir, publish_csv = sys.argv[1], sys.argv[2], sys.argv[3]
 
 try:
   state = json.load(open(state_file))
@@ -430,9 +455,8 @@ except Exception:
   state = {}
 apps = (state.get("apps") or {})
 
-# Walk manifests for slug → subdomain map. Underscore-prefixed
-# manifests (e.g. _appliance.json) are not real apps — skip.
-slug_to_sub = {}
+# slug → label (for the printed summary)
+slug_to_label = {}
 for f in sorted(os.listdir(manifests_dir)):
   if not f.endswith(".json") or f.startswith("_"):
     continue
@@ -440,26 +464,14 @@ for f in sorted(os.listdir(manifests_dir)):
     m = json.load(open(os.path.join(manifests_dir, f)))
   except Exception:
     continue
-  slug, sub = m.get("slug"), m.get("subdomain")
-  if slug and sub:
-    slug_to_sub[slug] = sub
+  slug = m.get("slug")
+  if slug:
+    slug_to_label[slug] = m.get("name") or slug
 
-# Parse the operator-supplied publish list. Whitespace-tolerant; empty
-# tokens (trailing commas, double commas) are dropped silently. The
-# pre-flight in the calling shell already rejected an empty list.
-requested = [s.strip() for s in publish_csv.split(",")]
-requested = [s for s in requested if s]
-
-# Validate each requested slug:
-#   - must exist as a manifest (typo guard)
-#   - must be enabled in state.apps[slug].enabled (publishing a disabled
-#     app would create a dangling CNAME that 502s)
-# Skipped slugs go to stderr as warnings; the script continues so a
-# typo on slug N doesn't kill an otherwise-correct provision of N-1
-# valid slugs.
-hosts = []
+requested = [s.strip() for s in publish_csv.split(",") if s.strip()]
+ok = []
 for slug in requested:
-  if slug not in slug_to_sub:
+  if slug not in slug_to_label:
     print(f"[cloudflared-up] WARN: slug '{slug}' has no manifest under {manifests_dir} — skipping",
           file=sys.stderr)
     continue
@@ -468,62 +480,49 @@ for slug in requested:
           f"Enable the app from the admin UI first, then re-run this script.",
           file=sys.stderr)
     continue
-  hosts.append(slug_to_sub[slug])
+  ok.append({ "slug": slug, "label": slug_to_label[slug] })
 
-if not hosts:
-  print("[cloudflared-up] ERROR: publish list resolved to zero valid hosts. "
+if not ok:
+  print("[cloudflared-up] ERROR: publish list resolved to zero enabled apps. "
         "Check that each slug in CLOUDFLARE_TUNNEL_PUBLISH names a real, ENABLED app.",
         file=sys.stderr)
   sys.exit(2)
 
-# Dedupe, preserve order. Two manifests claiming the same subdomain
-# would otherwise produce duplicate ingress rules; Cloudflare rejects
-# that with a 400.
-seen, ordered = set(), []
-for h in hosts:
-  if h not in seen:
-    seen.add(h)
-    ordered.append(h)
+print(json.dumps(ok))
+PYEOF
+)"
+if [[ -z "$PUBLISHED_SLUGS_JSON" ]]; then
+  die "publish list validation failed; see the WARN/ERROR lines above."
+fi
 
-# Build the ingress array. Every rule forwards to caddy:443 inside
-# vibe_net; noTLSVerify lets Caddy serve whatever cert it has (LE,
-# self-signed, doesn't matter — Cloudflare's edge does TLS to the
-# real client). The catch-all 404 at the end is required by Cloudflare
-# Tunnel — without it the tunnel rejects the config.
-#
-# originServerName is set to the request hostname so cloudflared sends
-# SNI = the FQDN the user typed (e.g. "tb.firm.com"). WITHOUT this,
-# cloudflared defaults SNI to the service URL hostname ("caddy"), and
-# Caddy — which only has internal-CA certs for the rendered per-host
-# vhosts — has no cert for the bare service name and aborts the
-# handshake with "tls: internal error". noTLSVerify is what disables
-# *verification* of the cert returned; originServerName is what tells
-# cloudflared which name to ASK for. Both are required in tunnel mode.
-#
-# Apex (@) and www are NOT included — landing page + admin UI live there
-# and stay LAN/Tailscale-only. Infra subdomains (cockpit/portainer/
-# backup) are also excluded for the same reason. See the script header
-# for the full rationale.
-ingress = []
-for host in ordered:
-  fqdn = f"{host}.{domain}"
-  ingress.append({
+# Build the single-rule ingress. Every request to the tunnel hostname
+# forwards to caddy:443 inside vibe_net; noTLSVerify lets Caddy serve
+# its self-signed internal cert (Cloudflare's edge does the public
+# TLS). originServerName=TUNNEL_FQDN makes cloudflared send SNI for
+# the operator-typed hostname so Caddy's named site block matches —
+# without this, SNI defaults to "caddy" and Caddy aborts with "tls:
+# internal error" (commit 06e962a). The catch-all 404 at the end is
+# required by Cloudflare Tunnel.
+log_step "building single-hostname ingress config" host="$TUNNEL_FQDN"
+INGRESS_JSON="$(python3 - "$TUNNEL_FQDN" <<'PYEOF'
+import json, sys
+fqdn = sys.argv[1]
+ingress = [
+  {
     "hostname": fqdn,
     "service":  "https://caddy:443",
     "originRequest": {
       "noTLSVerify":      True,
       "originServerName": fqdn,
     },
-  })
-ingress.append({ "service": "http_status:404" })
-
+  },
+  { "service": "http_status:404" },
+]
 print(json.dumps({ "config": { "ingress": ingress } }))
 PYEOF
 )"
-# python3 exited non-zero (e.g. publish list resolved to zero valid hosts)
-# — bail with a clear message rather than pushing an empty config.
 if [[ -z "$INGRESS_JSON" ]]; then
-  die "ingress build failed; see the WARN/ERROR lines above."
+  die "ingress build failed; check that python3 is installed."
 fi
 
 # --- 4. Push ingress config to the tunnel -----------------------------
@@ -760,35 +759,40 @@ else
     "fix:check that outbound TCP 7844 is allowed from this host (any firewall rules?)"
 fi
 
-log_ok "Cloudflare Tunnel is up" tunnel_id="$TUNNEL_ID" tunnel_name="$CF_TUNNEL_NAME"
+log_ok "Cloudflare Tunnel is up" tunnel_id="$TUNNEL_ID" tunnel_name="$CF_TUNNEL_NAME" host="$TUNNEL_FQDN"
 
-# Pretty list of the published FQDNs for the operator's confirmation.
-PUBLISHED_FQDNS="$(python3 -c "
+# Per-app reachable URLs under the single hostname.
+PUBLISHED_LINES="$(python3 - "$PUBLISHED_SLUGS_JSON" "$TUNNEL_FQDN" <<'PYEOF'
 import json, sys
-d = json.loads(sys.argv[1])
-out = [e['hostname'] for e in d['config']['ingress'] if e.get('hostname')]
-print('\n  '.join(out))
-" "$INGRESS_JSON" 2>/dev/null || true)"
-FIRST_FQDN="$(printf '%s\n' "$PUBLISHED_FQDNS" | head -n1 | sed 's/^[[:space:]]*//')"
+items = json.loads(sys.argv[1])
+host = sys.argv[2]
+for it in items:
+  print(f"  https://{host}/{it['slug']}/  ({it['label']})")
+PYEOF
+2>/dev/null || true)"
 
 printf '\n'
 printf 'Cloudflare Tunnel "%s" is up.\n' "$CF_TUNNEL_NAME"
 printf '  Tunnel ID:    %s\n' "$TUNNEL_ID"
+printf '  Public host:  https://%s\n' "$TUNNEL_FQDN"
 printf '  CNAME target: %s\n' "$TARGET_CONTENT"
 printf '  Container:    docker logs vibe-cloudflared --tail 30\n'
 printf '\n'
-printf 'Published over the tunnel (public on the internet):\n'
-printf '  %s\n' "$PUBLISHED_FQDNS"
+printf 'Console (landing + admin):\n'
+printf '  https://%s/\n' "$TUNNEL_FQDN"
+printf '\n'
+printf 'Apps over the tunnel:\n'
+if [[ -n "$PUBLISHED_LINES" ]]; then
+  printf '%s\n' "$PUBLISHED_LINES"
+else
+  printf '  (no apps in CLOUDFLARE_TUNNEL_PUBLISH; nothing to list)\n'
+fi
 printf '\n'
 printf 'NOT published (LAN/Tailscale-only by design):\n'
 printf '  %s, www.%s, cockpit.%s, portainer.%s, backup.%s\n' \
   "$DOMAIN" "$DOMAIN" "$DOMAIN" "$DOMAIN" "$DOMAIN"
 printf '\n'
 printf 'Verify from a network OUTSIDE your LAN (e.g. cellular):\n'
-if [[ -n "$FIRST_FQDN" ]]; then
-  printf '  curl -sI https://%s/ — 200/302/401 means the tunnel is working.\n' "$FIRST_FQDN"
-else
-  printf '  (no published apps; nothing external to test)\n'
-fi
+printf '  curl -sI https://%s/ — 200/302/401 means the tunnel is working.\n' "$TUNNEL_FQDN"
 printf '  5xx responses usually mean Caddy:443 is unreachable inside vibe_net —\n'
 printf '  check `docker logs vibe-cloudflared --tail 30` for the connector handshake.\n'

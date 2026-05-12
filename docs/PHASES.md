@@ -1312,3 +1312,49 @@ Append to this list as phases complete. Format:
   "Phase 8.5 substrate verified YYYY-MM-DD on DO droplet" and the
   follow-up session may begin (Settings UI + test endpoints + rollback
   machinery).
+
+- 2026-05-12 — Single-hostname routing for domain mode.
+
+  Replaced per-app subdomain routing in domain mode with a single
+  `${tunnel_subdomain}.${domain}` host that path-routes per app
+  (`/<slug>/`), mirroring LAN. The prior subdomain-per-app model
+  broke login flows: SPAs are bundled with `base: '/<slug>/'`, so
+  each subdomain needed a `/<slug>/` mount, which required a catch-all
+  302 from `/` — and HTTP 302 downgrades POST to GET (RFC 7231
+  §6.4.3), silently breaking every credential POST. See commit
+  4907588 (attempt) and 3a6ffee (revert).
+
+  Path-based routing on one host avoids both the SPA `base` mismatch
+  (apps live at `/<slug>/` where the bundle expects them) and the
+  catch-all redirect (none needed). One ingress rule, one CNAME, one
+  cert.
+
+  Changes:
+  - `bootstrap.sh` — new `--tunnel-subdomain` flag (default `vibe`).
+  - `lib/render-caddyfile.sh` — domain mode emits one TLS vhost
+    `${sub}.${domain}` containing per-app `render_path_handler()`
+    blocks. Apex redirects to that host. Cockpit/Portainer/Duplicati
+    keep their own subdomains (admin-only, never tunnelled).
+  - `lib/enable-app.sh` — `_render_app_env` in domain mode now sets
+    `ALLOWED_ORIGIN=https://${sub}.${domain}` (single origin shared
+    by every app) and `VITE_BASE_PATH=/<slug>/` (same as LAN).
+  - `infra/cloudflared-up.sh` — single catch-all ingress for
+    `${sub}.${domain}`. Old per-app CNAMEs pointing at this tunnel
+    are auto-pruned by the existing stale-CNAME sweep (section 5b).
+  - `console/server.js` — `appPublicUrl()` returns
+    `https://${sub}.${domain}/<slug>/`; DDNS host list updated;
+    network-mode-switch endpoint auto-reruns `enable-app.sh` for
+    each enabled app so env files don't drift (promotes the
+    `mode-change-env-rerender.md` manual recipe to automatic).
+
+  Verify on a fresh DO droplet:
+  ```
+  sudo ./bootstrap.sh --mode domain --domain <test.example> \
+                      --tunnel-subdomain vibe --email admin@example.com
+  ```
+  - Enable an app (e.g. vibe-tb). `https://vibe.<domain>/vibe-tb/`
+    loads the SPA; login POST returns 200 with a session cookie.
+  - Mode-switch from LAN to domain via Settings → Network leaves
+    every enabled app working at the new URL with no manual re-enable.
+  - `curl -i -X POST https://vibe.<domain>/vibe-tb/api/auth/login` is
+    a 200 (not a 302) — the regression bar.

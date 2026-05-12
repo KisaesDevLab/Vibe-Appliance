@@ -700,15 +700,25 @@ _image_uid_gid() {
 _render_app_env() {
   local slug="$1" manifest="$2" tmpl="$3" out="$4"
 
-  local subdomain mode domain ip allowed_origin vite_base_path session_secure
+  local subdomain mode domain tunnel_subdomain ip allowed_origin vite_base_path session_secure
   subdomain="$(_manifest_field "$manifest" 'data["subdomain"]')"
   mode="$(python3 -c "import json;print(json.load(open('${VIBE_STATE_FILE}')).get('config',{}).get('mode','lan'))")"
   domain="$(python3 -c "import json;print(json.load(open('${VIBE_STATE_FILE}')).get('config',{}).get('domain',''))")"
+  tunnel_subdomain="$(python3 -c "import json;print(json.load(open('${VIBE_STATE_FILE}')).get('config',{}).get('tunnel_subdomain','vibe') or 'vibe')")"
 
   if [[ "$mode" == "domain" && -n "$domain" ]]; then
-    allowed_origin="https://${subdomain}.${domain}"
-    # Domain mode → app lives at its own subdomain, served from root.
-    vite_base_path="/"
+    # Single-hostname routing: every app lives under
+    # `${tunnel_subdomain}.${domain}/<slug>/`. ALLOWED_ORIGIN is the
+    # same single host for every app (the SPA is loaded from that
+    # origin, so cookie + CORS need to match it). VITE_BASE_PATH is
+    # `/<slug>/` — same as LAN — because the bundled SPA is built with
+    # `base: '/<slug>/'` and the /docker-entrypoint.d/40-base-path.sh
+    # hook sed-substitutes the sentinel at container start. Per-app
+    # subdomains were the prior model and required vite_base_path=/
+    # plus a catch-all 302 that downgraded login POSTs (commit 4907588
+    # / revert 3a6ffee).
+    allowed_origin="https://${tunnel_subdomain}.${domain}"
+    vite_base_path="/${slug}/"
   else
     ip="$(_host_lan_ip)"
     allowed_origin="http://${ip:-localhost}"

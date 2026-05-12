@@ -1,14 +1,28 @@
 # Per-app env re-render on mode change
 
-## What's missing
+> **Status (2026-05-12): automatic.** The console's
+> `POST /api/v1/admin/network-mode/switch` endpoint now re-runs
+> `enable-app.sh` for every enabled app after a successful Caddy
+> reload, and `bootstrap.sh phase_apps` already does the same on
+> every re-run. The manual recipe below is kept as a reference for
+> operators who edit `state.json` directly or otherwise bypass the
+> two automatic paths.
+>
+> Note: the routing change of 2026-05-12 also altered the values
+> `_render_app_env` produces in domain mode —
+> `ALLOWED_ORIGIN=https://${tunnel_subdomain}.${domain}` (single
+> shared origin) and `VITE_BASE_PATH=/<slug>/` (same as LAN). See
+> `docs/PHASES.md` for the rationale.
+
+## What used to be missing
 
 `lib/enable-app.sh:_render_app_env` already correctly derives the right
 values for the appliance's current mode:
 
 ```bash
 if [[ "$mode" == "domain" && -n "$domain" ]]; then
-  allowed_origin="https://${subdomain}.${domain}"
-  vite_base_path="/"
+  allowed_origin="https://${tunnel_subdomain}.${domain}"
+  vite_base_path="/${slug}/"
 else
   allowed_origin="http://${ip:-localhost}"
   vite_base_path="/${slug}/"
@@ -21,11 +35,11 @@ And the Vibe-* web images include
 container start. So a fresh `enable-app.sh` after the operator picks
 a mode produces a correctly-baseed SPA.
 
-**The gap:** when the operator changes `state.config.mode` after apps
-are already enabled (LAN → domain when first wiring up Cloudflare
-Tunnel, say), nothing re-runs `_render_app_env` for each enabled app.
-Their `/opt/vibe/env/<slug>.env` files keep the old `ALLOWED_ORIGIN`
-and `VITE_BASE_PATH`. Symptoms after the switch:
+**The gap (now closed):** when the operator changed `state.config.mode`
+after apps were already enabled (LAN → domain when first wiring up
+Cloudflare Tunnel, say), nothing re-ran `_render_app_env` for each
+enabled app. Their `/opt/vibe/env/<slug>.env` files kept the old
+`ALLOWED_ORIGIN` and `VITE_BASE_PATH`. Symptoms after the switch:
 
 - Backend rejects login (Origin mismatch): SPA shows "invalid credentials"
 - SPA loads but every absolute asset reference 404s: blank white page
@@ -51,26 +65,23 @@ That re-renders every enabled app's env file from the current
 `state.config.mode` and bounces the containers so the entrypoint
 substitutes the new `VITE_BASE_PATH` into the bundle.
 
-## What the automatic fix looks like
+## How the automatic fix works (2026-05-12)
 
-The settings-save flow in `console/server.js` already detects when
-`state.config.mode` changes. When it does, it should:
+`POST /api/v1/admin/network-mode/switch` in `console/server.js`
+now diffs `state.config.{mode,domain,tunnel_subdomain}` against the
+prior values. When any of them changed AND there are enabled apps,
+it loops `enable-app.sh <slug>` for each one. `enable_app` is
+idempotent and re-runs the full sequence (re-render env, pull, db
+bootstrap, compose up, health-check, render Caddy, reload Caddy) so
+no separate "restart in dependency order" step is needed — compose
+brings up the api tier before the web tier through `depends_on`.
 
-1. Iterate `state.apps` for enabled apps.
-2. For each, invoke the same `_render_app_env` path that
-   `enable-app.sh` uses today (extract it into a re-render-only
-   helper that doesn't restart anything yet).
-3. `docker restart` each affected container in dependency order
-   (api before web, since web nginx may have baked api hostnames).
-4. Reload Caddy once at the end (the rendered Caddyfile depends on
-   mode too, so it changes shape as part of the same transition).
+`bootstrap.sh phase_apps` independently re-runs `enable_app` for
+every enabled app on every bootstrap invocation, so re-running
+bootstrap with new flags converges the same way.
 
-This is a one-shot helper, not a long-running watcher — it fires
-exactly when state.config.mode flips. The operator's "Save" click in
-the Network tab is the trigger.
-
-Tracking this as a discrete commit. Until it lands, the manual
-re-enable loop above is the documented recovery.
+Both paths reach the operator's two entry points (UI Settings save
+vs. `sudo ./bootstrap.sh`), so neither flow needs the manual loop.
 
 ## What this replaces
 
