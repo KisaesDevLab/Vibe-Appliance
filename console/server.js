@@ -1166,6 +1166,22 @@ app.post('/api/v1/admin/cloudflare/discover', requireAdmin, testRateLimit, async
 // validates that each slug names a real, ENABLED app — invalid slugs
 // surface as warnings in stdout/stderr and are skipped.
 app.post('/api/v1/admin/cloudflare/provision', requireAdmin, testRateLimit, async (req, res) => {
+  // Tunnel ingress forwards to https://caddy:443 with noTLSVerify.
+  // In LAN/Tailscale modes Caddy has no :443 listener at all — every
+  // tunnel request would 502 silently. Hard-fail at the API layer
+  // so the wizard (and curl-ers) get a clear, immediate error
+  // instead of provisioning a doomed tunnel.
+  const state = readState();
+  const currentMode = (state.config || {}).mode;
+  if (currentMode !== 'domain') {
+    return res.status(400).json({
+      ok: false,
+      action: 'cloudflare-provision',
+      error: `Cloudflare Tunnel requires mode=domain (currently: ${currentMode || 'unset'}). ` +
+             `Switch primary network access first via Configuration → Network → Primary network access → 'Public domain'.`,
+    });
+  }
+
   const body = req.body || {};
   if (Array.isArray(body.publishSlugs)) {
     // Validate slug format up front. The script does its own

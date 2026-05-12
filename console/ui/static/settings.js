@@ -14,7 +14,7 @@
 // operators can confirm in DevTools (F12 → Console) that the file
 // they're running is the version they expect, vs. a stale cached
 // copy. Compare against the server's /api/v1/version response.
-const SETTINGS_JS_VERSION = '2026-05-11-tailscale-ip-primary';
+const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
 
 (function () {
   // eslint-disable-next-line no-console
@@ -1364,6 +1364,7 @@ const SETTINGS_JS_VERSION = '2026-05-11-tailscale-ip-primary';
     const wiz = {
       screen:    'IDLE',
       domain:    null,
+      currentMode: null,  // state.config.mode — gates the Set-up flow
       nsOk:      null,
       token:     '',
       accounts:  [],
@@ -1416,12 +1417,13 @@ const SETTINGS_JS_VERSION = '2026-05-11-tailscale-ip-primary';
     // /api/v1/apps + status. Never downgrades — a failed status check
     // leaves the operator on IDLE with the Set-up button visible.
     async function bootstrap() {
-      const [domain, appsResp, statusResp] = await Promise.all([
-        fetchDomain(),
+      const [stateCfg, appsResp, statusResp] = await Promise.all([
+        fetchStateConfig(),
         fetch('/api/v1/apps', { credentials: 'same-origin' }).catch(() => null),
         fetch('/api/v1/admin/cloudflare/status', { credentials: 'same-origin' }).catch(() => null),
       ]);
-      wiz.domain = domain;
+      wiz.domain      = stateCfg.domain;
+      wiz.currentMode = stateCfg.mode;
 
       if (appsResp && appsResp.ok) {
         try {
@@ -1465,6 +1467,33 @@ const SETTINGS_JS_VERSION = '2026-05-11-tailscale-ip-primary';
         ' the public landing page, the admin UI, Cockpit (host), Portainer (containers), ' +
         'and Duplicati (backup). The tunnel never publishes them, even if you turn it on.',
       ]));
+
+      // Mode gate: Cloudflare Tunnel only works in Domain mode.
+      // In LAN/Tailscale modes Caddy has no :443 listener, so the
+      // tunnel ingress (forwards to caddy:443) silently 502s every
+      // request. Block setup entirely with a callout pointing at the
+      // Primary network access section.
+      if (wiz.bootstrapped && wiz.currentMode && wiz.currentMode !== 'domain') {
+        section.appendChild(el('div', {
+          style: 'margin-top:0.6rem;padding:0.7rem 0.9rem;background:rgba(220,38,38,0.06);border:1px solid var(--bad);border-radius:4px;',
+        }, [
+          el('p', { style: 'margin:0;font-weight:600;color:var(--bad);' }, [
+            '⚠ Cloudflare Tunnel requires Domain mode',
+          ]),
+          el('p', { class: 'help', style: 'margin:0.3rem 0 0;' }, [
+            'Currently: ',
+            el('strong', null, [wiz.currentMode === 'lan' ? 'LAN-only' : 'Tailscale-only']),
+            '. Caddy only emits per-subdomain vhosts in Domain mode, so the tunnel\'s ',
+            'forwarding target (', el('span', { class: 'mono' }, ['https://caddy:443']),
+            ') has no listener in LAN/Tailscale modes — public requests would return 502.',
+          ]),
+          el('p', { class: 'help', style: 'margin:0.3rem 0 0;' }, [
+            'Switch in the ', el('strong', null, ['Primary network access']),
+            ' section above (radio for Public domain). You\'ll need to provide your domain + ACME email.',
+          ]),
+        ]));
+        return;
+      }
 
       // Three states:
       //   bootstrap not yet done → show the button optimistically with
@@ -2069,13 +2098,17 @@ const SETTINGS_JS_VERSION = '2026-05-11-tailscale-ip-primary';
       section.appendChild(cta);
     }
 
-    async function fetchDomain() {
+    async function fetchStateConfig() {
       try {
         const r = await fetch('/api/v1/state', { credentials: 'same-origin' });
-        if (!r.ok) return '';
+        if (!r.ok) return { domain: '', mode: null };
         const s = await r.json();
-        return ((s.config || {}).domain || '').trim();
-      } catch { return ''; }
+        const cfg = s.config || {};
+        return {
+          domain: (cfg.domain || '').trim(),
+          mode:   cfg.mode || null,
+        };
+      } catch { return { domain: '', mode: null }; }
     }
   }
 

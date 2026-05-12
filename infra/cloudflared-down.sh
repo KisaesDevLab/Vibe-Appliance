@@ -166,4 +166,29 @@ if [[ -f "$VIBE_ENV_SHARED" ]] && grep -q '^TUNNEL_TOKEN=' "$VIBE_ENV_SHARED"; t
   mv "$tmp" "$VIBE_ENV_SHARED"
 fi
 
+# --- 6. Clear CLOUDFLARE_TUNNEL_ENABLED + reload Caddy ---------------
+# render-caddyfile.sh switches every site block to `tls internal`
+# and disables auto_https when CLOUDFLARE_TUNNEL_ENABLED=true. Once
+# the tunnel is gone, those switches no longer apply — Caddy should
+# go back to Let's Encrypt mode (if the operator still has direct
+# DNS pointing at the host) or stay tls-internal for LAN. Flip the
+# flag and re-render so Caddy picks up the right config on reload.
+log_step "clearing CLOUDFLARE_TUNNEL_ENABLED in appliance.env"
+# shellcheck source=/dev/null
+. "$APPLIANCE_DIR/lib/secrets.sh"
+secrets_set_kv_appliance CLOUDFLARE_TUNNEL_ENABLED "false"
+
+log_step "re-rendering Caddyfile + reloading Caddy"
+# shellcheck source=/dev/null
+. "$APPLIANCE_DIR/lib/state.sh"
+# shellcheck source=/dev/null
+. "$APPLIANCE_DIR/lib/render-caddyfile.sh"
+if render_caddyfile >>"$VIBE_LOG_FILE" 2>&1 && reload_caddyfile >>"$VIBE_LOG_FILE" 2>&1; then
+  log_ok "Caddy reloaded — tunnel-mode config flags removed"
+else
+  log_warn "Caddyfile re-render or reload failed; Caddy may still be in tunnel-mode config" \
+    "diagnose:sudo docker logs vibe-caddy --tail 30" \
+    "fix:sudo bash $APPLIANCE_DIR/bootstrap.sh    # idempotent re-render path"
+fi
+
 log_ok "Cloudflare Tunnel torn down. Re-run infra/cloudflared-up.sh to bring it back up."

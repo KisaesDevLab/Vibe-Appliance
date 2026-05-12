@@ -250,18 +250,27 @@ fi
 
 # Caddy listens on :443 in domain mode and tailscale mode. LAN mode is
 # :80-only, which means the tunnel's https://caddy:443 ingress target
-# won't have anything answering. Soft-warn for LAN mode rather than
-# fail — an operator who's deliberately tweaked the Caddyfile by hand
-# might know what they're doing. Anything other than the three known
-# modes is unrecognised and worth a hard failure.
+# won't have anything answering. Hard-fail anything that isn't Domain
+# mode: in lan/tailscale the Caddyfile renders no :443 listener at all
+# (only path-prefix routes on the catch-all :80 site), so the tunnel
+# ingress (which forwards to https://caddy:443 noTLSVerify) silently
+# 502s every request. Better to refuse the provision than leave the
+# operator chasing a 502 with no obvious cause.
 case "$MODE" in
-  domain|tailscale)
+  domain)
     : ;;
-  lan)
-    log_warn "state.config.mode is 'lan' — Caddy only listens on :80, but the tunnel forwards to https://caddy:443. Public requests through the tunnel will 502. Re-run bootstrap.sh with --mode domain --domain $DOMAIN before running this script, or hand-edit the Caddyfile to add a :443 listener."
-    ;;
-  "")
-    die "state.config.mode is empty — bootstrap.sh has not been run, or state.json was wiped. Run bootstrap.sh --mode domain --domain $DOMAIN first."
+  lan|tailscale|"")
+    die "Cloudflare Tunnel requires Domain mode (currently: '${MODE:-unset}').
+
+  Caddy emits per-subdomain vhosts on :443 only when state.config.mode=domain.
+  In LAN/Tailscale mode the tunnel ingress forwards to https://caddy:443
+  but Caddy has no :443 listener — every public request would 502.
+
+  Fix:
+    1. Open the admin console → Configuration → Network → Primary network
+       access → switch to 'Public domain'. Provide a domain + ACME email.
+       Re-run this script (or click 'Provision tunnel' in the wizard).
+    2. Or hand: sudo bash /opt/vibe/appliance/bootstrap.sh --mode domain --domain <yours>"
     ;;
   *)
     log_warn "state.config.mode='$MODE' is not one of domain/tailscale/lan — proceeding, but verify Caddy is listening on :443."
@@ -536,6 +545,44 @@ for e in d['config']['ingress']:
   create_or_update_cname "${fqdn%.${DOMAIN}}"
 done
 
+# --- 5b. Delete stale CNAMEs no longer in the publish list -----------
+# On a re-provision after the operator un-ticks an app, the old
+# CNAME for that app stays pointing at the tunnel — the ingress
+# config now 404s it, but the DNS record persists and clutters the
+# zone. Find all CNAMEs in the zone whose content matches THIS
+# tunnel's hostname and whose name is NOT in the current publish
+# list, then delete them.
+log_step "removing stale CNAMEs no longer in publish list"
+current_fqdns="$(python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+for e in d['config']['ingress']:
+  h = e.get('hostname')
+  if h:
+    print(h)
+" "$INGRESS_JSON")"
+existing="$(cf_api GET "/zones/$CF_ZONE_ID/dns_records?type=CNAME&per_page=200")"
+stale_pairs="$(_CURRENT="$current_fqdns" python3 - "$existing" "$TARGET_CONTENT" <<'PYEOF'
+import json, os, sys
+data, target = sys.argv[1], sys.argv[2]
+current = set(s for s in os.environ.get('_CURRENT', '').strip().split('\n') if s)
+try:
+  d = json.loads(data)
+except Exception:
+  sys.exit(0)
+for r in (d.get('result') or []):
+  if r.get('content') == target and r.get('name') not in current:
+    print(r.get('id', ''), r.get('name', ''))
+PYEOF
+)"
+while IFS=' ' read -r rid rname; do
+  [[ -z "$rid" ]] && continue
+  r="$(cf_api DELETE "/zones/$CF_ZONE_ID/dns_records/$rid")"
+  if cf_check_success "$r" "delete stale CNAME $rname"; then
+    log_info "deleted stale CNAME" host="$rname"
+  fi
+done <<< "$stale_pairs"
+
 # --- 6. Fetch the connector token, persist to shared.env --------------
 
 log_step "fetching connector token"
@@ -567,6 +614,53 @@ log_step "bringing up cloudflared container"
     docker compose -f docker-compose.yml -f infra/cloudflared.yml up -d cloudflared \
   ) >>"$VIBE_LOG_FILE" 2>&1 \
   || die "compose up cloudflared failed; see $VIBE_LOG_FILE"
+
+# --- 8. Re-render Caddyfile + reload Caddy ---------------------------
+# The wizard's settings-save flow wrote CLOUDFLARE_TUNNEL_ENABLED=true
+# to appliance.env before invoking this script, but Caddy's running
+# config still uses Let's Encrypt + auto_https=on (the pre-tunnel
+# state). Port 80 is unreachable from the public internet now (the
+# tunnel is the only ingress), so HTTP-01 issuance fails and Caddy
+# serves "TLS internal error" on every request from cloudflared's
+# edge — silent 502 until the Caddyfile gets re-rendered.
+# Force the render + reload here so the tunnel routing works from
+# the moment the wizard reports "Up".
+log_step "re-rendering Caddyfile + reloading Caddy"
+# shellcheck source=/dev/null
+. "$APPLIANCE_DIR/lib/state.sh"
+# shellcheck source=/dev/null
+. "$APPLIANCE_DIR/lib/render-caddyfile.sh"
+if render_caddyfile >>"$VIBE_LOG_FILE" 2>&1 && reload_caddyfile >>"$VIBE_LOG_FILE" 2>&1; then
+  log_ok "Caddy reloaded with tls internal + auto_https off"
+else
+  log_warn "Caddyfile re-render or reload failed — tunnel may 502 until manual fix" \
+    "diagnose:sudo docker logs vibe-caddy --tail 30" \
+    "fix:sudo bash $APPLIANCE_DIR/bootstrap.sh    # idempotent re-render path"
+fi
+
+# --- 9. Connector health check ---------------------------------------
+# Poll the cloudflared container's logs for the "Registered tunnel
+# connection" message. If it appears within ~12s, the connector
+# successfully dialed Cloudflare's edge over TCP 7844 and is ready
+# to receive ingress. If it doesn't, surface a clear hint — most
+# common cause is the host firewall blocking outbound 7844.
+log_step "verifying cloudflared connector registered"
+_connector_ok=0
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  if docker logs vibe-cloudflared 2>&1 \
+       | grep -qE 'Registered tunnel connection|connection registered with location'; then
+    _connector_ok=1
+    break
+  fi
+  sleep 1
+done
+if [[ "$_connector_ok" == "1" ]]; then
+  log_ok "cloudflared connector registered with Cloudflare edge"
+else
+  log_warn "cloudflared didn't report a registered connection within 12s — public requests may fail" \
+    "diagnose:sudo docker logs vibe-cloudflared --tail 30" \
+    "fix:check that outbound TCP 7844 is allowed from this host (any firewall rules?)"
+fi
 
 log_ok "Cloudflare Tunnel is up" tunnel_id="$TUNNEL_ID" tunnel_name="$CF_TUNNEL_NAME"
 
