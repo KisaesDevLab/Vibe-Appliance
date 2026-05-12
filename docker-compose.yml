@@ -300,17 +300,26 @@ services:
     container_name: vibe-emergency-proxy
     restart: unless-stopped
     ports:
-      - "5171:5171"
-      - "5172:5172"
-      - "5181:5181"
-      - "5182:5182"
-      - "5191:5191"
-      - "5192:5192"
+      # App frontends — one publish per emergencyPort declared in
+      # console/manifests/*.json. When adding an app with a new
+      # emergencyPort, ALSO add the port here, otherwise lib/render-haproxy.sh
+      # emits a `frontend` block inside the container but the LAN can't
+      # reach it (connection refused from any non-host source). The UFW
+      # rules in lib/ufw-rules.sh cover the whole 5171-5198 range so
+      # they don't need per-port updates.
+      - "5171:5171"   # vibe-mybooks
+      - "5172:5172"   # vibe-tb
+      - "5174:5174"   # vibe-calculators
+      - "5175:5175"   # vibe-tx-converter
+      - "5181:5181"   # vibe-connect (main)
+      - "5182:5182"   # vibe-connect (public)
+      - "5191:5191"   # vibe-tax-research
+      - "5192:5192"   # vibe-payroll
       # Phase 8.5 v1.2 — fallback ports for infra services. Same UFW
       # gating, same rate-limit + custom 503 — Duplicati / Portainer
       # become reachable when Caddy / DNS / certs are broken.
-      - "5197:5197"
-      - "5198:5198"
+      - "5197:5197"   # portainer
+      - "5198:5198"   # duplicati
       # Stats UI on loopback only — SSH-tunnel for diagnostics, never
       # exposed off-host. See docs/addenda/emergency-access.md §4.1.
       - "127.0.0.1:5199:5199"
