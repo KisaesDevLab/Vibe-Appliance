@@ -851,11 +851,14 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
         // the app card's "backup" row uses. Caddy-routed; works when
         // mDNS / vibe.local is the failure point.
         lanFallbackUrl: appLanFallbackUrl(m, state.config || {}),
-        // Tailnet URL — only when the live daemon probe shows
-        // BackendState=Running + hostname is known + mode supports
-        // path-prefix routing. Null in Domain mode (per-app paths
-        // over tailnet hit catch-all).
-        tailnetUrl:    appTailnetUrl(m, state.config || {}, live),
+        // Tailnet URL — http://<tailnet-ip>/<slug>/. Works whenever
+        // daemon is Running + mode supports path-prefix routes.
+        // Plain HTTP, but inside the encrypted WireGuard tunnel.
+        tailnetUrl:         appTailnetUrl(m, state.config || {}, live),
+        // Tailnet HTTPS URL — only when Tailscale Serve has been
+        // enabled in the tailnet admin AND `tailscale serve --https`
+        // rules are configured on this node.
+        tailnetHostnameUrl: appTailnetHostnameUrl(m, state.config || {}, live),
         // HAProxy emergency-port URL — Emergency Access panel only.
         // Bypasses Caddy entirely; for the "Caddy is down" failure
         // mode. Has known SPA blank-page limitations per
@@ -1325,28 +1328,42 @@ function runOnHost(shellCommand) {
 // refreshes hit /admin/status every 15s and we want < one probe
 // cost per refresh cycle while keeping the value fresh.
 const _DAEMON_TTL_MS = 10 * 1000;
-let _daemonCache = { value: { backendState: null, hostname: null }, ts: 0 };
+const _EMPTY_DAEMON = { backendState: null, hostname: null, ip: null, serve_configured: false };
+let _daemonCache = { value: { ..._EMPTY_DAEMON }, ts: 0 };
 
 async function _liveTailscaleState() {
   if (Date.now() - _daemonCache.ts < _DAEMON_TTL_MS) {
     return _daemonCache.value;
   }
   const probe = await tsHost('status', '--json');
-  const out = { backendState: null, hostname: null };
+  const out = { ..._EMPTY_DAEMON };
   if (probe.code === 0) {
     try {
       const s = JSON.parse(probe.stdout);
       out.backendState = (s.BackendState || '').trim() || null;
       const dns = (s.Self && s.Self.DNSName ? String(s.Self.DNSName) : '').replace(/\.$/, '');
       out.hostname = dns || null;
+      // First IPv4 in the CGNAT range; Self.TailscaleIPs is [IPv4, IPv6].
+      const ips = (s.Self && Array.isArray(s.Self.TailscaleIPs)) ? s.Self.TailscaleIPs : [];
+      out.ip = ips.find(a => /^\d{1,3}(\.\d{1,3}){3}$/.test(a)) || null;
     } catch { /* leave nulls */ }
+  }
+  // `tailscale serve --https=…` is gated behind a separate tailnet
+  // admin toggle (distinct from HTTPS Certificates). Probe whether
+  // any serve rule is currently configured so the UI can decide
+  // whether to surface the MagicDNS HTTPS URL alongside the IP one.
+  // Only meaningful when daemon is Running; skip the probe otherwise.
+  if (out.backendState === 'Running') {
+    const serveProbe = await tsHost('serve', 'status');
+    const text = (serveProbe.stdout || '').trim();
+    out.serve_configured = serveProbe.code === 0 && text && text !== 'No serve config';
   }
   _daemonCache = { value: out, ts: Date.now() };
   return out;
 }
 
 function _invalidateDaemonCache() {
-  _daemonCache = { value: { backendState: null, hostname: null }, ts: 0 };
+  _daemonCache = { value: { ..._EMPTY_DAEMON }, ts: 0 };
 }
 
 // 5-minute in-memory cache for apt-cache policy probes. The Update
@@ -1668,7 +1685,10 @@ app.get('/api/v1/admin/tailscale/status', requireAdmin, async (_req, res) => {
     cli_installed:       false,
     daemon_state:        null,   // "Running" / "NeedsLogin" / "Stopped" / null
     tailnet_hostname:    null,   // host.tailnet.ts.net (no trailing dot)
+    tailnet_ip:          null,   // 100.x.x.x — Self.TailscaleIPs[0]
     magicdns_url:        null,   // https://<hostname>
+    tailnet_ip_url:      null,   // http://<tailnet-ip> — always works while daemon is up
+    serve_configured:    false,  // `tailscale serve status` reports configured rules
     current_hostname:    null,   // Self.HostName — what the hostname-edit field shows
     key_expiry_iso:      null,
     key_expires_in_days: null,
@@ -1678,14 +1698,15 @@ app.get('/api/v1/admin/tailscale/status', requireAdmin, async (_req, res) => {
     error:               null,
   };
 
-  // status + version run on every call; apt-cache is bounded by a
-  // 5-minute in-memory cache. The Update card only needs to surface
-  // a newer version once; refreshing it every status read (which
-  // happens after every panel action) hammers apt for no gain.
-  const [probe, verResult, aptResult] = await Promise.all([
+  // status + version + serve run on every call; apt-cache is bounded
+  // by a 5-minute in-memory cache. The Update card only needs to
+  // surface a newer version once; refreshing it every status read
+  // (which happens after every panel action) hammers apt for no gain.
+  const [probe, verResult, aptResult, serveResult] = await Promise.all([
     tsHost('status', '--json'),
     runOnHost('tailscale version 2>/dev/null | head -1 || true'),
     _cachedAptAvailable(),
+    tsHost('serve', 'status'),
   ]);
 
   if (probe.code === 0) {
@@ -1696,6 +1717,12 @@ app.get('/api/v1/admin/tailscale/status', requireAdmin, async (_req, res) => {
       const dns = (s.Self && s.Self.DNSName ? String(s.Self.DNSName) : '').replace(/\.$/, '');
       out.tailnet_hostname = dns || null;
       if (dns) out.magicdns_url = 'https://' + dns;
+      const ips = (s.Self && Array.isArray(s.Self.TailscaleIPs)) ? s.Self.TailscaleIPs : [];
+      const ip4 = ips.find(a => /^\d{1,3}(\.\d{1,3}){3}$/.test(a));
+      if (ip4) {
+        out.tailnet_ip = ip4;
+        out.tailnet_ip_url = 'http://' + ip4;
+      }
       out.current_hostname = (s.Self && s.Self.HostName) ? String(s.Self.HostName) : null;
       const expiry = s.Self && s.Self.KeyExpiry;
       if (expiry) {
@@ -1734,6 +1761,14 @@ app.get('/api/v1/admin/tailscale/status', requireAdmin, async (_req, res) => {
   if (aptResult.code === 0) {
     const m = (aptResult.stdout || '').trim().match(/^([0-9]+\.[0-9]+\.[0-9]+)/);
     if (m) out.apt_available_version = m[1];
+  }
+
+  // serve_configured: `tailscale serve status` reports either
+  // "No serve config" or a rules table. Non-zero exit code happens
+  // when Tailscale Serve hasn't been approved at the tailnet admin.
+  {
+    const text = (serveResult.stdout || '').trim();
+    out.serve_configured = serveResult.code === 0 && !!text && text !== 'No serve config';
   }
 
   // authkey_pending: when appliance.env has a non-empty TAILSCALE_AUTHKEY,
@@ -3930,17 +3965,28 @@ function appLanFallbackUrl(manifest, config) {
   return `http://${ip}/${manifest.slug}/`;
 }
 
-// Tailnet URL for an app. Only returned when the LIVE daemon probe
-// shows BackendState===Running and reports a hostname. Mirrors what
-// the Tailscale panel itself uses (the source of truth), so the
-// card stays in sync with daemon reality even when state.config.
-// tailscale or state.config.tailscale_hostname drift.
+// Tailnet URL (plain HTTP via the Tailscale node IP). Always works
+// when the daemon is Running — doesn't require Tailscale Serve or
+// HTTPS Certificates to be enabled in the tailnet admin. Traffic
+// stays encrypted inside the WireGuard tunnel.
 function appTailnetUrl(manifest, config, live) {
-  if (!live || live.backendState !== 'Running' || !live.hostname) return null;
+  if (!live || live.backendState !== 'Running' || !live.ip) return null;
   // Domain mode: Caddy emits per-subdomain vhosts only; /<slug>/ on
-  // the tailnet falls to the catch-all console. Don't render a
+  // the tailnet IP falls to the catch-all console. Don't render a
   // misleading row.
   if (config.mode === 'domain') return null;
+  return `http://${live.ip}/${manifest.slug}/`;
+}
+
+// Tailnet HTTPS URL (MagicDNS hostname). Only surfaces when the
+// operator has enabled Tailscale Serve AND HTTPS Certificates AND
+// run `tailscale serve --bg --https=443 http://127.0.0.1:80`.
+// Hidden by default; appears once `tailscale serve status` reports
+// configured rules.
+function appTailnetHostnameUrl(manifest, config, live) {
+  if (!live || live.backendState !== 'Running' || !live.hostname) return null;
+  if (config.mode === 'domain') return null;
+  if (!live.serve_configured) return null;
   return `https://${live.hostname}/${manifest.slug}/`;
 }
 
@@ -3958,14 +4004,15 @@ function appPublicUrl(manifest, config, live) {
     return `http://${host}.local/${manifest.slug}/`;
   }
 
-  // Tailscale-primary mode → the tailnet URL is the canonical access
-  // path. Prefer the live probe (always fresh); fall back to the
-  // bootstrap-cached state.config.tailscale_hostname if the daemon
-  // is currently unreachable. Final fallback to LAN-IP so the card
-  // renders something usable.
+  // Tailscale-primary mode → use the Tailscale IP (plain HTTP via
+  // Caddy :80). Works whenever the daemon is up — doesn't require
+  // Tailscale Serve to be enabled in the tailnet admin. Traffic
+  // stays encrypted inside the WireGuard tunnel.
+  // Fallback chain: live IP → cached hostname (if Serve was set up
+  // before, MagicDNS HTTPS may work) → LAN IP → text marker.
   if (config.mode === 'tailscale') {
-    const host = (live && live.hostname) ||
-                 (config.tailscale_hostname || '').replace(/\.$/, '');
+    if (live && live.ip) return `http://${live.ip}/${manifest.slug}/`;
+    const host = (config.tailscale_hostname || '').replace(/\.$/, '');
     if (host) return `https://${host}/${manifest.slug}/`;
     if (config.host_ip) return `http://${config.host_ip}/${manifest.slug}/`;
     return `(tailscale mode without a recorded tailnet hostname — re-Connect from the Tailscale panel)`;
@@ -4161,8 +4208,10 @@ async function collectStatus() {
     containers: containerList,
     state: readState(),
     tailscale_live: {
-      state:    tsLive.backendState,
-      hostname: tsLive.hostname,
+      state:            tsLive.backendState,
+      hostname:         tsLive.hostname,
+      ip:               tsLive.ip,
+      serve_configured: tsLive.serve_configured,
     },
     now: new Date().toISOString(),
   };

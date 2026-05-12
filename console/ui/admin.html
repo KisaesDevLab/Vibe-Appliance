@@ -904,7 +904,10 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
               <span class="muted">(LAN / Tailscale only)</span></dd>` : ''}
             ${a.tailnetUrl ? `
             <dt>tailnet</dt><dd><a href="${escapeHtml(a.tailnetUrl)}">${escapeHtml(a.tailnetUrl)}</a>
-              <span class="muted">(via Tailscale)</span></dd>` : ''}
+              <span class="muted">(via Tailscale IP)</span></dd>` : ''}
+            ${a.tailnetHostnameUrl ? `
+            <dt>tailnet (HTTPS)</dt><dd><a href="${escapeHtml(a.tailnetHostnameUrl)}">${escapeHtml(a.tailnetHostnameUrl)}</a>
+              <span class="muted">(via Tailscale Serve)</span></dd>` : ''}
           </dl>
           ${imageHint}
           ${a.error ? '<div class="error-banner">' + escapeHtml(a.error) + '</div>' : ''}

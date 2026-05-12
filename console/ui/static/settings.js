@@ -14,7 +14,7 @@
 // operators can confirm in DevTools (F12 → Console) that the file
 // they're running is the version they expect, vs. a stale cached
 // copy. Compare against the server's /api/v1/version response.
-const SETTINGS_JS_VERSION = '2026-05-10-tailscale-full-management';
+const SETTINGS_JS_VERSION = '2026-05-11-tailscale-ip-primary';
 
 (function () {
   // eslint-disable-next-line no-console
@@ -1082,6 +1082,38 @@ const SETTINGS_JS_VERSION = '2026-05-10-tailscale-full-management';
          : m;
   }
 
+  // Renders a "Label: <mono url> [Copy]" row plus a muted subtitle
+  // for the Tailscale panel. Used for both the IP URL (primary) and
+  // the MagicDNS HTTPS URL (secondary when Tailscale Serve is on).
+  function _tailscaleUrlRow(label, url, subtitle) {
+    const wrap = el('div', { style: 'margin-top:0.2rem;' });
+    const urlRow = el('p', { class: 'help', style: 'margin:0;' });
+    urlRow.appendChild(el('strong', null, [label]));
+    urlRow.appendChild(el('a', {
+      href: url, target: '_blank', rel: 'noopener noreferrer',
+      class: 'mono',
+    }, [url]));
+    urlRow.appendChild(document.createTextNode(' '));
+    urlRow.appendChild(el('button', {
+      type: 'button', class: 'btn btn--ghost',
+      style: 'padding:0.15rem 0.5rem;font-size:0.85em;',
+      onclick: async (e) => {
+        try {
+          await navigator.clipboard.writeText(url);
+          e.target.textContent = 'Copied';
+          setTimeout(() => { e.target.textContent = 'Copy'; }, 1500);
+        } catch { e.target.textContent = 'Copy failed'; }
+      },
+    }, ['Copy']));
+    wrap.appendChild(urlRow);
+    if (subtitle) {
+      wrap.appendChild(el('p', {
+        class: 'help', style: 'margin:0;color:var(--text-muted);font-size:0.85em;',
+      }, [subtitle]));
+    }
+    return wrap;
+  }
+
   // Describes how a Running tailscale daemon interacts with the
   // current primary access mode. Surfaced as a subtitle on the
   // Tailscale panel so the operator knows what the tailnet URL
@@ -2137,24 +2169,58 @@ const SETTINGS_JS_VERSION = '2026-05-10-tailscale-full-management';
       body.appendChild(el('p', { class: 'help', style: 'color:var(--text-muted);margin-top:0.15rem;' }, [
         _tailscaleAlongsideText(primaryMode),
       ]));
-      if (data.magicdns_url) {
-        const url = data.magicdns_url;
-        const urlRow = el('p', { class: 'help', style: 'margin-top:0.2rem;' });
-        urlRow.appendChild(el('strong', null, ['Reach this appliance at: ']));
-        urlRow.appendChild(el('span', { class: 'mono' }, [url]));
-        urlRow.appendChild(document.createTextNode(' '));
-        urlRow.appendChild(el('button', {
-          type: 'button', class: 'btn btn--ghost',
-          style: 'padding:0.15rem 0.5rem;font-size:0.85em;',
-          onclick: async (e) => {
-            try {
-              await navigator.clipboard.writeText(url);
-              e.target.textContent = 'Copied';
-              setTimeout(() => { e.target.textContent = 'Copy'; }, 1500);
-            } catch { e.target.textContent = 'Copy failed'; }
-          },
-        }, ['Copy']));
-        body.appendChild(urlRow);
+      // Primary URL: tailnet IP, plain HTTP. Always works while the
+      // daemon is Running — doesn't depend on the operator enabling
+      // Tailscale Serve in the tailnet admin. Traffic stays encrypted
+      // inside the WireGuard tunnel.
+      if (data.tailnet_ip_url) {
+        body.appendChild(_tailscaleUrlRow(
+          'Reach this appliance at: ', data.tailnet_ip_url,
+          '(plain HTTP via Tailscale IP — works without admin toggles; traffic still encrypted by WireGuard)',
+        ));
+      }
+      // Secondary: MagicDNS HTTPS URL — only when Tailscale Serve
+      // has been approved at the tailnet admin AND `tailscale serve
+      // --bg --https=443 http://127.0.0.1:80` is configured.
+      if (data.serve_configured && data.magicdns_url) {
+        body.appendChild(_tailscaleUrlRow(
+          'Also at: ', data.magicdns_url,
+          '(HTTPS via Tailscale Serve)',
+        ));
+      } else if (data.tailnet_hostname) {
+        // Daemon up + hostname known but Serve not configured. Surface
+        // a collapsible hint so the operator knows the upgrade path
+        // without forcing the UI to attempt it.
+        const det = el('details', { style: 'margin-top:0.3rem;' });
+        det.appendChild(el('summary', { class: 'help', style: 'cursor:pointer;' },
+          ['Enable HTTPS via Tailscale Serve?']));
+        const wrap = el('div', { class: 'help', style: 'margin-top:0.3rem;' });
+        wrap.appendChild(el('p', null, [
+          'Tailscale Serve adds an HTTPS URL at ',
+          el('span', { class: 'mono' }, [data.magicdns_url || 'https://<host>.<tailnet>.ts.net']),
+          ' with a real Tailscale-CA cert. Requires two tailnet admin toggles:',
+        ]));
+        const steps = el('ol', { style: 'margin:0.2rem 0 0 1.1rem;' });
+        steps.appendChild(el('li', null, [
+          'Enable ', el('strong', null, ['HTTPS Certificates']), ' at ',
+          el('a', {
+            href: 'https://login.tailscale.com/admin/dns',
+            target: '_blank', rel: 'noopener noreferrer',
+          }, ['login.tailscale.com/admin/dns']), '.',
+        ]));
+        steps.appendChild(el('li', null, [
+          'Run ',
+          el('span', { class: 'mono' }, ['sudo tailscale serve --bg --https=443 http://127.0.0.1:80']),
+          ' on the host. First time only: it returns a URL like ',
+          el('span', { class: 'mono' }, ['login.tailscale.com/f/serve?node=...']),
+          ' — open it and approve Serve for the tailnet.',
+        ]));
+        wrap.appendChild(steps);
+        wrap.appendChild(el('p', { style: 'margin-top:0.3rem;' }, [
+          'Until then, use the IP URL above (works the same; only the address bar looks less polished).',
+        ]));
+        det.appendChild(wrap);
+        body.appendChild(det);
       }
     } else {
       body.appendChild(el('p', null, [
