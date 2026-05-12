@@ -369,13 +369,30 @@ def render_lan_gated_handlers(handlers_str):
     RFC1918 + loopback + Tailscale CGNAT cover every realistic LAN
     source. IPv6 link-local (fe80::/10) and ULA (fd00::/8) are
     included for v6-on-LAN setups.
+
+    CRITICAL: Caddy's `handle` directives are mutually exclusive —
+    once @lan matches and execution enters this block, the outer
+    site's `handle {...}` console default does NOT fire. So this
+    block has to include its own default `handle` that proxies to
+    the console; otherwise LAN traffic to anything that isn't an
+    app path (e.g. `/admin`) drops into the void instead of reaching
+    the console.
     """
     if not handlers_str.strip():
-        return "\t# (no apps enabled — LAN access goes to console)"
-    indented = "\n".join(
-        ("\t" + ln) if ln.strip() else ln
-        for ln in handlers_str.split("\n")
-    )
+        # No apps + no infra rendered; @lan block still needs the
+        # console default so LAN /admin keeps working.
+        inner = "\t# (no apps enabled)\n\thandle {\n\t\treverse_proxy console:3000 {\n\t\t\theader_up X-Real-IP {remote_host}\n\t\t}\n\t}"
+    else:
+        indented = "\n".join(
+            ("\t" + ln) if ln.strip() else ln
+            for ln in handlers_str.split("\n")
+        )
+        # Append a per-block console default INSIDE the @lan handle.
+        # Outer console default exists for non-LAN traffic.
+        inner = (
+            indented +
+            "\n\n\thandle {\n\t\treverse_proxy console:3000 {\n\t\t\theader_up X-Real-IP {remote_host}\n\t\t}\n\t}"
+        )
     return (
         "\t# LAN / Tailscale direct-IP access — path-routes apps so a\n"
         "\t# staff member on the office network can reach\n"
@@ -384,7 +401,7 @@ def render_lan_gated_handlers(handlers_str):
         "\t# is port-forwarded.\n"
         "\t@lan remote_ip 127.0.0.1/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fe80::/10 fd00::/8 ::1\n"
         "\thandle @lan {\n"
-        + indented +
+        + inner +
         "\n\t}"
     )
 
