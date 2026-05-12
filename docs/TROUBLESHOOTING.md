@@ -128,6 +128,12 @@ token from `shared.env`. As of 2026-05-12 the script always passes
 recreated. Earlier builds relied on compose's env_file change
 detection, which was unreliable across Compose versions.
 
+`--no-deps` is also required: cloudflared's `depends_on` chain is
+cloudflared → caddy → console, and `--force-recreate` cascades up
+the chain by default. Without `--no-deps`, a manual re-run from the
+console host kills the console container mid-command and the wizard
+sees an empty response.
+
 **Diagnose:** check the container's start time matches the rotation:
 ```
 sudo docker inspect vibe-cloudflared --format '{{.State.StartedAt}}'
@@ -139,7 +145,7 @@ If the start time predates the rotation, the recreate didn't happen.
 ```
 sudo docker compose -f /opt/vibe/appliance/docker-compose.yml \
                    -f /opt/vibe/appliance/infra/cloudflared.yml \
-                   up -d --force-recreate cloudflared
+                   up -d --no-deps --force-recreate cloudflared
 ```
 
 ### Symptom: wizard freezes on "Checking tunnel state…" forever

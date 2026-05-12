@@ -682,9 +682,19 @@ mv "$tmp" "$VIBE_ENV_SHARED"
 # rotation or a re-provision against a new tunnel. The 3-5s restart
 # is acceptable; it's part of the cost of running this script
 # (which is itself an explicit reconfiguration action).
+#
+# --no-deps is REQUIRED, not optional. This script is spawned by the
+# vibe-console daemon. cloudflared's depends_on chain is
+# cloudflared → caddy → console. Without --no-deps, --force-recreate
+# cascades up the chain and recreates the console container running
+# this very script — the console gets SIGTERM mid-provision, the HTTP
+# response to the wizard never sends, and the operator sees "Provision
+# returned no exit code and no error". The deps are already up
+# (pre-flight verified vibe_net + vibe-caddy at the top of the script);
+# we only need to recreate cloudflared itself.
 log_step "bringing up cloudflared container"
 ( cd "$APPLIANCE_DIR" && \
-    docker compose -f docker-compose.yml -f infra/cloudflared.yml up -d --force-recreate cloudflared \
+    docker compose -f docker-compose.yml -f infra/cloudflared.yml up -d --no-deps --force-recreate cloudflared \
   ) >>"$VIBE_LOG_FILE" 2>&1 \
   || die "compose up cloudflared failed; see $VIBE_LOG_FILE"
 
