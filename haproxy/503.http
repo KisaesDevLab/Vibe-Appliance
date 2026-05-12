@@ -23,10 +23,13 @@ Content-Type: text/html; charset=utf-8
 <h1>App not running</h1>
 <p>You reached the Vibe Appliance <strong>emergency access</strong> port for an app
 that isn't currently enabled (or its container is down).</p>
-<p>Open the admin console at <code>https://admin.&lt;your-server&gt;/admin</code> to
-enable the app or check its status. The admin URL was printed during
+<p>Open the admin console at <code>https://&lt;tunnel-subdomain&gt;.&lt;your-domain&gt;/admin</code>
+(the default is <code>https://vibe.&lt;your-domain&gt;/admin</code>) to enable
+the app or check its status. The admin URL was printed during
 installation — see <code>/opt/vibe/CREDENTIALS.txt</code> on the host if
-you've forgotten it.</p>
+you've forgotten it. On LAN / Tailscale installs, the same path works
+on the appliance's LAN IP or tailnet hostname (e.g.
+<code>http://&lt;host&gt;.local/admin</code>).</p>
 <p class="note">This is plain HTTP on a non-standard port. Browsers may flag
 it as insecure — that's expected. Emergency access is gated to your LAN
 or Tailscale network and exists only for staff use when the primary
