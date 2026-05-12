@@ -367,6 +367,60 @@
         "input":     "password-change-flow",
         "appliance": "shared"
       }
+    },
+    {
+      "name":  "LANDING_SHOW_LAN_FALLBACK",
+      "value": "true",
+      "doc":   "Whether the public landing page (/) renders the LAN-IP fallback URL (http://<host-ip>/<slug>/) alongside the primary URL on each app card. Default true preserves the v1 behavior. Set false to hide LAN paths from public visitors when the LAN IP shouldn't be exposed on a public page.",
+      "ui": {
+        "tier":      1,
+        "category":  "Landing page",
+        "label":     "Show LAN fallback URL",
+        "helpText":  "Renders the http://<lan-ip>/<slug>/ backup row on the public landing page. On since v1; toggle off to keep the LAN IP off the public surface.",
+        "input":     "toggle",
+        "appliance": "shared",
+        "validate":  "enum",
+        "options": [
+          { "value": "true",  "label": "Show"  },
+          { "value": "false", "label": "Hide" }
+        ]
+      }
+    },
+    {
+      "name":  "LANDING_SHOW_TAILNET_IP",
+      "value": "false",
+      "doc":   "Whether the public landing page exposes the Tailscale IP URL (http://100.x.x.x/<slug>/) on each app card. Only renders when Tailscale daemon is Running. Off by default — clients without Tailscale see no benefit from the row and the IP isn't useful information for them. Operators with mixed tailnet/public deployments can toggle on.",
+      "ui": {
+        "tier":      1,
+        "category":  "Landing page",
+        "label":     "Show Tailscale IP URL",
+        "helpText":  "Renders http://<tailnet-ip>/<slug>/ on the public landing page when Tailscale is running. Off by default — tailnet links are noise to non-staff clients.",
+        "input":     "toggle",
+        "appliance": "shared",
+        "validate":  "enum",
+        "options": [
+          { "value": "true",  "label": "Show"  },
+          { "value": "false", "label": "Hide" }
+        ]
+      }
+    },
+    {
+      "name":  "LANDING_SHOW_TAILNET_HTTPS",
+      "value": "false",
+      "doc":   "Whether the public landing page exposes the MagicDNS HTTPS URL (https://<host>.<tailnet>.ts.net/<slug>/) on each app card. Only renders when Tailscale daemon is Running AND `tailscale serve --https=…` is configured on this node (requires the operator to enable Tailscale Serve in the tailnet admin and run the serve command). Off by default.",
+      "ui": {
+        "tier":      1,
+        "category":  "Landing page",
+        "label":     "Show Tailscale HTTPS URL",
+        "helpText":  "Renders https://<host>.<tailnet>.ts.net/<slug>/ on the public landing page when Tailscale Serve is wired up. Off by default.",
+        "input":     "toggle",
+        "appliance": "shared",
+        "validate":  "enum",
+        "options": [
+          { "value": "true",  "label": "Show"  },
+          { "value": "false", "label": "Hide" }
+        ]
+      }
     }
   ]
 }

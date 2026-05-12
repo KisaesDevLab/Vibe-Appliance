@@ -72,16 +72,22 @@
           ? `<a href="${escapeHtml(a.url)}">${escapeHtml(a.url)}</a>`
           : `<span class="muted">${escapeHtml(a.url || '—')}</span>`;
 
-        // LAN-fallback row — http://<host_ip>/<slug>/ via Caddy. The
-        // right URL when vibe.local mDNS isn't resolving but Caddy is
-        // up. Goes through the same path-prefix routing as the primary
-        // URL (prefix strip + api/* split), so SPAs and APIs both work.
-        // Distinct from the HAProxy emergency-port URLs which live in
-        // /admin's Emergency Access panel (different failure mode).
+        // Alternative-access rows. Each is gated server-side by an
+        // admin toggle (Configuration → Landing page) plus the URL
+        // being actually available. Server only includes the field
+        // when both gates pass, so we render whatever's present.
         const fallbackRow = a.lanFallbackUrl ? `
           <dt>backup</dt>
           <dd><a href="${escapeHtml(a.lanFallbackUrl)}">${escapeHtml(a.lanFallbackUrl)}</a>
-            <span class="muted">(LAN/Tailscale only)</span></dd>` : '';
+            <span class="muted">(LAN-only)</span></dd>` : '';
+        const tailnetIpRow = a.tailnetUrl ? `
+          <dt>tailnet</dt>
+          <dd><a href="${escapeHtml(a.tailnetUrl)}">${escapeHtml(a.tailnetUrl)}</a>
+            <span class="muted">(via Tailscale IP)</span></dd>` : '';
+        const tailnetHttpsRow = a.tailnetHostnameUrl ? `
+          <dt>tailnet (HTTPS)</dt>
+          <dd><a href="${escapeHtml(a.tailnetHostnameUrl)}">${escapeHtml(a.tailnetHostnameUrl)}</a>
+            <span class="muted">(via Tailscale Serve)</span></dd>` : '';
 
         return `
         <article class="app-card">
@@ -92,6 +98,8 @@
           <dl class="kv app-card__kv">
             <dt>primary</dt><dd>${primaryUrl}</dd>
             ${fallbackRow}
+            ${tailnetIpRow}
+            ${tailnetHttpsRow}
           </dl>
           <div class="app-card__actions">
             <a class="btn" href="${escapeHtml(a.url)}" target="_blank" rel="noopener noreferrer">Open</a>

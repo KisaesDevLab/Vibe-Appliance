@@ -779,28 +779,51 @@ app.get('/api/v1/admin/status', requireAdmin, async (_req, res) => {
 //
 // No auth required.
 
-app.get('/api/v1/public/apps', (_req, res) => {
+app.get('/api/v1/public/apps', async (_req, res) => {
   const state = readState();
   const config = state.config || {};
   const stateApps = state.apps || {};
+
+  // Operator-controlled visibility flags. Default LAN_FALLBACK=true
+  // (preserves v1 behavior); tailnet flavors default false. Toggles
+  // live in _appliance.json under the "Landing page" category and
+  // are persisted to /opt/vibe/env/appliance.env via settings-save.
+  const appliance = parseEnvFile(path.join(ENV_DIR, 'appliance.env'));
+  const showLanFallback   = (appliance.LANDING_SHOW_LAN_FALLBACK   || 'true').trim() !== 'false';
+  const showTailnetIp     = (appliance.LANDING_SHOW_TAILNET_IP     || 'false').trim() === 'true';
+  const showTailnetHttps  = (appliance.LANDING_SHOW_TAILNET_HTTPS  || 'false').trim() === 'true';
+
+  // Only probe the daemon when a tailnet flavor is enabled — public
+  // landing hits shouldn't trigger a docker spawn for no reason.
+  const live = (showTailnetIp || showTailnetHttps) ? await _liveTailscaleState() : null;
+
   const items = Object.values(MANIFESTS)
     .filter((m) => !!(stateApps[m.slug] || {}).enabled)
-    .map((m) => ({
-      slug:        m.slug,
-      displayName: m.displayName,
-      description: m.description,
-      url:         appPublicUrl(m, config),
-      // LAN-fallback URL — http://<host_ip>/<slug>/ via Caddy. Used
-      // by the app card's "backup" row when the primary mDNS/DNS path
-      // is the failure point. Null in domain mode and when host_ip
-      // hasn't been cached yet.
-      lanFallbackUrl: appLanFallbackUrl(m, config),
-      // HAProxy emergency-port URL — used only by the Emergency Access
-      // admin panel ("Caddy itself is down" failure mode). Kept on the
-      // public payload so the panel can build its list from one fetch.
-      emergencyUrl:  appEmergencyUrl(m, config),
-      emergencyNote: m.emergencyNote || null,
-    }))
+    .map((m) => {
+      const out = {
+        slug:        m.slug,
+        displayName: m.displayName,
+        description: m.description,
+        url:         appPublicUrl(m, config, live || undefined),
+        // HAProxy emergency-port URL — used only by the Emergency Access
+        // admin panel ("Caddy itself is down" failure mode). Kept on the
+        // public payload so the panel can build its list from one fetch.
+        emergencyUrl:  appEmergencyUrl(m, config),
+        emergencyNote: m.emergencyNote || null,
+      };
+      if (showLanFallback) {
+        // http://<host_ip>/<slug>/ via Caddy. Null in domain mode and
+        // when host_ip hasn't been cached yet.
+        out.lanFallbackUrl = appLanFallbackUrl(m, config);
+      }
+      if (showTailnetIp && live) {
+        out.tailnetUrl = appTailnetUrl(m, config, live);
+      }
+      if (showTailnetHttps && live) {
+        out.tailnetHostnameUrl = appTailnetHostnameUrl(m, config, live);
+      }
+      return out;
+    })
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
   res.json({ apps: items });
 });
