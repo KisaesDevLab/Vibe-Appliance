@@ -17,6 +17,78 @@ hint that points at the right section.
 
 ---
 
+## Quickest path — read this first
+
+**For a novice using a domain name on Cloudflare:** the whole install
+is the seven steps below. If any step doesn't behave as written, jump
+to the matching numbered section further down for detail; otherwise
+just keep going.
+
+You will need, before you start:
+
+- A **domain name** you own (e.g. `firm.com`).
+- A **DigitalOcean account** with a payment method on file (or another
+  cloud provider — DigitalOcean is the one this guide uses by name).
+- A **Cloudflare account** with your domain's nameservers pointed at
+  Cloudflare. (Free. If you haven't done this yet, see §2 step 1.)
+- About **30 minutes** of attention. The actual install runs ~5–15
+  minutes; the rest is account setup and DNS waiting.
+
+### The seven steps
+
+1. **Create an Ubuntu 24.04 droplet** at DigitalOcean. Recommended size:
+   `s-2vcpu-8gb` ($48/mo). Note its public IP.
+2. **SSH in:** `ssh root@<droplet-ip>`. (On Windows, use PowerShell's
+   built-in `ssh` or PuTTY.)
+3. **Create a Cloudflare API token** at
+   https://dash.cloudflare.com/profile/api-tokens → "Custom token".
+   Permissions: **Account → Cloudflare Tunnel → Edit** and
+   **Zone → DNS → Edit** on your zone. Copy the token.
+4. **Run the installer.** Paste this on the droplet, replacing the two
+   placeholder values:
+
+   ```
+   curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh \
+     | sudo bash -s -- \
+       --mode domain \
+       --domain firm.com \
+       --tunnel-subdomain vibe \
+       --email admin@firm.com
+   ```
+
+   This takes 5–15 minutes. You'll see eight numbered phases. The last
+   one prints a banner with your console URL and admin password.
+   **Copy the password now** — you'll also find it in
+   `/opt/vibe/CREDENTIALS.txt` if you lose it.
+5. **Open the admin console.** Visit `https://<droplet-ip>/admin` in
+   your browser (you'll get a self-signed cert warning — click through;
+   we set up real TLS via the tunnel next). Username `admin`, paste
+   the password.
+6. **Provision the Cloudflare Tunnel.** In the admin console:
+   **Configuration → Network → Cloudflare Tunnel**. Paste your API
+   token from step 3 into the wizard. The wizard auto-discovers your
+   account and zone. Click **Use these values**, then **Save**, then
+   **Provision tunnel now**. About 30 seconds. When it finishes, your
+   appliance is reachable from anywhere at
+   `https://vibe.firm.com/`.
+7. **Enable your first app.** In the admin console → **Apps** →
+   click **Enable** on Vibe Trial Balance. Wait ~2 minutes for the
+   badge to read **running**. Open `https://vibe.firm.com/vibe-tb/`
+   in a new tab — you should see the app's login page. The default
+   login is `admin` / `admin`; it'll force you to change the password
+   immediately.
+
+Done. The appliance is live, public, behind real TLS via Cloudflare,
+with one app running. Repeat step 7 for any other apps you want
+enabled. Then come back and do §8 (backups) before relying on any of
+it for real work.
+
+> Everything below is detail and alternatives — port-forwarding domain
+> mode, LAN-only, Tailscale, Namecheap, larger droplets, etc. Skip
+> what doesn't apply.
+
+---
+
 ## 0. Decide which install you want
 
 Three modes. Pick one before you start.
@@ -29,6 +101,20 @@ Three modes. Pick one before you start.
 
 You can run **Domain + Tailscale** at the same time — public on the
 domain for clients, tailnet-only for staff admin.
+
+**How URLs are shaped in each mode:**
+
+| Mode      | Console at        | An app (e.g. Vibe-TB) at         |
+| --------- | ----------------- | -------------------------------- |
+| Domain    | `https://vibe.firm.com/`           | `https://vibe.firm.com/vibe-tb/`           |
+| LAN       | `http://<host>.local/`             | `http://<host>.local/vibe-tb/`             |
+| Tailscale | `http://<tailnet-ip>/`             | `http://<tailnet-ip>/vibe-tb/`             |
+
+Every mode uses the **same single-hostname + per-app path** shape.
+The `vibe` part of `vibe.firm.com` is the **tunnel subdomain** — a
+single label you choose at install time (default `vibe`, change with
+`--tunnel-subdomain`). All apps live under that one hostname; the
+bare apex (`firm.com`) just redirects there.
 
 ---
 
@@ -96,179 +182,187 @@ Recommended for all eight apps **without** `vibe-glm-ocr`: 4+ GiB RAM,
 
 If you're not doing domain mode, skip to step 3.
 
-You need a domain — say `firm.com`. The appliance will serve apps at
-subdomains like `tb.firm.com`, `mybooks.firm.com`, `connect.firm.com`.
+You need a domain — say `firm.com`. The appliance will serve everything
+(console + all apps + the apex redirect) through **one** hostname:
+`vibe.firm.com` by default. Apps live at `/<slug>/` underneath
+(e.g. `vibe.firm.com/vibe-tb/`). You only need DNS records for:
 
-### Option A (recommended): Cloudflare DNS-01 wildcard
+- `vibe.firm.com` — the appliance's public hostname (the one record
+  that matters)
+- Optionally `firm.com` and `www.firm.com` — handy redirects to
+  `vibe.firm.com`
+- Optionally `cockpit.firm.com`, `portainer.firm.com`,
+  `backup.firm.com` — admin tooling. These are reachable on the LAN /
+  Tailscale only; you only need DNS for them if you intend to use
+  split-DNS at the office. They are **never** exposed via Cloudflare
+  Tunnel by design.
 
-This gives you wildcard certificates with one DNS record and zero
-ongoing fuss when you add new apps.
+That's it. There is no per-app DNS work as you enable more apps.
 
-1. If your domain isn't on Cloudflare yet, [transfer DNS to Cloudflare](https://developers.cloudflare.com/dns/zone-setups/full-setup/setup/) (free; doesn't change your registrar).
+### Option A (recommended): Cloudflare DNS-01
+
+If your domain's DNS lives at Cloudflare, this is the smoothest path.
+
+1. If your domain isn't on Cloudflare yet,
+   [transfer DNS to Cloudflare](https://developers.cloudflare.com/dns/zone-setups/full-setup/setup/)
+   (free; doesn't change your registrar).
 2. In the Cloudflare dashboard, add an A record:
-   - **Name:** `*` (asterisk — covers `tb.firm.com`, `mybooks.firm.com`, etc.)
-   - **IPv4 address:** your droplet IP
-   - **Proxy status:** DNS only (grey cloud) — Cloudflare's orange-cloud proxy is incompatible with the appliance's TLS handling for now.
+   - **Name:** `vibe` (the tunnel subdomain — match whatever you pass
+     to `--tunnel-subdomain` at install time; `vibe` is the default).
+   - **IPv4 address:** your droplet IP.
+   - **Proxy status:** DNS only (grey cloud) — Cloudflare's
+     orange-cloud proxy is incompatible with this path; for the
+     orange-cloud version use Option E (Cloudflare Tunnel) instead.
 3. Generate an API token:
    - Cloudflare → My Profile → API Tokens → Create Token → "Edit zone DNS" template
-   - **Zone Resources:** include the specific zone (e.g. `firm.com`)
+   - **Zone Resources:** include the specific zone (e.g. `firm.com`).
    - Copy the token; you'll paste it into the install command.
+
+The appliance issues one Let's Encrypt cert covering `vibe.firm.com`
+via DNS-01 on the first request. Adding apps later doesn't trigger
+new cert work — they all live under the same hostname.
 
 ### Option B: HTTP-01 (any registrar)
 
-Skip the API token. Add an A record per subdomain you want to use:
-`tb.firm.com → <droplet-ip>`, `mybooks.firm.com → <droplet-ip>`, etc.
-The appliance will issue per-subdomain certificates from Let's Encrypt
-on each app's first request. Slower than DNS-01 (one cert challenge
-per app) but works on any DNS host.
+Skip the API token. Add ONE A record at your registrar:
+`vibe.firm.com → <droplet-ip>`. The appliance issues a single Let's
+Encrypt cert via HTTP-01 on the first request. Requires inbound TCP/80
+reachable from the public internet (router port-forward, no
+firewall block) — if that's not possible, use Option E (Cloudflare
+Tunnel) instead.
 
-### Option E: Cloudflare Tunnel (no port forwarding)
+### Option E: Cloudflare Tunnel (no port forwarding) — recommended
 
-Use this if you can't or don't want to forward ports 80/443 from your
-router — residential ISPs that block inbound TCP/80, restrictive
-office networks, or just operators who'd rather avoid touching router
-config. The appliance dials *outbound* to Cloudflare's edge; public
-requests to your subdomains arrive over that tunnel.
+This is the **easiest path for most novices**. Use it if you can't or
+don't want to forward ports 80/443 from your router — residential ISPs
+that block inbound TCP/80, restrictive office networks, or anyone who'd
+rather avoid touching router config. The appliance dials *outbound*
+to Cloudflare's edge; public requests arrive over that tunnel.
 
-Hard prerequisite: **the domain's DNS must be hosted on Cloudflare's
-nameservers.** You can keep registration at any registrar (Namecheap,
+**Prerequisite:** your domain's DNS must be on Cloudflare's
+nameservers. You can keep registration at any registrar (Namecheap,
 GoDaddy, etc.) — only the nameserver records change. The switch is
 free, doesn't touch your registration, and takes a few minutes to
-propagate. After the switch, Cloudflare DNS-01 (Option A) and
-Cloudflare Tunnel (this option) both become available.
+propagate.
 
-#### Easy path: in-page setup wizard (recommended)
+#### Step 1 — Move DNS to Cloudflare (skip if already done)
 
-After bootstrap completes:
+1. Sign up at [cloudflare.com](https://cloudflare.com) (free).
+2. Click **Add a site** → enter your domain (e.g. `firm.com`).
+3. Cloudflare imports your existing records and shows you **two
+   nameservers** (e.g. `nia.ns.cloudflare.com`,
+   `walt.ns.cloudflare.com`). Copy them.
+4. Log into your registrar (Namecheap, GoDaddy, whatever) → find the
+   "Nameservers" or "DNS" setting → switch from the default to
+   **Custom DNS** → paste Cloudflare's two values.
+5. Save. Propagation usually takes 5–30 minutes. Verify with
+   `dig NS firm.com +short` on your laptop — you should see
+   Cloudflare's nameservers in the output.
 
-1. **Move DNS to Cloudflare** if you haven't already (free, takes
-   ~5 minutes — see the manual-path step 1 below for the exact
-   navigation).
+#### Step 2 — Create a Cloudflare API token
 
-2. **Create a Cloudflare API token** at
-   https://dash.cloudflare.com/profile/api-tokens with these scopes:
+1. Sign in to Cloudflare → top-right profile menu → **My Profile** →
+   **API Tokens** → **Create Token** → **Custom token**.
+2. Set **Permissions**:
    - **Account → Cloudflare Tunnel → Edit**
-   - **Zone → DNS → Edit** on the target zone
+   - **Zone → DNS → Edit**
+3. Set **Account Resources** to: Include → Specific account → your
+   account.
+4. Set **Zone Resources** to: Include → Specific zone → your domain.
+5. **Continue to summary** → **Create Token**.
+6. **Copy the token NOW** — Cloudflare only shows it once. If you
+   navigate away, you'll have to delete it and create a fresh one.
 
-3. **Open the admin console** at `https://<your-host>/admin/settings`,
-   switch to the **Network** tab, toggle **Cloudflare Tunnel** ON. A
-   four-step wizard appears below the form:
+#### Step 3 — Install the appliance
 
-   - **Step 1** — auto-verifies that your domain's nameservers point at
-     Cloudflare. ✓ in 1–2 seconds when DNS has propagated.
-   - **Step 2** — paste your API token, click **Verify token**. The
-     wizard validates the token, lists your accessible accounts and
-     zones, and lets you pick the right one with dropdowns. Click
-     **Use these values** when you have them right.
-   - **Step 3** — click the standard **Save changes** button at the
-     bottom of the page (the wizard queued the three values into the
-     dirty map; this just persists them through the normal
-     snapshot/write/restart/rollback flow).
-   - **Step 4** — click **Provision tunnel now**. The wizard runs
-     `infra/cloudflared-up.sh` server-side via an admin endpoint and
-     streams the script output below. ~15–30 seconds end-to-end.
+If you haven't already, run the installer on your server (see §3 for
+the full command). You can include the Cloudflare token at install
+time with `--cloudflare-api-token YOUR_TOKEN`, or skip it and add it
+through the UI in step 4.
 
-4. **Verify from outside your LAN** (cellular tether):
-   `curl -sI https://firm.com/admin` should answer 200/302/401.
+#### Step 4 — Provision the tunnel from the admin UI
 
-The wizard is idempotent — safe to revisit anytime. The status badge
-at the top tells you whether the tunnel is currently up.
+1. Open the admin console at `https://<your-droplet-ip>/admin`. Your
+   browser will warn about a self-signed cert — that's expected
+   before the tunnel is up. Click through.
+2. Username `admin`, password from `/opt/vibe/CREDENTIALS.txt` on the
+   server (`sudo cat /opt/vibe/CREDENTIALS.txt`).
+3. Navigate to **Configuration → Network**.
+4. Toggle **Cloudflare Tunnel** ON. A wizard appears.
+5. **Wizard step 1** — auto-verifies your nameservers point at
+   Cloudflare. ✓ in 1–2 seconds. If it fails, propagation isn't done
+   yet — wait a few minutes and refresh.
+6. **Wizard step 2** — paste your API token from §2 step 2. Click
+   **Verify token**. The wizard discovers your account and zone via
+   the token's scopes and offers dropdowns. Confirm the right ones,
+   click **Use these values**.
+7. **Wizard step 3** — click the **Save changes** button at the bottom
+   of the page. Settings persist to `/opt/vibe/env/appliance.env`.
+8. **Wizard step 4** — click **Provision tunnel now**. The script
+   creates the tunnel object at Cloudflare, creates one CNAME for
+   `vibe.firm.com` pointing at the tunnel, fetches the connector
+   token, and brings the `vibe-cloudflared` container up. About
+   30 seconds. Output streams below the button.
+9. **Verify from outside your LAN** (your phone on cellular is
+   easiest): visit `https://vibe.firm.com/` — you should see the
+   appliance's landing page over real Cloudflare TLS.
 
-#### Power-user path: hand-fill + SSH (skip if using the wizard)
+#### What you just got
 
-1. **Move DNS to Cloudflare** if you haven't already. Cloudflare's
-   onboarding walks you through it: sign up at cloudflare.com → Add
-   site → enter your domain → Cloudflare imports existing records →
-   Cloudflare gives you two nameservers → log into your registrar and
-   point the domain's NS records at those two values. Wait for
-   propagation (`dig NS firm.com +short` should show Cloudflare's
-   nameservers).
+- **Zero port forwarding required.** Your router stays untouched.
+  Only outbound TCP 7844 (Cloudflare's tunnel control protocol)
+  needs to leave the network — virtually all ISPs allow that.
+- **Public TLS handled by Cloudflare's edge.** No Let's Encrypt
+  challenges to manage. Caddy serves a self-signed cert internally;
+  the tunnel forwards with `noTLSVerify`.
+- **DDoS protection, WAF, analytics** included for free at the
+  Cloudflare edge.
+- **One DNS record** (`vibe.firm.com`) covers every current and
+  future app. Enabling new apps creates no DNS work.
 
-2. **Create a Cloudflare API token** at
-   https://dash.cloudflare.com/profile/api-tokens → "Create Token" →
-   "Custom token". Permissions:
-   - **Account → Cloudflare Tunnel → Edit** (lets the script create + manage the tunnel)
-   - **Zone → DNS → Edit** (lets the script create CNAMEs for each subdomain)
+#### What's *not* exposed via the tunnel (by design)
 
-   Account Resources → "Include → Specific account → <your account>".
-   Zone Resources → "Include → Specific zone → <your domain>".
+- The **bare apex** (`firm.com`) and `www.firm.com` — these
+  redirect to `vibe.firm.com` from Caddy but are never registered
+  as tunnel routes.
+- **`cockpit.firm.com`**, **`portainer.firm.com`**,
+  **`backup.firm.com`** — admin surfaces. Reach them from the LAN
+  (with split-DNS pointing those names at the droplet's LAN IP if
+  you want clean URLs there) or via Tailscale.
 
-3. **Find your account ID and zone ID.** Cloudflare dashboard:
-   - **Account ID** — visible at the top of any Account-level page
-     (Account Home, Workers & Pages sidebar). Or in the URL:
-     `dash.cloudflare.com/<account-id>/...`.
-   - **Zone ID** — bottom-right of the Overview page for the specific
-     domain. Or in the URL when viewing the zone:
-     `dash.cloudflare.com/<account-id>/<domain>` → "API" pane on the
-     right.
+#### To remove
 
-4. **Save the four values in the appliance.** In the admin console,
-   **Configuration → Network**:
-   - **Cloudflare Tunnel** → toggle ON.
-   - **Cloudflare API token (Tunnel)** → the token from step 2.
-   - **Cloudflare account ID** → from step 3.
-   - **Cloudflare zone ID** → from step 3.
-   - **Cloudflare tunnel name** → leave the default `vibe-appliance`
-     unless you're running multiple appliances under one Cloudflare
-     account.
+```
+sudo bash /opt/vibe/appliance/infra/cloudflared-down.sh
+```
 
-   Click **Save**. The console restarts settings-save's downstream
-   apps (none, since these are tunnel-only); env values land in
-   `/opt/vibe/env/appliance.env`.
+Stops the container, deletes the CNAME (only the one pointing at
+this tunnel), deletes the tunnel object at Cloudflare, strips
+`TUNNEL_TOKEN` from `shared.env`. Idempotent — safe to re-run.
 
-5. **Run the setup script on the host** to provision the tunnel + DNS
-   routes + bring up the cloudflared container:
+#### Power-user shortcut: install + provision in one shot
 
-   ```
-   sudo bash /opt/vibe/appliance/infra/cloudflared-up.sh
-   ```
+If you'd rather not click through the UI wizard, you can pre-fill the
+Cloudflare API credentials in the install command and run the tunnel
+setup script directly:
 
-   The script is idempotent — re-runnable if you add new apps later.
-   It looks up the tunnel by name (creates it if missing), pushes the
-   ingress config, creates one CNAME per published host (apex, www,
-   cockpit, portainer, backup, plus every enabled app's subdomain)
-   pointing at `<tunnel-id>.cfargotunnel.com`, fetches the connector
-   token, writes it to `shared.env`, and runs `docker compose up -d
-   cloudflared`.
+```
+curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh \
+  | sudo bash -s -- \
+    --mode domain \
+    --domain firm.com \
+    --tunnel-subdomain vibe \
+    --email admin@firm.com \
+    --cloudflare-api-token YOUR_TOKEN
 
-6. **Verify** from outside your LAN (cellular tether is easiest):
+# Hand-write the three other Cloudflare values, then provision:
+sudo /opt/vibe/appliance/infra/cloudflared-up.sh
+```
 
-   ```
-   curl -sI https://firm.com/admin
-   curl -sI https://tb.firm.com/
-   ```
-
-   200/302/401 responses mean the tunnel is working. Connection refused
-   or timeout means cloudflared isn't connected — `sudo docker logs
-   vibe-cloudflared --tail 30` on the host will show why.
-
-What this gets you:
-- **Zero port forwarding required.** The router stays untouched. Only
-  outbound TCP 7844 (Cloudflare's tunnel-control protocol) needs to
-  exit the network — virtually all ISPs allow this.
-- **Public TLS handled by Cloudflare's edge.** Your appliance doesn't
-  need to issue Let's Encrypt certs at all (Caddy can serve self-
-  signed internally; the tunnel forwards via `noTLSVerify`).
-- **DDoS protection / WAF / analytics** for free (Cloudflare's standard
-  edge features).
-
-Sharp edges:
-- **You enable apps, then re-run cloudflared-up.sh.** The script reads
-  `state.apps[*].enabled` to know which subdomains to publish. New
-  apps don't get their CNAME until the script runs again. Build it
-  into your enable workflow: enable from admin, then run the script.
-- **Caddy still listens on 443 internally** to receive the tunnel's
-  forwarded requests. The Caddy cert situation is now moot (no public
-  client ever hits Caddy directly), but Caddy still needs *some*
-  cert to handshake on 443 — its self-signed default works because
-  the tunnel runs with `noTLSVerify`.
-- **The setup script needs `python3` and `curl` on the host.** Both
-  are present on a stock Ubuntu 24.04 install; the bootstrap pre-flight
-  already verifies them.
-- **To remove:** `sudo bash /opt/vibe/appliance/infra/cloudflared-down.sh`
-  stops the container, deletes the CNAMEs (only those pointing at this
-  tunnel), deletes the tunnel object at Cloudflare, strips
-  `TUNNEL_TOKEN` from shared.env. Re-runnable.
+(You still need to set `CLOUDFLARE_ACCOUNT_ID` and
+`CLOUDFLARE_ZONE_ID` in `/opt/vibe/env/appliance.env` before the
+script runs. The UI wizard is genuinely faster — recommended unless
+you're scripting an unattended install.)
 
 ### Option D: Generic DNS-01 (Namecheap)
 
@@ -276,14 +370,15 @@ Use this if your domain stays on Namecheap's nameservers **and** any of
 the following is true:
 
 - Your ISP blocks inbound TCP/80 (HTTP-01 won't work then).
-- You want a single wildcard cert (`*.firm.com`) covering every present
-  and future subdomain instead of per-subdomain Let's Encrypt round-
-  trips.
-- You don't want to switch DNS hosting to Cloudflare.
+- You want to keep DNS at Namecheap rather than switching to Cloudflare.
 
 The label is "Generic DNS-01" in the admin Settings dropdown so we can
 add other DNS-01 providers under the same option later. Today it's
 backed by Namecheap's account-level Domains API.
+
+With single-hostname routing you only need one cert — covering
+`vibe.firm.com`. The wildcard path is no longer necessary; DNS-01 is
+useful here purely to bypass the port-80 reachability requirement.
 
 Setup:
 
@@ -326,24 +421,23 @@ Setup:
    - Click **Test** — Namecheap should accept the credential probe.
    - **Save**.
 
-6. The next request to any subdomain triggers wildcard cert issuance.
+6. The next request to `vibe.firm.com` triggers cert issuance.
    Caddy writes a TXT record at Namecheap, completes the ACME-DNS
-   challenge, drops `*.firm.com` into its cert store, and the cert
-   covers every current and future subdomain.
+   challenge, drops the cert in its store. Enabling more apps later
+   doesn't trigger new cert work — they all live under the same
+   `vibe.firm.com` hostname.
 
 What this gets you:
-- **Wildcard cert.** One cert covers every subdomain — adding apps no
-  longer triggers per-app cert issuance.
 - **No port-80 reachability requirement.** The DNS-01 challenge proves
   ownership via DNS, not HTTP. Your ISP can block 80 freely.
 - **Compatible with Namecheap DDNS.** If your IP rotates, the DDNS
-  updater (Option C) keeps the A records current; the wildcard cert
-  doesn't care about IP changes since it covers any subdomain.
+  updater (Option C) keeps the A record for `vibe.firm.com` current.
 
 Sharp edges:
-- **You still need A records** at Namecheap for the bare domain and
-  every subdomain you'll publish (or a wildcard `* → <ip>` record).
-  Cert issuance doesn't depend on A records, but DNS resolution does.
+- **You still need A records** at Namecheap for `vibe.firm.com` (and
+  optionally `cockpit/portainer/backup` if you intend to reach those
+  admin tools by name on the LAN). Cert issuance doesn't depend on A
+  records, but DNS resolution does.
 - **IP allowlist drift.** If your public IP rotates and the new IP
   isn't in Namecheap's allowlist, every cert renewal fails until you
   update both the allowlist at Namecheap AND the
@@ -379,27 +473,28 @@ Setup:
    updates existing records — it does not create them*, and an update
    to a non-existent host returns "No Records updated. A record not
    Found." Under the **Host Records** section of the Advanced DNS tab,
-   add one A record per host:
+   add these A records (six total — far fewer than the old per-app
+   model required):
 
    ```
-   Type    Host          Value              TTL
-   ----    -----         -----              ---
-   A       @             <current-public-ip>  Automatic
-   A       www           <current-public-ip>  Automatic
-   A       tb            <current-public-ip>  Automatic   # if enabling Vibe-TB
-   A       mybooks       <current-public-ip>  Automatic   # if enabling Vibe-MyBooks
-   A       calc          <current-public-ip>  Automatic   # if enabling Vibe-Calculators
-   A       payroll       <current-public-ip>  Automatic   # if enabling Vibe-Payroll-Time
-   A       taxresearch   <current-public-ip>  Automatic   # if enabling Vibe-Tax-Research-Chat
-   A       vibetc        <current-public-ip>  Automatic   # if enabling Vibe-TX-Converter
-   A       backup        <current-public-ip>  Automatic   # Duplicati subdomain
-   A       cockpit       <current-public-ip>  Automatic   # Cockpit subdomain
-   A       portainer     <current-public-ip>  Automatic   # Portainer subdomain
+   Type    Host          Value                TTL
+   ----    -----         -----                ---
+   A       @             <current-public-ip>  Automatic   # apex
+   A       www           <current-public-ip>  Automatic   # www → apex
+   A       vibe          <current-public-ip>  Automatic   # the tunnel hostname (matches --tunnel-subdomain)
+   A       cockpit       <current-public-ip>  Automatic   # Cockpit (admin; LAN access only)
+   A       portainer     <current-public-ip>  Automatic   # Portainer (admin; LAN access only)
+   A       backup        <current-public-ip>  Automatic   # Duplicati (admin; LAN access only)
    ```
 
    The initial value can be any IP; the appliance overwrites it on the
    first DDNS tick. Find your current public IP at
    `https://api.ipify.org` — paste that as a placeholder.
+
+   If you chose a different `--tunnel-subdomain` (e.g. `apps`), replace
+   the `vibe` row's Host value with that label. Apps don't get
+   per-subdomain records anymore — they all live under
+   `vibe.firm.com/<slug>/`.
 
 4. Run the appliance installer in domain mode (HTTP-01 — Cloudflare
    DNS-01 is incompatible because it requires Cloudflare nameservers).
@@ -414,11 +509,11 @@ Setup:
      (within seconds — config is re-read fresh per cycle). No console
      restart required. The "Force update" button on the same panel
      lights up once Save completes.
-6. The appliance keeps every host record current going forward. When
-   you enable a new app later, **first** add its A record at Namecheap
-   (one of the rows above), then enable the app from the admin Apps
-   tab. The Network tab's status panel will show "✓ N hosts up-to-date"
-   on each tick.
+6. The appliance keeps every host record current going forward.
+   Because all apps now live under the single tunnel hostname, you do
+   **not** need to add new DNS records when you enable new apps —
+   the six rows from step 3 are the complete list. The Network tab's
+   status panel will show "✓ 6 hosts up-to-date" on each tick.
 
 Trade-offs:
 - Cert renewal during ISP IP rotation has a small window: if your IP
@@ -431,7 +526,7 @@ Trade-offs:
   root-owned). Same protection as the rest of the appliance secrets.
 
 Either way, **wait until your DNS records actually resolve before
-running the install** — `dig tb.firm.com +short` from your laptop
+running the install** — `dig vibe.firm.com +short` from your laptop
 should return the droplet IP. DNS propagation usually takes 1–10
 minutes on Cloudflare; up to a few hours on slower registrars.
 
@@ -440,24 +535,57 @@ minutes on Cloudflare; up to a few hours on slower registrars.
 ## 3. Run the installer
 
 Pick the line that matches your mode. Run it on the server, as root
-(or via `sudo`).
+(or via `sudo`). Replace `firm.com` and `admin@firm.com` with your
+actual values.
 
-### Domain mode + Cloudflare DNS-01 (recommended)
+> **About `--tunnel-subdomain`.** Domain-mode commands include
+> `--tunnel-subdomain vibe`. That's the single subdomain label that
+> fronts every app (`vibe.firm.com` → console; `vibe.firm.com/vibe-tb/`
+> → an app). Change `vibe` to whatever label you want (`apps`,
+> `cpa`, etc.). Must be a single DNS label — no dots, no underscores.
+> Re-running bootstrap with a different `--tunnel-subdomain` later is
+> the supported way to rename it; the appliance auto-converges.
+
+### Domain mode + Cloudflare Tunnel (easiest — no port forwarding)
+
+This is the path the **Quickest path** section at the top walks
+through. You finish the Cloudflare-side setup in the admin UI after
+bootstrap.
 
 ```
 curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash -s -- \
   --mode domain \
   --domain firm.com \
+  --tunnel-subdomain vibe \
+  --email admin@firm.com
+```
+
+### Domain mode + Cloudflare DNS-01 (port-forward path)
+
+For installs where you can forward port 443 from your router (or your
+host is publicly reachable). The Cloudflare token lets Caddy issue a
+real Let's Encrypt cert via DNS-01 — no port-80 traffic needed.
+
+```
+curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash -s -- \
+  --mode domain \
+  --domain firm.com \
+  --tunnel-subdomain vibe \
   --email admin@firm.com \
   --cloudflare-api-token YOUR_TOKEN_HERE
 ```
 
 ### Domain mode + HTTP-01 fallback (no Cloudflare token)
 
+The simplest port-forward path. Requires inbound TCP/80 reachable
+from the public internet so Caddy can complete Let's Encrypt's
+HTTP-01 challenge.
+
 ```
 curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash -s -- \
   --mode domain \
   --domain firm.com \
+  --tunnel-subdomain vibe \
   --email admin@firm.com
 ```
 
@@ -497,6 +625,7 @@ curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bo
 curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash -s -- \
   --mode domain \
   --domain firm.com \
+  --tunnel-subdomain vibe \
   --email admin@firm.com \
   --cloudflare-api-token YOUR_TOKEN_HERE \
   --tailscale --tailscale-authkey tskey-auth-XXXXXX
@@ -544,9 +673,10 @@ sudo cat /opt/vibe/CREDENTIALS.txt
 
 You only need three things from this file:
 
-- The **console admin URL** (`https://firm.com/admin` for domain mode,
-  `http://<server-ip>/admin` for LAN, `https://<host>.<tailnet>.ts.net/admin`
-  for Tailscale).
+- The **console admin URL**:
+  - Domain mode: `https://vibe.firm.com/admin`
+  - LAN mode: `http://<server-ip>/admin`
+  - Tailscale mode: `https://<host>.<tailnet>.ts.net/admin`
 - The **username** (`admin`).
 - The **password** (a 64-character hex string — paste it; don't type it).
 
@@ -577,11 +707,16 @@ Watch the card. Within ~2 minutes you'll see the badge transition:
 not-installed → enabling… → running
 ```
 
-Once the status badge says **running**, click the URL on the card.
-You should see Vibe-TB's login page. Log in with the default
-credentials shown in the **First-login info** section of admin
-(`admin` / `admin` for most apps), and the app will force you to set
-a real password.
+Once the status badge says **running**, the card shows the live URL.
+In domain mode this is `https://vibe.firm.com/vibe-tb/` — every app
+lives at `/<slug>/` under the single tunnel hostname. **No new DNS
+record is needed** to enable an app; the existing
+`vibe.firm.com` already covers it.
+
+Click the URL. You should see Vibe-TB's login page. Log in with the
+default credentials shown in the **First-login info** section of
+admin (`admin` / `admin` for most apps), and the app will force you
+to set a real password.
 
 Repeat for the other apps you want enabled. On a 2 GiB droplet, two
 apps running comfortably is realistic. For all eight without
@@ -594,7 +729,9 @@ eight **with** `vibe-glm-ocr`, plan on at least 8 GiB RAM
 ## 8. Configure backups
 
 In the admin console → **Infra services** → click **Duplicati
-(backup)**. This opens Duplicati's UI on its subdomain.
+(backup)**. Duplicati lives on its own admin subdomain
+(`backup.firm.com` in domain mode); this link is reachable from the
+LAN/Tailscale only — never via Cloudflare Tunnel.
 
 1. Set Duplicati's web password (any value — it only protects the UI).
 2. Click **Add backup** and follow the wizard.
@@ -627,8 +764,8 @@ path actually works.
 | Check for app updates               | Admin → an **update available** badge appears on the card.   |
 | Update an app                       | Admin → click **Update** on the card.                        |
 | Roll back a bad update              | Admin → click **Roll back** on the card.                     |
-| See container state                 | Admin → **Containers** table, OR Portainer at portainer.…    |
-| See host metrics                    | Cockpit at cockpit.\<domain\> (sudo-user login).             |
+| See container state                 | Admin → **Containers** table, OR `portainer.<domain>` (LAN).  |
+| See host metrics                    | `cockpit.<domain>` on the LAN (sudo-user login).             |
 
 Every admin action has a corresponding `vibe ...` CLI command if you
 prefer the terminal — see `vibe --help`.
@@ -640,6 +777,33 @@ prefer the terminal — see `vibe --help`.
 **The CPA on staff doesn't have an SSH client. Can someone else do the install for them?**
 Yes. The install is one shot. Once it's done, day-to-day operation
 happens entirely through the browser admin console.
+
+**How do I change the tunnel subdomain after install?**
+Re-run bootstrap with the new label, then re-provision the tunnel:
+
+```
+sudo /opt/vibe/appliance/bootstrap.sh \
+  --mode domain \
+  --domain firm.com \
+  --tunnel-subdomain apps \
+  --email admin@firm.com
+sudo bash /opt/vibe/appliance/infra/cloudflared-up.sh
+```
+
+The appliance auto-rewrites every enabled app's env file (so
+`ALLOWED_ORIGIN` matches the new host) and bounces the containers.
+The old CNAME at Cloudflare is auto-pruned; the new one is created.
+About 1 minute end-to-end.
+
+Or do it through the admin UI: **Configuration → Network**, change
+the `tunnel_subdomain` field, **Save**, then click **Provision tunnel
+now**. Same outcome.
+
+**How do I add a new app subdomain?**
+You don't — apps don't get their own subdomains anymore. Enabling an
+app from the admin **Apps** tab is the whole flow. The app appears
+at `https://vibe.firm.com/<slug>/` immediately. No DNS work, no
+Caddy edit, no Cloudflare re-provision.
 
 **Can I move the appliance to a bigger server later?**
 Yes. `tar czf vibe.tgz /opt/vibe/data /opt/vibe/env`, copy to the new
