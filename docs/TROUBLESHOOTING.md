@@ -105,6 +105,57 @@ verified Caddy is actually serving tunnel-mode config.
 If neither is reachable, see the "Panic switch" section above to drop
 back to LAN-only mode.
 
+### Symptom: every public hit returns 502, cloudflared logs say `tls: internal error`
+
+cloudflared's log lines look like:
+```
+ERR error="Unable to reach the origin service ... remote error: tls: internal error" originService=https://caddy:443
+```
+
+Two distinct bugs can produce this signature; both were fixed on
+2026-05-12 and are documented here so a downgrade or hand-edit that
+revives them is easy to diagnose:
+
+1. **Caddy never issued internal certs.** If `lib/render-caddyfile.sh`
+   emits `auto_https off` in tunnel mode, Caddy's TLS automation is
+   fully suppressed and the per-vhost `tls internal` directives never
+   actually produce certs. The fix is `auto_https disable_redirects`,
+   which keeps cert management on while still suppressing the
+   HTTP→HTTPS redirects we don't want under a tunnel. Diagnose by
+   asking Caddy for its running TLS policies:
+   ```
+   sudo docker exec vibe-caddy wget -qO- http://127.0.0.1:2019/config/apps/tls
+   ```
+   An empty `policies` array means cert automation is disabled.
+
+2. **cloudflared sends SNI=`caddy` instead of the request hostname.**
+   With `service: https://caddy:443` in the ingress, cloudflared
+   defaults SNI to the service URL hostname. Caddy has no cert for
+   the bare name `caddy`, so it aborts the handshake. The fix is per
+   ingress rule:
+   ```yaml
+   originRequest:
+     noTLSVerify:      true
+     originServerName: <the request hostname>
+   ```
+   `cloudflared-up.sh` sets this automatically per published app.
+   Diagnose by running two in-network smoke tests against caddy:
+   ```
+   # SNI=caddy — what a buggy ingress sends. Should fail.
+   sudo docker run --rm --network vibe_net curlimages/curl:8.10.1 \
+       -k -sS -o /dev/null -w 'http=%{http_code}\n' \
+       -H 'Host: tb.<your-domain>' https://caddy:443/
+
+   # SNI=<request hostname> — what the fixed ingress sends. Should be 2xx/3xx/4xx.
+   sudo docker run --rm --network vibe_net curlimages/curl:8.10.1 \
+       -k -sS -o /dev/null -w 'http=%{http_code}\n' \
+       --connect-to tb.<your-domain>:443:caddy:443 \
+       https://tb.<your-domain>/
+   ```
+   If only the second works, the ingress is missing `originServerName`.
+   Re-run `sudo bash /opt/vibe/appliance/infra/cloudflared-up.sh` to
+   push a corrected config to Cloudflare.
+
 ### Symptom: connector container starts but never registers
 
 **Diagnose:**

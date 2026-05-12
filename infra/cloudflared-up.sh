@@ -491,6 +491,15 @@ for h in hosts:
 # real client). The catch-all 404 at the end is required by Cloudflare
 # Tunnel — without it the tunnel rejects the config.
 #
+# originServerName is set to the request hostname so cloudflared sends
+# SNI = the FQDN the user typed (e.g. "tb.firm.com"). WITHOUT this,
+# cloudflared defaults SNI to the service URL hostname ("caddy"), and
+# Caddy — which only has internal-CA certs for the rendered per-host
+# vhosts — has no cert for the bare service name and aborts the
+# handshake with "tls: internal error". noTLSVerify is what disables
+# *verification* of the cert returned; originServerName is what tells
+# cloudflared which name to ASK for. Both are required in tunnel mode.
+#
 # Apex (@) and www are NOT included — landing page + admin UI live there
 # and stay LAN/Tailscale-only. Infra subdomains (cockpit/portainer/
 # backup) are also excluded for the same reason. See the script header
@@ -501,7 +510,10 @@ for host in ordered:
   ingress.append({
     "hostname": fqdn,
     "service":  "https://caddy:443",
-    "originRequest": { "noTLSVerify": True },
+    "originRequest": {
+      "noTLSVerify":      True,
+      "originServerName": fqdn,
+    },
   })
 ingress.append({ "service": "http_status:404" })
 

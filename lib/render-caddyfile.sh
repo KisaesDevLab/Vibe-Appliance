@@ -413,13 +413,24 @@ def main():
 
     global_snippet = render_global_snippet(snippets_dir, mode, email)
 
-    # Tunnel mode: also disable Caddy's global auto_https so it stops
-    # background-issuing (and failing) certs. Append to the global
-    # snippet — the snippet is what fills the global block in the
-    # template, so adding `auto_https off` here lands it inside the
-    # outer `{ ... }`.
+    # Tunnel mode: turn off Caddy's HTTP→HTTPS redirects (the public
+    # edge is Cloudflare; we never want Caddy to advertise its own
+    # redirect target). We use `disable_redirects`, NOT `off`. `off`
+    # disables ALL automatic-HTTPS features including the internal CA
+    # cert issuance that the per-site `tls internal` directives depend
+    # on — Caddy parses `tls internal`, declares the issuer, but never
+    # actually obtains the cert, and every TLS handshake aborts with
+    # "tls: internal error" the moment cloudflared dials caddy:443.
+    # `disable_redirects` keeps automation on (so `tls internal` works)
+    # while still suppressing the redirects we don't want.
+    #
+    # We don't worry about Caddy attempting Let's Encrypt under
+    # `disable_redirects`: every named vhost rendered in this mode
+    # already has `tls internal`, which selects the local CA. The :80
+    # catch-all has no `tls` directive but is HTTP-only and has no
+    # hostname, so Caddy's automation has nothing to issue against.
     if tunnel_active and mode == "domain":
-        global_snippet = global_snippet.rstrip("\n") + "\n\tauto_https off\n"
+        global_snippet = global_snippet.rstrip("\n") + "\n\tauto_https disable_redirects\n"
 
     enabled = list_enabled_apps(state, manifests_dir)
 
