@@ -10,10 +10,12 @@
 #                                 state intact). This is the safe one
 #                                 you want 99% of the time.
 #
-#   uninstall.sh --remove-data  Tier 1 + nuke /opt/vibe/data and
-#                                 /opt/vibe/env. Equivalent to a fresh
-#                                 install on the next bootstrap. Asks
-#                                 for "YES" to confirm.
+#   uninstall.sh --remove-data  Tier 1 + delete any Cloudflare tunnel
+#                                 the appliance provisioned (tunnel
+#                                 object + CNAMEs at Cloudflare) +
+#                                 nuke /opt/vibe/data and /opt/vibe/env.
+#                                 Equivalent to a fresh install on the
+#                                 next bootstrap. Asks for "YES".
 #
 #   uninstall.sh --full         --remove-data + remove Docker, Cockpit,
 #                                 Tailscale, Avahi, our apt repos, the
@@ -101,6 +103,39 @@ confirm() {
   if [[ "$got" != "$expected" ]]; then
     echo "Aborted." >&2
     exit 1
+  fi
+}
+
+# ---- step 0: Cloudflare tunnel state (--remove-data and --full only) --
+#
+# Cleans up the tunnel object and DNS CNAMEs in the operator's
+# Cloudflare account before the local env that holds the API creds
+# gets wiped. Skipping this would leave an orphaned tunnel at
+# Cloudflare with no local record — the next install would either
+# reuse the same tunnel (by name) or fail at create-time. Best to
+# leave Cloudflare clean so a re-install is a true blank-slate test.
+#
+# Idempotent. The down-script silently skips when:
+#   - CLOUDFLARE_TUNNEL_API_TOKEN / account / zone aren't set (tunnel
+#     was never provisioned)
+#   - the named tunnel doesn't exist at Cloudflare anymore
+#   - the cloudflared container is already gone
+#
+# A non-zero exit from cloudflared-down.sh does NOT abort the
+# uninstall: local teardown still runs. The operator gets a warning
+# pointing at dash.cloudflare.com so they can finish any orphaned
+# Cloudflare-side state by hand.
+cleanup_cloudflare() {
+  local down_script="${APPLIANCE_DIR}/infra/cloudflared-down.sh"
+  if [[ ! -x "$down_script" ]]; then
+    note "cloudflared-down.sh not present — Cloudflare-side cleanup skipped"
+    return 0
+  fi
+  step "cleaning up Cloudflare tunnel state"
+  if bash "$down_script"; then
+    ok "Cloudflare tunnel state cleaned"
+  else
+    warn "cloudflared-down.sh exited non-zero — local teardown will continue. Check dash.cloudflare.com → Zero Trust → Networks → Tunnels for any leftover state."
   fi
 }
 
@@ -267,7 +302,8 @@ case "$LEVEL" in
     ;;
 
   data)
-    confirm "About to STOP all vibe containers AND DELETE /opt/vibe/data + /opt/vibe/env." "YES"
+    confirm "About to STOP all vibe containers AND DELETE /opt/vibe/data + /opt/vibe/env. Any Cloudflare Tunnel provisioned by this appliance will also be deleted from your Cloudflare account." "YES"
+    cleanup_cloudflare
     stop_containers
     remove_images
     remove_network
@@ -276,8 +312,9 @@ case "$LEVEL" in
     ;;
 
   full)
-    confirm "About to perform a FULL UNINSTALL: containers, images, data, env, Docker, Cockpit, Tailscale, Avahi, Claude Code (npm package only — Node preserved), the CLI symlink, and /opt/vibe." "YES"
+    confirm "About to perform a FULL UNINSTALL: Cloudflare tunnel state, containers, images, data, env, Docker, Cockpit, Tailscale, Avahi, Claude Code (npm package only — Node preserved), the CLI symlink, and /opt/vibe." "YES"
     confirm "Final confirm — this is destructive and not reversible without re-running curl|bash from scratch." "I AM SURE"
+    cleanup_cloudflare
     stop_containers
     remove_images
     remove_network
