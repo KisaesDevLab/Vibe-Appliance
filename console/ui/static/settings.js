@@ -1621,8 +1621,9 @@ const SETTINGS_JS_VERSION = '2026-05-12-cf-pause-resume-and-error-surfacing';
         fetchWithTimeout('/api/v1/apps', { credentials: 'same-origin' }, 10_000).catch(() => null),
         fetchWithTimeout('/api/v1/admin/cloudflare/status', { credentials: 'same-origin' }, 10_000).catch(() => null),
       ]);
-      wiz.domain      = stateCfg.domain;
-      wiz.currentMode = stateCfg.mode;
+      wiz.domain           = stateCfg.domain;
+      wiz.tunnelSubdomain  = stateCfg.tunnel_subdomain || 'vibe';
+      wiz.currentMode      = stateCfg.mode;
 
       if (appsResp && appsResp.ok) {
         try {
@@ -1630,6 +1631,16 @@ const SETTINGS_JS_VERSION = '2026-05-12-cf-pause-resume-and-error-surfacing';
           wiz.enabledApps = (data.apps || [])
             .filter(a => a.enabled)
             .map(a => ({ slug: a.slug, displayName: a.displayName, subdomain: a.subdomain }));
+          // Single-hostname routing: every enabled app is reachable
+          // through the tunnel via /<slug>/ paths. selectedSlugs is
+          // auto-populated with the full list so the operator doesn't
+          // have to pick a subset (the per-app subdomain model where
+          // that pick mattered is gone — see commit c7a9029).
+          // CLOUDFLARE_TUNNEL_PUBLISH is still written for backwards-
+          // compat / informational purposes by the provision endpoint.
+          if (!wiz.selectedSlugs || wiz.selectedSlugs.length === 0) {
+            wiz.selectedSlugs = wiz.enabledApps.map(a => a.slug);
+          }
         } catch { /* leave empty; READY screen surfaces the issue */ }
       }
 
@@ -1638,7 +1649,14 @@ const SETTINGS_JS_VERSION = '2026-05-12-cf-pause-resume-and-error-surfacing';
           const data = await statusResp.json();
           wiz.lastRunTs = data.last_run_ts;
           wiz.publishedSlugs = Array.isArray(data.published_slugs) ? data.published_slugs : [];
-          wiz.selectedSlugs  = wiz.publishedSlugs.slice();
+          // Single-hostname model: every enabled app is reachable
+          // through the tunnel — the historical "published_slugs"
+          // subset is informational only. Re-derive selectedSlugs
+          // from the live enabled set so a per-app deselect from
+          // before the routing change doesn't accidentally drop
+          // an app from the (now-irrelevant) CLOUDFLARE_TUNNEL_PUBLISH
+          // env var.
+          wiz.selectedSlugs  = wiz.enabledApps.map(a => a.slug);
           // Pull bound IDs from /status so cold-bootstrap into PAUSED
           // or UP has the data it needs to render the "Manage at
           // Cloudflare ↗" link and to power Rotate token's bound-zone
@@ -1989,31 +2007,28 @@ const SETTINGS_JS_VERSION = '2026-05-12-cf-pause-resume-and-error-surfacing';
 
       section.appendChild(grid);
 
-      // Publish-list checkboxes — one row per enabled app, default OFF.
-      // The wizard never auto-selects; the operator opts each app in
-      // explicitly so the surface area is always a deliberate decision.
+      // Apps reachable through the tunnel — read-only summary. In the
+      // single-hostname routing model every enabled app is reachable
+      // at /<slug>/ under the tunnel hostname; the legacy per-app
+      // subdomain pick is no longer a meaningful choice. Enable /
+      // disable apps from the Apps tab; this list reflects state.apps
+      // directly.
+      const tunnelHost = (wiz.tunnelSubdomain || 'vibe') + '.' + (wiz.domain || '<your-domain>');
       section.appendChild(el('h3', {
         style: 'margin:1.2rem 0 0.3rem;font-size:0.95rem;text-transform:uppercase;letter-spacing:0.1em;',
-      }, ['Apps to publish']));
+      }, ['Apps reachable through this tunnel']));
       section.appendChild(el('p', { class: 'help', style: 'margin:0 0 0.4rem;' }, [
-        'Tick each app you want reachable from the public internet through this tunnel. ',
-        el('strong', null, ['At least one is required.']),
-        ' Apex/admin/cockpit/portainer/backup are never published, even if you tick everything below.',
+        'Every enabled app is reachable at ',
+        el('span', { class: 'mono' }, ['https://' + tunnelHost + '/<slug>/']),
+        '. Enable or disable apps on the Apps tab to change this list. ',
+        'Apex/admin/cockpit/portainer/backup are never exposed through the tunnel.',
       ]));
-      section.appendChild(renderPublishList());
-
-      // Live FQDN preview — what the operator is about to expose. Updates
-      // as checkboxes change via repaintPreview().
-      const preview = el('p', {
-        class: 'help', 'data-cf-preview': '1',
-        style: 'margin-top:0.3rem;',
-      });
-      section.appendChild(preview);
-      repaintPreview(preview);
+      section.appendChild(renderReachableList());
 
       section.appendChild(el('p', { class: 'help', style: 'margin-top:0.6rem;' }, [
-        'Provision saves these values to appliance.env, creates the tunnel + CNAMEs at ' +
-        'Cloudflare for the ticked apps only, and starts the cloudflared container. Idempotent — safe to re-run.',
+        'Provision saves the four Cloudflare values to appliance.env, creates one tunnel + one CNAME at ',
+        el('span', { class: 'mono' }, [tunnelHost]),
+        ', and starts the cloudflared container. Idempotent — safe to re-run.',
       ]));
 
       const cta = el('div', { class: 'cta-row', style: 'gap:0.5rem;margin-top:0.5rem;' });
@@ -2028,105 +2043,58 @@ const SETTINGS_JS_VERSION = '2026-05-12-cf-pause-resume-and-error-surfacing';
       }, ['← Back']));
       section.appendChild(cta);
 
-      // Disable Provision while the publish list is empty — prevents
-      // the obvious failure where the script bails on an empty
-      // CLOUDFLARE_TUNNEL_PUBLISH. Checkbox toggles call paint(), so
-      // this expression re-runs on every list change.
-      provisionBtn.disabled = wiz.selectedSlugs.length === 0;
-
       if (wiz.error) {
         section.appendChild(el('p', { class: 'help', style: 'color:var(--bad);margin-top:0.5rem;' }, ['✗ ' + wiz.error]));
       }
     }
 
-    // renderPublishList — checkbox per enabled app. Used by both READY
-    // (initial publish-list pick) and UP (edit live publish list).
-    // Mutates wiz.selectedSlugs in place; the onchange handler triggers
-    // paint() so all dependent UI (FQDN preview, button labels, button
-    // disabled state) refreshes from the new list.
-    function renderPublishList() {
+    // renderReachableList — read-only list of every enabled app with
+    // its path URL under the tunnel hostname. Used by both READY and
+    // UP screens. No checkboxes — every enabled app is reachable via
+    // the tunnel by definition in the single-hostname routing model.
+    // To change which apps are public, enable/disable them on the
+    // Apps tab.
+    function renderReachableList() {
       if (!wiz.enabledApps.length) {
         return el('p', { class: 'help', style: 'color:var(--warn);' }, [
-          '⚠ No apps are enabled yet. Enable an app from the ',
-          el('a', { href: '/admin' }, ['admin page']),
-          ', then come back and the publish list will populate.',
+          '⚠ No apps are enabled yet. Enable one from the ',
+          el('a', { href: '/admin' }, ['Apps tab']),
+          ', then come back — this list reflects whatever\'s enabled.',
         ]);
       }
-      const wrap = el('div', { style: 'display:grid;gap:0.25rem;max-width:36rem;' });
+      const host = (wiz.tunnelSubdomain || 'vibe') + '.' + (wiz.domain || '<your-domain>');
+      const wrap = el('ul', { style: 'margin:0.3rem 0 0;padding-left:1.4rem;max-width:36rem;' });
       for (const a of wiz.enabledApps) {
-        const id = 'cf-pub-' + a.slug;
-        const checked = wiz.selectedSlugs.includes(a.slug);
-        const row = el('label', {
-          style: 'display:flex;gap:0.5rem;align-items:baseline;cursor:pointer;padding:0.2rem 0;',
-        });
-        const cb = el('input', {
-          type: 'checkbox', id,
-          'data-cf-slug': a.slug,
-          onchange: (e) => {
-            const slug = e.target.getAttribute('data-cf-slug');
-            const ix = wiz.selectedSlugs.indexOf(slug);
-            if (e.target.checked && ix < 0) wiz.selectedSlugs.push(slug);
-            if (!e.target.checked && ix >= 0) wiz.selectedSlugs.splice(ix, 1);
-            // Full re-paint keeps the FQDN preview, the
-            // disable-on-empty button state, and the UP screen's
-            // "Save & re-provision" vs "Re-provision (no changes)"
-            // label all in sync without per-element fiddling.
-            paint();
-          },
-        });
-        if (checked) cb.setAttribute('checked', '');
-        row.appendChild(cb);
-        row.appendChild(el('span', null, [
-          el('span', { style: 'font-weight:600;' }, [a.displayName]),
-          ' — ', el('span', { class: 'mono' }, [a.subdomain + '.' + (wiz.domain || '<your-domain>')]),
-        ]));
-        wrap.appendChild(row);
+        const li = el('li', { style: 'padding:0.15rem 0;' });
+        li.appendChild(el('span', { style: 'font-weight:600;' }, [a.displayName]));
+        li.appendChild(document.createTextNode(' — '));
+        li.appendChild(el('span', { class: 'mono' }, ['https://' + host + '/' + a.slug + '/']));
+        wrap.appendChild(li);
       }
       return wrap;
     }
 
-    // repaintPreview — write the currently-selected FQDN list into the
-    // preview <p>. Cheap; called on every checkbox toggle.
-    function repaintPreview(node) {
-      node.innerHTML = '';
-      if (!wiz.selectedSlugs.length) {
-        node.style.color = 'var(--text-muted)';
-        node.appendChild(el('em', null, ['No apps selected. Tick at least one above.']));
-        return;
-      }
-      const fqdns = wiz.selectedSlugs
-        .map(slug => (wiz.enabledApps.find(a => a.slug === slug) || {}).subdomain)
-        .filter(Boolean)
-        .map(sub => sub + '.' + (wiz.domain || '<your-domain>'));
-      node.style.color = 'var(--text)';
-      node.appendChild(el('strong', null, ['Will publish: ']));
-      node.appendChild(document.createTextNode(fqdns.join(', ')));
-    }
-
     function paintProvisioning() {
+      const tunnelHost = (wiz.tunnelSubdomain || 'vibe') + '.' + (wiz.domain || '<your-domain>');
       section.appendChild(el('p', { class: 'help', style: 'color:var(--text-muted);' }, [
         el('span', { 'data-cf-prov': '1' }, ['⋯ Provisioning… (0 s)']),
       ]));
       section.appendChild(el('p', { class: 'help' }, [
         'Typical run is 15–30 seconds. The script:',
-        el('br'), '1. Saves the five CLOUDFLARE_TUNNEL_* values plus the publish list to appliance.env.',
+        el('br'), '1. Saves the five CLOUDFLARE_TUNNEL_* values to appliance.env.',
         el('br'), '2. Creates (or reuses) a tunnel at Cloudflare named "', wiz.tunnelName, '".',
-        el('br'), '3. Creates one CNAME per ticked app at the zone (apex/admin/infra never get CNAMEs).',
+        el('br'), '3. Creates ONE CNAME at ', el('span', { class: 'mono' }, [tunnelHost]),
+                  ' pointing at the tunnel (apex/admin/infra never get CNAMEs).',
         el('br'), '4. Fetches the connector token, writes it to shared.env.',
         el('br'), '5. Starts the cloudflared container on this appliance.',
       ]));
     }
 
     async function provision() {
-      // Bail before transitioning if the operator somehow clicked
-      // Provision with an empty publish list (e.g. via DevTools).
-      // The button is disabled in that state, but defense in depth is
-      // free — and the script-side error message is opaque.
-      if (!wiz.selectedSlugs.length) {
-        wiz.error = 'Tick at least one app under "Apps to publish" before provisioning.';
-        paint();
-        return;
-      }
+      // No empty-publish-list guard anymore — selectedSlugs is auto-
+      // populated from the enabled-apps set at wizard bootstrap. If
+      // somehow zero apps are enabled, the script will surface that
+      // clearly and we don't need a separate check here.
 
       wiz.error = '';
       wiz.screen = 'PROVISIONING';
@@ -2251,65 +2219,51 @@ const SETTINGS_JS_VERSION = '2026-05-12-cf-pause-resume-and-error-surfacing';
 
     function paintUp() {
       const ageStr = wiz.lastRunTs ? ' (last script run ' + humanAge(wiz.lastRunTs) + ' ago)' : '';
+      const tunnelHost = (wiz.tunnelSubdomain || 'vibe') + '.' + (wiz.domain || '<your-domain>');
       section.appendChild(el('p', null, [
         el('span', { style: 'color:var(--good);font-weight:600;' }, ['✓ Tunnel is up']),
         el('span', { class: 'help' }, [ageStr]),
       ]));
 
-      // Currently published list — what's actually publicly reachable
-      // right now. Pulled from /cloudflare/status's published_slugs and
-      // pre-filled into selectedSlugs on bootstrap; rendered live.
-      const publishedFqdns = wiz.publishedSlugs
-        .map(slug => (wiz.enabledApps.find(a => a.slug === slug) || {}))
-        .filter(a => a.subdomain)
-        .map(a => a.subdomain + '.' + (wiz.domain || '<your-domain>'));
-
-      if (publishedFqdns.length) {
-        section.appendChild(el('p', { class: 'help' }, [
-          el('strong', null, ['Currently public: ']),
-          el('span', { class: 'mono' }, [publishedFqdns.join(', ')]),
-        ]));
+      // Public hostname + reachable apps. Single-hostname model: one
+      // CNAME, one cert, every enabled app reachable through paths.
+      section.appendChild(el('p', { class: 'help' }, [
+        el('strong', null, ['Public host: ']),
+        el('span', { class: 'mono' }, ['https://' + tunnelHost + '/']),
+      ]));
+      if (wiz.enabledApps.length) {
         section.appendChild(el('p', { class: 'help', style: 'margin-top:0.2rem;' }, [
           'Verify from outside your LAN (cellular tether is easiest): ',
-          el('span', { class: 'mono' }, ['curl -sI https://' + publishedFqdns[0] + '/']),
+          el('span', { class: 'mono' }, ['curl -sI https://' + tunnelHost + '/']),
         ]));
       } else {
         section.appendChild(el('p', { class: 'help', style: 'color:var(--warn);' }, [
-          '⚠ No apps are currently published. Pick at least one below and click Save & re-provision.',
+          '⚠ No apps are enabled. The console is still reachable at the public host above; enable apps from the Apps tab to expose them.',
         ]));
       }
       section.appendChild(el('p', { class: 'help', style: 'margin-top:0.2rem;' }, [
-        el('strong', null, ['Not published (LAN/Tailscale-only): ']),
+        el('strong', null, ['Not exposed via tunnel (LAN/Tailscale-only): ']),
         wiz.domain || '<your-domain>', ', www.', wiz.domain || '<your-domain>',
-        ', cockpit, portainer, backup',
+        ', cockpit.', wiz.domain || '<your-domain>',
+        ', portainer.', wiz.domain || '<your-domain>',
+        ', backup.', wiz.domain || '<your-domain>',
       ]));
 
-      // Inline edit of the publish list. The same checkbox UI as the
-      // READY screen, but the button is "Save & re-provision" instead
-      // of "Provision tunnel" so the operator can adjust without
-      // tearing down. Clicking it skips the token-paste flow because
-      // appliance.env already has the four creds.
+      // Reachable-apps list — read-only, mirrors the Apps tab. Changes
+      // happen there, not here. The Re-provision button below is for
+      // re-syncing Cloudflare-side state (CNAME content, connector
+      // refresh) after, say, rebuilding the appliance host.
       section.appendChild(el('h3', {
         style: 'margin:1.2rem 0 0.3rem;font-size:0.95rem;text-transform:uppercase;letter-spacing:0.1em;',
-      }, ['Apps to publish']));
-      section.appendChild(renderPublishList());
-
-      const preview = el('p', {
-        class: 'help', 'data-cf-preview': '1',
-        style: 'margin-top:0.3rem;',
-      });
-      section.appendChild(preview);
-      repaintPreview(preview);
-
-      const dirty = !arraysEqual(wiz.selectedSlugs, wiz.publishedSlugs);
+      }, ['Apps reachable through this tunnel']));
+      section.appendChild(renderReachableList());
 
       const cta = el('div', { class: 'cta-row', style: 'gap:0.5rem;margin-top:0.5rem;flex-wrap:wrap;' });
       const saveBtn = el('button', {
         type: 'button',
-        class: dirty ? 'btn' : 'btn btn--ghost',
+        class: 'btn btn--ghost',
         onclick: () => reprovision(),
-      }, [dirty ? 'Save & re-provision' : 'Re-provision (no changes)']);
-      saveBtn.disabled = wiz.selectedSlugs.length === 0;
+      }, ['Re-provision']);
       cta.appendChild(saveBtn);
       cta.appendChild(el('button', {
         type: 'button', class: 'btn btn--ghost',
@@ -2657,17 +2611,17 @@ const SETTINGS_JS_VERSION = '2026-05-12-cf-pause-resume-and-error-surfacing';
         'Re-Enable safely resumes the previous state.',
       ]));
 
-      // Show the published list so the operator knows what will come
-      // back online once they Enable. Pulled from /status's
-      // published_slugs, same as the UP screen.
-      const publishedFqdns = wiz.publishedSlugs
-        .map(slug => (wiz.enabledApps.find(a => a.slug === slug) || {}))
-        .filter(a => a.subdomain)
-        .map(a => a.subdomain + '.' + (wiz.domain || '<your-domain>'));
-      if (publishedFqdns.length) {
-        section.appendChild(el('p', { class: 'help', style: 'margin-top:0.4rem;' }, [
-          el('strong', null, ['Will resume publishing on Enable: ']),
-          el('span', { class: 'mono' }, [publishedFqdns.join(', ')]),
+      // Show the tunnel hostname + reachable apps so the operator
+      // knows what will come back online once they Enable.
+      const pausedHost = (wiz.tunnelSubdomain || 'vibe') + '.' + (wiz.domain || '<your-domain>');
+      section.appendChild(el('p', { class: 'help', style: 'margin-top:0.4rem;' }, [
+        el('strong', null, ['Will resume routing on Enable: ']),
+        el('span', { class: 'mono' }, ['https://' + pausedHost + '/']),
+      ]));
+      if (wiz.enabledApps.length) {
+        const slugs = wiz.enabledApps.map(a => a.slug).join(', ');
+        section.appendChild(el('p', { class: 'help', style: 'margin-top:0.2rem;color:var(--text-muted);' }, [
+          'Enabled apps reachable at /<slug>/ paths: ', slugs,
         ]));
       }
 
@@ -2802,14 +2756,15 @@ const SETTINGS_JS_VERSION = '2026-05-12-cf-pause-resume-and-error-surfacing';
     async function fetchStateConfig() {
       try {
         const r = await fetchWithTimeout('/api/v1/state', { credentials: 'same-origin' }, 10_000);
-        if (!r.ok) return { domain: '', mode: null };
+        if (!r.ok) return { domain: '', mode: null, tunnel_subdomain: 'vibe' };
         const s = await r.json();
         const cfg = s.config || {};
         return {
-          domain: (cfg.domain || '').trim(),
-          mode:   cfg.mode || null,
+          domain:           (cfg.domain || '').trim(),
+          mode:             cfg.mode || null,
+          tunnel_subdomain: (cfg.tunnel_subdomain || 'vibe').trim() || 'vibe',
         };
-      } catch { return { domain: '', mode: null }; }
+      } catch { return { domain: '', mode: null, tunnel_subdomain: 'vibe' }; }
     }
 
     // fetchWithTimeout — wraps fetch with an AbortController + ms
