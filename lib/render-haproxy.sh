@@ -129,14 +129,25 @@ try:
 except (FileNotFoundError, json.JSONDecodeError):
     pass
 
-enabled_apps = []
-for slug, app_state in (state.get("apps", {}) or {}).items():
-    if app_state.get("enabled") and app_state.get("status") != "failed":
-        enabled_apps.append(slug)
+# Render a frontend for every manifest-declared emergencyPort,
+# regardless of whether the app is currently enabled. The
+# docker-compose.yml publishes the ports unconditionally (one publish
+# line per port — see the explicit list in the compose file); if
+# HAProxy doesn't have a frontend bound on a published port, the host's
+# docker-proxy accepts the TCP connection but then RST's it the moment
+# the container has nothing listening. The client sees
+# "connection reset by peer" with no helpful indication of what's
+# wrong. By always emitting a frontend, disabled apps get the friendly
+# 503 ("App not running — enable from admin console") that the panel
+# was designed to show. HAProxy's `init-addr last,libc,none` lets the
+# server stay DOWN at start-up if the upstream container doesn't exist
+# yet, so this is safe.
+all_app_slugs = []
+for fname in sorted(Path(manifests_dir).iterdir() if Path(manifests_dir).is_dir() else []):
+    if not fname.name.endswith(".json") or fname.name.startswith("_"):
+        continue
+    all_app_slugs.append(fname.name[:-len(".json")])
 
-# For each enabled app, look up its manifest and pull emergencyPort +
-# default_upstream + emergencyNote. Skip apps without an emergencyPort
-# (e.g. userFacing=false services).
 frontends = []
 # Track ports across ALL manifests too — two apps declaring the same
 # port (e.g. typo) would emit duplicate `bind *:N` lines and HAProxy
@@ -144,7 +155,7 @@ frontends = []
 # warning. The 5199 stats port is internally bound by the global config
 # (not via candidates) so doesn't conflict here.
 seen_ports_global = set()
-for slug in enabled_apps:
+for slug in all_app_slugs:
     mpath = Path(manifests_dir) / f"{slug}.json"
     if not mpath.exists():
         continue
@@ -354,9 +365,12 @@ if not frontends:
 else:
     lines.append("# Emergency-access frontends. Each has a per-IP rate limit of")
     lines.append("# 30 req/sec via stick-table to prevent accidental DoS from a")
-    lines.append("# misbehaving LAN client. App backends health-check via")
-    lines.append("# /api/v1/ping; infra backends (Duplicati, Portainer) check /")
-    lines.append("# since they don't expose a Vibe-style ping endpoint.")
+    lines.append("# misbehaving LAN client. Backends health-check via GET / and")
+    lines.append("# accept any non-5xx as 'alive' — apps' web tiers serve the SPA")
+    lines.append("# at root (200), infra services redirect (3xx), and the prior")
+    lines.append("# strict /api/v1/ping + 200-only check marked apps DOWN whose")
+    lines.append("# web tier doesn't proxy /api/* internally (Vibe-Tax-Research's")
+    lines.append("# web tier returns 404 for /api/v1/ping → permanently DOWN).")
     for fe in frontends:
         lines.append("")
         lines.append(f"# [{fe.get('kind', 'app')}] {fe['label']}" + (f" — {fe['note']}" if fe['note'] else ""))
@@ -367,18 +381,8 @@ else:
         lines.append(f"  http-request deny deny_status 429 if {{ sc_http_req_rate(0) gt 300 }}")
         lines.append(f"  default_backend be_{fe['name']}")
         lines.append(f"backend be_{fe['name']}")
-        lines.append(f"  option httpchk GET {fe.get('health', '/api/v1/ping')}")
-        # Apps expose /api/v1/ping as a strict 200 (codebase convention)
-        # — match exactly. Infra services (Portainer/Duplicati) probe `/`
-        # which serves redirects: Portainer returns 307 to /timeout.html,
-        # Duplicati similar. Use HAProxy's range syntax to accept any
-        # non-5xx as "alive." Earlier attempt with `! rstatus ^5..` did
-        # not actually pass 307 (HAProxy logs showed "Layer7 wrong
-        # status, code: 307") — the explicit numeric range is reliable.
-        if fe.get('kind') == 'infra':
-            lines.append(f"  http-check expect status 100-499")
-        else:
-            lines.append(f"  http-check expect status 200")
+        lines.append(f"  option httpchk GET /")
+        lines.append(f"  http-check expect status 100-499")
         lines.append(f"  server {fe['name']} {fe['upstream']} check inter 30s fall 3 rise 1 resolvers docker init-addr last,libc,none")
 
 with open(out_path, "w") as f:
