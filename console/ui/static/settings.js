@@ -14,7 +14,7 @@
 // operators can confirm in DevTools (F12 → Console) that the file
 // they're running is the version they expect, vs. a stale cached
 // copy. Compare against the server's /api/v1/version response.
-const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
+const SETTINGS_JS_VERSION = '2026-05-12-cf-pause-resume-and-error-surfacing';
 
 (function () {
   // eslint-disable-next-line no-console
@@ -2204,7 +2204,29 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
         wiz.publishedSlugs = wiz.selectedSlugs.slice();
         finishProv('UP');
       } else {
-        wiz.error = 'cloudflared-up.sh exit ' + (provData.exit_code != null ? provData.exit_code : '?');
+        // Three failure shapes from /provision:
+        //   1. Pre-flight rejection: { ok: false, error: "...", action: "..." }
+        //      — no exit_code (script never ran). Surface provData.error
+        //        directly; this is the mode-gate, slug-validation, or
+        //        env-write failure case.
+        //   2. Script ran but failed: { exit_code: N, stdout, stderr }
+        //      — show the code + recovery hint, rely on wiz.output for
+        //        diagnostic detail (rendered on FAILED screen below).
+        //   3. Body unparseable / response truncated: catch returns {}
+        //      — surface as "no response body".
+        if (provData.error) {
+          wiz.error = provData.error +
+            (provData.context ? ' [' + provData.context + ']' : '') +
+            ' — fix the indicated issue and click Provision tunnel again.';
+        } else if (provData.exit_code != null) {
+          wiz.error = 'cloudflared-up.sh exit ' + provData.exit_code +
+            '. See the script output below for diagnostics; ' +
+            'most common causes: outbound TCP 7844 blocked, Caddy reload failed, ' +
+            'token scope changed at Cloudflare, or the tunnel name conflicts with an existing one.';
+        } else {
+          wiz.error = 'Provision returned no exit code and no error — the response was empty or unparseable. ' +
+            'Diagnose: sudo docker logs vibe-console --tail 50. Retry by clicking Provision tunnel again.';
+        }
         finishProv('FAILED');
       }
     }
@@ -2527,10 +2549,23 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
           wiz.publishedSlugs = wiz.selectedSlugs.slice();
           finishProv('UP');
         } else {
-          wiz.error = 'cloudflared-up.sh exit ' + data.exit_code + '. ' +
-                      'Check the script output below for diagnostics; ' +
-                      'most common causes: outbound TCP 7844 blocked, ' +
-                      'Caddy reload failed, or token scope changed.';
+          // Three failure shapes (see provision() for the symmetric
+          // version + rationale): pre-flight rejection surfaces
+          // data.error verbatim; script-ran failure surfaces exit_code;
+          // unparseable response surfaces "no response body".
+          if (data.error) {
+            wiz.error = data.error +
+              (data.context ? ' [' + data.context + ']' : '') +
+              ' — fix the indicated issue and click Save & re-provision again.';
+          } else if (data.exit_code != null) {
+            wiz.error = 'cloudflared-up.sh exit ' + data.exit_code + '. ' +
+                        'See the script output below for diagnostics; ' +
+                        'most common causes: outbound TCP 7844 blocked, ' +
+                        'Caddy reload failed, or token scope changed.';
+          } else {
+            wiz.error = 'Re-provision returned no exit code and no error — the response was empty or unparseable. ' +
+              'Diagnose: sudo docker logs vibe-console --tail 50. Retry by clicking Save & re-provision again.';
+          }
           finishProv('FAILED');
         }
       } catch (err) {
