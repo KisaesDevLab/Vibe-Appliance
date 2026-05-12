@@ -59,12 +59,12 @@
     {
       "name":   "CLOUDFLARE_API_TOKEN",
       "secret": true,
-      "doc":    "Cloudflare API token with Zone:DNS:Edit. Today writes to /opt/vibe/env/appliance.env via the standard Settings save flow. The Caddy container's env_file list is updated to include appliance.env so the cloudflare plugin reads the value at runtime. (Pre-v1.2 operators using bootstrap.sh --cloudflare-api-token can continue — that path writes to shared.env, which still wins as a legacy override.)",
+      "doc":    "Cloudflare API token with Zone:DNS:Edit, used ONLY for ACME DNS-01 wildcard cert issuance via Caddy's Cloudflare plugin. Distinct from CLOUDFLARE_TUNNEL_API_TOKEN (which has wider scope and is managed by the Cloudflare Tunnel wizard). Today writes to /opt/vibe/env/appliance.env via the standard Settings save flow. The Caddy container's env_file list is updated to include appliance.env so the cloudflare plugin reads the value at runtime. (Pre-v1.2 operators using bootstrap.sh --cloudflare-api-token can continue — that path writes to shared.env, which still wins as a legacy override.)",
       "ui": {
         "tier":            1,
         "category":        "Network",
-        "label":           "Cloudflare API token",
-        "helpText":        "Required when DNS provider is cloudflare. Token must have Zone:DNS:Edit on the appliance's domain.",
+        "label":           "Cloudflare API token (ACME DNS-01)",
+        "helpText":        "Used ONLY for ACME DNS-01 wildcard cert issuance — distinct from the Cloudflare Tunnel wizard above, which manages its own (wider-scope) token. Scope here: Zone:DNS:Edit only. If you set up Cloudflare Tunnel via the wizard, this field becomes moot (Caddy switches to tls-internal and stops issuing public certs) and is auto-hidden.",
         "input":           "password",
         "appliance":       "shared",
         "validate":        "non-empty",
