@@ -263,6 +263,43 @@ preflight_port() {
       return 0
     fi
 
+    # Orphan-rename detection: docker-proxy is holding the port, the
+    # canonical container name is absent, but compose has a running
+    # container for this service under a different name. That's the
+    # state docker compose leaves behind when a 'compose up
+    # --force-recreate' is interrupted mid-recreation — the old
+    # container gets renamed with a hash prefix and never replaced.
+    # The "stop and rm vibe-caddy" hint the generic message offers is
+    # a no-op in this case (there IS no vibe-caddy to stop), so
+    # surface the actual fix: docker rename.
+    #
+    # owner_container is "vibe-<service>"; the compose service name
+    # is the part after "vibe-". docker-compose.yml sets the project
+    # name to "vibe", so filtering by both project + service labels
+    # uniquely identifies a Vibe-owned container regardless of name.
+    if [[ "$who" == *docker-proxy* ]] \
+       && command -v docker >/dev/null 2>&1; then
+      local service_name="${owner_container#vibe-}"
+      local orphan
+      orphan="$(docker ps \
+                  --filter "label=com.docker.compose.project=vibe" \
+                  --filter "label=com.docker.compose.service=${service_name}" \
+                  --filter status=running \
+                  --format '{{.Names}}' 2>/dev/null \
+                | grep -v "^${owner_container}\$" | head -n1)"
+      if [[ -n "$orphan" ]]; then
+        log_check_fail "$title (orphaned container)" \
+          "An orphan container '${orphan}' is bound to port ${port}." \
+          "cause:A prior 'docker compose up --force-recreate' was interrupted mid-recreation. Compose renamed the old container with a hash prefix and never replaced it, so the live container has the compose service label '${service_name}' but its name doesn't match what bootstrap expects (${owner_container})." \
+          "diagnose:sudo docker ps --filter label=com.docker.compose.service=${service_name}" \
+          "fix:Rename the orphan to its canonical name — instant, no restart, no downtime: sudo docker rename ${orphan} ${owner_container}" \
+          "fix:Re-run bootstrap. Pre-flight should now pass."
+
+        [[ -n "$who" ]] && printf '        Listener: %s\n\n' "$who" >&2 || true
+        return 1
+      fi
+    fi
+
     log_check_fail "$title" \
       "Something is already listening on port ${port}." \
       "cause:An existing service (Apache, Nginx, Plesk, dev server) is bound to ${port}." \

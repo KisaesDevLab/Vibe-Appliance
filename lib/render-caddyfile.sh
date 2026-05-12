@@ -592,18 +592,62 @@ PYEOF
   log_info "Caddyfile written" path="$VIBE_CADDYFILE"
 }
 
-# Reload running Caddy. No-op if Caddy isn't up yet (initial bootstrap).
+# Reload running Caddy. Three states to distinguish:
+#
+#   1. vibe-caddy is running under the canonical name — reload.
+#   2. No caddy container exists at all (first bootstrap, before
+#      phase_core_up brings up the core stack) — legitimate skip.
+#   3. A caddy-service container IS running, but under a different
+#      name (e.g. <hash>_vibe-caddy from an interrupted compose
+#      `--force-recreate`). docker exec by name fails; if we silently
+#      "skip" here, every subsequent Caddyfile render writes the new
+#      shape to disk but the OLD config keeps serving forever. That
+#      is exactly how a domain-mode state.json ended up with a
+#      LAN-mode running Caddy in the 2026-05-12 tunnel-bringup
+#      incident — fail loudly with the rename fix instead.
 reload_caddyfile() {
-  if ! docker ps --filter name=^vibe-caddy$ --filter status=running -q | grep -q .; then
-    log_info "caddy is not running yet; reload skipped"
-    return 0
+  local canonical
+  canonical="$(docker ps --filter name=^vibe-caddy$ --filter status=running -q 2>/dev/null | head -n1)"
+
+  if [[ -n "$canonical" ]]; then
+    log_step "reloading Caddy"
+    if docker exec vibe-caddy caddy reload --config /etc/caddy/Caddyfile >>"$VIBE_LOG_FILE" 2>&1; then
+      log_info "caddy reloaded"
+      return 0
+    else
+      die "caddy reload failed. Check 'docker logs vibe-caddy'."
+    fi
   fi
-  log_step "reloading Caddy"
-  if docker exec vibe-caddy caddy reload --config /etc/caddy/Caddyfile >>"$VIBE_LOG_FILE" 2>&1; then
-    log_info "caddy reloaded"
-  else
-    die "caddy reload failed. Check 'docker logs vibe-caddy'."
+
+  # No canonical vibe-caddy. Look for an orphan under the compose
+  # service label before assuming this is a legitimate first-boot
+  # skip. project=vibe + service=caddy is set on every container
+  # `docker compose` spawns from this repo's compose file, no matter
+  # what its --name becomes after a rename.
+  local orphan
+  orphan="$(docker ps \
+              --filter "label=com.docker.compose.project=vibe" \
+              --filter "label=com.docker.compose.service=caddy" \
+              --filter status=running \
+              --format '{{.Names}}' 2>/dev/null | head -n1)"
+  if [[ -n "$orphan" ]]; then
+    die "caddy reload skipped: a caddy-service container is running but named '${orphan}', not 'vibe-caddy'.
+
+  This is the state docker compose leaves behind when a
+  'compose up --force-recreate' is interrupted mid-recreation.
+  Caddy keeps serving the OLD config — every render produced
+  after this point would silently fail to apply, leaving the
+  rendered Caddyfile on disk diverged from what's actually
+  serving traffic.
+
+  Fix (instant, no restart, no downtime):
+    sudo docker rename ${orphan} vibe-caddy
+
+  Then re-run whatever invoked this script."
   fi
+
+  log_info "caddy is not running yet; reload skipped"
+  return 0
 }
 
 # --- helpers ------------------------------------------------------------
