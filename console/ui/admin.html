@@ -48,21 +48,6 @@
       <div class="apps-list" id="infra-list"></div>
     </section>
 
-    <!-- Phase 8.5 W-D — Emergency Access panel (addendum §8). Always
-         visible (when the operator hasn't passed --no-emergency-proxy);
-         shows HAProxy status + per-app emergency URLs + LAN / Tailscale
-         IPs so staff have a fallback path documented in one place. -->
-    <section id="emergency-section">
-      <h2>Emergency access</h2>
-      <p class="muted">
-        Plain-HTTP fallback when DNS, certs, or Caddy are broken. UFW-gated to
-        LAN + Tailscale only. Browsers will warn the connection isn't secure —
-        that's expected.
-      </p>
-      <p class="muted" id="emergency-meta">—</p>
-      <div class="apps-list" id="emergency-list"></div>
-    </section>
-
     <section>
       <h2>First-login info</h2>
       <p class="muted">Default credentials surfaced from each enabled app's manifest. Change the password as soon as you log in.</p>
@@ -419,12 +404,6 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
         renderFirstLogin((firstLogin && firstLogin.first_login) || []);
         renderSetupBanners(settingsValues, status.state && status.state.config || {}, status.tailscale_live || null);
         renderHostServices((hostServices && hostServices.host_services) || []);
-        renderEmergency(
-          apps.apps || [],
-          (infra && infra.infra) || [],
-          status.containers || [],
-          status.state && status.state.config || {}
-        );
         document.getElementById('now').textContent =
           'Snapshot at ' + (status.now || new Date().toISOString());
       } catch (err) {
@@ -481,112 +460,6 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
           ${escapeHtml(b.msg)}
           <a href="${b.link}" style="margin-left: 0.5rem;">${escapeHtml(b.linkText)}</a>
         </div>`).join('');
-    }
-
-    // Phase 8.5 W-D — Emergency Access panel. Composed from data the
-    // page already loads: apps[].emergencyUrl + emergencyNote (server
-    // builds these from manifest + state.host_ip), containers[] (for
-    // the HAProxy sidecar status), config.host_ip + config.tailscale_hostname.
-    // No new endpoint needed.
-    function renderEmergency(apps, infra, containers, config) {
-      const list = document.getElementById('emergency-list');
-      const meta = document.getElementById('emergency-meta');
-
-      // HAProxy sidecar state — pull from the containers list.
-      const proxy = (containers || []).find(c => c.name === 'vibe-emergency-proxy');
-      let proxyBadge;
-      if (!proxy) {
-        proxyBadge = '<span class="badge badge--bad">missing</span>';
-      } else if (proxy.health === 'healthy' || (proxy.state === 'running' && !proxy.health)) {
-        proxyBadge = '<span class="badge badge--good">running</span>';
-      } else if (proxy.state === 'running') {
-        proxyBadge = '<span class="badge badge--warn">' + escapeHtml(proxy.health || 'starting') + '</span>';
-      } else {
-        proxyBadge = '<span class="badge badge--bad">' + escapeHtml(proxy.state || 'down') + '</span>';
-      }
-
-      const lanIp  = config.host_ip || '';
-      const tsHost = config.tailscale_hostname || '';
-      // Refresh link rebuilds host_ip in state.json by spawning a
-      // host-network alpine container that runs `ip route get 1.1.1.1`.
-      // The console daemon also runs this every 5 minutes in the
-      // background; the link just lets the operator skip the wait
-      // when they know the IP just changed (DHCP renewal, moved
-      // networks, etc.).
-      const refreshLink = ' <a href="#" id="host-ip-refresh" data-host-ip-refresh="1"' +
-        ' style="font-size:0.85em;margin-left:0.5em;">Refresh</a>';
-      meta.innerHTML =
-        'HAProxy sidecar: ' + proxyBadge +
-        '   ·   Server LAN IP: <span class="mono">' +
-          (lanIp ? escapeHtml(lanIp) : '(not detected — check `hostname -I` on the host)') + '</span>' +
-          refreshLink +
-        (tsHost
-          ? '   ·   Tailnet host: <span class="mono">' + escapeHtml(tsHost) + '</span>'
-          : '');
-      // Attach the click handler each render — the meta innerHTML
-      // assignment above replaces any prior <a id="host-ip-refresh">.
-      const refreshEl = document.getElementById('host-ip-refresh');
-      if (refreshEl) refreshEl.addEventListener('click', refreshHostIp);
-
-      // Build a unified list: apps with emergencyUrl, then infra
-      // services with emergencyUrl. Cockpit gets a special entry
-      // pointing at its native :9090 (still LAN/Tailnet-reachable
-      // even when Caddy is broken since it binds the host port
-      // directly — same emergency-access shape, different mechanism).
-      const items = [];
-      for (const a of apps || []) {
-        if (!a.emergencyUrl) continue;
-        const status = a.enabled && a.status === 'running'
-          ? '<span class="badge badge--good">app running</span>'
-          : '<span class="badge badge--muted">app ' + escapeHtml(a.status || 'idle') + '</span>';
-        items.push({
-          title: a.displayName, badge: status,
-          url: a.emergencyUrl, note: a.emergencyNote || '',
-        });
-      }
-      for (const s of infra || []) {
-        if (!s.emergencyUrl && s.slug !== 'cockpit') continue;
-        // Cockpit's emergency URL is its native :9090 (which is the
-        // same as its primary URL in non-domain modes). Inline it
-        // here so operators see all three admin tools in one place.
-        let url = s.emergencyUrl;
-        let note = '';
-        if (s.slug === 'cockpit') {
-          if (!lanIp) continue;     // can't construct URL without LAN IP
-          url = `https://${lanIp}:9090/`;
-          note = 'native host port (self-signed cert; click through the warning)';
-        }
-        const stat = s.running === true
-          ? '<span class="badge badge--good">running</span>'
-          : '<span class="badge badge--bad">' + escapeHtml(s.running === false ? 'stopped' : 'unknown') + '</span>';
-        items.push({ title: s.label, badge: stat, url, note });
-      }
-
-      if (!items.length) {
-        list.innerHTML = '<p class="muted">No emergency access available. ' +
-          'Either no apps are enabled, no infra is running, or the host LAN IP ' +
-          'could not be detected (set <span class="mono">state.config.host_ip</span> via re-bootstrap).</p>';
-        return;
-      }
-
-      list.innerHTML = items.map(it => {
-        const note = it.note
-          ? '<p class="muted" style="margin:0.4rem 0 0;font-size:0.9em;">' + escapeHtml(it.note) + '</p>'
-          : '';
-        return `
-          <article class="app-card">
-            <header class="app-card__head">
-              <h3 class="app-card__title">${escapeHtml(it.title)}</h3>
-              ${it.badge}
-            </header>
-            <p class="app-card__desc">
-              <a href="${escapeHtml(it.url)}" target="_blank" rel="noopener">
-                ${escapeHtml(it.url)}
-              </a>
-            </p>
-            ${note}
-          </article>`;
-      }).join('');
     }
 
     // Phase 8.5 v1.2 — Avahi/UFW host status. Source-of-truth is
@@ -682,14 +555,10 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
         const noteBlock = (linkable && s.note)
           ? '<p class="muted" style="margin-top:0.4rem;font-size:0.9em">' + escapeHtml(s.note) + '</p>'
           : '';
-        // Phase 8.5 v1.2 — fallback URL via emergency-proxy. Cockpit
-        // is omitted here because its native :9090 URL is already the
-        // primary URL in non-domain modes.
-        const fallbackBlock = s.emergencyUrl ? `
-          <p class="muted" style="margin-top:0.4rem;font-size:0.9em;">
-            Fallback (when Caddy/DNS/cert is broken):
-            <a href="${escapeHtml(s.emergencyUrl)}">${escapeHtml(s.emergencyUrl)}</a>
-          </p>` : '';
+        // Emergency-access fallback link removed — the emergency
+        // ports proved unreliable in practice (see commit history).
+        // Kept the data on the API for SSH-level debugging.
+        const fallbackBlock = '';
         return `
           <article class="app-card">
             <header class="app-card__head">
@@ -1058,12 +927,10 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
     }
 
     // ---------- Host IP refresh ----------
-    // Triggered by the small "Refresh" link next to the Server LAN IP
-    // line in the Emergency-access meta. Server-side this re-detects
-    // via `docker run --network=host`, atomically updates
-    // state.config.host_ip in state.json, and returns the new value.
-    // We then reload the page so every URL on this admin view picks
-    // up the new IP — easier than surgically re-rendering each card.
+    // Trigger element was removed with the Emergency-access section.
+    // Function kept (dead) until the next cleanup pass because it has
+    // no harm — JS just never invokes it. Remove if/when we touch
+    // this file substantively again.
     async function refreshHostIp(ev) {
       if (ev) ev.preventDefault();
       const a = document.getElementById('host-ip-refresh');
