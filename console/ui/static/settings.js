@@ -20,6 +20,20 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
   // eslint-disable-next-line no-console
   console.log('[vibe] settings.js loaded — version', SETTINGS_JS_VERSION);
   // ---------- helpers --------------------------------------------------
+
+  // _friendlyError — convert fetch / AbortController errors into
+  // operator-friendly text. fetchWithTimeout aborts via
+  // AbortController on deadline, which surfaces as a DOMException
+  // with name='AbortError' and a message like "signal is aborted
+  // without reason" — useless to a CPA. Convert known patterns to
+  // clear language. Used by every catch block that surfaces an
+  // error to the operator.
+  function _friendlyError(err) {
+    if (!err) return 'unknown error';
+    if (err.name === 'AbortError') return 'Request timed out';
+    return err.message || String(err);
+  }
+
   function escapeHtml(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
       '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
@@ -664,7 +678,36 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
     }
 
     const fields = state.schema.appliance[cat] || [];
-    if (!fields.length) {
+
+    // Network tab is special-cased BEFORE the empty-fields check so the
+    // panels (Primary network access, Cloudflare Tunnel, DDNS, Tailscale)
+    // always mount even if the manifest declared zero plain form fields
+    // for this category. Pre-refactor the empty-Network case fell through
+    // to "No fields in this category." and the wizard never rendered —
+    // a real bug the operator would experience as "the wizard is gone."
+    // The wizard handles its five managed fields programmatically; we
+    // filter them out of the form so we don't duplicate the surface.
+    if (cat === 'Network') {
+      renderNetworkModeSection(panelEl);
+      renderCloudflareTunnelSection(panelEl);
+      const renderedFields = fields.filter(f =>
+        f.key !== 'CLOUDFLARE_TUNNEL_ENABLED' &&
+        f.key !== 'CLOUDFLARE_TUNNEL_API_TOKEN' &&
+        f.key !== 'CLOUDFLARE_ACCOUNT_ID' &&
+        f.key !== 'CLOUDFLARE_ZONE_ID' &&
+        f.key !== 'CLOUDFLARE_TUNNEL_NAME' &&
+        f.key !== 'TAILSCALE_ENABLED' &&
+        f.key !== 'TAILSCALE_AUTHKEY'
+      );
+      if (renderedFields.length) {
+        const form = el('form', { class: 'settings-form', onsubmit: e => { e.preventDefault(); saveAll(); } });
+        for (const f of renderedFields) {
+          const cur = currentRawFor(f);
+          form.appendChild(renderField(f, cur));
+        }
+        panelEl.appendChild(form);
+      }
+    } else if (!fields.length) {
       panelEl.appendChild(el('p', { class: 'muted' }, ['No fields in this category.']));
     } else if (cat === 'Email & SMS') {
       // Email & SMS share a tab but are two distinct sub-flows. The
@@ -674,30 +717,8 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
       // provider dropdown first within each section.
       panelEl.appendChild(renderEmailSmsForm(fields));
     } else {
-      // Network tab gets the Cloudflare Tunnel wizard rendered FIRST,
-      // ABOVE the form, because tunnel setup is the primary action that
-      // brings the operator to this tab. Wizard is always visible so
-      // discoverability doesn't depend on the operator successfully
-      // saving a toggle (which is exactly what kept getting stuck).
-      // The five wizard-managed fields below are filtered out of the
-      // form — the wizard handles them programmatically; rendering them
-      // as inputs as well would duplicate the surface area for no win.
-      let renderedFields = fields;
-      if (cat === 'Network') {
-        renderNetworkModeSection(panelEl);
-        renderCloudflareTunnelSection(panelEl);
-        renderedFields = fields.filter(f =>
-          f.key !== 'CLOUDFLARE_TUNNEL_ENABLED' &&
-          f.key !== 'CLOUDFLARE_TUNNEL_API_TOKEN' &&
-          f.key !== 'CLOUDFLARE_ACCOUNT_ID' &&
-          f.key !== 'CLOUDFLARE_ZONE_ID' &&
-          f.key !== 'CLOUDFLARE_TUNNEL_NAME' &&
-          f.key !== 'TAILSCALE_ENABLED' &&
-          f.key !== 'TAILSCALE_AUTHKEY'
-        );
-      }
       const form = el('form', { class: 'settings-form', onsubmit: e => { e.preventDefault(); saveAll(); } });
-      for (const f of renderedFields) {
+      for (const f of fields) {
         const cur = currentRawFor(f);
         form.appendChild(renderField(f, cur));
       }
@@ -1073,6 +1094,97 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
     const repaint = () => renderModeOptions(selWrap, sel, currentMode, tsStatus, section, repaint);
     body.appendChild(selWrap);
     repaint();
+
+    // Emergency exit from domain mode — only relevant when currently
+    // in domain mode (no reason to surface this from lan or tailscale).
+    // Sits below the normal Switch UI as a clearly-labelled break-
+    // glass action; uses typed confirmation ("lan") rather than just
+    // a click-OK because this flips Caddy back to LAN config and
+    // affects every public-facing app at once.
+    if (currentMode === 'domain') {
+      renderEmergencyExitDomain(body, section);
+    }
+  }
+
+  function renderEmergencyExitDomain(host, section) {
+    const wrap = el('div', {
+      style: 'margin-top:1.4rem;padding:0.7rem 0.9rem;border:1px solid var(--bad);border-radius:4px;background:rgba(220,38,38,0.03);max-width:42rem;',
+    });
+    wrap.appendChild(el('h3', {
+      style: 'margin:0;font-size:0.9rem;text-transform:uppercase;letter-spacing:0.1em;color:var(--bad);',
+    }, ['Emergency: drop to LAN mode']));
+    wrap.appendChild(el('p', { class: 'help', style: 'margin:0.4rem 0 0;' }, [
+      'Break-glass when domain mode is broken (Let\'s Encrypt failing, Cloudflare Tunnel stuck, etc.) and you need the appliance reachable on the LAN immediately. ',
+      'Stops the cloudflared container (does NOT delete the tunnel object or CNAMEs at Cloudflare), sets ',
+      el('span', { class: 'mono' }, ['state.config.mode=lan']),
+      ', re-renders Caddyfile in LAN mode, and reloads Caddy. ',
+      el('strong', null, ['Every public-facing app goes back to LAN-only access.']),
+    ]));
+    wrap.appendChild(el('p', { class: 'help', style: 'margin:0.3rem 0 0;' }, [
+      'Reversible by switching back to Domain mode in the radios above.',
+    ]));
+
+    const status = el('p', { class: 'help', style: 'margin:0.4rem 0 0;' });
+    const confirmInput = el('input', {
+      type: 'text', placeholder: 'type "lan" to confirm', autocomplete: 'off',
+      style: 'margin-top:0.4rem;padding:0.35rem 0.55rem;border:1px solid var(--border);border-radius:4px;background:var(--surface);font:inherit;width:14rem;',
+      oninput: () => { exitBtn.disabled = (confirmInput.value || '').trim() !== 'lan'; },
+    });
+    const exitBtn = el('button', {
+      type: 'button', class: 'btn',
+      style: 'margin-left:0.4rem;background:var(--bad);border-color:var(--bad);color:white;',
+      onclick: async () => {
+        if ((confirmInput.value || '').trim() !== 'lan') return;
+        exitBtn.disabled = true; exitBtn.textContent = 'Dropping…';
+        status.style.color = '';
+        status.textContent = 'Stopping connector, re-rendering Caddyfile, reloading Caddy…';
+        try {
+          // 120s timeout — the script does Caddy reload + state.json
+          // rewrite + container stop. Healthy runs are <10s; the cap
+          // exists so a hung script can't deadlock the UI.
+          const r = await fetchWithTimeout('/api/v1/admin/network/exit-domain-mode', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ confirm: 'lan' }),
+          }, 120_000);
+          const data = await r.json().catch(() => ({}));
+          if (r.ok && data.exit_code === 0) {
+            status.style.color = 'var(--good)';
+            status.textContent = '✓ Dropped to LAN mode. Re-loading network state…';
+            setTimeout(() => loadNetworkMode(section), 1200);
+            // The script flipped state.config.mode to 'lan'. Notify
+            // the Cloudflare wizard so it re-bootstraps and shows
+            // the mode-blocked callout instead of a stale UP screen.
+            // Same event the network-mode/switch endpoint dispatches;
+            // listeners just care that mode changed.
+            document.dispatchEvent(new CustomEvent('vibe:network-mode-changed', {
+              detail: { mode: 'lan' },
+            }));
+          } else {
+            status.style.color = 'var(--bad)';
+            status.textContent = '✗ ' + (data.error || ('exit-domain-mode.sh exit ' + data.exit_code));
+            if (data.stderr || data.stdout) {
+              wrap.appendChild(el('details', { style: 'margin-top:0.3rem;', open: '' }, [
+                el('summary', { class: 'help', style: 'cursor:pointer;' }, ['Script output']),
+                el('pre', { class: 'maintenance__output' }, [[data.stdout, data.stderr].filter(Boolean).join('\n')]),
+              ]));
+            }
+            exitBtn.disabled = false; exitBtn.textContent = 'Drop to LAN mode';
+          }
+        } catch (err) {
+          status.style.color = 'var(--bad)';
+          status.textContent = '✗ ' + _friendlyError(err) +
+            ' — the script may still be running on the host. SSH path: ' +
+            'sudo bash /opt/vibe/appliance/lib/exit-domain-mode.sh';
+          exitBtn.disabled = false; exitBtn.textContent = 'Drop to LAN mode';
+        }
+      },
+    }, ['Drop to LAN mode']);
+    exitBtn.disabled = true;
+    wrap.appendChild(confirmInput);
+    wrap.appendChild(exitBtn);
+    wrap.appendChild(status);
+    host.appendChild(wrap);
   }
 
   function _modeLabel(m) {
@@ -1261,6 +1373,22 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
   };
 
   async function doModeSwitch(sel, currentMode, section, tsStatus) {
+    // Refuse if a Cloudflare-Tunnel provision is in flight in the
+    // wizard panel on this same page. Switching modes while the
+    // provision script is running corrupts state: the script may
+    // write mode-specific ingress, fetch a connector token, force-
+    // recreate the container, and reload Caddy — all assuming the
+    // mode that was active at the start. If mode changes mid-flight,
+    // the script's Caddyfile re-render may fight the mode-switch's
+    // re-render, and the final ingress config may target a Caddy
+    // listener that no longer exists. The wizard exposes its screen
+    // state via data-cf-screen on its section element; check there.
+    const cfSection = document.querySelector('[data-cf-section]');
+    if (cfSection && cfSection.getAttribute('data-cf-screen') === 'PROVISIONING') {
+      alert('A Cloudflare Tunnel provision is currently in progress. Wait for it to finish (or fail) before switching network mode — switching now would corrupt the appliance state.');
+      return;
+    }
+
     const copyKey = currentMode + '->' + sel.mode;
     const tmpl = _MODE_SWITCH_COPY[copyKey] || 'Switch to ' + _modeLabel(sel.mode) + '?';
     let msg = tmpl.replace('{domain}', sel.domain || '<domain>');
@@ -1279,7 +1407,11 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
 
     let data;
     try {
-      const r = await fetch('/api/v1/admin/network-mode/switch', {
+      // 120s timeout — switching modes triggers a Caddyfile re-render
+      // and reload that can take 5-10s normally and longer if Caddy
+      // is slow to reload (large config, busy daemon). Hung scripts
+      // shouldn't deadlock the UI.
+      const r = await fetchWithTimeout('/api/v1/admin/network-mode/switch', {
         method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1287,13 +1419,13 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
           domain: sel.mode === 'domain' ? sel.domain : undefined,
           email:  sel.mode === 'domain' ? sel.email  : undefined,
         }),
-      });
+      }, 120_000);
       data = await r.json().catch(() => ({}));
       data._http = r.status;
     } catch (err) {
       body.innerHTML = '';
       body.appendChild(el('p', { class: 'help', style: 'color:var(--bad);' }, [
-        '✗ Switch failed: ' + err.message,
+        '✗ Switch failed: ' + _friendlyError(err),
       ]));
       // Re-render fresh so the operator can retry.
       setTimeout(() => loadNetworkMode(section), 1500);
@@ -1314,6 +1446,19 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
       }
       // Refresh in place so the new "Currently:" line shows.
       setTimeout(() => loadNetworkMode(section), 2000);
+      // Notify the Cloudflare wizard (and anyone else listening) that
+      // state.config.mode changed. Without this the wizard's cached
+      // wiz.currentMode stays stale and its modeBlocked gate misfires
+      // — operator switches LAN→Domain in this section, then sees the
+      // wizard still showing "requires Domain mode" until page reload.
+      // Only dispatch when data.to is present — a malformed success
+      // response without `to` would otherwise propagate `mode:
+      // undefined` to listeners.
+      if (data.to) {
+        document.dispatchEvent(new CustomEvent('vibe:network-mode-changed', {
+          detail: { mode: data.to },
+        }));
+      }
       return;
     }
 
@@ -1386,8 +1531,56 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
     paint();
     bootstrap();
 
+    // Listen for network-mode changes from the Primary network access
+    // section. Without this the wizard's cached wiz.currentMode goes
+    // stale after a mode switch in the same panel — operator switches
+    // LAN→Domain, then sees the wizard still showing "requires Domain
+    // mode" until full page reload.
+    //
+    // Self-cleaning pattern: the handler first checks whether `section`
+    // is still in the DOM (selectTab clears panelEl when the operator
+    // navigates tabs, detaching this section). If not, it unregisters
+    // itself and bails. This avoids a MutationObserver watching the
+    // whole document for every checkbox toggle and every render — the
+    // cleanup happens on the next event after detachment, not on
+    // every DOM mutation. The brief leak (one stale closure per tab
+    // navigation, until the next mode-change event) is bounded and
+    // tiny.
+    const onModeChanged = (ev) => {
+      if (!document.contains(section)) {
+        document.removeEventListener('vibe:network-mode-changed', onModeChanged);
+        return;
+      }
+      const newMode = (ev && ev.detail && ev.detail.mode) || null;
+      wiz.bootstrapped = false;
+      // Don't interrupt an active provision. For UP, downgrade to
+      // IDLE when the new mode is non-domain — the connector may
+      // still be running but Caddy no longer serves :443 so the
+      // tunnel 502s on every request. Leaving UP visible would lie
+      // to the operator. bootstrap() re-runs below and will re-set
+      // UP if (and only if) the new mode is still domain.
+      if (wiz.screen === 'PROVISIONING') {
+        // keep — let it finish; bootstrap() re-paints when done
+      } else if (wiz.screen === 'UP' && newMode && newMode !== 'domain') {
+        wiz.screen = 'IDLE';
+      } else if (wiz.screen !== 'UP') {
+        wiz.screen = 'IDLE';
+      }
+      paint();
+      bootstrap();
+    };
+    document.addEventListener('vibe:network-mode-changed', onModeChanged);
+
     function paint() {
       section.innerHTML = '';
+      // Reflect the current wizard screen as a data attribute so
+      // other panels (specifically the Primary network access
+      // section's doModeSwitch) can detect when a provision is
+      // in flight and refuse to switch modes — preventing the
+      // state-corruption race where a script writes mode-specific
+      // ingress while the operator changes the mode out from under
+      // it.
+      section.setAttribute('data-cf-screen', wiz.screen);
       // Header row: title + tiny build-version stamp. The version
       // makes deployment problems instantly visible — if the operator
       // sees this header at all, the wizard is rendering AND they can
@@ -1408,6 +1601,7 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
         case 'READY':         paintReady();        break;
         case 'PROVISIONING':  paintProvisioning(); break;
         case 'UP':            paintUp();           break;
+        case 'PAUSED':        paintPaused();       break;
         case 'FAILED':        paintFailed();       break;
       }
     }
@@ -1417,10 +1611,15 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
     // /api/v1/apps + status. Never downgrades — a failed status check
     // leaves the operator on IDLE with the Set-up button visible.
     async function bootstrap() {
+      // Each fetch gets an AbortController-backed 10s timeout. Without
+      // this, a hung connection (TCP-FIN-WAIT, captive portal, console
+      // crashed mid-request) left the wizard stuck on the LOADING
+      // screen forever — operator's only escape was a full page reload.
+      // 10s is generous; healthy round-trips are <100ms.
       const [stateCfg, appsResp, statusResp] = await Promise.all([
         fetchStateConfig(),
-        fetch('/api/v1/apps', { credentials: 'same-origin' }).catch(() => null),
-        fetch('/api/v1/admin/cloudflare/status', { credentials: 'same-origin' }).catch(() => null),
+        fetchWithTimeout('/api/v1/apps', { credentials: 'same-origin' }, 10_000).catch(() => null),
+        fetchWithTimeout('/api/v1/admin/cloudflare/status', { credentials: 'same-origin' }, 10_000).catch(() => null),
       ]);
       wiz.domain      = stateCfg.domain;
       wiz.currentMode = stateCfg.mode;
@@ -1440,8 +1639,42 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
           wiz.lastRunTs = data.last_run_ts;
           wiz.publishedSlugs = Array.isArray(data.published_slugs) ? data.published_slugs : [];
           wiz.selectedSlugs  = wiz.publishedSlugs.slice();
-          if (data.container_status === 'running' && data.token_present) {
-            wiz.screen = 'UP';
+          // Pull bound IDs from /status so cold-bootstrap into PAUSED
+          // or UP has the data it needs to render the "Manage at
+          // Cloudflare ↗" link and to power Rotate token's bound-zone
+          // check. Pre-fix these were only populated by SETUP → READY,
+          // so a cold load straight into PAUSED rendered a broken
+          // dashboard URL like one.dash.cloudflare.com//networks/tunnels.
+          if (data.account_id)  wiz.accountId  = data.account_id;
+          if (data.zone_id)     wiz.zoneId     = data.zone_id;
+          if (data.tunnel_name) wiz.tunnelName = data.tunnel_name;
+
+          // Bootstrap state transitions from default IDLE:
+          //   - UP:     container running + token + mode=domain.
+          //             The tunnel is actively routing public traffic.
+          //   - PAUSED: container stopped OR paused (`docker pause`) +
+          //             token + mode=domain. Cloudflare-side state
+          //             intact, resumable via /enable. We collapse the
+          //             two docker states into one wizard state because
+          //             the operator's action (Enable) is the same;
+          //             the /enable endpoint handles the distinction.
+          //   - IDLE:   anything else (container not-found / unknown,
+          //             no token, or mode != domain).
+          //
+          // The container_status='running' && mode!='domain' case
+          // intentionally falls through to IDLE — the tunnel is
+          // running but Caddy can't serve :443 in non-domain mode,
+          // so public traffic 502s. Showing UP would lie. The
+          // mode-blocked callout on IDLE points at the right fix.
+          if (data.token_present && wiz.currentMode === 'domain') {
+            if (data.container_status === 'running') {
+              wiz.screen = 'UP';
+            } else if (
+              data.container_status === 'stopped' ||
+              data.container_status === 'paused'
+            ) {
+              wiz.screen = 'PAUSED';
+            }
           }
         } catch { /* stay on IDLE */ }
       }
@@ -1471,9 +1704,15 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
       // Mode gate: Cloudflare Tunnel only works in Domain mode.
       // In LAN/Tailscale modes Caddy has no :443 listener, so the
       // tunnel ingress (forwards to caddy:443) silently 502s every
-      // request. Block setup entirely with a callout pointing at the
-      // Primary network access section.
-      if (wiz.bootstrapped && wiz.currentMode && wiz.currentMode !== 'domain') {
+      // request. Render the red callout but DO NOT early-return —
+      // operators reported "the wizard is gone" when the Set-up
+      // button vanished. We keep the button visible-but-disabled so
+      // the wizard's existence and shape stay obvious; the disabled
+      // state + tooltip + Jump-to-section ghost button below
+      // funnel the operator to the fix instead of leaving them
+      // staring at a red box wondering what changed.
+      const modeBlocked = wiz.bootstrapped && wiz.currentMode && wiz.currentMode !== 'domain';
+      if (modeBlocked) {
         section.appendChild(el('div', {
           style: 'margin-top:0.6rem;padding:0.7rem 0.9rem;background:rgba(220,38,38,0.06);border:1px solid var(--bad);border-radius:4px;',
         }, [
@@ -1492,34 +1731,58 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
             ' section above (radio for Public domain). You\'ll need to provide your domain + ACME email.',
           ]),
         ]));
-        return;
       }
 
-      // Three states:
-      //   bootstrap not yet done → show the button optimistically with
-      //     a loading-domain placeholder. Don't flash a "no domain"
-      //     error before the fetch even returns.
-      //   bootstrap done, domain present → show domain + button.
-      //   bootstrap done, domain missing → show error + no button.
+      // Four pre-setup states:
+      //   bootstrap not yet done → show button optimistically with
+      //     a loading placeholder. Don't flash errors before fetch.
+      //   bootstrap done, domain present, mode=domain → normal flow.
+      //   bootstrap done, domain missing → button stays visible
+      //     (disabled) with a domain-error explanation. Symmetry
+      //     with modeBlocked — never silently remove the button.
+      //   modeBlocked already handled above; falls through here.
+      const domainMissing = wiz.bootstrapped && !wiz.domain;
       if (!wiz.bootstrapped) {
         section.appendChild(el('p', { class: 'help muted' }, ['Loading appliance state…']));
-      } else if (!wiz.domain) {
-        section.appendChild(el('p', { class: 'help', style: 'color:var(--bad);' }, [
+      } else if (domainMissing) {
+        section.appendChild(el('p', { class: 'help', style: 'color:var(--bad);margin-top:0.6rem;' }, [
           'state.config.domain is not set. Cloudflare Tunnel needs the apex domain so it can create CNAMEs. ',
           'Re-run ', el('span', { class: 'mono' }, ['sudo bash /opt/vibe/appliance/bootstrap.sh --mode domain --domain <yours>']), ' first.',
         ]));
-        return;
-      } else {
+      } else if (!modeBlocked) {
         section.appendChild(el('p', { class: 'help' }, [
           'Domain: ', el('span', { class: 'mono' }, [wiz.domain]),
         ]));
       }
 
-      const cta = el('div', { class: 'cta-row', style: 'margin-top:0.6rem;' });
-      cta.appendChild(el('button', {
+      const blocked = modeBlocked || domainMissing;
+      const cta = el('div', { class: 'cta-row', style: 'margin-top:0.6rem;gap:0.5rem;' });
+      const setupBtn = el('button', {
         type: 'button', class: 'btn',
         onclick: () => { wiz.screen = 'SETUP'; paint(); checkDns(); },
-      }, ['Set up Cloudflare Tunnel']));
+      }, ['Set up Cloudflare Tunnel']);
+      if (blocked) {
+        setupBtn.disabled = true;
+        setupBtn.title = modeBlocked
+          ? 'Cloudflare Tunnel requires Domain mode — switch in Primary network access above'
+          : 'Set state.config.domain via bootstrap first';
+      }
+      cta.appendChild(setupBtn);
+
+      // Mode-blocked path gets a ghost CTA that scrolls the
+      // Primary network access section into view. The data-mode-
+      // section attribute is set in renderNetworkModeSection.
+      // Domain-missing path doesn't get this — there's nowhere
+      // in-page to fix it; that requires SSH + bootstrap.
+      if (modeBlocked) {
+        cta.appendChild(el('button', {
+          type: 'button', class: 'btn btn--ghost',
+          onclick: () => {
+            const target = document.querySelector('[data-mode-section]');
+            if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          },
+        }, ['Jump to Primary network access ↑']));
+      }
       section.appendChild(cta);
     }
 
@@ -1561,11 +1824,16 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
           verifyBtn.disabled = true;
           verifyBtn.textContent = 'Verifying…';
           try {
-            const r = await fetch('/api/v1/admin/cloudflare/discover', {
+            // 30s timeout — /discover paginates accounts + zones at
+            // 10 pages × 50/page max. Each CF API call is fast (<1s)
+            // but 20 round-trips over a slow link could approach 15s.
+            // 30s leaves headroom without leaving the UI hung if the
+            // console is unreachable.
+            const r = await fetchWithTimeout('/api/v1/admin/cloudflare/discover', {
               method: 'POST', credentials: 'same-origin',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ apiToken: wiz.token }),
-            });
+            }, 30_000);
             const data = await r.json().catch(() => ({}));
             if (!data.ok) { wiz.error = data.error || ('HTTP ' + r.status); paint(); return; }
             wiz.accounts = data.accounts || [];
@@ -1576,8 +1844,16 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
             wiz.screen = 'READY';
             paint();
           } catch (err) {
-            wiz.error = err.message;
+            wiz.error = _friendlyError(err) +
+              ' — token verification failed. Check the token has not been revoked at dash.cloudflare.com/profile/api-tokens and that the console can reach api.cloudflare.com.';
             paint();
+          } finally {
+            // Always re-enable the Verify button so the operator can
+            // retry after fixing the issue (revoked token, network
+            // blip, etc.). Pre-fix the button would stay disabled
+            // forever on any failure path.
+            verifyBtn.disabled = false;
+            verifyBtn.textContent = 'Verify and continue';
           }
         },
       }, ['Verify and continue']);
@@ -1802,7 +2078,7 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
         row.appendChild(cb);
         row.appendChild(el('span', null, [
           el('span', { style: 'font-weight:600;' }, [a.displayName]),
-          ' — ', el('span', { class: 'mono' }, [a.subdomain + '.' + (wiz.domain || 'firm.com')]),
+          ' — ', el('span', { class: 'mono' }, [a.subdomain + '.' + (wiz.domain || '<your-domain>')]),
         ]));
         wrap.appendChild(row);
       }
@@ -1821,7 +2097,7 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
       const fqdns = wiz.selectedSlugs
         .map(slug => (wiz.enabledApps.find(a => a.slug === slug) || {}).subdomain)
         .filter(Boolean)
-        .map(sub => sub + '.' + (wiz.domain || 'firm.com'));
+        .map(sub => sub + '.' + (wiz.domain || '<your-domain>'));
       node.style.color = 'var(--text)';
       node.appendChild(el('strong', null, ['Will publish: ']));
       node.appendChild(document.createTextNode(fqdns.join(', ')));
@@ -1872,14 +2148,20 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
       };
       let saveResp;
       try {
-        const r = await fetch('/api/v1/settings/save', {
+        // 15s timeout — settings-save is an atomic env-file write
+        // with audit-log insert. Healthy runs are <500ms; 15s leaves
+        // headroom for SQLite contention or slow disks without
+        // letting a hung console stall the wizard.
+        const r = await fetchWithTimeout('/api/v1/settings/save', {
           method: 'POST', credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(saveBody),
-        });
+        }, 15_000);
         saveResp = await r.json().catch(() => ({}));
       } catch (err) {
-        wiz.error = 'save failed: ' + err.message;
+        wiz.error = 'Saving settings failed: ' + _friendlyError(err) +
+          '. Diagnose: sudo docker logs vibe-console --tail 50. ' +
+          'The wizard didn\'t reach the provision step — retry by clicking Provision tunnel again.';
         finishProv('FAILED');
         return;
       }
@@ -1891,17 +2173,28 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
 
       // 2. Run cloudflared-up.sh with the publish list. The endpoint
       // writes CLOUDFLARE_TUNNEL_PUBLISH=<csv> to appliance.env before
-      // invoking the script.
+      // invoking the script. 120s timeout: a fresh-install provision
+      // needs to verify the token (1 CF call), create/find the
+      // tunnel (1-2 calls), PUT ingress config (1 call), create N
+      // CNAMEs (N calls), prune stale CNAMEs (1-2 calls), fetch the
+      // connector token (1 call), bring up the container
+      // (force-recreate + edge registration, ~5-15s), and re-render
+      // Caddy (~2-5s). Worst-case healthy run is ~30-45s; 120s is
+      // generous headroom for slow CF API responses or contended
+      // disks.
       let provData;
       try {
-        const r = await fetch('/api/v1/admin/cloudflare/provision', {
+        const r = await fetchWithTimeout('/api/v1/admin/cloudflare/provision', {
           method: 'POST', credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ publishSlugs: wiz.selectedSlugs }),
-        });
+        }, 120_000);
         provData = await r.json().catch(() => ({}));
       } catch (err) {
-        wiz.error = 'provision call failed: ' + err.message;
+        wiz.error = 'Provision call failed: ' + _friendlyError(err) +
+          '. The script may still be running on the host. Diagnose: ' +
+          'sudo docker logs vibe-cloudflared --tail 30 (connector) or ' +
+          '/opt/vibe/logs/cloudflared.log (script). Re-run by clicking Provision tunnel again — the script is idempotent.';
         finishProv('FAILED');
         return;
       }
@@ -1947,7 +2240,7 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
       const publishedFqdns = wiz.publishedSlugs
         .map(slug => (wiz.enabledApps.find(a => a.slug === slug) || {}))
         .filter(a => a.subdomain)
-        .map(a => a.subdomain + '.' + (wiz.domain || 'firm.com'));
+        .map(a => a.subdomain + '.' + (wiz.domain || '<your-domain>'));
 
       if (publishedFqdns.length) {
         section.appendChild(el('p', { class: 'help' }, [
@@ -1965,7 +2258,7 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
       }
       section.appendChild(el('p', { class: 'help', style: 'margin-top:0.2rem;' }, [
         el('strong', null, ['Not published (LAN/Tailscale-only): ']),
-        wiz.domain || 'firm.com', ', www.', wiz.domain || 'firm.com',
+        wiz.domain || '<your-domain>', ', www.', wiz.domain || '<your-domain>',
         ', cockpit, portainer, backup',
       ]));
 
@@ -1998,14 +2291,52 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
       cta.appendChild(saveBtn);
       cta.appendChild(el('button', {
         type: 'button', class: 'btn btn--ghost',
+        onclick: () => disableTunnel(),
+        title: 'Stop the connector container without deleting Cloudflare-side state. Reversible via Enable tunnel on the next screen.',
+      }, ['Disable tunnel']));
+      cta.appendChild(el('button', {
+        type: 'button', class: 'btn btn--ghost',
         onclick: () => teardown(),
       }, ['Tear down']));
+      // Declare testResultRow BEFORE testBtn so its binding is
+      // initialized when JS evaluates the surrounding scope. Strictly,
+      // the closure is invoked at click time (well after both consts
+      // are initialized), but declaration order makes the dependency
+      // obvious to a reader and removes any risk of regression if
+      // someone later inserts synchronous-paint logic between them.
+      // Test connection: scrapes container logs server-side and
+      // classifies the connector's state. The authoritative health
+      // signal the script's post-provision poll uses, re-runnable on
+      // demand without a re-provision.
+      const testResultRow = el('div', { 'data-cf-test-result': '1', style: 'margin-top:0.4rem;' });
+      const testBtn = el('button', {
+        type: 'button', class: 'btn btn--ghost',
+        onclick: () => testConnection(testBtn, testResultRow),
+      }, ['Test connection']);
+      cta.appendChild(testBtn);
       cta.appendChild(el('a', {
         class: 'btn btn--ghost',
         href: 'https://one.dash.cloudflare.com/' + (wiz.accountId || '') + '/networks/tunnels',
         target: '_blank', rel: 'noopener noreferrer',
       }, ['Manage at Cloudflare ↗']));
       section.appendChild(cta);
+
+      // Result row lands below the button row so it doesn't shift the
+      // publish-list edit above when populated.
+      section.appendChild(testResultRow);
+
+      // Rotate API token — collapsed by default so the UP screen
+      // stays uncluttered. The disclosed flow is paste → verify →
+      // (account/zone confirmed match the bound tunnel) → swap +
+      // re-run cloudflared-up.sh. We can't delete the old token at
+      // Cloudflare from here, so the success advisory points the
+      // operator to dash.cloudflare.com to do that manually.
+      const rotateDetails = el('details', { style: 'margin-top:0.8rem;' });
+      rotateDetails.appendChild(el('summary', {
+        class: 'help', style: 'cursor:pointer;font-weight:600;',
+      }, ['Rotate API token']));
+      renderRotateTokenForm(rotateDetails);
+      section.appendChild(rotateDetails);
 
       if (wiz.error) {
         section.appendChild(el('p', { class: 'help', style: 'color:var(--bad);margin-top:0.5rem;' }, ['✗ ' + wiz.error]));
@@ -2017,6 +2348,149 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
         det.appendChild(el('pre', { class: 'maintenance__output' }, [wiz.output]));
         section.appendChild(det);
       }
+    }
+
+    // Inline form rendered inside the "Rotate API token" <details>
+    // disclosure on the UP screen. Stays in browser memory until
+    // submit; the verified token is then handed to the
+    // rotate-token endpoint which validates account/zone coverage
+    // before persisting.
+    function renderRotateTokenForm(host) {
+      host.appendChild(el('p', { class: 'help', style: 'margin-top:0.5rem;' }, [
+        'Paste a new Cloudflare API token. It must still have ',
+        el('strong', null, ['Account.Cloudflare-Tunnel:Edit']), ' + ',
+        el('strong', null, ['Zone.DNS:Edit']),
+        ' on the bound account+zone. If you\'re moving to a different account, Tear down first instead.',
+      ]));
+      host.appendChild(el('p', { class: 'help', style: 'margin-top:0.3rem;' }, [
+        'The rotation is atomic: the new token is fully validated (token verify + zone match + account match + connector-token fetch) before ',
+        el('span', { class: 'mono' }, ['appliance.env']),
+        ' is touched. A pre-flight failure leaves the previous token in place.',
+      ]));
+      const tokenInput = el('input', {
+        type: 'password', placeholder: 'New Cloudflare API token', autocomplete: 'off',
+        style: 'width:100%;max-width:36rem;padding:0.45rem 0.65rem;border:1px solid var(--border);border-radius:4px;font:inherit;background:var(--surface);',
+      });
+      host.appendChild(tokenInput);
+      const status = el('p', { class: 'help', style: 'margin-top:0.3rem;' });
+      // Container for the optional stderr/stdout disclosure block. We
+      // recreate it on each click so retried rotations don't pile up
+      // stale output below.
+      const detailsHost = el('div', { 'data-rotate-details': '1' });
+      const rotateBtn = el('button', {
+        type: 'button', class: 'btn',
+        style: 'margin-top:0.4rem;',
+        onclick: async () => {
+          const t = (tokenInput.value || '').trim();
+          if (!t) { status.textContent = 'paste a token first'; return; }
+          rotateBtn.disabled = true; rotateBtn.textContent = 'Rotating…';
+          status.style.color = '';
+          status.textContent = 'verifying replacement token + re-syncing connector…';
+          detailsHost.innerHTML = '';
+          try {
+            // 120s timeout — rotate does pre-flight CF API calls
+            // (4-5 round trips) + cloudflared-up.sh re-sync
+            // (~30s). 120s caps a hung server at twice the
+            // worst-case healthy run.
+            const r = await fetchWithTimeout('/api/v1/admin/cloudflare/rotate-token', {
+              method: 'POST', credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ apiToken: t }),
+            }, 120_000);
+            const data = await r.json().catch(() => ({}));
+            if (r.ok && data.exit_code === 0) {
+              status.style.color = 'var(--good)';
+              status.innerHTML = '';
+              status.appendChild(el('strong', null, ['✓ Rotated. ']));
+              status.appendChild(document.createTextNode(
+                'Now delete the old token at dash.cloudflare.com/profile/api-tokens — the new one is in use.',
+              ));
+              tokenInput.value = '';
+            } else {
+              status.style.color = 'var(--bad)';
+              // Three failure shapes we surface differently:
+              //   - Pre-flight rejection: data.error (no script run)
+              //   - Script ran but exit != 0: data.stdout/stderr show why
+              //   - Network/auth/etc transport error: caught above
+              status.textContent = '✗ ' + (data.error || ('script exited ' + (data.exit_code != null ? data.exit_code : '?')));
+              if (data.context) {
+                status.textContent += '  [' + data.context + ']';
+              }
+              const out = [data.stdout, data.stderr].filter(Boolean).join('\n').trim();
+              if (out) {
+                const det = el('details', { style: 'margin-top:0.3rem;', open: '' }, [
+                  el('summary', { class: 'help', style: 'cursor:pointer;' }, ['Script output']),
+                  el('pre', { class: 'maintenance__output' }, [out]),
+                ]);
+                detailsHost.appendChild(det);
+              }
+            }
+          } catch (err) {
+            status.style.color = 'var(--bad)';
+            status.textContent = '✗ ' + _friendlyError(err) +
+              ' — token rotation could not complete. The prior token may still be in use; ' +
+              'retry by clicking Rotate token again, or revert by setting CLOUDFLARE_TUNNEL_API_TOKEN ' +
+              'in /opt/vibe/env/appliance.env back to the old value.';
+          }
+          rotateBtn.disabled = false; rotateBtn.textContent = 'Rotate token';
+        },
+      }, ['Rotate token']);
+      host.appendChild(rotateBtn);
+      host.appendChild(status);
+      host.appendChild(detailsHost);
+    }
+
+    // Test connection — POST /cloudflare/test, render the result
+    // beside the buttons. The endpoint scrapes 200 lines of
+    // cloudflared logs and classifies into hints: ok,
+    // outbound-tcp-7844-blocked, stale-token, container-not-running,
+    // no-connection-yet. We render the hint + connection count +
+    // last_error excerpt; the operator can copy the excerpt into
+    // a search.
+    async function testConnection(btn, host) {
+      // Guard against double-click: if the button is already disabled
+      // we're mid-request, ignore subsequent clicks. The disabled
+      // attribute also prevents browser-default re-fires, but a
+      // programmatic .click() would bypass it — this check is the
+      // safety belt.
+      if (btn.disabled) return;
+      btn.disabled = true; btn.textContent = 'Testing…';
+      host.innerHTML = '';
+      try {
+        // 10s timeout via fetchWithTimeout so a hung console container
+        // doesn't leave the button disabled forever. The endpoint
+        // itself shells out to docker inspect + docker logs, both
+        // local and fast — anything over 5s is anomalous.
+        const r = await fetchWithTimeout('/api/v1/admin/cloudflare/test', {
+          method: 'POST', credentials: 'same-origin',
+        }, 10_000);
+        const data = await r.json().catch(() => ({}));
+        const hintLabels = {
+          'ok':                       ['✓ Connector registered with Cloudflare edge', 'var(--good)'],
+          'no-connection-yet':        ['⏳ Connector running but no edge registrations yet — wait 10s and try again', 'var(--warn)'],
+          'stale-token':              ['✗ Connector reports invalid credentials — rotate the API token or re-provision', 'var(--bad)'],
+          'outbound-tcp-7844-blocked':['✗ Connector cannot reach Cloudflare edge — outbound TCP 7844 may be firewalled', 'var(--bad)'],
+          'container-not-running':    ['✗ vibe-cloudflared container is not running — check Portainer', 'var(--bad)'],
+        };
+        const [label, color] = hintLabels[data.hint] || ['Unknown state: ' + (data.hint || '?'), 'var(--text)'];
+        host.appendChild(el('p', { class: 'help', style: 'color:' + color + ';margin:0;' }, [label]));
+        host.appendChild(el('p', { class: 'help', style: 'margin:0.2rem 0 0;' }, [
+          'Edge connections registered: ',
+          el('strong', null, [String(data.connections_registered || 0)]),
+        ]));
+        if (data.last_error) {
+          host.appendChild(el('pre', {
+            class: 'maintenance__output',
+            style: 'margin-top:0.3rem;font-size:0.8em;max-height:8rem;',
+          }, [data.last_error]));
+        }
+      } catch (err) {
+        host.appendChild(el('p', { class: 'help', style: 'color:var(--bad);margin:0;' }, [
+          '✗ ' + _friendlyError(err) +
+          ' — could not reach the test endpoint. The console may be down or overloaded; try again in a moment.',
+        ]));
+      }
+      btn.disabled = false; btn.textContent = 'Test connection';
     }
 
     function arraysEqual(a, b) {
@@ -2038,11 +2512,14 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
       paint();
       startSpinner('Re-provisioning');
       try {
-        const r = await fetch('/api/v1/admin/cloudflare/provision', {
+        // 120s timeout — same as first-time provision. Re-provision
+        // tends to be faster (tunnel reused, fewer CNAME ops) but
+        // the cap is the same so behavior is predictable.
+        const r = await fetchWithTimeout('/api/v1/admin/cloudflare/provision', {
           method: 'POST', credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ publishSlugs: wiz.selectedSlugs }),
-        });
+        }, 120_000);
         const data = await r.json().catch(() => ({}));
         wiz.output = [data.stdout, data.stderr].filter(Boolean).join('\n').trim();
         if (data.exit_code === 0) {
@@ -2050,10 +2527,20 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
           wiz.publishedSlugs = wiz.selectedSlugs.slice();
           finishProv('UP');
         } else {
-          wiz.error = 'cloudflared-up.sh exit ' + data.exit_code;
+          wiz.error = 'cloudflared-up.sh exit ' + data.exit_code + '. ' +
+                      'Check the script output below for diagnostics; ' +
+                      'most common causes: outbound TCP 7844 blocked, ' +
+                      'Caddy reload failed, or token scope changed.';
           finishProv('FAILED');
         }
-      } catch (err) { wiz.error = err.message; finishProv('FAILED'); }
+      } catch (err) {
+        wiz.error = _friendlyError(err) +
+          ' — re-provision request failed. The console may be down or the script may still be running on the host. ' +
+          'Diagnose: sudo docker logs vibe-console --tail 50 (console health), ' +
+          'or /opt/vibe/logs/cloudflared.log (script progress). ' +
+          'Re-run by clicking Save & re-provision again — the script is idempotent.';
+        finishProv('FAILED');
+      }
     }
 
     async function teardown() {
@@ -2062,21 +2549,178 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
       paint();
       startSpinner('Tearing down');
       try {
-        const r = await fetch('/api/v1/admin/cloudflare/teardown', { method: 'POST', credentials: 'same-origin' });
+        // 90s timeout — teardown does CF API calls (delete CNAMEs +
+        // tunnel object), container stop, env file strip, Caddyfile
+        // re-render. Healthy runs are <20s; 90s caps any hung step.
+        const r = await fetchWithTimeout(
+          '/api/v1/admin/cloudflare/teardown',
+          { method: 'POST', credentials: 'same-origin' },
+          90_000,
+        );
         const data = await r.json().catch(() => ({}));
         wiz.output = [data.stdout, data.stderr].filter(Boolean).join('\n').trim();
         if (data.exit_code === 0) {
+          // Reset the wizard's working state so the next setup
+          // starts clean. wiz.tunnelName intentionally NOT cleared
+          // — the operator may want to reuse the same name on
+          // re-setup (the SETUP screen will pre-fill it).
           wiz.token = '';
           wiz.accounts = [];
           wiz.zones = [];
           wiz.publishedSlugs = [];
           wiz.selectedSlugs = [];
+          wiz.accountId = '';
+          wiz.zoneId = '';
           finishProv('IDLE');
         } else {
-          wiz.error = 'teardown exit ' + data.exit_code;
+          wiz.error = 'teardown exit ' + data.exit_code + '. ' +
+                      'The container may have stopped but Cloudflare-side cleanup (tunnel object, CNAMEs) failed. ' +
+                      'Re-run teardown — the script is idempotent. ' +
+                      'If it keeps failing, the Cloudflare API token may have been rotated or revoked.';
           finishProv('FAILED');
         }
-      } catch (err) { wiz.error = err.message; finishProv('FAILED'); }
+      } catch (err) {
+        wiz.error = _friendlyError(err) +
+          ' — teardown request failed. The connector container may still be running and ' +
+          'Cloudflare-side state (tunnel object, CNAMEs) may not have been cleaned up. ' +
+          'SSH path: sudo bash /opt/vibe/appliance/infra/cloudflared-down.sh (idempotent).';
+        finishProv('FAILED');
+      }
+    }
+
+    // paintPaused — wizard screen when the connector container is
+    // stopped but Cloudflare-side state is intact. Reached via the
+    // Disable tunnel button on the UP screen, or via bootstrap
+    // detection if the container was stopped externally (Portainer,
+    // docker CLI, etc.). The operator's options here are:
+    //   - Enable tunnel: start the container, return to UP
+    //   - Tear down: full destructive disable (delete CF-side state)
+    function paintPaused() {
+      section.appendChild(el('p', null, [
+        el('span', { style: 'color:var(--warn);font-weight:600;' }, ['⏸ Tunnel paused']),
+        el('span', { class: 'help' }, [
+          ' — connector container is stopped. Cloudflare-side state (tunnel object, CNAMEs, ',
+          el('span', { class: 'mono' }, ['TUNNEL_TOKEN']),
+          ') is preserved.',
+        ]),
+      ]));
+
+      section.appendChild(el('p', { class: 'help', style: 'margin-top:0.4rem;' }, [
+        'No public traffic is routed through Cloudflare while paused. ',
+        'Apps remain reachable on the LAN and (if connected) Tailscale via Caddy\'s tls-internal certs. ',
+        'Click ', el('strong', null, ['Enable tunnel']), ' to resume public access without re-pasting credentials.',
+      ]));
+
+      // Explanatory note for the cold-load case: operator opens admin
+      // and lands directly on PAUSED without having clicked Disable
+      // this session. The container was stopped via the Disable
+      // button in a prior session, externally (Portainer, docker CLI),
+      // or by exit-domain-mode.sh. Naming the likely causes prevents
+      // "why is this paused?" support tickets.
+      section.appendChild(el('p', { class: 'help', style: 'margin-top:0.4rem;color:var(--text-muted);font-size:0.85em;' }, [
+        'Stopped via the Disable button, externally (Portainer / docker CLI), or by the emergency drop-to-LAN flow. ',
+        'Re-Enable safely resumes the previous state.',
+      ]));
+
+      // Show the published list so the operator knows what will come
+      // back online once they Enable. Pulled from /status's
+      // published_slugs, same as the UP screen.
+      const publishedFqdns = wiz.publishedSlugs
+        .map(slug => (wiz.enabledApps.find(a => a.slug === slug) || {}))
+        .filter(a => a.subdomain)
+        .map(a => a.subdomain + '.' + (wiz.domain || '<your-domain>'));
+      if (publishedFqdns.length) {
+        section.appendChild(el('p', { class: 'help', style: 'margin-top:0.4rem;' }, [
+          el('strong', null, ['Will resume publishing on Enable: ']),
+          el('span', { class: 'mono' }, [publishedFqdns.join(', ')]),
+        ]));
+      }
+
+      const cta = el('div', { class: 'cta-row', style: 'gap:0.5rem;margin-top:0.6rem;' });
+      cta.appendChild(el('button', {
+        type: 'button', class: 'btn',
+        onclick: () => enableTunnel(),
+      }, ['Enable tunnel']));
+      cta.appendChild(el('button', {
+        type: 'button', class: 'btn btn--ghost',
+        onclick: () => teardown(),
+      }, ['Tear down']));
+      cta.appendChild(el('a', {
+        class: 'btn btn--ghost',
+        href: 'https://one.dash.cloudflare.com/' + (wiz.accountId || '') + '/networks/tunnels',
+        target: '_blank', rel: 'noopener noreferrer',
+      }, ['Manage at Cloudflare ↗']));
+      section.appendChild(cta);
+
+      if (wiz.error) {
+        section.appendChild(el('p', { class: 'help', style: 'color:var(--bad);margin-top:0.5rem;' }, ['✗ ' + wiz.error]));
+      }
+    }
+
+    // disableTunnel — soft-disable: stops the connector container,
+    // leaves Cloudflare-side state intact. POST /disable returns
+    // quickly (docker stop is sub-second); transition to PAUSED via
+    // a brief PROVISIONING screen with a "Pausing" spinner so the
+    // operator sees feedback.
+    async function disableTunnel() {
+      if (!confirm('Pause the Cloudflare tunnel? The connector container will stop and public traffic will stop routing. Cloudflare-side state stays intact and you can re-enable without re-pasting credentials.')) return;
+      wiz.error = ''; wiz.output = '';
+      wiz.screen = 'PROVISIONING';
+      paint();
+      startSpinner('Pausing');
+      try {
+        // 30s timeout — docker stop with 5s grace should be <10s.
+        const r = await fetchWithTimeout('/api/v1/admin/cloudflare/disable', {
+          method: 'POST', credentials: 'same-origin',
+        }, 30_000);
+        const data = await r.json().catch(() => ({}));
+        if (r.ok && data.ok) {
+          finishProv('PAUSED');
+        } else {
+          wiz.error = (data.error || ('disable returned HTTP ' + r.status)) +
+            ' — the connector may still be running. Diagnose: ' +
+            'sudo docker ps --filter name=vibe-cloudflared. ' +
+            'SSH path: sudo docker stop vibe-cloudflared.';
+          finishProv('FAILED');
+        }
+      } catch (err) {
+        wiz.error = _friendlyError(err) +
+          ' — disable request failed. The connector may still be running on the host. ' +
+          'SSH path: sudo docker stop vibe-cloudflared.';
+        finishProv('FAILED');
+      }
+    }
+
+    // enableTunnel — counterpart to disableTunnel: starts the stopped
+    // connector container. Reads the existing TUNNEL_TOKEN from
+    // shared.env (no re-fetch from Cloudflare needed). Quick op —
+    // similar timeout as disable.
+    async function enableTunnel() {
+      wiz.error = ''; wiz.output = '';
+      wiz.screen = 'PROVISIONING';
+      paint();
+      startSpinner('Enabling');
+      try {
+        const r = await fetchWithTimeout('/api/v1/admin/cloudflare/enable', {
+          method: 'POST', credentials: 'same-origin',
+        }, 30_000);
+        const data = await r.json().catch(() => ({}));
+        if (r.ok && data.ok) {
+          wiz.lastRunTs = new Date().toISOString();
+          finishProv('UP');
+        } else {
+          wiz.error = (data.error || ('enable returned HTTP ' + r.status)) +
+            ' — connector failed to start. ' +
+            'Diagnose: sudo docker logs vibe-cloudflared --tail 30. ' +
+            'If the container was removed (404), re-run the wizard via Tear down → Set up.';
+          finishProv('FAILED');
+        }
+      } catch (err) {
+        wiz.error = _friendlyError(err) +
+          ' — enable request failed. ' +
+          'SSH path: sudo docker start vibe-cloudflared.';
+        finishProv('FAILED');
+      }
     }
 
     function paintFailed() {
@@ -2087,9 +2731,31 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
         section.appendChild(el('pre', { class: 'maintenance__output', style: 'margin-top:0.5rem;' }, [wiz.output]));
       }
       const cta = el('div', { class: 'cta-row', style: 'gap:0.5rem;margin-top:0.5rem;' });
+      // "Try again" routes based on where the operator was when the
+      // failure happened:
+      //   wiz.token present  → mid-setup (verify succeeded, provision
+      //                        failed) → go back to READY so they can
+      //                        adjust app selection without re-pasting
+      //                        the token
+      //   wiz.token absent   → either an early SETUP failure OR a
+      //                        disable/enable failure on a live tunnel.
+      //                        Re-run bootstrap() to detect actual
+      //                        current state (UP, PAUSED, IDLE) from
+      //                        /status, rather than guessing SETUP.
       cta.appendChild(el('button', {
         type: 'button', class: 'btn',
-        onclick: () => { wiz.error = ''; wiz.screen = wiz.token ? 'READY' : 'SETUP'; paint(); },
+        onclick: () => {
+          wiz.error = ''; wiz.output = '';
+          if (wiz.token) {
+            wiz.screen = 'READY';
+            paint();
+          } else {
+            wiz.screen = 'LOADING';
+            wiz.bootstrapped = false;
+            paint();
+            bootstrap();
+          }
+        },
       }, ['Try again']));
       cta.appendChild(el('button', {
         type: 'button', class: 'btn btn--ghost',
@@ -2100,7 +2766,7 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
 
     async function fetchStateConfig() {
       try {
-        const r = await fetch('/api/v1/state', { credentials: 'same-origin' });
+        const r = await fetchWithTimeout('/api/v1/state', { credentials: 'same-origin' }, 10_000);
         if (!r.ok) return { domain: '', mode: null };
         const s = await r.json();
         const cfg = s.config || {};
@@ -2109,6 +2775,19 @@ const SETTINGS_JS_VERSION = '2026-05-11-cf-routing-gates';
           mode:   cfg.mode || null,
         };
       } catch { return { domain: '', mode: null }; }
+    }
+
+    // fetchWithTimeout — wraps fetch with an AbortController + ms
+    // deadline so a hung server can't deadlock the wizard's bootstrap.
+    // Without this, a single fetch hanging means the wizard sits on
+    // LOADING forever (no way to surface the issue, no way to retry
+    // without a full page reload). AbortController is supported in
+    // every browser we target.
+    function fetchWithTimeout(url, opts, timeoutMs) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+      const merged = Object.assign({}, opts || {}, { signal: ctrl.signal });
+      return fetch(url, merged).finally(() => clearTimeout(timer));
     }
   }
 

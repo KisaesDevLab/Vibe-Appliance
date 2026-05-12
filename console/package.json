@@ -9,7 +9,9 @@
   },
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start":           "node server.js",
+    "test":            "node --test ../tests/",
+    "test:cloudflare": "node --test ../tests/cloudflare/unit/"
   },
   "dependencies": {
     "better-sqlite3": "^11.3.0",

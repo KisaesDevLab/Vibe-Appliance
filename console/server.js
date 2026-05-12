@@ -41,6 +41,7 @@ const UPDATE_SCRIPT  = path.join(APPLIANCE_DIR, 'update.sh');
 const PRUNE_SCRIPT             = path.join(APPLIANCE_DIR, 'prune-images.sh');
 const CLOUDFLARED_UP_SCRIPT    = path.join(APPLIANCE_DIR, 'infra', 'cloudflared-up.sh');
 const CLOUDFLARED_DOWN_SCRIPT  = path.join(APPLIANCE_DIR, 'infra', 'cloudflared-down.sh');
+const EXIT_DOMAIN_MODE_SCRIPT  = path.join(APPLIANCE_DIR, 'lib',   'exit-domain-mode.sh');
 const LOGS_DIR                 = path.join(VIBE_DIR, 'logs');
 const ENV_DIR                  = path.join(VIBE_DIR, 'env');
 
@@ -1026,6 +1027,17 @@ app.get('/api/v1/version', (_req, res) => {
 // they're additive — the manual SSH path via cloudflared-up.sh still
 // works for sysadmins who'd rather skip the UI.
 
+// Cloudflare helpers live in ./lib/cf-helpers.js so they're testable
+// without booting Express. Both helpers take their fetch + log
+// dependencies as parameters so tests can inject stubs. The local
+// arrow wrappers below curry the runtime dependencies (_testFetch +
+// log) onto the call sites so endpoint code stays terse.
+const cfHelpers = require('./lib/cf-helpers');
+const parseCfJson    = (body, context, status) => cfHelpers.parseCfJson(body, context, status, log);
+const cfPaginatedGet = (urlBase, headers, context) => cfHelpers.cfPaginatedGet(urlBase, headers, context, _testFetch, log);
+const classifyTunnelHealth = cfHelpers.classifyTunnelHealth;
+const demuxDockerLogs      = cfHelpers.demuxDockerLogs;
+
 // Token validation + accessible accounts/zones discovery. Body:
 // { apiToken }. The token is NOT persisted by this call — it sits in the
 // request body and is forgotten when the response goes out. The wizard
@@ -1036,9 +1048,13 @@ app.post('/api/v1/admin/cloudflare/discover', requireAdmin, testRateLimit, async
   if (!apiToken) {
     return res.status(400).json({ ok: false, error: 'apiToken required in request body' });
   }
-  // Token format: Cloudflare API tokens are 40 chars, [A-Za-z0-9_-]. Tighter
-  // than Cloudflare's actual constraint but catches obvious typos before
-  // we round-trip a useless API call.
+  // Token format: deliberately loose. Cloudflare's classic API tokens
+  // are 40 chars [A-Za-z0-9_-], but the format has changed historically
+  // and Account-owned tokens (introduced 2025) use different lengths.
+  // Tightening this regex risks rejecting valid tokens. The
+  // /user/tokens/verify call below is the authoritative check; this
+  // regex is only here to catch the obvious "I pasted my email by
+  // mistake" cases before round-tripping a useless API call.
   if (!/^[A-Za-z0-9_-]{30,80}$/.test(apiToken)) {
     return res.json({
       ok: false,
@@ -1063,53 +1079,50 @@ app.post('/api/v1/admin/cloudflare/discover', requireAdmin, testRateLimit, async
       error: 'Cloudflare API unreachable: ' + (verify.error || `HTTP ${verify.status}`),
     });
   }
-  let verifyJson = null;
-  try { verifyJson = JSON.parse(verify.body); } catch { /* fall through */ }
+  const verifyJson = parseCfJson(verify.body, 'verify token', verify.status);
   if (!verifyJson || !verifyJson.success) {
     const errs = (verifyJson && verifyJson.errors) || [];
-    const msg  = errs.length ? errs.map(e => `${e.code}: ${e.message}`).join('; ') : 'token rejected';
+    const msg  = errs.length ? errs.map(e => `${e.code}: ${e.message}`).join('; ') : 'token rejected (response not parseable — see warn log)';
     return res.json({
-      ok:    false,
-      error: 'Cloudflare rejected the token (' + msg + '). Make sure it has Account.Cloudflare-Tunnel:Edit AND Zone.DNS:Edit scopes.',
+      ok:      false,
+      context: 'verify token',
+      error:   'Cloudflare rejected the token (' + msg + '). Make sure it has Account.Cloudflare-Tunnel:Edit AND Zone.DNS:Edit scopes.',
     });
   }
 
-  // 2. List accessible accounts. BEST EFFORT — we don't bail when this
-  // returns empty, because Cloudflare's token model for narrow scopes
-  // (e.g. Zone.DNS:Edit + Account.Cloudflare-Tunnel:Edit on a specific
-  // account) sometimes excludes the token from the top-level /accounts
-  // listing even though it has full per-resource access. Every zone
-  // object in the /zones response includes its parent account.id and
-  // account.name — we derive the account list from there if /accounts
-  // comes back empty.
+  // 2. List accessible accounts (paginated, BEST EFFORT). Some tokens
+  // scoped narrowly to a single account+zone (Zone.DNS:Edit +
+  // Account.Cloudflare-Tunnel:Edit) don't surface in the top-level
+  // /accounts listing even though they have full per-resource access.
+  // Every zone object includes its parent account info, so we derive
+  // accounts from zones[].account when /accounts comes back empty.
   let accounts = [];
-  try {
-    const accountsResp = await _testFetch(
-      'https://api.cloudflare.com/client/v4/accounts?per_page=50',
-      { headers: cfHeaders },
-    );
-    if (accountsResp.ok) {
-      const accountsJson = JSON.parse(accountsResp.body);
-      if (accountsJson && accountsJson.success && Array.isArray(accountsJson.result)) {
-        accounts = accountsJson.result.map(a => ({ id: a.id, name: a.name }));
-      }
-    }
-  } catch { /* fall through — derive from zones below */ }
+  const accountsRes = await cfPaginatedGet(
+    'https://api.cloudflare.com/client/v4/accounts',
+    cfHeaders, 'list accounts',
+  );
+  if (accountsRes.ok) {
+    accounts = accountsRes.accumulated.map(a => ({ id: a.id, name: a.name }));
+  }
+  // Non-fatal — derived from zones below. Log so operators can see
+  // which path the wizard took for debugging "I only see one account."
 
-  // 3. List accessible zones. Required — without zones the wizard has
-  // no CNAME targets and the tunnel has nowhere to route to.
-  const zonesResp = await _testFetch('https://api.cloudflare.com/client/v4/zones?per_page=200', {
-    headers: cfHeaders,
-  });
-  let zonesJson = null;
-  try { zonesJson = JSON.parse(zonesResp.body); } catch { /* ignore */ }
-  if (!zonesResp.ok || !zonesJson || !zonesJson.success) {
+  // 3. List accessible zones (paginated). Required — without zones the
+  // wizard has no CNAME targets and the tunnel has nowhere to route to.
+  const zonesRes = await cfPaginatedGet(
+    'https://api.cloudflare.com/client/v4/zones',
+    cfHeaders, 'list zones',
+  );
+  if (!zonesRes.ok) {
     return res.json({
-      ok:    false,
-      error: 'Could not list zones. Token may lack Zone.DNS:Edit on the target zone, or lack Zone:Read across the account.',
+      ok:      false,
+      context: 'list zones',
+      error:   'Could not list zones. Token may lack Zone.DNS:Edit on the target zone, or lack Zone:Read across the account.' +
+               (zonesRes.transportError ? ' Transport error: ' + zonesRes.transportError : '') +
+               (zonesRes.lastStatus ? ' (last HTTP status: ' + zonesRes.lastStatus + ')' : ''),
     });
   }
-  const zones = (zonesJson.result || []).map(z => ({
+  const zones = zonesRes.accumulated.map(z => ({
     id:           z.id,
     name:         z.name,
     account_id:   z.account && z.account.id,
@@ -1210,6 +1223,489 @@ app.post('/api/v1/admin/cloudflare/provision', requireAdmin, testRateLimit, asyn
   await runShell(res, [CLOUDFLARED_UP_SCRIPT], 'cloudflared-up');
 });
 
+// Rotate the Cloudflare API token in place — paste-new-token flow that
+// validates the replacement covers the same account+zone as the running
+// tunnel, then atomically swaps it in appliance.env and re-runs
+// cloudflared-up.sh so the connector picks up the new credentials.
+// Refusing token rotations that move the account/zone is deliberate:
+// rotating to a different account would orphan the live tunnel + CNAMEs,
+// which is a teardown + setup, not a rotation. The operator must
+// explicitly tear down first if they want to switch accounts. We can't
+// delete the old token at Cloudflare from here (a token can't delete
+// itself); the response advises the operator to do that manually.
+app.post('/api/v1/admin/cloudflare/rotate-token', requireAdmin, testRateLimit, async (req, res) => {
+  const apiToken = (req.body && req.body.apiToken || '').trim();
+  if (!apiToken) {
+    return res.status(400).json({ ok: false, error: 'apiToken required in request body' });
+  }
+  if (!/^[A-Za-z0-9_-]{30,80}$/.test(apiToken)) {
+    return res.status(400).json({
+      ok: false,
+      error: 'apiToken does not look like a valid Cloudflare token (expected 30–80 chars of [A-Za-z0-9_-]).',
+    });
+  }
+
+  // Pull the current bound account/zone from appliance.env. These are
+  // the IDs the new token must still grant access to — otherwise we'd
+  // happily swap in a token that can't reach the tunnel and the next
+  // re-sync would silently fail.
+  const env = parseEnvFile(path.join(ENV_DIR, 'appliance.env'));
+  const boundAccountId = (env.CLOUDFLARE_ACCOUNT_ID || '').trim();
+  const boundZoneId    = (env.CLOUDFLARE_ZONE_ID    || '').trim();
+  if (!boundAccountId || !boundZoneId) {
+    return res.status(400).json({
+      ok: false,
+      error: 'No tunnel currently bound (CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_ZONE_ID empty in appliance.env). Use the setup wizard, not rotate.',
+    });
+  }
+
+  const cfHeaders = {
+    'Authorization': 'Bearer ' + apiToken,
+    'Content-Type':  'application/json',
+  };
+
+  // Verify the new token is valid at all.
+  const verify = await _testFetch('https://api.cloudflare.com/client/v4/user/tokens/verify', { headers: cfHeaders });
+  if (verify.error || !verify.ok) {
+    return res.json({
+      ok: false,
+      context: 'verify token',
+      error: 'Cloudflare API unreachable while verifying replacement token: ' + (verify.error || `HTTP ${verify.status}`),
+    });
+  }
+  const verifyJson = parseCfJson(verify.body, 'verify rotate token', verify.status);
+  if (!verifyJson || !verifyJson.success) {
+    const errs = (verifyJson && verifyJson.errors) || [];
+    const msg  = errs.length ? errs.map(e => `${e.code}: ${e.message}`).join('; ') : 'token rejected';
+    return res.json({
+      ok: false,
+      context: 'verify token',
+      error: 'Cloudflare rejected the replacement token (' + msg + ').',
+    });
+  }
+
+  // Pull the new token's zone list and cross-check that it covers the
+  // bound zone (which also confirms account coverage via z.account.id).
+  const zonesRes = await cfPaginatedGet(
+    'https://api.cloudflare.com/client/v4/zones',
+    cfHeaders, 'list zones (rotate)',
+  );
+  if (!zonesRes.ok) {
+    return res.json({
+      ok: false,
+      context: 'list zones',
+      error: 'Replacement token could not list zones. It probably lacks Zone.DNS:Edit.',
+    });
+  }
+  const matchedZone = zonesRes.accumulated.find(z => z.id === boundZoneId);
+  const zone_match    = !!matchedZone;
+  const account_match = !!(matchedZone && matchedZone.account && matchedZone.account.id === boundAccountId);
+  if (!zone_match) {
+    return res.status(400).json({
+      ok: false, zone_match, account_match,
+      error: `Replacement token does not have access to the bound zone (${boundZoneId}). Add Zone.DNS:Edit on that zone, or tear down + reprovision if you're moving accounts.`,
+    });
+  }
+  if (!account_match) {
+    return res.status(400).json({
+      ok: false, zone_match, account_match,
+      error: `Replacement token's zone resolves to a different account than the bound one (${boundAccountId}). Tear down + reprovision instead of rotating across accounts.`,
+    });
+  }
+
+  // CRITICAL pre-flight: confirm the replacement token can ACTUALLY
+  // fetch the connector token. /zones returning the bound zone proves
+  // Zone.DNS:Edit but says nothing about Account.Cloudflare-Tunnel:Edit
+  // on the parent account. Without that scope the script would die at
+  // step 6 (`fetching connector token`) AFTER we've already mutated
+  // appliance.env — leaving the operator with a broken-but-persisted
+  // bad token. Probing the connector-token endpoint here, BEFORE the
+  // env write, makes the rotation atomic from the operator's POV.
+  //
+  // We need the existing TUNNEL_ID to probe — read it from the live
+  // tunnel name. Same lookup the script does at step 2.
+  const tunnelName = (env.CLOUDFLARE_TUNNEL_NAME || 'vibe-appliance').trim();
+  const tunnelLookup = await _testFetch(
+    `https://api.cloudflare.com/client/v4/accounts/${boundAccountId}/cfd_tunnel?name=${encodeURIComponent(tunnelName)}&is_deleted=false`,
+    { headers: cfHeaders },
+  );
+  if (tunnelLookup.error || !tunnelLookup.ok) {
+    return res.json({
+      ok: false, zone_match, account_match,
+      context: 'tunnel lookup (rotate preflight)',
+      error: 'Replacement token cannot reach the tunnel API endpoint. Likely missing Account.Cloudflare-Tunnel:Edit on the bound account.' +
+             (tunnelLookup.error ? ' Transport error: ' + tunnelLookup.error : ` (HTTP ${tunnelLookup.status})`),
+    });
+  }
+  const tunnelJson = parseCfJson(tunnelLookup.body, 'tunnel lookup (rotate preflight)', tunnelLookup.status);
+  if (!tunnelJson || !tunnelJson.success) {
+    return res.status(400).json({
+      ok: false, zone_match, account_match,
+      context: 'tunnel lookup (rotate preflight)',
+      error: 'Replacement token returned a tunnel-lookup error. Probably missing Account.Cloudflare-Tunnel:Edit. ' +
+             ((tunnelJson && tunnelJson.errors) || []).map(e => `${e.code}: ${e.message}`).join('; '),
+    });
+  }
+  const liveTunnelId = (tunnelJson.result || []).map(t => t.id).find(Boolean);
+  if (!liveTunnelId) {
+    return res.status(400).json({
+      ok: false, zone_match, account_match,
+      context: 'tunnel lookup (rotate preflight)',
+      error: `Tunnel '${tunnelName}' no longer exists in the bound account. Tear down and re-provision rather than rotating.`,
+    });
+  }
+  // Final pre-flight: connector-token fetch. If this works the script
+  // is guaranteed to succeed at step 6.
+  const ctProbe = await _testFetch(
+    `https://api.cloudflare.com/client/v4/accounts/${boundAccountId}/cfd_tunnel/${liveTunnelId}/token`,
+    { headers: cfHeaders },
+  );
+  if (ctProbe.error || !ctProbe.ok) {
+    return res.json({
+      ok: false, zone_match, account_match,
+      context: 'connector-token preflight',
+      error: 'Replacement token verified but cannot fetch the connector token. Token likely missing Account.Cloudflare-Tunnel:Edit.' +
+             (ctProbe.error ? ' Transport: ' + ctProbe.error : ` (HTTP ${ctProbe.status})`),
+    });
+  }
+  const ctJson = parseCfJson(ctProbe.body, 'connector-token preflight', ctProbe.status);
+  if (!ctJson || !ctJson.success || !ctJson.result) {
+    return res.status(400).json({
+      ok: false, zone_match, account_match,
+      context: 'connector-token preflight',
+      error: 'Replacement token cannot fetch a connector token. ' +
+             ((ctJson && ctJson.errors) || []).map(e => `${e.code}: ${e.message}`).join('; '),
+    });
+  }
+
+  // All pre-flights passed — the new token is functionally equivalent
+  // to the old one for every operation the script will need. Capture
+  // the prior value's presence (NOT the value itself) so the audit
+  // log below can record old_value='(changed)' vs '(set)'. No
+  // automatic rollback path exists: if the script fails after this
+  // point, the operator's recovery is either (a) re-run rotation
+  // with the same (now-current) token — script is idempotent — or
+  // (b) restore the prior value by hand from
+  // /opt/vibe/env/.history if the settings-save flow created a
+  // snapshot. We deliberately don't mass-rollback because the env
+  // file might have other concurrent edits between rotation and
+  // script-fail.
+  const hadPriorToken = !!((env.CLOUDFLARE_TUNNEL_API_TOKEN || '').trim());
+  try {
+    setApplianceEnv('CLOUDFLARE_TUNNEL_API_TOKEN', apiToken);
+  } catch (err) {
+    log('error', 'rotate-token: writing CLOUDFLARE_TUNNEL_API_TOKEN failed', { err: err.message });
+    return res.status(500).json({ ok: false, error: 'persisting rotated token failed: ' + err.message });
+  }
+  log('info', 'cloudflare token rotated (pre-flights passed, env updated)', {
+    account: boundAccountId, zone: boundZoneId, tunnel: liveTunnelId,
+  });
+
+  // Insert an audit-log entry so operators have a durable record of
+  // when rotation happened — value is redacted because the token is
+  // a secret, but the timestamp + result is enough to debug "when did
+  // we last rotate" questions. Best-effort: a DB write failure
+  // doesn't block the rotation (the env-file mutation is already
+  // committed).
+  try {
+    db.prepare(`
+      INSERT INTO settings_audit (ts, user, category, setting, old_value, new_value, result, details)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      new Date().toISOString(),
+      'admin',
+      'Network',
+      'CLOUDFLARE_TUNNEL_API_TOKEN',
+      hadPriorToken ? '(changed)' : '(set)',
+      '(set)',
+      'rotated',
+      JSON.stringify({ account: boundAccountId, zone: boundZoneId, tunnel: liveTunnelId }),
+    );
+  } catch (err) {
+    log('warn', 'audit insert for token rotation failed', { err: err.message });
+  }
+
+  // runShell sends the response itself; ingress_synced is implied by
+  // exit_code === 0 on the client side. We deliberately do NOT pass
+  // {account_match, zone_match} via `extra` because those fields would
+  // appear true even if the script subsequently fails — misleading to
+  // anyone scanning the response. If the operator needs that signal
+  // they can deduce it from the fact that the rotation reached this
+  // line (all pre-flights passed). If the script unexpectedly fails
+  // despite all pre-flights, the client-side error handler surfaces
+  // it; the operator can re-run rotation with the same token
+  // (idempotent) or restore the prior token by hand from
+  // appliance.env's history dir.
+  await runShell(res, [CLOUDFLARED_UP_SCRIPT], 'cloudflared-rotate');
+});
+
+// Test the live tunnel connection by tailing the connector container's
+// recent logs and looking for Cloudflare's "Registered tunnel connection"
+// line (positive) or known dial failures (negative). This is the
+// authoritative health signal — we can't probe outbound TCP 7844 from
+// the console container in a portable way without `nc`, and the
+// connector itself logs every connection attempt with enough detail
+// to classify the failure.
+app.post('/api/v1/admin/cloudflare/test', requireAdmin, testRateLimit, async (_req, res) => {
+  let logsText = '';
+  let containerRunning = false;
+  try {
+    const c = docker.getContainer('vibe-cloudflared');
+    const info = await c.inspect();
+    containerRunning = !!(info.State && info.State.Running);
+    // Non-TTY containers' logs come back as multiplexed frames
+    // (8-byte header per chunk). demuxDockerLogs strips those —
+    // without it, last_error returned to the wizard would have
+    // embedded control bytes and the regex captures would include
+    // header bytes from the next frame. tail=200 is enough to catch
+    // a startup cycle even on a hot-restart container.
+    const logsBuf = await c.logs({
+      tail: 200, stdout: true, stderr: true, follow: false, timestamps: false,
+    });
+    logsText = demuxDockerLogs(logsBuf);
+  } catch (err) {
+    return res.json({
+      ok: false,
+      container_running: false,
+      connections_registered: 0,
+      last_error: null,
+      hint: 'container-not-running',
+      detail: 'vibe-cloudflared container not found or unreachable: ' + err.message,
+    });
+  }
+
+  // classifyTunnelHealth lives in lib/cf-helpers.js — extracted so the
+  // hint classification ladder is unit-testable without booting Express.
+  const verdict = classifyTunnelHealth(logsText, containerRunning);
+  res.json({
+    container_running: containerRunning,
+    ...verdict,
+  });
+});
+
+// --- Tunnel pause / resume --------------------------------------------
+//
+// Soft enable/disable: stops or starts the vibe-cloudflared container
+// without touching Cloudflare-side state (tunnel object, CNAMEs) or
+// the appliance.env credentials. Distinct from /teardown (which deletes
+// the tunnel object + CNAMEs at Cloudflare) and from
+// /admin/network/exit-domain-mode (which also flips the appliance to
+// LAN mode and re-renders Caddy).
+//
+// Use case: operator wants to temporarily stop accepting public
+// traffic — overnight, during a migration, during a Cloudflare
+// outage — without losing the tunnel configuration. Disable stops
+// the connector container in place; the next Enable starts it
+// again with the same TUNNEL_TOKEN, no re-provision needed.
+//
+// We deliberately do NOT flip CLOUDFLARE_TUNNEL_ENABLED in
+// appliance.env. That value controls Caddy's tls-internal vs
+// Let's Encrypt mode; flipping it on disable would re-render Caddy
+// and break LAN access to apps. Leaving it true keeps Caddy in
+// tunnel-mode config; apps remain reachable on LAN/Tailscale via
+// tls-internal even while the connector is stopped.
+
+// _inspectCloudflared — single source of truth for "does the container
+// exist, and what state is it in?". Wraps dockerode.inspect with a
+// catch that distinguishes three failure modes so callers can return
+// the right HTTP status + recovery hint:
+//   { container, info }                 — inspect succeeded
+//   { error: { daemonDown: true } }     — docker socket unreachable
+//                                          (ECONNREFUSED / ENOENT /
+//                                          EACCES). Operator's fix is
+//                                          to restart docker, not the
+//                                          wizard.
+//   { error: { daemonDown: false } }    — container not found (true
+//                                          404 from a reachable
+//                                          daemon, or any other
+//                                          inspect failure). Operator's
+//                                          fix is to re-run the wizard.
+async function _inspectCloudflared() {
+  const c = docker.getContainer('vibe-cloudflared');
+  try {
+    const info = await c.inspect();
+    return { container: c, info };
+  } catch (err) {
+    // Socket-level errors (Node net layer, not docker-modem) signal
+    // the daemon isn't reachable at all. ECONNREFUSED = daemon not
+    // listening; ENOENT = socket file missing (dockerd not running);
+    // EACCES = permission denied on socket. Anything else (most
+    // notably statusCode=404 from a reachable daemon's HTTP layer)
+    // means the daemon answered but the container doesn't exist.
+    const code = err && err.code;
+    const daemonDown = code === 'ECONNREFUSED' || code === 'ENOENT' || code === 'EACCES';
+    return { error: { daemonDown, raw: err.message || String(err) } };
+  }
+}
+
+// _auditTunnelStateChange — best-effort audit log entry for soft
+// disable / enable so operators have a durable record of who paused
+// what when. Mirrors the rotate-token audit pattern. DB failures
+// don't block the underlying operation.
+function _auditTunnelStateChange(oldState, newState, result, details) {
+  try {
+    db.prepare(`
+      INSERT INTO settings_audit (ts, user, category, setting, old_value, new_value, result, details)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      new Date().toISOString(),
+      'admin',
+      'Network',
+      'CLOUDFLARE_TUNNEL_STATE',
+      oldState,
+      newState,
+      result,
+      JSON.stringify(details || {}),
+    );
+  } catch (err) {
+    log('warn', 'audit insert for tunnel state change failed', { err: err.message });
+  }
+}
+
+app.post('/api/v1/admin/cloudflare/disable', requireAdmin, testRateLimit, async (_req, res) => {
+  const found = await _inspectCloudflared();
+  if (found.error) {
+    if (found.error.daemonDown) {
+      return res.status(503).json({
+        ok: false,
+        error: 'Docker daemon is unreachable from the console. Check `sudo systemctl status docker` on the host, and that the console container has access to the docker socket. Underlying error: ' + found.error.raw,
+      });
+    }
+    return res.status(404).json({
+      ok: false,
+      error: 'vibe-cloudflared container not found. The tunnel was never provisioned, has been torn down, or the container was removed externally (e.g. via Portainer). Re-run the wizard to provision a tunnel.',
+    });
+  }
+  const { container, info } = found;
+  const state = info.State || {};
+  if (!state.Running && !state.Paused) {
+    return res.json({ ok: true, status: 'already-stopped' });
+  }
+  try {
+    // 5s grace before SIGKILL — cloudflared cleans up edge connections
+    // on SIGTERM (logs "Initiating graceful shutdown..."). 5s is
+    // generous; healthy shutdown is sub-second. If the container was
+    // `docker pause`d (not stopped), stop() works on it too — docker
+    // resumes then kills.
+    await container.stop({ t: 5 });
+    log('info', 'cloudflare tunnel disabled (container stopped)');
+    _auditTunnelStateChange(
+      state.Paused ? 'paused' : 'running',
+      'stopped',
+      'disabled',
+      { source: 'admin-ui' },
+    );
+    return res.json({ ok: true, status: 'stopped' });
+  } catch (err) {
+    log('error', 'cloudflare disable failed', { err: err.message });
+    return res.status(500).json({
+      ok: false,
+      error: 'Stop failed: ' + err.message +
+             '. The container may still be running. ' +
+             'Diagnose: sudo docker ps --filter name=vibe-cloudflared. ' +
+             'SSH path: sudo docker stop vibe-cloudflared.',
+    });
+  }
+});
+
+app.post('/api/v1/admin/cloudflare/enable', requireAdmin, testRateLimit, async (_req, res) => {
+  const found = await _inspectCloudflared();
+  if (found.error) {
+    if (found.error.daemonDown) {
+      return res.status(503).json({
+        ok: false,
+        error: 'Docker daemon is unreachable from the console. Check `sudo systemctl status docker` on the host, and that the console container has access to the docker socket. Underlying error: ' + found.error.raw,
+      });
+    }
+    return res.status(404).json({
+      ok: false,
+      error: 'vibe-cloudflared container not found. Run the wizard to provision a tunnel first.',
+    });
+  }
+  const { container, info } = found;
+  const state = info.State || {};
+  if (state.Running) {
+    return res.json({ ok: true, status: 'already-running' });
+  }
+
+  const wasPaused = !!state.Paused;
+  try {
+    // `docker pause` and `docker stop` need different unpause/start
+    // verbs. dockerode's container.unpause() resumes a paused
+    // container; container.start() starts a stopped one. Calling
+    // start() on a paused container fails with 409 Conflict.
+    if (wasPaused) {
+      await container.unpause();
+    } else {
+      // Start the stopped container. It still has its prior env_file
+      // mounts (shared.env with TUNNEL_TOKEN) and image — no recreate
+      // needed. If TUNNEL_TOKEN was rotated externally since the
+      // container was stopped (e.g. operator hand-edited shared.env),
+      // the connector will dial Cloudflare with the new token on
+      // start; that's actually desirable for the pause/resume use case.
+      await container.start();
+    }
+
+    // Post-start health verification — wait up to 5s for State.Running
+    // to flip to true. Without this, a container that starts and
+    // immediately crashes (corrupt image, bad env, etc.) would return
+    // HTTP 200 here with the operator believing the tunnel is up
+    // when it's actually dead. We poll because docker container
+    // start doesn't synchronously guarantee a running state. The 5s
+    // window is conservative for cloudflared (which normally enters
+    // Running in 1-2s); the extra headroom covers heavily-loaded
+    // droplets where docker scheduling lags.
+    //
+    // The inspect() inside the loop is wrapped in its own try because
+    // the container could be removed mid-poll (an operator running
+    // `docker rm` from a separate session, say). We swallow inspect
+    // errors here and let the loop fall through to the "not running"
+    // branch, which surfaces the right diagnostic ("check docker logs").
+    let running = false;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      try {
+        const info2 = await container.inspect();
+        if (info2.State && info2.State.Running) { running = true; break; }
+      } catch (_inspectErr) {
+        break;
+      }
+      // 100ms × 50 = 5s total polling window.
+      await new Promise(r => setTimeout(r, 100));
+    }
+    if (!running) {
+      log('warn', 'cloudflare enable: container started but did not enter Running state', {
+        was_paused: wasPaused,
+      });
+      return res.status(500).json({
+        ok: false,
+        error: 'Container started but failed to enter Running state within 5s. ' +
+               'It may be crashing on startup or have been removed mid-start. ' +
+               'Diagnose: sudo docker logs vibe-cloudflared --tail 30. ' +
+               'Likely causes: corrupted TUNNEL_TOKEN in shared.env, image pull failure on restart, ' +
+               'or the tunnel object was deleted at Cloudflare. ' +
+               'Recovery: re-run the wizard (Tear down then Set up) to refresh credentials.',
+      });
+    }
+
+    log('info', 'cloudflare tunnel enabled (container running)', { was_paused: wasPaused });
+    _auditTunnelStateChange(
+      wasPaused ? 'paused' : 'stopped',
+      'running',
+      'enabled',
+      { source: 'admin-ui', was_paused: wasPaused },
+    );
+    return res.json({ ok: true, status: 'running' });
+  } catch (err) {
+    log('error', 'cloudflare enable failed', { err: err.message });
+    return res.status(500).json({
+      ok: false,
+      error: 'Start failed: ' + err.message +
+             '. Diagnose: sudo docker logs vibe-cloudflared --tail 30. ' +
+             'SSH path: sudo docker start vibe-cloudflared (or sudo docker unpause vibe-cloudflared if previously paused).',
+    });
+  }
+});
+
 // writeEnvKey — atomic single-key update of an env file. Filters out
 // any prior line for the key, appends the new value, renames into place
 // at mode 600. Mirrors the bash idiom used in lib/secrets.sh and
@@ -1247,7 +1743,21 @@ app.get('/api/v1/admin/cloudflare/status', requireAdmin, async (_req, res) => {
   try {
     const c = docker.getContainer('vibe-cloudflared');
     const info = await c.inspect();
-    containerStatus = (info.State && info.State.Running) ? 'running' : 'stopped';
+    // Distinguish four states that look the same to a naive
+    // !State.Running check: actually-running, stopped (exited
+    // cleanly), paused (`docker pause`, distinct lifecycle —
+    // resumes via `docker unpause`, not start), and unknown
+    // (info shape unexpected). The wizard's bootstrap routes
+    // each to a different UI state.
+    if (!info.State) {
+      containerStatus = 'unknown';
+    } else if (info.State.Running) {
+      containerStatus = 'running';
+    } else if (info.State.Paused) {
+      containerStatus = 'paused';
+    } else {
+      containerStatus = 'stopped';
+    }
   } catch {
     containerStatus = 'not-found';
   }
@@ -1282,15 +1792,22 @@ app.get('/api/v1/admin/cloudflare/status', requireAdmin, async (_req, res) => {
     tokenPresent = !!(sharedEnv.TUNNEL_TOKEN || '').trim();
   } catch { /* file missing → token absent → tunnel not up */ }
 
-  // Published slug list — wizard reads this to pre-tick checkboxes on
-  // re-entry. Comma-separated in appliance.env, normalised to an array
-  // here so the client doesn't re-implement the parser. Filtered to
-  // slugs that have a real manifest (typo guard) AND are enabled in
-  // state.json (publishing a disabled app is a no-op at the script
-  // level, but the UI shouldn't pretend it's published).
+  // Published slug list + bound account/zone — wizard reads these to
+  // pre-fill the UP / PAUSED screens on re-entry. Without account_id
+  // the "Manage at Cloudflare ↗" link breaks on cold-bootstrap into
+  // PAUSED (operator stopped container externally, never went through
+  // the wizard's SETUP screen). Reading from appliance.env directly
+  // means /status is fully self-sufficient: bootstrap doesn't need a
+  // separate /discover round-trip just to learn the bound IDs.
   let publishedSlugs = [];
+  let accountId = '';
+  let zoneId = '';
+  let tunnelName = '';
   try {
     const applianceEnv = parseEnvFile(path.join(ENV_DIR, 'appliance.env'));
+    accountId  = (applianceEnv.CLOUDFLARE_ACCOUNT_ID  || '').trim();
+    zoneId     = (applianceEnv.CLOUDFLARE_ZONE_ID     || '').trim();
+    tunnelName = (applianceEnv.CLOUDFLARE_TUNNEL_NAME || '').trim();
     const csv = (applianceEnv.CLOUDFLARE_TUNNEL_PUBLISH || '').trim();
     if (csv) {
       const state = readState();
@@ -1299,13 +1816,16 @@ app.get('/api/v1/admin/cloudflare/status', requireAdmin, async (_req, res) => {
         .map(s => s.trim())
         .filter(s => s && SLUG_RE.test(s) && MANIFESTS[s] && (stateApps[s] || {}).enabled);
     }
-  } catch { /* file missing → empty list */ }
+  } catch { /* file missing → empty values */ }
 
   res.json({
     container_status: containerStatus,
     token_present:    tokenPresent,
     last_run_ts:      lastRunTs,
     published_slugs:  publishedSlugs,
+    account_id:       accountId,
+    zone_id:          zoneId,
+    tunnel_name:      tunnelName,
   });
 });
 
@@ -1993,6 +2513,25 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, async
       ? `Manual recovery required. Run: sudo cp ${stateBak} ${STATE_PATH} && sudo cp ${caddyBak} ${caddyfile} && sudo docker exec vibe-caddy caddy reload --config /etc/caddy/Caddyfile`
       : null,
   });
+});
+
+// Emergency drop from domain mode back to LAN. Wraps the canonical
+// lib/exit-domain-mode.sh — see that script's header for the exact
+// reverse sequence. This affects every public-facing app (Caddyfile is
+// re-rendered without per-subdomain vhosts) so the request requires a
+// typed confirmation of the literal string "lan" to ensure a single
+// stray click can't flip the entire appliance. The UI gates the
+// button behind a typed-confirm modal; this server-side check is a
+// belt for that suspenders.
+app.post('/api/v1/admin/network/exit-domain-mode', requireAdmin, testRateLimit, async (req, res) => {
+  const confirm = (req.body && req.body.confirm || '').trim();
+  if (confirm !== 'lan') {
+    return res.status(400).json({
+      ok: false,
+      error: 'Missing or invalid confirm field. Send { "confirm": "lan" } to acknowledge this drops every public-facing app back to LAN access.',
+    });
+  }
+  await runShell(res, [EXIT_DOMAIN_MODE_SCRIPT], 'exit-domain-mode');
 });
 
 // Inline admin-password rotation. Persists a scrypt hash to the meta
@@ -3906,9 +4445,14 @@ async function runShell(res, args, action, extra = {}) {
   });
   child.on('exit', (code) => {
     log('info', 'shell finished', { action, code, ...extra });
+    // `extra` spreads FIRST so the reserved fields (action, exit_code,
+    // stdout, stderr) override anything a caller might have passed
+    // by accident. In JS object literals, later keys win — so a
+    // caller that passes { exit_code: 99 } in `extra` cannot make a
+    // successful script look failed (or vice versa) to the client.
     res.status(code === 0 ? 200 : 500).json({
-      action,
       ...extra,
+      action,
       exit_code: code,
       stdout: trim(stdout),
       stderr: trim(stderr),

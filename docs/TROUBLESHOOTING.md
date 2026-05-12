@@ -64,6 +64,107 @@ sudo bash /opt/vibe/appliance/infra/cloudflared-down.sh
 
 ---
 
+## Cloudflare Tunnel — emergency recovery
+
+### Symptom: "wizard reports Tunnel is up" but apps 502 from the public internet
+
+The connector dialed Cloudflare's edge successfully, but the tunnel
+forwards to `https://caddy:443` inside `vibe_net` and Caddy is serving
+a stale (pre-tunnel) config — usually because Caddy reload failed
+silently during the original provision.
+
+**Diagnose:**
+```
+sudo docker logs vibe-caddy --tail 30
+sudo docker logs vibe-cloudflared --tail 30
+sudo grep CLOUDFLARE_TUNNEL_ENABLED /opt/vibe/env/appliance.env
+```
+
+If `appliance.env` says `CLOUDFLARE_TUNNEL_ENABLED=true` but Caddy's
+logs show ACME / Let's Encrypt failures (not "tls internal"), the
+Caddyfile is stale.
+
+**Fix:**
+```
+sudo bash /opt/vibe/appliance/infra/cloudflared-up.sh
+```
+
+The script is idempotent — re-running re-renders the Caddyfile and
+reloads Caddy. As of 2026-05-12 this step is fatal-on-failure (was
+warn-only), so any future provision that gets to "✓ Tunnel is up" has
+verified Caddy is actually serving tunnel-mode config.
+
+### Symptom: admin / cockpit / portainer / backup don't load via the public domain
+
+**By design.** The tunnel deliberately never publishes apex (`@`),
+`www`, `cockpit`, `portainer`, or `backup`. Reach the admin UI via:
+
+- LAN: `http://<host-ip>/admin` (auth: admin / see `/opt/vibe/CREDENTIALS.txt`)
+- Tailscale: `https://<host>.<tailnet>.ts.net/admin` if Tailscale is connected
+
+If neither is reachable, see the "Panic switch" section above to drop
+back to LAN-only mode.
+
+### Symptom: connector container starts but never registers
+
+**Diagnose:**
+```
+sudo docker logs vibe-cloudflared --tail 30 | grep -E 'dial|Registered|register'
+```
+
+Common patterns:
+
+| Pattern | Meaning | Fix |
+|---|---|---|
+| `failed to dial`, `dial tcp ... :7844 ... timeout` | Outbound TCP 7844 blocked | Open egress for `region1.v2.argotunnel.com:7844` (and the regional fallbacks) at your firewall / cloud security group |
+| `401 Unauthorized`, `tunnel token is invalid` | The connector token in `shared.env` doesn't match the tunnel at Cloudflare | Re-run `cloudflared-up.sh` (fetches a fresh connector token) or rotate the API token via the wizard |
+| `Registered tunnel connection connIndex=N` | Healthy | (no fix; tunnel works) |
+
+### Symptom: token rotation appears to succeed but apps still don't route
+
+The connector container needs to restart to pick up a new connector
+token from `shared.env`. As of 2026-05-12 the script always passes
+`--force-recreate` to compose up, so the connector is always
+recreated. Earlier builds relied on compose's env_file change
+detection, which was unreliable across Compose versions.
+
+**Diagnose:** check the container's start time matches the rotation:
+```
+sudo docker inspect vibe-cloudflared --format '{{.State.StartedAt}}'
+```
+
+If the start time predates the rotation, the recreate didn't happen.
+
+**Fix:**
+```
+sudo docker compose -f /opt/vibe/appliance/docker-compose.yml \
+                   -f /opt/vibe/appliance/infra/cloudflared.yml \
+                   up -d --force-recreate cloudflared
+```
+
+### Symptom: wizard freezes on "Checking tunnel state…" forever
+
+The wizard's bootstrap fetches state, app list, and tunnel status in
+parallel; one of those hanging deadlocks the page. As of 2026-05-12
+each fetch has a 10s timeout, so the wizard falls through to a usable
+state even if one endpoint is unreachable. Older builds required a
+full page reload.
+
+**Diagnose:**
+```
+curl -s --max-time 5 -u admin:<password> http://<host-ip>/admin/api/v1/state
+curl -s --max-time 5 -u admin:<password> http://<host-ip>/admin/api/v1/admin/cloudflare/status
+curl -s --max-time 5 -u admin:<password> http://<host-ip>/admin/api/v1/apps
+```
+
+Whichever doesn't return within 5s is what's hung. Restart the
+console container:
+```
+sudo docker restart vibe-console
+```
+
+---
+
 ## Pre-flight failures (PHASE 1)
 
 The installer's first phase is ruthlessly thorough. Each FAIL points

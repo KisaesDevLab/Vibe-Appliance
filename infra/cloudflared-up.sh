@@ -102,6 +102,34 @@ VIBE_ENV_APPLIANCE="${VIBE_ENV_APPLIANCE:-${VIBE_ENV_DIR}/appliance.env}"
 . "${APPLIANCE_DIR}/lib/log.sh"
 log_init
 
+# Cleanup trap — remove any leaked .tmp.$$ files in /opt/vibe/env on
+# any exit path. Without this, every aborted run (Ctrl-C, die,
+# unexpected non-zero) leaks a .tmp.<pid> file in the env dir; an
+# operator that re-runs after 50 failures finds 50 stale files. The
+# trap fires once at script exit, no matter the cause.
+_VIBE_TMP_PATTERN="${VIBE_ENV_DIR}/*.tmp.$$"
+# shellcheck disable=SC2064
+trap "rm -f ${_VIBE_TMP_PATTERN}" EXIT
+
+# --- Docker / network pre-flight ---------------------------------------
+# Bail BEFORE we make any Cloudflare API calls if the local Docker
+# environment is broken — otherwise we'd create a tunnel object and
+# CNAMEs at Cloudflare, then fail when bringing the container up,
+# leaving Cloudflare-side state hanging until the operator runs
+# cloudflared-down.sh.
+if ! docker info >/dev/null 2>&1; then
+  die "Docker daemon is unreachable. Check 'sudo systemctl status docker' and that the user running this script can use docker (group membership or sudo)."
+fi
+if ! docker network inspect vibe_net >/dev/null 2>&1; then
+  die "vibe_net Docker network does not exist. Run 'sudo bash $APPLIANCE_DIR/bootstrap.sh' first to provision the core stack."
+fi
+# Caddy doesn't have to be running at THIS instant (the script reloads
+# it later), but if its container is missing entirely the operator has
+# bigger problems — log a warning so they see it next to the rest.
+if ! docker ps -a --filter name=^vibe-caddy$ -q 2>/dev/null | grep -q .; then
+  log_warn "vibe-caddy container is not present — tunnel ingress would 502 even on success. Run bootstrap.sh to create it."
+fi
+
 # --- Pre-flight --------------------------------------------------------
 
 # Read a key from appliance.env. We use grep+cut instead of `source`
@@ -303,7 +331,7 @@ resp, action = sys.argv[1], sys.argv[2]
 try:
   d = json.loads(resp)
 except Exception as e:
-  print(f"[ddns-up] could not parse Cloudflare response for '{action}': {e}", file=sys.stderr)
+  print(f"[cloudflared-up] could not parse Cloudflare response for '{action}': {e}; body excerpt: {resp[:200]!r}", file=sys.stderr)
   sys.exit(1)
 if d.get("success"):
   sys.exit(0)
@@ -339,12 +367,21 @@ cf_check_success "$verify_check" "token verify" \
 
 log_step "looking up tunnel '$CF_TUNNEL_NAME'"
 tunnel_search="$(cf_api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel?name=$CF_TUNNEL_NAME&is_deleted=false")"
+# Inline try/except (not 2>/dev/null) so parse failures reach the
+# operator instead of silently coercing TUNNEL_ID to empty and
+# treating it as "no tunnel found" — which then creates a duplicate
+# tunnel at Cloudflare. The empty stdout still triggers the
+# create-new-tunnel branch below, but stderr now explains why.
 TUNNEL_ID="$(python3 -c "
 import json, sys
-d = json.loads(sys.argv[1])
+try:
+    d = json.loads(sys.argv[1])
+except Exception as e:
+    print(f'[cloudflared-up] JSON parse failed for tunnel search: {e}; body excerpt: {sys.argv[1][:200]!r}', file=sys.stderr)
+    sys.exit(0)
 res = d.get('result') or []
 print(res[0].get('id', '') if res else '')
-" "$tunnel_search" 2>/dev/null || true)"
+" "$tunnel_search" || true)"
 
 if [[ -z "$TUNNEL_ID" ]]; then
   log_step "creating tunnel '$CF_TUNNEL_NAME'"
@@ -359,8 +396,20 @@ if [[ -z "$TUNNEL_ID" ]]; then
     || die "tunnel create failed; check the token has 'Account.Cloudflare Tunnel:Edit' scope"
   TUNNEL_ID="$(python3 -c "
 import json, sys
-print(json.loads(sys.argv[1])['result']['id'])
-" "$create_resp" 2>/dev/null)"
+try:
+    d = json.loads(sys.argv[1])
+except Exception as e:
+    print(f'[cloudflared-up] JSON parse failed for tunnel create response: {e}; body excerpt: {sys.argv[1][:200]!r}', file=sys.stderr)
+    sys.exit(1)
+try:
+    print(d['result']['id'])
+except (KeyError, TypeError) as e:
+    print(f'[cloudflared-up] tunnel create response missing result.id: {e}; body excerpt: {sys.argv[1][:200]!r}', file=sys.stderr)
+    sys.exit(1)
+" "$create_resp")"
+  if [[ -z "$TUNNEL_ID" ]]; then
+    die "tunnel create returned no id; see stderr above"
+  fi
   log_ok "tunnel created" id="$TUNNEL_ID"
 else
   log_info "tunnel exists; reusing" id="$TUNNEL_ID"
@@ -487,18 +536,29 @@ create_or_update_cname() {
   local search
   search="$(cf_api GET "/zones/$CF_ZONE_ID/dns_records?type=CNAME&name=$fqdn")"
   local existing_id existing_content
-  existing_id="$(python3 -c "
+  # Single python call extracts both fields; halves the parse cost and
+  # halves the surface area for divergent error messages. Inline
+  # try/except (not 2>/dev/null) so the operator sees a malformed-JSON
+  # diagnostic instead of silently treating it as "record not found"
+  # and creating a duplicate CNAME.
+  local cname_fields
+  cname_fields="$(python3 -c "
 import json, sys
-d = json.loads(sys.argv[1])
+try:
+    d = json.loads(sys.argv[1])
+except Exception as e:
+    print(f'[cloudflared-up] JSON parse failed for CNAME lookup ({sys.argv[2]}): {e}; body excerpt: {sys.argv[1][:200]!r}', file=sys.stderr)
+    sys.exit(0)
 res = d.get('result') or []
-print(res[0].get('id', '') if res else '')
-" "$search" 2>/dev/null || true)"
-  existing_content="$(python3 -c "
-import json, sys
-d = json.loads(sys.argv[1])
-res = d.get('result') or []
-print(res[0].get('content', '') if res else '')
-" "$search" 2>/dev/null || true)"
+if res:
+    print(res[0].get('id', ''))
+    print(res[0].get('content', ''))
+else:
+    print('')
+    print('')
+" "$search" "$fqdn" || true)"
+  existing_id="$(printf '%s\n' "$cname_fields" | sed -n '1p')"
+  existing_content="$(printf '%s\n' "$cname_fields" | sed -n '2p')"
 
   local record_body
   record_body="$(python3 -c "
@@ -568,7 +628,10 @@ data, target = sys.argv[1], sys.argv[2]
 current = set(s for s in os.environ.get('_CURRENT', '').strip().split('\n') if s)
 try:
   d = json.loads(data)
-except Exception:
+except Exception as e:
+  # Was: silent sys.exit(0). That left stale CNAMEs in place
+  # without telling the operator the prune step was a no-op.
+  print(f"[cloudflared-up] JSON parse failed for stale-CNAME enumeration: {e}; body excerpt: {data[:200]!r}", file=sys.stderr)
   sys.exit(0)
 for r in (d.get('result') or []):
   if r.get('content') == target and r.get('name') not in current:
@@ -589,9 +652,13 @@ log_step "fetching connector token"
 token_resp="$(cf_api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/token")"
 TUNNEL_TOKEN="$(python3 -c "
 import json, sys
-d = json.loads(sys.argv[1])
+try:
+    d = json.loads(sys.argv[1])
+except Exception as e:
+    print(f'[cloudflared-up] JSON parse failed for connector-token response: {e}; body excerpt: {sys.argv[1][:200]!r}', file=sys.stderr)
+    sys.exit(1)
 print(d.get('result', '') if d.get('success') else '')
-" "$token_resp" 2>/dev/null)"
+" "$token_resp")"
 [[ -n "$TUNNEL_TOKEN" ]] || die "could not fetch connector token; raw response: $token_resp"
 
 # Atomic update of shared.env: filter out any prior TUNNEL_TOKEN line,
@@ -608,10 +675,16 @@ chmod 600 "$tmp"
 mv "$tmp" "$VIBE_ENV_SHARED"
 
 # --- 7. Bring up the cloudflared container ----------------------------
-
+# --force-recreate is deliberate: docker compose v2's env_file change
+# detection has historically been unreliable across versions. Without
+# this, the running container keeps the OLD TUNNEL_TOKEN even after
+# shared.env is rewritten — silent connector drift after a token
+# rotation or a re-provision against a new tunnel. The 3-5s restart
+# is acceptable; it's part of the cost of running this script
+# (which is itself an explicit reconfiguration action).
 log_step "bringing up cloudflared container"
 ( cd "$APPLIANCE_DIR" && \
-    docker compose -f docker-compose.yml -f infra/cloudflared.yml up -d cloudflared \
+    docker compose -f docker-compose.yml -f infra/cloudflared.yml up -d --force-recreate cloudflared \
   ) >>"$VIBE_LOG_FILE" 2>&1 \
   || die "compose up cloudflared failed; see $VIBE_LOG_FILE"
 
@@ -623,8 +696,13 @@ log_step "bringing up cloudflared container"
 # tunnel is the only ingress), so HTTP-01 issuance fails and Caddy
 # serves "TLS internal error" on every request from cloudflared's
 # edge — silent 502 until the Caddyfile gets re-rendered.
-# Force the render + reload here so the tunnel routing works from
-# the moment the wizard reports "Up".
+#
+# This step is REQUIRED for the tunnel to actually route traffic. If
+# it fails we DIE rather than warn — the alternative was leaving the
+# operator with a "Tunnel is up" status while every public request
+# 502'd. Dying here surfaces the failure immediately; the connector
+# stays up (already started above) and cloudflared-down.sh is a clean
+# rollback path if the operator can't fix Caddy.
 log_step "re-rendering Caddyfile + reloading Caddy"
 # shellcheck source=/dev/null
 . "$APPLIANCE_DIR/lib/state.sh"
@@ -633,9 +711,7 @@ log_step "re-rendering Caddyfile + reloading Caddy"
 if render_caddyfile >>"$VIBE_LOG_FILE" 2>&1 && reload_caddyfile >>"$VIBE_LOG_FILE" 2>&1; then
   log_ok "Caddy reloaded with tls internal + auto_https off"
 else
-  log_warn "Caddyfile re-render or reload failed — tunnel may 502 until manual fix" \
-    "diagnose:sudo docker logs vibe-caddy --tail 30" \
-    "fix:sudo bash $APPLIANCE_DIR/bootstrap.sh    # idempotent re-render path"
+  die "Caddyfile re-render or reload FAILED. The tunnel container is running but Caddy is still serving the pre-tunnel config — every public request will 502. Diagnose: sudo docker logs vibe-caddy --tail 30. Re-render manually: sudo bash $APPLIANCE_DIR/bootstrap.sh. Or roll back: sudo bash $APPLIANCE_DIR/infra/cloudflared-down.sh."
 fi
 
 # --- 9. Connector health check ---------------------------------------

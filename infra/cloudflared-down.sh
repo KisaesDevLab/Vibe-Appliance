@@ -40,6 +40,13 @@ VIBE_ENV_APPLIANCE="${VIBE_ENV_APPLIANCE:-${VIBE_ENV_DIR}/appliance.env}"
 . "${APPLIANCE_DIR}/lib/log.sh"
 log_init
 
+# Cleanup trap — mirrors cloudflared-up.sh. Removes any leaked
+# .tmp.<pid> files in /opt/vibe/env on any exit path so repeated
+# failed runs don't accumulate cruft.
+_VIBE_TMP_PATTERN="${VIBE_ENV_DIR}/*.tmp.$$"
+# shellcheck disable=SC2064
+trap "rm -f ${_VIBE_TMP_PATTERN}" EXIT
+
 _get_env_value() {
   local key="$1"
   [[ -f "$VIBE_ENV_APPLIANCE" ]] || return 0
@@ -161,9 +168,17 @@ fi
 if [[ -f "$VIBE_ENV_SHARED" ]] && grep -q '^TUNNEL_TOKEN=' "$VIBE_ENV_SHARED"; then
   log_step "stripping TUNNEL_TOKEN from $VIBE_ENV_SHARED"
   tmp="${VIBE_ENV_SHARED}.tmp.$$"
+  # grep -v returns 1 if no lines match (i.e., empty file after
+  # filtering). That's a legitimate result, not an error — coerce to
+  # success. But preserve actual write failures (disk full, perm
+  # denied) by checking the mv result explicitly.
   grep -v '^TUNNEL_TOKEN=' "$VIBE_ENV_SHARED" > "$tmp" || true
   chmod 600 "$tmp"
-  mv "$tmp" "$VIBE_ENV_SHARED"
+  if ! mv "$tmp" "$VIBE_ENV_SHARED"; then
+    rm -f "$tmp"
+    log_error "could not write $VIBE_ENV_SHARED — TUNNEL_TOKEN still present. Check disk space and file permissions."
+    log_warn "manual cleanup: edit $VIBE_ENV_SHARED as root and remove the TUNNEL_TOKEN= line."
+  fi
 fi
 
 # --- 6. Clear CLOUDFLARE_TUNNEL_ENABLED + reload Caddy ---------------

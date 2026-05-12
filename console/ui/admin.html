@@ -289,8 +289,12 @@
           <p><strong>Adding/removing apps later</strong></p>
           <p>Re-open the wizard. The <em>Apps to publish</em> checkboxes are pre-ticked to match the live tunnel; toggle them, click <em>Save &amp; re-provision</em>. Idempotent &mdash; ~5 second round-trip; no container restart.</p>
 
-          <p><strong>To remove the tunnel entirely</strong></p>
-          <p>In the wizard, click <em>Tear down</em>. That stops the cloudflared container, deletes only the CNAMEs that point at this tunnel, deletes the tunnel object at Cloudflare, and clears <span class="mono">TUNNEL_TOKEN</span> from <span class="mono">shared.env</span>. Operator-added CNAMEs pointing elsewhere are never touched. Equivalent SSH command if the wizard is unreachable: <span class="mono">sudo bash /opt/vibe/appliance/infra/cloudflared-down.sh</span>.</p>
+          <p><strong>Temporarily pause the tunnel (Disable / Enable)</strong></p>
+          <p>In the wizard UP state, click <em>Disable tunnel</em>. The connector container stops; Cloudflare-side state (tunnel object, CNAMEs, <span class="mono">TUNNEL_TOKEN</span>) stays intact. Public traffic to your apps stops; LAN and Tailscale access are unaffected. The wizard transitions to a PAUSED state with an <em>Enable tunnel</em> button to resume &mdash; no token re-paste, no Cloudflare API calls, just a docker container start. Useful for off-hours, maintenance windows, or while debugging an upstream Cloudflare issue.</p>
+          <p>Equivalent SSH if the wizard is unreachable: <span class="mono">sudo docker stop vibe-cloudflared</span> (pause) / <span class="mono">sudo docker start vibe-cloudflared</span> (resume). The wizard detects externally-stopped containers and renders the PAUSED screen automatically on next load.</p>
+
+          <p><strong>To remove the tunnel entirely (irreversible)</strong></p>
+          <p>For temporary off, use <em>Disable tunnel</em> above. For permanent removal: in the wizard, click <em>Tear down</em>. That stops the cloudflared container, deletes only the CNAMEs that point at this tunnel, deletes the tunnel object at Cloudflare, and clears <span class="mono">TUNNEL_TOKEN</span> from <span class="mono">shared.env</span>. Operator-added CNAMEs pointing elsewhere are never touched. Equivalent SSH command if the wizard is unreachable: <span class="mono">sudo bash /opt/vibe/appliance/infra/cloudflared-down.sh</span>.</p>
 
           <p><strong>Manual / fallback path (when the wizard is broken)</strong></p>
           <ol>
