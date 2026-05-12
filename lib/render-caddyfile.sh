@@ -92,20 +92,36 @@ def list_enabled_apps(state, manifests_dir):
 
 def render_vhost(slug, manifest, mode, domain, tls_internal=False):
     """
-    Emit a single Caddy site block for the app under domain mode at
-    `<subdomain>.<domain>`. Returns empty for non-domain modes — those
-    use path-prefix handlers via render_path_handler() instead.
+    Emit a Caddy site block for the app at <subdomain>.<domain>.
+
+    Path-prefix shape under the subdomain. The Vibe app frontends are
+    built with Vite `base: '/<slug>/'` so their HTML emits absolute
+    references like `<script src="/<slug>/assets/...">`. That base is
+    baked into the bundle at build time and works in LAN path-prefix
+    mode (the LAN catch-all mounts the app under /<slug>/*). When the
+    same image is mounted at a subdomain root, the browser asks for
+    /<slug>/... but Caddy proxies path-for-path to a container that
+    has no /<slug>/ directory — 404, blank page.
+
+    To keep one GHCR image working unchanged across both harnesses,
+    the subdomain also mounts under /<slug>/* internally. Routing:
+      - /<slug>          — 301 to /<slug>/   (so SPAs find their root)
+      - /<slug>/*        — strip prefix, route per manifest matchers
+      - anything else    — 302 to /<slug>{uri}, preserving the path
+                           so deep links like /login become
+                           /<slug>/login (SPA router takes over).
+    Visible URL becomes <sub>.<domain>/<slug>/...
+
+    When the per-app frontends grow runtime base-path support and can
+    emit root-relative HTML, this whole shape collapses to a clean
+    reverse_proxy at root. Tracked in docs/PHASES.md.
 
     tls_internal=True makes Caddy use its embedded local CA for the
     cert (self-signed). Required when the appliance is fronted by
     Cloudflare Tunnel: port 80 isn't reachable from the public
-    internet (it's all going through outbound TCP 7844), so Let's
-    Encrypt's HTTP-01 challenge can't validate. Caddy keeps trying,
-    fails, has no cert, returns 'TLS internal error' to cloudflared
-    on every request, and the public sees 502. With tls internal,
-    Caddy issues a self-signed cert immediately; cloudflared's
-    ingress noTLSVerify=true accepts it; Cloudflare's edge handles
-    the real public TLS to the user.
+    internet, so Let's Encrypt's HTTP-01 challenge can't validate.
+    cloudflared's ingress with noTLSVerify=true accepts the self-
+    signed cert; Cloudflare's edge handles the real public TLS.
     """
     if mode != "domain" or not domain:
         return ""
@@ -127,31 +143,52 @@ def render_vhost(slug, manifest, mode, domain, tls_internal=False):
     lines.append("    }")
     lines.append("")
 
-    # Matcher declarations.
+    # Exact /<slug> (no trailing slash) — 301 to /<slug>/ so an SPA
+    # whose router expects a base-with-slash gets one. Mirrors the
+    # LAN catch-all's bare-prefix redirect.
+    lines.append(f"    @bare_slug path /{slug}")
+    lines.append(f"    redir @bare_slug /{slug}/ permanent")
+    lines.append("")
+
+    # /<slug>/* — strip the prefix and route per the manifest's
+    # matchers. Matcher names are scoped to this enclosing site, so
+    # there's no risk of @api colliding with another subdomain's @api.
+    lines.append(f"    handle /{slug}/* {{")
+    lines.append(f"        uri strip_prefix /{slug}")
+
     for m in matchers:
-        lines.append(f"    @{m['name']} path {m['path']}")
+        lines.append(f"        @{m['name']} path {m['path']}")
     if matchers:
         lines.append("")
 
-    # Per-matcher handles.
     for m in matchers:
-        lines.append(f"    handle @{m['name']} {{")
+        lines.append(f"        handle @{m['name']} {{")
         if m.get("streaming"):
-            lines.append(f"        reverse_proxy {m['upstream']} {{")
-            lines.append("            flush_interval -1")
-            lines.append("            transport http {")
-            lines.append("                read_timeout 3600s")
+            lines.append(f"            reverse_proxy {m['upstream']} {{")
+            lines.append("                flush_interval -1")
+            lines.append("                transport http {")
+            lines.append("                    read_timeout 3600s")
+            lines.append("                }")
             lines.append("            }")
-            lines.append("        }")
         else:
-            lines.append(f"        reverse_proxy {m['upstream']}")
-        lines.append("    }")
+            lines.append(f"            reverse_proxy {m['upstream']}")
+        lines.append("        }")
     if matchers:
         lines.append("")
 
-    # Default handler.
+    lines.append("        handle {")
+    lines.append(f"            reverse_proxy {default_upstream}")
+    lines.append("        }")
+    lines.append("    }")
+    lines.append("")
+
+    # Catch-all: bare / and any non-slug path → 302 into the slug
+    # prefix, preserving the path+query so deep links work. {uri} is
+    # the full request URI (path + query). A 302 (not 301) so this
+    # workaround can be removed cleanly once per-app frontends ship
+    # runtime base-path support — browsers won't have cached it.
     lines.append("    handle {")
-    lines.append(f"        reverse_proxy {default_upstream}")
+    lines.append(f"        redir * /{slug}{{uri}} 302")
     lines.append("    }")
     lines.append("}")
     return "\n".join(lines) + "\n"
