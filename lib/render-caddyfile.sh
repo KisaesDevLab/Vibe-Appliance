@@ -354,6 +354,41 @@ def render_infra_vhost(svc, mode, domain, tls_internal=False):
     return "\n".join(lines) + "\n"
 
 
+def render_lan_gated_handlers(handlers_str):
+    """Wrap a tab-indented path-handler block in a `@lan` remote_ip
+    matcher so direct host-IP traffic from the LAN / Tailscale CGNAT
+    range reaches app + infra paths, while any external request that
+    happens to hit the host's :80 (port-forwarded domain mode, or a
+    misconfigured firewall) falls through to the default `handle`
+    (console) instead of bypassing HTTPS.
+
+    Domain-mode-only. LAN/Tailscale modes use this block unwrapped —
+    those modes assume the appliance is only reachable from trusted
+    networks already.
+
+    RFC1918 + loopback + Tailscale CGNAT cover every realistic LAN
+    source. IPv6 link-local (fe80::/10) and ULA (fd00::/8) are
+    included for v6-on-LAN setups.
+    """
+    if not handlers_str.strip():
+        return "\t# (no apps enabled — LAN access goes to console)"
+    indented = "\n".join(
+        ("\t" + ln) if ln.strip() else ln
+        for ln in handlers_str.split("\n")
+    )
+    return (
+        "\t# LAN / Tailscale direct-IP access — path-routes apps so a\n"
+        "\t# staff member on the office network can reach\n"
+        "\t# http://<host-ip>/<slug>/ without going through Cloudflare.\n"
+        "\t# remote_ip gate keeps this off the public surface when :80\n"
+        "\t# is port-forwarded.\n"
+        "\t@lan remote_ip 127.0.0.1/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fe80::/10 fd00::/8 ::1\n"
+        "\thandle @lan {\n"
+        + indented +
+        "\n\t}"
+    )
+
+
 def render_infra_path_handler(svc):
     """Path-prefix block for an infra service in lan/tailscale modes."""
     if not svc.get("path_ok"):
@@ -566,7 +601,21 @@ def main():
         if infra_vhosts.strip():
             vhost_pieces.append(infra_vhosts)
         vhost_blocks = "\n".join(p for p in vhost_pieces if p.strip())
-        path_blocks = "\t# (domain mode: apps and infra live under the single tunnel subdomain vhost above)"
+        # Also expose the same path handlers on the :80 catch-all,
+        # gated to LAN/Tailscale sources via remote_ip. Lets staff
+        # reach apps at `http://<host-ip>/<slug>/` from the office
+        # network without a Cloudflare round-trip, while keeping the
+        # public face HTTPS-only. Same render_path_handler /
+        # render_infra_path_handler functions LAN mode uses, just
+        # wrapped in a remote_ip-gated handle block.
+        app_path_blocks = "\n".join(
+            render_path_handler(slug, m) for slug, m in enabled
+        ) if enabled else ""
+        infra_path_blocks = "\n".join(
+            render_infra_path_handler(s) for s in INFRA_SERVICES
+        )
+        combined = (app_path_blocks + ("\n" if app_path_blocks and infra_path_blocks else "") + infra_path_blocks)
+        path_blocks = render_lan_gated_handlers(combined)
     elif mode in ("lan", "tailscale"):
         app_path_blocks = "\n".join(
             render_path_handler(slug, m) for slug, m in enabled
