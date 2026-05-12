@@ -56,6 +56,13 @@ COPY ui/ ./ui/
 # top-level only.
 COPY manifests/ ./manifests/
 
+# Server-side helper modules (cf-helpers.js, etc.). server.js does
+# `require('./lib/cf-helpers')` at module-load time, so missing this
+# directory crashes the console container on startup with
+# MODULE_NOT_FOUND. Bootstrap Phase 7 dumps the resulting crash logs
+# and aborts — operators cannot reach /admin to fix it.
+COPY lib/ ./lib/
+
 EXPOSE 3000
 
 # Healthcheck redundancy with the compose-level check is intentional:
