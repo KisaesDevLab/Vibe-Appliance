@@ -3358,11 +3358,7 @@ const SETTINGS_JS_VERSION = '2026-05-12-customer-landing-tab';
   //
   // UX: optimistic toggle, revert on error. Apps with userFacing=false
   // (vibe-glm-ocr today) are excluded server-side AND would be again
-  // here in case the server contract drifts. Apps that declare a
-  // client-portal subdomain in their manifest but don't have a Caddy
-  // vhost rendered for it (currently always true in domain mode pending
-  // deferred Phase 8.5 routing work) get a warning row so the operator
-  // knows clients will hit a dead URL until that lands.
+  // here in case the server contract drifts.
   async function renderCustomerLandingPanel() {
     panelEl.appendChild(el('p', { class: 'muted' }, ['Loading…']));
     let data;
@@ -3426,17 +3422,6 @@ const SETTINGS_JS_VERSION = '2026-05-12-customer-landing-tab';
     if (!app.enabled) {
       wrap.appendChild(el('p', { class: 'help', style: 'color:#8a6f3a;' }, [
         'App is not enabled — the toggle has no effect until you enable it from the admin home page.',
-      ]));
-    }
-
-    if (app.clientPortalDeclared && !app.clientPortalRouted) {
-      wrap.appendChild(el('p', { class: 'help', style: 'color:#a04040;' }, [
-        'Routing for ',
-        el('span', { class: 'mono' }, [app.clientPortalName + '.<your-domain>']),
-        " isn't wired yet — per-subdomain Caddy routing is a deferred ",
-        'Phase 8.5 item. Until it lands, clients clicking this card in domain mode ',
-        "will hit a DNS error. Leave the toggle off until that's fixed, or test ",
-        'end-to-end first.',
       ]));
     }
 

@@ -814,11 +814,7 @@ app.get('/api/v1/public/apps', async (_req, res) => {
         slug:        m.slug,
         displayName: m.displayName,
         description: m.description,
-        // Customer-facing URL — uses the manifest's client-portal
-        // subdomain when declared, otherwise falls back to the
-        // standard URL. See appCustomerLandingUrl for the routing
-        // caveat about deferred per-subdomain Caddy vhosts.
-        url:         appCustomerLandingUrl(m, config, live || undefined),
+        url:         appPublicUrl(m, config, live || undefined),
         // HAProxy emergency-port URL — used only by the Emergency Access
         // admin panel ("Caddy itself is down" failure mode). Kept on the
         // public payload so the panel can build its list from one fetch.
@@ -941,27 +937,17 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
 // per-manifest metadata. Cheap read; no rate limit.
 app.get('/api/v1/admin/customer-visibility', requireAdmin, (_req, res) => {
   const state = readState();
-  const config = state.config || {};
   const stateApps = state.apps || {};
   const items = Object.values(MANIFESTS)
     .filter((m) => m.userFacing !== false)
     .map((m) => {
       const s = stateApps[m.slug] || {};
-      const portal = manifestClientPortalSubdomain(m);
       return {
         slug:               m.slug,
         displayName:        m.displayName,
         description:        m.description,
         enabled:            s.enabled === true,
         visibleToCustomers: s.visibleToCustomers === true,
-        // Manifest declares a client-portal subdomain. Today only
-        // Vibe-Connect; future apps opt in by adding the same shape.
-        clientPortalDeclared: !!portal,
-        clientPortalName:     portal ? portal.name : null,
-        // True when the declared client-portal URL isn't actually
-        // routable yet (per-subdomain Caddy vhosts are deferred).
-        // The tab uses this to render a warning row.
-        clientPortalRouted:   portal ? !appHasUnroutedClientPortal(m, config) : true,
       };
     })
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
@@ -4753,51 +4739,6 @@ function appPublicUrl(manifest, config, live) {
     return `(domain mode without a --domain flag — re-bootstrap with --domain)`;
   }
   return `(mode "${config.mode || 'unknown'}" — see admin host info)`;
-}
-
-// Find the `audience: "client portal"` entry in manifest.subdomains[],
-// if declared. Generic — no slug-coded special cases. Vibe-Connect is
-// the only manifest declaring this today; future apps opt in by adding
-// the same `audience` string to their subdomains[] block.
-function manifestClientPortalSubdomain(manifest) {
-  const list = Array.isArray(manifest.subdomains) ? manifest.subdomains : [];
-  return list.find((s) => s && s.audience === 'client portal') || null;
-}
-
-// URL surfaced on the customer landing at /. Apps that declare a
-// client-portal subdomain in their manifest get that subdomain's URL
-// (e.g. https://client.firm.com/); other apps fall back to the
-// standard appPublicUrl.
-//
-// Caveat: per-subdomain Caddy vhost rendering is a deferred Phase 8.5
-// item — until it lands the client.firm.com URL won't resolve in domain
-// mode. The /admin "Customer landing" tab flags affected apps with a
-// warning row so the operator knows before clients hit a dead URL.
-// LAN/tailscale modes use the standard URL regardless — a separate
-// subdomain only exists in domain mode.
-function appCustomerLandingUrl(manifest, config, live) {
-  const portal = manifestClientPortalSubdomain(manifest);
-  if (!portal || !portal.name) return appPublicUrl(manifest, config, live);
-  if (config.mode === 'domain' && config.domain) {
-    return `https://${portal.name}.${config.domain}/`;
-  }
-  return appPublicUrl(manifest, config, live);
-}
-
-// True when the manifest declares a client-portal subdomain AND we're
-// in domain mode (where the separate URL would be expected to resolve)
-// AND per-subdomain Caddy routing isn't yet wired. The Customer landing
-// settings tab uses this to render a "not wired yet" warning row.
-//
-// Until lib/render-caddyfile.sh learns to emit per-subdomain vhosts,
-// this is true whenever a client-portal subdomain is declared in
-// domain mode. Once that work lands, this becomes a check against
-// rendered vhost state.
-function appHasUnroutedClientPortal(manifest, config) {
-  const portal = manifestClientPortalSubdomain(manifest);
-  if (!portal || !portal.name) return false;
-  if (config.mode !== 'domain' || !config.domain) return false;
-  return true;
 }
 
 // --- Doctor endpoint --------------------------------------------------
