@@ -14,7 +14,7 @@
 // operators can confirm in DevTools (F12 → Console) that the file
 // they're running is the version they expect, vs. a stale cached
 // copy. Compare against the server's /api/v1/version response.
-const SETTINGS_JS_VERSION = '2026-05-12-customer-landing-tab';
+const SETTINGS_JS_VERSION = '2026-05-12-client-landing-buttons';
 
 (function () {
   // eslint-disable-next-line no-console
@@ -3422,6 +3422,18 @@ const SETTINGS_JS_VERSION = '2026-05-12-customer-landing-tab';
     if (!app.enabled) {
       wrap.appendChild(el('p', { class: 'help', style: 'color:#8a6f3a;' }, [
         'App is not enabled — the toggle has no effect until you enable it from the admin home page.',
+      ]));
+    }
+
+    // Manifest-declared client entries — when present, the card on /
+    // renders one button per entry instead of a single Open button.
+    // Show the labels here so the operator knows exactly what clients
+    // will see without having to load the public landing themselves.
+    const entries = Array.isArray(app.clientLanding) ? app.clientLanding : [];
+    if (entries.length) {
+      const labels = entries.map((e) => e.label).join(', ');
+      wrap.appendChild(el('p', { class: 'help' }, [
+        'Card will show: ' + labels + '.',
       ]));
     }
 

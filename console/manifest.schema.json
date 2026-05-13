@@ -99,6 +99,21 @@
       "description": "If false, the app is internal-only (consumed by other Vibe apps, never directly by users). Internal apps do not get an emergency port and may be excluded from the public landing page."
     },
 
+    "clientLanding": {
+      "type": "array",
+      "description": "Optional client-facing entry points surfaced as buttons on the public landing page at /. Each entry produces one button on the app's card under the standard path-prefix base URL (e.g. https://vibe.firm.com/<slug><path>). Omit for the default single 'Open' button behavior. Skip entries that require per-client tokens (those are emailed by staff, not surfaceable on a static page).",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["label", "path"],
+        "additionalProperties": false,
+        "properties": {
+          "label": { "type": "string", "minLength": 1, "maxLength": 40 },
+          "path":  { "type": "string", "pattern": "^/.*$", "maxLength": 200 }
+        }
+      }
+    },
+
     "ports": {
       "type": "object",
       "additionalProperties": false,

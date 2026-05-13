@@ -95,11 +95,25 @@
             ${tailnetHttpsRow}
           </dl>
           <div class="app-card__actions">
-            <a class="btn" href="${escapeHtml(a.url)}" target="_blank" rel="noopener noreferrer">Open</a>
+            ${renderActions(a)}
           </div>
         </article>`;
       }).join('');
       return `<div class="admin-grid">${cards}</div>`;
+    }
+
+    // One button per clientLanding entry when the manifest declares
+    // them, otherwise a single "Open" button. Both arms target _blank
+    // with noopener — clients may have the staff console open in the
+    // same browser, and a same-tab navigation would lose that session.
+    function renderActions(a) {
+      const entries = Array.isArray(a.clientLanding) ? a.clientLanding : [];
+      if (entries.length) {
+        return entries.map((e) =>
+          `<a class="btn" href="${escapeHtml(e.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(e.label)}</a>`
+        ).join(' ');
+      }
+      return `<a class="btn" href="${escapeHtml(a.url)}" target="_blank" rel="noopener noreferrer">Open</a>`;
     }
 
     function applyFirmName(firmName) {

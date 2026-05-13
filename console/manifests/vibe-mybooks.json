@@ -15,6 +15,13 @@
   "emergencyPort": 5171,
   "ports":         { "server": 3001, "client": 5173 },
 
+  "clientLanding": [
+    { "label": "Sign in",          "path": "/portal/login" },
+    { "label": "Submit a receipt", "path": "/portal/capture" },
+    { "label": "View reports",     "path": "/portal/financials" },
+    { "label": "Answer questions", "path": "/portal/questions" }
+  ],
+
   "routing": {
     "default_upstream": "vibe-mybooks-web:5173",
     "matchers": [

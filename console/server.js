@@ -821,6 +821,12 @@ app.get('/api/v1/public/apps', async (_req, res) => {
         emergencyUrl:  appEmergencyUrl(m, config),
         emergencyNote: m.emergencyNote || null,
       };
+      // Per-app client entry buttons from manifest.clientLanding[]. Omit
+      // the field entirely when the manifest declares none — the UI
+      // branches on its presence to render either the multi-button or
+      // single-button layout.
+      const clientLanding = appClientLandingEntries(m, config, live || undefined);
+      if (clientLanding.length) out.clientLanding = clientLanding;
       if (showLanFallback) {
         // http://<host_ip>/<slug>/ via Caddy. Null in domain mode and
         // when host_ip hasn't been cached yet.
@@ -948,6 +954,10 @@ app.get('/api/v1/admin/customer-visibility', requireAdmin, (_req, res) => {
         description:        m.description,
         enabled:            s.enabled === true,
         visibleToCustomers: s.visibleToCustomers === true,
+        // Raw manifest declarations — the settings tab uses just the
+        // labels for an informational "Card will show: …" hint. URL
+        // building lives on the public endpoint, not here.
+        clientLanding:      Array.isArray(m.clientLanding) ? m.clientLanding : [],
       };
     })
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
@@ -4739,6 +4749,26 @@ function appPublicUrl(manifest, config, live) {
     return `(domain mode without a --domain flag — re-bootstrap with --domain)`;
   }
   return `(mode "${config.mode || 'unknown'}" — see admin host info)`;
+}
+
+// Build the per-card client landing buttons from manifest.clientLanding[].
+// Each entry's `path` is appended to the app's standard public base URL
+// (the path-prefixed root from appPublicUrl). Returns [] when the
+// manifest declares no entries — callers fall back to a single "Open"
+// button. The base URL is computed once per app, not per entry.
+function appClientLandingEntries(manifest, config, live) {
+  const entries = Array.isArray(manifest.clientLanding) ? manifest.clientLanding : [];
+  if (!entries.length) return [];
+  const base = appPublicUrl(manifest, config, live);
+  // appPublicUrl can return a parenthesized error string when mode is
+  // misconfigured — pass that through unchanged in the URL field so
+  // the UI surfaces the same diagnostic the default button would.
+  if (typeof base !== 'string' || !base.startsWith('http')) return [];
+  const root = base.replace(/\/$/, '');
+  return entries.map((e) => ({
+    label: e.label,
+    url:   root + e.path,
+  }));
 }
 
 // --- Doctor endpoint --------------------------------------------------
