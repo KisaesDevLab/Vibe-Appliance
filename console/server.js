@@ -36,6 +36,7 @@ const SQLITE_PATH    = path.join(SQLITE_DIR, 'console.sqlite');
 const MANIFESTS_DIR  = path.join(__dirname, 'manifests');
 const ENABLE_SCRIPT  = path.join(APPLIANCE_DIR, 'lib', 'enable-app.sh');
 const DISABLE_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'disable-app.sh');
+const CUSTOMER_VISIBILITY_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'set-customer-visibility.sh');
 const DOCTOR_SCRIPT  = path.join(APPLIANCE_DIR, 'doctor.sh');
 const UPDATE_SCRIPT  = path.join(APPLIANCE_DIR, 'update.sh');
 const PRUNE_SCRIPT             = path.join(APPLIANCE_DIR, 'prune-images.sh');
@@ -792,19 +793,32 @@ app.get('/api/v1/public/apps', async (_req, res) => {
   const showLanFallback   = (appliance.LANDING_SHOW_LAN_FALLBACK   || 'true').trim() !== 'false';
   const showTailnetIp     = (appliance.LANDING_SHOW_TAILNET_IP     || 'false').trim() === 'true';
   const showTailnetHttps  = (appliance.LANDING_SHOW_TAILNET_HTTPS  || 'false').trim() === 'true';
+  const firmName          = (appliance.LANDING_FIRM_NAME           || '').trim() || null;
 
   // Only probe the daemon when a tailnet flavor is enabled — public
   // landing hits shouldn't trigger a docker spawn for no reason.
   const live = (showTailnetIp || showTailnetHttps) ? await _liveTailscaleState() : null;
 
+  // Two-gate filter: app must be `enabled` (running) AND
+  // `visibleToCustomers` (admin opted it in for the client landing).
+  // Default-false on visibleToCustomers makes upgrade safe — a fresh
+  // landing page is empty until the operator explicitly toggles apps
+  // on from /admin → Settings → Customer landing.
   const items = Object.values(MANIFESTS)
-    .filter((m) => !!(stateApps[m.slug] || {}).enabled)
+    .filter((m) => {
+      const s = stateApps[m.slug] || {};
+      return s.enabled === true && s.visibleToCustomers === true;
+    })
     .map((m) => {
       const out = {
         slug:        m.slug,
         displayName: m.displayName,
         description: m.description,
-        url:         appPublicUrl(m, config, live || undefined),
+        // Customer-facing URL — uses the manifest's client-portal
+        // subdomain when declared, otherwise falls back to the
+        // standard URL. See appCustomerLandingUrl for the routing
+        // caveat about deferred per-subdomain Caddy vhosts.
+        url:         appCustomerLandingUrl(m, config, live || undefined),
         // HAProxy emergency-port URL — used only by the Emergency Access
         // admin panel ("Caddy itself is down" failure mode). Kept on the
         // public payload so the panel can build its list from one fetch.
@@ -825,7 +839,7 @@ app.get('/api/v1/public/apps', async (_req, res) => {
       return out;
     })
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
-  res.json({ apps: items });
+  res.json({ apps: items, firmName });
 });
 
 // --- Apps registry & toggle endpoints ---------------------------------
@@ -892,6 +906,16 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
         // admin-only /api/v1/first-login endpoint.
         username: m.firstLogin && m.firstLogin.username || null,
         enabled: !!s.enabled,
+        // Customer-landing visibility gate. Independent of `enabled`:
+        // an app can be running (enabled=true) but hidden from the
+        // customer page (visibleToCustomers=false), or pre-staged for
+        // visibility before enable. Default false on absent key.
+        visibleToCustomers: s.visibleToCustomers === true,
+        // Manifest-declared `userFacing` (defaults true). When false
+        // the app is internal-only and never appears on the customer
+        // landing — the Settings → Customer landing tab filters these
+        // out client-side as well.
+        userFacing: m.userFacing !== false,
         status: s.status || 'not-installed',
         image_tag: s.image_tag || null,
         last_at: s.at || null,
@@ -911,6 +935,39 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
   res.json({ apps: items });
 });
 
+// Admin read endpoint feeding the Settings → Customer landing tab.
+// Returns one row per userFacing manifest with everything the tab
+// needs to render — saves the UI from joining /api/v1/apps with
+// per-manifest metadata. Cheap read; no rate limit.
+app.get('/api/v1/admin/customer-visibility', requireAdmin, (_req, res) => {
+  const state = readState();
+  const config = state.config || {};
+  const stateApps = state.apps || {};
+  const items = Object.values(MANIFESTS)
+    .filter((m) => m.userFacing !== false)
+    .map((m) => {
+      const s = stateApps[m.slug] || {};
+      const portal = manifestClientPortalSubdomain(m);
+      return {
+        slug:               m.slug,
+        displayName:        m.displayName,
+        description:        m.description,
+        enabled:            s.enabled === true,
+        visibleToCustomers: s.visibleToCustomers === true,
+        // Manifest declares a client-portal subdomain. Today only
+        // Vibe-Connect; future apps opt in by adding the same shape.
+        clientPortalDeclared: !!portal,
+        clientPortalName:     portal ? portal.name : null,
+        // True when the declared client-portal URL isn't actually
+        // routable yet (per-subdomain Caddy vhosts are deferred).
+        // The tab uses this to render a warning row.
+        clientPortalRouted:   portal ? !appHasUnroutedClientPortal(m, config) : true,
+      };
+    })
+    .sort((a, b) => a.displayName.localeCompare(b.displayName));
+  res.json({ apps: items });
+});
+
 // Phase 8.5 hardening — rate-limit the toggle and update endpoints.
 // Each call spawns a docker compose pull / restart that hits GHCR or
 // dockerhub; without a limit, a hostile or runaway client can burn
@@ -922,6 +979,27 @@ app.post('/api/v1/enable/:slug', requireAdmin, testRateLimit, async (req, res) =
 
 app.post('/api/v1/disable/:slug', requireAdmin, testRateLimit, async (req, res) => {
   await runToggle(req, res, DISABLE_SCRIPT, 'disable');
+});
+
+// Flip apps.<slug>.visibleToCustomers in state.json. Pure state mutation
+// — no Caddy reload, no container touch. Same admin + rate-limit gates
+// as enable/disable so a misbehaving client can't burn the JSON write
+// path. Body: { visible: boolean }. The script enforces the manifest's
+// userFacing constraint (refuses internal-only apps).
+app.post('/api/v1/customer-visibility/:slug', requireAdmin, testRateLimit, async (req, res) => {
+  const slug = req.params.slug;
+  if (!SLUG_RE.test(slug)) {
+    return res.status(400).json({ error: 'invalid slug' });
+  }
+  if (!MANIFESTS[slug]) {
+    return res.status(404).json({ error: 'unknown app' });
+  }
+  const visible = req.body && req.body.visible;
+  if (visible !== true && visible !== false) {
+    return res.status(400).json({ error: 'body must be { visible: true|false }' });
+  }
+  await runShell(res, [CUSTOMER_VISIBILITY_SCRIPT, slug, visible ? 'true' : 'false'],
+                 'customer-visibility', { slug, visible });
 });
 
 // --- Update endpoints --------------------------------------------------
@@ -4675,6 +4753,51 @@ function appPublicUrl(manifest, config, live) {
     return `(domain mode without a --domain flag — re-bootstrap with --domain)`;
   }
   return `(mode "${config.mode || 'unknown'}" — see admin host info)`;
+}
+
+// Find the `audience: "client portal"` entry in manifest.subdomains[],
+// if declared. Generic — no slug-coded special cases. Vibe-Connect is
+// the only manifest declaring this today; future apps opt in by adding
+// the same `audience` string to their subdomains[] block.
+function manifestClientPortalSubdomain(manifest) {
+  const list = Array.isArray(manifest.subdomains) ? manifest.subdomains : [];
+  return list.find((s) => s && s.audience === 'client portal') || null;
+}
+
+// URL surfaced on the customer landing at /. Apps that declare a
+// client-portal subdomain in their manifest get that subdomain's URL
+// (e.g. https://client.firm.com/); other apps fall back to the
+// standard appPublicUrl.
+//
+// Caveat: per-subdomain Caddy vhost rendering is a deferred Phase 8.5
+// item — until it lands the client.firm.com URL won't resolve in domain
+// mode. The /admin "Customer landing" tab flags affected apps with a
+// warning row so the operator knows before clients hit a dead URL.
+// LAN/tailscale modes use the standard URL regardless — a separate
+// subdomain only exists in domain mode.
+function appCustomerLandingUrl(manifest, config, live) {
+  const portal = manifestClientPortalSubdomain(manifest);
+  if (!portal || !portal.name) return appPublicUrl(manifest, config, live);
+  if (config.mode === 'domain' && config.domain) {
+    return `https://${portal.name}.${config.domain}/`;
+  }
+  return appPublicUrl(manifest, config, live);
+}
+
+// True when the manifest declares a client-portal subdomain AND we're
+// in domain mode (where the separate URL would be expected to resolve)
+// AND per-subdomain Caddy routing isn't yet wired. The Customer landing
+// settings tab uses this to render a "not wired yet" warning row.
+//
+// Until lib/render-caddyfile.sh learns to emit per-subdomain vhosts,
+// this is true whenever a client-portal subdomain is declared in
+// domain mode. Once that work lands, this becomes a check against
+// rendered vhost state.
+function appHasUnroutedClientPortal(manifest, config) {
+  const portal = manifestClientPortalSubdomain(manifest);
+  if (!portal || !portal.name) return false;
+  if (config.mode !== 'domain' || !config.domain) return false;
+  return true;
 }
 
 // --- Doctor endpoint --------------------------------------------------

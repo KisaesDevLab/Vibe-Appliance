@@ -14,7 +14,7 @@
 // operators can confirm in DevTools (F12 → Console) that the file
 // they're running is the version they expect, vs. a stale cached
 // copy. Compare against the server's /api/v1/version response.
-const SETTINGS_JS_VERSION = '2026-05-12-cf-pause-resume-and-error-surfacing';
+const SETTINGS_JS_VERSION = '2026-05-12-customer-landing-tab';
 
 (function () {
   // eslint-disable-next-line no-console
@@ -656,6 +656,17 @@ const SETTINGS_JS_VERSION = '2026-05-12-cf-pause-resume-and-error-surfacing';
       }, ['Apps']);
       tabsEl.appendChild(btn);
     }
+    // Customer landing — fixed tab listing each userFacing app with a
+    // per-app "show on the public client portal at /" toggle. Backed
+    // by /api/v1/admin/customer-visibility; not part of the manifest
+    // schema since the flag lives in state.json, not env files.
+    tabsEl.appendChild(el('button', {
+      class: 'settings-tab',
+      role: 'tab',
+      'data-tab': 'Customer landing',
+      'aria-selected': state.activeTab === 'Customer landing' ? 'true' : 'false',
+      onclick: () => selectTab('Customer landing'),
+    }, ['Customer landing']));
     if (!state.activeTab) state.activeTab = cats[0] || 'Apps';
     selectTab(state.activeTab);
   }
@@ -674,6 +685,11 @@ const SETTINGS_JS_VERSION = '2026-05-12-cf-pause-resume-and-error-surfacing';
 
     if (cat === 'Apps') {
       renderAppsPanel();
+      return;
+    }
+
+    if (cat === 'Customer landing') {
+      renderCustomerLandingPanel();
       return;
     }
 
@@ -3335,6 +3351,132 @@ const SETTINGS_JS_VERSION = '2026-05-12-cf-pause-resume-and-error-surfacing';
   // v1.2 — Apps tab. Top row: sub-tabs per slug. Below: that slug's
   // per-app fields grouped by category, with Override / Revert buttons
   // for fields that have an appliance-level counterpart (scope: 'both').
+  // Customer landing panel — per-app toggle for "show on /". State
+  // lives in /opt/vibe/state.json apps.<slug>.visibleToCustomers, not
+  // in env files, so this panel sits outside the manifest-driven
+  // schema flow and uses its own admin endpoints.
+  //
+  // UX: optimistic toggle, revert on error. Apps with userFacing=false
+  // (vibe-glm-ocr today) are excluded server-side AND would be again
+  // here in case the server contract drifts. Apps that declare a
+  // client-portal subdomain in their manifest but don't have a Caddy
+  // vhost rendered for it (currently always true in domain mode pending
+  // deferred Phase 8.5 routing work) get a warning row so the operator
+  // knows clients will hit a dead URL until that lands.
+  async function renderCustomerLandingPanel() {
+    panelEl.appendChild(el('p', { class: 'muted' }, ['Loading…']));
+    let data;
+    try {
+      const r = await fetch('/api/v1/admin/customer-visibility', { credentials: 'same-origin' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      data = await r.json();
+    } catch (err) {
+      panelEl.innerHTML = '';
+      panelEl.appendChild(el('p', { class: 'muted' }, [
+        "Couldn't load app list: " + _friendlyError(err),
+      ]));
+      return;
+    }
+    panelEl.innerHTML = '';
+    const apps = Array.isArray(data.apps) ? data.apps : [];
+
+    panelEl.appendChild(el('p', { class: 'help' }, [
+      "Apps shown here appear on your firm's public landing page at /. ",
+      "Clients see the cards you toggle on. Toggling visibility doesn't ",
+      "start or stop the app — use the admin home page for that. ",
+      "Disabled apps stay hidden from clients regardless of this toggle.",
+    ]));
+
+    if (!apps.length) {
+      panelEl.appendChild(el('p', { class: 'muted' }, ['No customer-facing apps declared.']));
+      return;
+    }
+
+    const list = el('div', { class: 'settings-form' });
+    for (const app of apps) {
+      list.appendChild(renderCustomerLandingRow(app));
+    }
+    panelEl.appendChild(list);
+  }
+
+  function renderCustomerLandingRow(app) {
+    const wrap = el('div', { class: 'settings-field', 'data-slug': app.slug });
+
+    const header = el('div', {
+      style: 'display:flex;align-items:center;justify-content:space-between;gap:1rem;',
+    });
+    const titleBlock = el('div', { style: 'min-width:0;' }, [
+      el('label', { for: 'cv-' + app.slug, style: 'font-weight:600;display:block;' }, [
+        app.displayName,
+      ]),
+      el('p', { class: 'help', style: 'margin:0.15rem 0 0;' }, [app.description || '']),
+    ]);
+    header.appendChild(titleBlock);
+
+    const checkbox = el('input', {
+      type: 'checkbox',
+      id: 'cv-' + app.slug,
+      'aria-label': 'Show ' + app.displayName + ' on the customer landing',
+    });
+    if (app.visibleToCustomers) checkbox.setAttribute('checked', 'checked');
+    checkbox.addEventListener('change', () => onCustomerVisibilityToggle(app, checkbox, wrap));
+    header.appendChild(checkbox);
+    wrap.appendChild(header);
+
+    if (!app.enabled) {
+      wrap.appendChild(el('p', { class: 'help', style: 'color:#8a6f3a;' }, [
+        'App is not enabled — the toggle has no effect until you enable it from the admin home page.',
+      ]));
+    }
+
+    if (app.clientPortalDeclared && !app.clientPortalRouted) {
+      wrap.appendChild(el('p', { class: 'help', style: 'color:#a04040;' }, [
+        'Routing for ',
+        el('span', { class: 'mono' }, [app.clientPortalName + '.<your-domain>']),
+        " isn't wired yet — per-subdomain Caddy routing is a deferred ",
+        'Phase 8.5 item. Until it lands, clients clicking this card in domain mode ',
+        "will hit a DNS error. Leave the toggle off until that's fixed, or test ",
+        'end-to-end first.',
+      ]));
+    }
+
+    return wrap;
+  }
+
+  async function onCustomerVisibilityToggle(app, checkbox, wrap) {
+    const next = checkbox.checked;
+    // Optimistic — disable the control during the round trip so the
+    // operator can't double-click. On error, revert AND surface the
+    // server's stderr inline so they can see what went wrong (the
+    // most likely cause is a manifest with userFacing:false slipped
+    // through, which we already filter server-side — but the script
+    // is the authoritative gate).
+    checkbox.setAttribute('disabled', 'disabled');
+    const oldErr = wrap.querySelector('[data-cv-err]');
+    if (oldErr) oldErr.remove();
+    try {
+      const r = await fetch('/api/v1/customer-visibility/' + encodeURIComponent(app.slug), {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ visible: next }),
+      });
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        throw new Error(body.stderr || body.error || ('HTTP ' + r.status));
+      }
+    } catch (err) {
+      checkbox.checked = !next;
+      const errEl = el('p', {
+        class: 'help', 'data-cv-err': '1',
+        style: 'color:#a04040;',
+      }, ["Couldn't update: " + _friendlyError(err)]);
+      wrap.appendChild(errEl);
+    } finally {
+      checkbox.removeAttribute('disabled');
+    }
+  }
+
   function renderAppsPanel() {
     const slugs = Object.keys(state.schema.perApp || {}).sort();
     if (!slugs.length) {

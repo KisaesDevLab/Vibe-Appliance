@@ -421,6 +421,19 @@
           { "value": "false", "label": "Hide" }
         ]
       }
+    },
+    {
+      "name":  "LANDING_FIRM_NAME",
+      "value": "",
+      "doc":   "Firm name shown on the customer landing page (/). When set, the hero reads '{Firm} · Client portal'; leave empty for generic copy. Optional — no validator, so empty is a valid value.",
+      "ui": {
+        "tier":      1,
+        "category":  "Landing page",
+        "label":     "Firm name on landing page",
+        "helpText":  "Shown as the hero on the public client portal at /. Leave empty for generic 'Client portal' copy.",
+        "input":     "text",
+        "appliance": "shared"
+      }
     }
   ]
 }

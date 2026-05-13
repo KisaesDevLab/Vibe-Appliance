@@ -3,36 +3,35 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Vibe Appliance</title>
+  <title>Client portal</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
   <main class="container">
     <header class="hero">
-      <p class="eyebrow">Vibe Appliance</p>
-      <h1>Your firm's stack, one box.</h1>
+      <p class="eyebrow">Client portal</p>
+      <h1 id="hero-title">Client portal</h1>
+      <p class="muted">
+        Welcome. Use the cards below to reach the tools your firm has shared with you.
+        If your account manager sent you a sign-in link, you can also go directly to it.
+      </p>
     </header>
 
     <section id="apps-section" aria-busy="true">
-      <div class="card"><h3>Loading…</h3><p class="muted">fetching enabled apps…</p></div>
+      <div class="card"><h3>Loading…</h3><p class="muted">fetching client tools…</p></div>
     </section>
 
     <footer class="footer">
-      <p>
-        Need help? Open the admin console for status, diagnostics, and the
-        per-app first-login info. The admin password was printed during
-        installation and is also in <span class="mono">/opt/vibe/CREDENTIALS.txt</span> on the server.
-      </p>
       <div class="cta-row" style="margin-top: 1rem;">
-        <a class="btn btn--ghost" href="/admin">Admin console</a>
+        <a class="btn btn--ghost" href="/admin">Staff sign-in</a>
       </div>
     </footer>
   </main>
 
   <script>
-    // Render enabled apps from /api/v1/public/apps. The endpoint exposes
-    // only slug/displayName/description/url for ENABLED apps; nothing
-    // sensitive ever lands in the public DOM.
+    // Render the apps the firm has chosen to expose to clients. Filter
+    // is server-side (enabled && visibleToCustomers). Page is public —
+    // no auth, no sensitive fields in the payload.
 
     function escapeHtml(s) {
       return String(s ?? '').replace(/[&<>"']/g, (c) => ({
@@ -43,14 +42,11 @@
     function renderEmpty() {
       return `
         <div class="empty-state">
-          <h2>No apps enabled yet.</h2>
+          <h2>Nothing to show yet.</h2>
           <p class="muted">
-            The administrator hasn't switched any apps on. Once they do,
-            each enabled app will appear here as a card with an Open button.
+            Your firm hasn't shared any apps to this page yet. If you were
+            expecting to see something, contact your account manager.
           </p>
-          <div class="cta-row">
-            <a class="btn" href="/admin">Go to admin console</a>
-          </div>
         </div>`;
     }
 
@@ -59,9 +55,6 @@
         <div class="empty-state">
           <h2>Couldn't load apps.</h2>
           <p class="muted">${escapeHtml(msg)}</p>
-          <div class="cta-row">
-            <a class="btn btn--ghost" href="/admin">Go to admin console</a>
-          </div>
         </div>`;
     }
 
@@ -109,12 +102,20 @@
       return `<div class="admin-grid">${cards}</div>`;
     }
 
+    function applyFirmName(firmName) {
+      if (!firmName) return;
+      const title = document.getElementById('hero-title');
+      if (title) title.textContent = `${firmName} · Client portal`;
+      document.title = `${firmName} · Client portal`;
+    }
+
     async function loadApps() {
       const section = document.getElementById('apps-section');
       try {
         const r = await fetch('/api/v1/public/apps', { credentials: 'omit' });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const data = await r.json();
+        applyFirmName(data.firmName);
         const apps = Array.isArray(data.apps) ? data.apps : [];
         section.innerHTML = apps.length ? renderApps(apps) : renderEmpty();
       } catch (err) {

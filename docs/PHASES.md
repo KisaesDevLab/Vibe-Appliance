@@ -298,7 +298,7 @@ If any audit item fails, open a PR against the app repo before integrating.
 - DNS-01 staging cert test — needs acme-client npm dep.
 - SMTP + TextLink test endpoints — needs nodemailer or TextLink LAN appliance.
 - ui blocks on `vibe-glm-ocr` manifest — pending the GLM-OCR addendum being written.
-- Per-subdomain Caddy routing (subdomains[].target) — gated on backend container splits in upstream Vibe-* repos. v1.2 schema permits `subdomains[]` but Caddy still only honors top-level `subdomain`.
+- Per-subdomain Caddy routing (subdomains[].target) — gated on backend container splits in upstream Vibe-* repos. v1.2 schema permits `subdomains[]` but Caddy still only honors top-level `subdomain`. The Customer landing tab (Settings → Customer landing, added 2026-05-12) now consumes the manifest's `audience: "client portal"` entry to surface the client-portal URL (e.g. `https://client.firm.com/`) on the public landing at `/`; that URL falls back to the standard URL in LAN/tailscale modes and the admin tab shows a "not wired yet" warning while domain-mode routing remains missing.
 - Tax-Research-Chat corpus-sync background job — upstream app needs a /admin/sync endpoint first.
 - App-side emergency-access compatibility audit per addendum §9 — separate per-app PR work.
 
