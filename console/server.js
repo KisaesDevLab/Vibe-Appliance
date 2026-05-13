@@ -842,7 +842,107 @@ app.get('/api/v1/public/apps', async (_req, res) => {
       return out;
     })
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
-  res.json({ apps: items, firmName, showStaffSignin });
+
+  // Operator-curated custom cards (state.customCards). Sanitized: only
+  // safe http(s) URLs surface. The render layer treats them as cards
+  // alongside manifest apps in the same 2-column grid.
+  const customCards = sanitizeCustomCardsForPublic(state.customCards);
+
+  res.json({ apps: items, customCards, firmName, showStaffSignin });
+});
+
+// --- Custom cards (operator-curated landing tiles) ---------------------
+//
+// Each card is a free-form tile rendered on /. The list is whole-
+// replaced by PUT (simpler than per-card CRUD and matches how the
+// admin form saves — collect rows, send the array). Validation lives
+// here, not in a shell script, because there's no shell side effect:
+// state.json is the only mutation.
+
+const CUSTOM_CARD_MAX_TITLE       = 80;
+const CUSTOM_CARD_MAX_DESCRIPTION = 400;
+const CUSTOM_CARD_MAX_BUTTON      = 40;
+const CUSTOM_CARD_MAX_URL         = 2000;
+const CUSTOM_CARD_MAX_COUNT       = 20;
+
+// Validate one card; return { ok, card } on success or { ok:false, error } on
+// failure. URLs must be absolute http(s) to prevent javascript:/data: links
+// reaching the public landing — clients click these without thinking.
+function validateCustomCard(raw, idx) {
+  if (!raw || typeof raw !== 'object') {
+    return { ok: false, error: `card[${idx}] is not an object` };
+  }
+  const title = typeof raw.title === 'string' ? raw.title.trim() : '';
+  const description = typeof raw.description === 'string' ? raw.description.trim() : '';
+  const buttonLabel = typeof raw.buttonLabel === 'string' ? raw.buttonLabel.trim() : '';
+  const url = typeof raw.url === 'string' ? raw.url.trim() : '';
+  if (!title) return { ok: false, error: `card[${idx}] title is required` };
+  if (title.length > CUSTOM_CARD_MAX_TITLE) {
+    return { ok: false, error: `card[${idx}] title exceeds ${CUSTOM_CARD_MAX_TITLE} chars` };
+  }
+  if (description.length > CUSTOM_CARD_MAX_DESCRIPTION) {
+    return { ok: false, error: `card[${idx}] description exceeds ${CUSTOM_CARD_MAX_DESCRIPTION} chars` };
+  }
+  if (buttonLabel.length > CUSTOM_CARD_MAX_BUTTON) {
+    return { ok: false, error: `card[${idx}] buttonLabel exceeds ${CUSTOM_CARD_MAX_BUTTON} chars` };
+  }
+  if (!url) return { ok: false, error: `card[${idx}] url is required` };
+  if (url.length > CUSTOM_CARD_MAX_URL) {
+    return { ok: false, error: `card[${idx}] url exceeds ${CUSTOM_CARD_MAX_URL} chars` };
+  }
+  let parsed;
+  try { parsed = new URL(url); }
+  catch { return { ok: false, error: `card[${idx}] url is not a valid URL` }; }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return { ok: false, error: `card[${idx}] url must start with http:// or https://` };
+  }
+  const id = (typeof raw.id === 'string' && /^[a-zA-Z0-9_-]{1,40}$/.test(raw.id))
+    ? raw.id
+    : crypto.randomBytes(8).toString('hex');
+  return { ok: true, card: { id, title, description, buttonLabel, url } };
+}
+
+// Sanitize stored cards for public consumption. Defensive — even if
+// somehow a bad value got into state.json (manual edit, prior bug),
+// only well-formed http(s) cards reach the public payload.
+function sanitizeCustomCardsForPublic(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const c of raw) {
+    const v = validateCustomCard(c, out.length);
+    if (v.ok) out.push(v.card);
+  }
+  return out;
+}
+
+app.get('/api/v1/admin/custom-cards', requireAdmin, (_req, res) => {
+  const state = readState();
+  const cards = Array.isArray(state.customCards) ? state.customCards : [];
+  res.json({ cards });
+});
+
+app.put('/api/v1/admin/custom-cards', requireAdmin, testRateLimit, (req, res) => {
+  const body = req.body || {};
+  if (!Array.isArray(body.cards)) {
+    return res.status(400).json({ error: 'body must be { cards: [...] }' });
+  }
+  if (body.cards.length > CUSTOM_CARD_MAX_COUNT) {
+    return res.status(400).json({ error: `at most ${CUSTOM_CARD_MAX_COUNT} cards` });
+  }
+  const validated = [];
+  for (let i = 0; i < body.cards.length; i++) {
+    const v = validateCustomCard(body.cards[i], i);
+    if (!v.ok) return res.status(400).json({ error: v.error });
+    validated.push(v.card);
+  }
+  try {
+    setStateCustomCards(validated);
+  } catch (err) {
+    log('error', 'custom-cards write failed', { err: err.message });
+    return res.status(500).json({ error: 'state.json write failed: ' + err.message });
+  }
+  log('info', 'custom-cards updated', { count: validated.length });
+  res.json({ ok: true, cards: validated });
 });
 
 // --- Apps registry & toggle endpoints ---------------------------------
@@ -2086,6 +2186,25 @@ function setStateConfigKey(key, value) {
   }
   state.config = state.config || {};
   state.config[key] = value;
+  const tmp = STATE_PATH + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+  fs.renameSync(tmp, STATE_PATH);
+}
+
+// Atomic whole-list replace for state.customCards. Operator-curated
+// extra tiles on the public landing — title/description/button/url
+// quadruples. Cards live in state.json (not env files) because they
+// are structured data, not flags, and survive bootstrap re-runs the
+// same way app state does.
+function setStateCustomCards(cards) {
+  let state;
+  try {
+    state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+  } catch (err) {
+    if (err.code === 'ENOENT') state = {};
+    else throw err;
+  }
+  state.customCards = cards;
   const tmp = STATE_PATH + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
   fs.renameSync(tmp, STATE_PATH);

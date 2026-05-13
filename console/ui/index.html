@@ -58,48 +58,29 @@
         </div>`;
     }
 
-    function renderApps(apps) {
-      const cards = apps.map((a) => {
-        // Primary URL row — always present, clickable when http(s).
-        const primaryUrl = a.url && a.url.startsWith('http')
-          ? `<a href="${escapeHtml(a.url)}">${escapeHtml(a.url)}</a>`
-          : `<span class="muted">${escapeHtml(a.url || '—')}</span>`;
+    function renderTiles(apps, customCards) {
+      const appTiles = apps.map((a) => renderCard({
+        title: a.displayName,
+        description: a.description,
+        actions: renderActions(a),
+      }));
+      const customTiles = customCards.map((c) => renderCard({
+        title: c.title,
+        description: c.description,
+        actions: `<a class="btn" href="${escapeHtml(c.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(c.buttonLabel || 'Open')}</a>`,
+      }));
+      return `<div class="client-grid">${[...appTiles, ...customTiles].join('')}</div>`;
+    }
 
-        // Alternative-access rows. Each is gated server-side by an
-        // admin toggle (Configuration → Landing page) plus the URL
-        // being actually available. Server only includes the field
-        // when both gates pass, so we render whatever's present.
-        const fallbackRow = a.lanFallbackUrl ? `
-          <dt>backup</dt>
-          <dd><a href="${escapeHtml(a.lanFallbackUrl)}">${escapeHtml(a.lanFallbackUrl)}</a>
-            <span class="muted">(LAN-only)</span></dd>` : '';
-        const tailnetIpRow = a.tailnetUrl ? `
-          <dt>tailnet</dt>
-          <dd><a href="${escapeHtml(a.tailnetUrl)}">${escapeHtml(a.tailnetUrl)}</a>
-            <span class="muted">(via Tailscale IP)</span></dd>` : '';
-        const tailnetHttpsRow = a.tailnetHostnameUrl ? `
-          <dt>tailnet (HTTPS)</dt>
-          <dd><a href="${escapeHtml(a.tailnetHostnameUrl)}">${escapeHtml(a.tailnetHostnameUrl)}</a>
-            <span class="muted">(via Tailscale Serve)</span></dd>` : '';
-
-        return `
+    function renderCard({ title, description, actions }) {
+      return `
         <article class="app-card">
           <header class="app-card__head">
-            <h3 class="app-card__title">${escapeHtml(a.displayName)}</h3>
+            <h3 class="app-card__title">${escapeHtml(title)}</h3>
           </header>
-          <p class="app-card__desc">${escapeHtml(a.description)}</p>
-          <dl class="kv app-card__kv">
-            <dt>primary</dt><dd>${primaryUrl}</dd>
-            ${fallbackRow}
-            ${tailnetIpRow}
-            ${tailnetHttpsRow}
-          </dl>
-          <div class="app-card__actions">
-            ${renderActions(a)}
-          </div>
+          <p class="app-card__desc">${escapeHtml(description || '')}</p>
+          <div class="app-card__actions">${actions}</div>
         </article>`;
-      }).join('');
-      return `<div class="client-grid">${cards}</div>`;
     }
 
     // One button per clientLanding entry when the manifest declares
@@ -140,7 +121,10 @@
         applyFirmName(data.firmName);
         applyStaffSignin(data.showStaffSignin !== false);
         const apps = Array.isArray(data.apps) ? data.apps : [];
-        section.innerHTML = apps.length ? renderApps(apps) : renderEmpty();
+        const customCards = Array.isArray(data.customCards) ? data.customCards : [];
+        section.innerHTML = (apps.length || customCards.length)
+          ? renderTiles(apps, customCards)
+          : renderEmpty();
       } catch (err) {
         section.innerHTML = renderError(err.message || String(err));
       } finally {

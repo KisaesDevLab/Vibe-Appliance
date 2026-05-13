@@ -14,7 +14,7 @@
 // operators can confirm in DevTools (F12 → Console) that the file
 // they're running is the version they expect, vs. a stale cached
 // copy. Compare against the server's /api/v1/version response.
-const SETTINGS_JS_VERSION = '2026-05-12-client-landing-buttons';
+const SETTINGS_JS_VERSION = '2026-05-13-custom-landing-cards';
 
 (function () {
   // eslint-disable-next-line no-console
@@ -3393,6 +3393,180 @@ const SETTINGS_JS_VERSION = '2026-05-12-client-landing-buttons';
       list.appendChild(renderCustomerLandingRow(app));
     }
     panelEl.appendChild(list);
+
+    await renderCustomCardsSection(panelEl);
+  }
+
+  // Operator-curated tiles on /. State lives in /opt/vibe/state.json
+  // (customCards array), separate from manifest apps. Save replaces the
+  // whole list — simpler than per-row CRUD and matches how the form
+  // collects values. The server generates an id when one is missing.
+  async function renderCustomCardsSection(parent) {
+    const heading = el('h3', {
+      style: 'margin:2rem 0 0.4rem;font-size:1rem;color:#6b4423;',
+    }, ['Custom cards']);
+    parent.appendChild(heading);
+    parent.appendChild(el('p', { class: 'help' }, [
+      'Free-form tiles shown on your firm\'s public landing page alongside the app cards above. ',
+      'Use these for links you want clients to reach (a scheduling page, a portal, a doc-upload form, …). ',
+      'Each card needs a title and a URL starting with http:// or https://.',
+    ]));
+
+    const editor = el('div', { 'data-custom-cards-editor': '1' });
+    parent.appendChild(editor);
+    editor.appendChild(el('p', { class: 'muted' }, ['Loading…']));
+
+    let cards = [];
+    try {
+      const r = await fetch('/api/v1/admin/custom-cards', { credentials: 'same-origin' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const body = await r.json();
+      cards = Array.isArray(body.cards) ? body.cards.map(c => ({
+        id: c.id || '',
+        title: c.title || '',
+        description: c.description || '',
+        buttonLabel: c.buttonLabel || '',
+        url: c.url || '',
+      })) : [];
+    } catch (err) {
+      editor.innerHTML = '';
+      editor.appendChild(el('p', { class: 'help', style: 'color:#a04040;' }, [
+        "Couldn't load custom cards: " + _friendlyError(err),
+      ]));
+      return;
+    }
+
+    editor.innerHTML = '';
+    const rowsEl = el('div');
+    const statusEl = el('p', { class: 'help', style: 'min-height:1.2em;' }, ['']);
+
+    function paint() {
+      rowsEl.innerHTML = '';
+      if (!cards.length) {
+        rowsEl.appendChild(el('p', { class: 'muted', style: 'margin:0.5rem 0;' }, [
+          'No custom cards yet. Click "Add card" to create one.',
+        ]));
+      } else {
+        cards.forEach((card, idx) => rowsEl.appendChild(renderCustomCardRow(card, idx, paint, cards)));
+      }
+    }
+    paint();
+
+    const addBtn = el('button', {
+      type: 'button',
+      class: 'btn btn--ghost',
+      style: 'margin-right:0.5rem;',
+      onclick: () => {
+        cards.push({ id: '', title: '', description: '', buttonLabel: '', url: '' });
+        paint();
+      },
+    }, ['Add card']);
+
+    const saveBtn = el('button', {
+      type: 'button',
+      class: 'btn',
+      onclick: async () => {
+        statusEl.style.color = '';
+        statusEl.textContent = 'Saving…';
+        saveBtn.setAttribute('disabled', 'disabled');
+        addBtn.setAttribute('disabled', 'disabled');
+        try {
+          const payload = cards.map(c => ({
+            id: c.id || undefined,
+            title: (c.title || '').trim(),
+            description: (c.description || '').trim(),
+            buttonLabel: (c.buttonLabel || '').trim(),
+            url: (c.url || '').trim(),
+          }));
+          const r = await fetch('/api/v1/admin/custom-cards', {
+            method: 'PUT',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ cards: payload }),
+          });
+          const body = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(body.error || ('HTTP ' + r.status));
+          cards = (body.cards || []).map(c => ({
+            id: c.id || '',
+            title: c.title || '',
+            description: c.description || '',
+            buttonLabel: c.buttonLabel || '',
+            url: c.url || '',
+          }));
+          paint();
+          statusEl.style.color = 'var(--good)';
+          statusEl.textContent = '✓ Saved.';
+        } catch (err) {
+          statusEl.style.color = 'var(--bad)';
+          statusEl.textContent = "Couldn't save: " + _friendlyError(err);
+        } finally {
+          saveBtn.removeAttribute('disabled');
+          addBtn.removeAttribute('disabled');
+        }
+      },
+    }, ['Save cards']);
+
+    editor.appendChild(rowsEl);
+    const actions = el('div', { style: 'margin-top:0.75rem;' }, [addBtn, saveBtn]);
+    editor.appendChild(actions);
+    editor.appendChild(statusEl);
+  }
+
+  function renderCustomCardRow(card, idx, repaint, cards) {
+    const wrap = el('div', {
+      class: 'settings-field',
+      style: 'display:grid;grid-template-columns:1fr auto;gap:0.5rem;align-items:start;',
+    });
+    const fields = el('div', { style: 'display:grid;gap:0.5rem;' });
+
+    fields.appendChild(el('label', { style: 'display:block;' }, [
+      el('span', { class: 'help', style: 'display:block;margin-bottom:0.15rem;' }, ['Title']),
+      el('input', {
+        type: 'text', value: card.title, maxlength: '80',
+        placeholder: 'Schedule a meeting',
+        style: 'width:100%;',
+        oninput: (e) => { card.title = e.target.value; },
+      }),
+    ]));
+    fields.appendChild(el('label', { style: 'display:block;' }, [
+      el('span', { class: 'help', style: 'display:block;margin-bottom:0.15rem;' }, ['Description']),
+      el('input', {
+        type: 'text', value: card.description, maxlength: '400',
+        placeholder: 'Pick a 30-minute slot on my calendar.',
+        style: 'width:100%;',
+        oninput: (e) => { card.description = e.target.value; },
+      }),
+    ]));
+    fields.appendChild(el('div', { style: 'display:grid;grid-template-columns:1fr 2fr;gap:0.5rem;' }, [
+      el('label', { style: 'display:block;' }, [
+        el('span', { class: 'help', style: 'display:block;margin-bottom:0.15rem;' }, ['Button label']),
+        el('input', {
+          type: 'text', value: card.buttonLabel, maxlength: '40',
+          placeholder: 'Open',
+          style: 'width:100%;',
+          oninput: (e) => { card.buttonLabel = e.target.value; },
+        }),
+      ]),
+      el('label', { style: 'display:block;' }, [
+        el('span', { class: 'help', style: 'display:block;margin-bottom:0.15rem;' }, ['URL']),
+        el('input', {
+          type: 'url', value: card.url, maxlength: '2000',
+          placeholder: 'https://example.com/path',
+          style: 'width:100%;',
+          oninput: (e) => { card.url = e.target.value; },
+        }),
+      ]),
+    ]));
+    wrap.appendChild(fields);
+
+    const removeBtn = el('button', {
+      type: 'button', class: 'btn btn--ghost',
+      'aria-label': 'Remove card ' + (idx + 1),
+      onclick: () => { cards.splice(idx, 1); repaint(); },
+    }, ['Remove']);
+    wrap.appendChild(removeBtn);
+
+    return wrap;
   }
 
   function renderCustomerLandingRow(app) {
