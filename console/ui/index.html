@@ -22,7 +22,7 @@
     </section>
 
     <footer class="footer">
-      <div class="cta-row" style="margin-top: 1rem;">
+      <div id="staff-signin" class="cta-row" style="margin-top: 1rem; display: none;">
         <a class="btn btn--ghost" href="/admin">Staff sign-in</a>
       </div>
     </footer>
@@ -99,7 +99,7 @@
           </div>
         </article>`;
       }).join('');
-      return `<div class="admin-grid">${cards}</div>`;
+      return `<div class="client-grid">${cards}</div>`;
     }
 
     // One button per clientLanding entry when the manifest declares
@@ -123,6 +123,14 @@
       document.title = `${firmName} · Client portal`;
     }
 
+    // Staff sign-in link is hidden by default and only revealed when the
+    // server reports the toggle on. Hiding by default avoids a flash of
+    // the link before the fetch resolves on operators who have it off.
+    function applyStaffSignin(show) {
+      const el = document.getElementById('staff-signin');
+      if (el && show) el.style.display = '';
+    }
+
     async function loadApps() {
       const section = document.getElementById('apps-section');
       try {
@@ -130,6 +138,7 @@
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const data = await r.json();
         applyFirmName(data.firmName);
+        applyStaffSignin(data.showStaffSignin !== false);
         const apps = Array.isArray(data.apps) ? data.apps : [];
         section.innerHTML = apps.length ? renderApps(apps) : renderEmpty();
       } catch (err) {

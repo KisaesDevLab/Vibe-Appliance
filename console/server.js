@@ -793,6 +793,7 @@ app.get('/api/v1/public/apps', async (_req, res) => {
   const showLanFallback   = (appliance.LANDING_SHOW_LAN_FALLBACK   || 'true').trim() !== 'false';
   const showTailnetIp     = (appliance.LANDING_SHOW_TAILNET_IP     || 'false').trim() === 'true';
   const showTailnetHttps  = (appliance.LANDING_SHOW_TAILNET_HTTPS  || 'false').trim() === 'true';
+  const showStaffSignin   = (appliance.LANDING_SHOW_STAFF_SIGNIN   || 'true').trim() !== 'false';
   const firmName          = (appliance.LANDING_FIRM_NAME           || '').trim() || null;
 
   // Only probe the daemon when a tailnet flavor is enabled — public
@@ -841,7 +842,7 @@ app.get('/api/v1/public/apps', async (_req, res) => {
       return out;
     })
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
-  res.json({ apps: items, firmName });
+  res.json({ apps: items, firmName, showStaffSignin });
 });
 
 // --- Apps registry & toggle endpoints ---------------------------------

@@ -434,6 +434,24 @@
         "input":     "text",
         "appliance": "shared"
       }
+    },
+    {
+      "name":  "LANDING_SHOW_STAFF_SIGNIN",
+      "value": "true",
+      "doc":   "Whether the public client landing at / shows a small 'Staff sign-in' link in the footer pointing at /admin. Default true preserves the v1 behavior; toggle off to hide the staff entry from clients (staff still reach /admin directly).",
+      "ui": {
+        "tier":      1,
+        "category":  "Landing page",
+        "label":     "Show 'Staff sign-in' link",
+        "helpText":  "Adds a footer link to /admin on the public client landing. Off hides the link from clients without affecting staff access to /admin.",
+        "input":     "toggle",
+        "appliance": "shared",
+        "validate":  "enum",
+        "options": [
+          { "value": "true",  "label": "Show" },
+          { "value": "false", "label": "Hide" }
+        ]
+      }
     }
   ]
 }

@@ -146,6 +146,22 @@ h3 { font-size: 1.1rem; line-height: 1.3;  margin: 0 0 0.35rem; }
   margin-bottom: 2rem;
 }
 
+/* Customer landing card grid — two columns on desktop (each card 50%
+   of the container minus gap), one column on narrow viewports so each
+   card fills the mobile screen. Separate from .admin-grid so changes
+   here don't affect the admin status page. */
+.client-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 1rem;
+  margin-bottom: 2rem;
+}
+@media (max-width: 640px) {
+  .client-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
