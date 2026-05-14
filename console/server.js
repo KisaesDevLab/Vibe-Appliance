@@ -2889,40 +2889,42 @@ function probeCockpit(timeoutMs = 1500) {
   });
 }
 
-// Mode-aware Cockpit URL — Phase 8.5 Workstream A. Three deployment modes:
-//   - domain mode: Caddy reverse-proxies cockpit.<domain> (existing).
-//   - tailscale mode: tailscale serve --https=9090 publishes the tailnet
-//     hostname on port 9090 with a Tailscale-CA cert.
-//   - lan mode: direct access on https://<host-ip>:9090 with self-signed
-//     cert (browsers will warn — that's expected on the LAN).
+// Cockpit URL — Phase 8.5 Workstream A.
+//
+// Cockpit insists on running at the root (no path-prefix support), so
+// its URL is always host:9090 directly. The cockpit.<domain> subdomain
+// was a domain-mode convenience but isn't reachable on the public
+// Cloudflare tunnel (admin/infra is deliberately LAN/Tailscale-only —
+// see admin.html "Admin and infra subdomains are LAN/Tailscale-only")
+// and requires split-DNS to work otherwise. Use the host-IP form
+// universally — it works on the LAN in every mode.
 //
 // Returns { url, note }. `url` is a clean URL when reachable, or null
 // when state lacks the info needed to construct one. `note` is optional
 // caveat text rendered alongside the link, never inside the href.
 function cockpitUrl(config) {
-  if (config.mode === 'domain' && config.domain) {
-    return { url: `https://cockpit.${config.domain}/`, note: null };
+  const tailscaleActive = config.mode === 'tailscale'
+                       || config.tailscale === true
+                       || config.tailscale === 'true';
+  if (tailscaleActive && config.tailscale_hostname) {
+    return { url: `https://${config.tailscale_hostname}:9090/`, note: null };
   }
-  if (config.mode === 'tailscale' || config.tailscale === true || config.tailscale === 'true') {
-    const tsHost = config.tailscale_hostname;
-    if (tsHost) return { url: `https://${tsHost}:9090/`, note: null };
+  if (config.host_ip) {
+    return {
+      url: `https://${config.host_ip}:9090/`,
+      note: 'self-signed cert — your browser will warn; click through (OK on the LAN)',
+    };
+  }
+  if (tailscaleActive) {
     return {
       url: null,
       note: 'tailnet hostname not yet cached in state — run `tailscale status`, then visit https://<host>.<tailnet>.ts.net:9090',
     };
   }
-  if (config.mode === 'lan') {
-    const ip = config.host_ip;
-    if (ip) return {
-      url: `https://${ip}:9090/`,
-      note: 'self-signed cert — your browser will warn; click through (OK on the LAN)',
-    };
-    return {
-      url: null,
-      note: 'LAN host IP not cached in state — visit https://<your-server-lan-ip>:9090 (self-signed cert OK on LAN)',
-    };
-  }
-  return { url: null, note: 'mode unknown — Cockpit is reachable on host:9090 directly' };
+  return {
+    url: null,
+    note: 'host IP not cached in state — visit https://<your-server-lan-ip>:9090 (self-signed cert OK on LAN)',
+  };
 }
 
 app.get('/api/v1/infra', requireAdmin, async (_req, res) => {
@@ -2937,23 +2939,29 @@ app.get('/api/v1/infra', requireAdmin, async (_req, res) => {
       // Returns { url, note } so the UI can render a clean clickable
       // link AND the caveat text without splicing them together.
       ({ url, note } = cockpitUrl(config));
-    } else if (config.mode === 'domain' && config.domain) {
-      url = `https://${svc.slug}.${config.domain}/`;
     } else {
-      // Non-domain modes: Duplicati and Portainer are reachable via
-      // Caddy's path-prefix routing under the appliance hostname.
-      // The exact host depends on mode (LAN: <host>.local, Tailscale:
-      // tailnet hostname). Be honest about not knowing.
-      const host = (config.mode === 'tailscale' && config.tailscale_hostname)
+      // Duplicati and Portainer are admin tooling — deliberately NOT
+      // registered with the public Cloudflare tunnel ingress in domain
+      // mode (see admin.html "Admin and infra subdomains are
+      // LAN/Tailscale-only"). They're reachable via Caddy's path-prefix
+      // routing on the :80 catch-all, which is wrapped in an @lan
+      // remote_ip matcher and works the same in every mode. Prefer the
+      // host LAN IP — universally reachable from the operator's
+      // network without split-DNS or /etc/hosts entries for the infra
+      // subdomain. The `<slug>.<domain>` subdomain that the prior
+      // domain-mode branch returned was misleading: novice operators
+      // without split-DNS landed on an unresolved host.
+      const tailscaleActive = config.mode === 'tailscale'
+                           || config.tailscale === true
+                           || config.tailscale === 'true';
+      const host = (tailscaleActive && config.tailscale_hostname)
                  ? config.tailscale_hostname
-                 : (config.mode === 'lan' && config.host_ip)
-                   ? config.host_ip
-                   : null;
+                 : (config.host_ip || null);
       if (host) {
-        const scheme = (config.mode === 'tailscale') ? 'https' : 'http';
+        const scheme = tailscaleActive ? 'https' : 'http';
         url = `${scheme}://${host}/${svc.slug}/`;
       } else {
-        note = `non-domain mode — reach via http(s)://<your-server>/${svc.slug}/`;
+        note = `host IP not cached in state — reach via http://<your-server-lan-ip>/${svc.slug}/ on the LAN`;
       }
     }
 
@@ -4223,13 +4231,15 @@ app.get('/api/v1/admin/backup/info', requireAdmin, async (_req, res) => {
     containerStatus = 'not-found';
   }
 
-  // Mode-aware Duplicati URL — mirrors the same logic that
-  // /api/v1/first-login uses for _infra_duplicati_web so the operator
-  // sees the same link no matter which page they're on.
+  // Duplicati URL — admin tooling, LAN/Tailscale-only by design. Use
+  // the host LAN IP + emergency-proxy port (UFW-gated to RFC1918 +
+  // Tailscale CGNAT) so the link works without depending on the
+  // `backup.<domain>` subdomain resolving (it isn't published on the
+  // public tunnel — see admin.html "Admin and infra subdomains are
+  // LAN/Tailscale-only"). Mirrors /api/v1/first-login's _infra_duplicati_web
+  // so the operator sees the same link no matter which page they're on.
   let webUrl = null;
-  if (config.mode === 'domain' && config.domain) {
-    webUrl = `https://backup.${config.domain}/`;
-  } else if (config.host_ip) {
+  if (config.host_ip) {
     webUrl = `http://${config.host_ip}:5198/`;
   }
 
@@ -4613,12 +4623,14 @@ app.get('/api/v1/first-login', requireAdmin, async (_req, res) => {
   // status from a docker inspect. Same shape as app items so the UI
   // renderer doesn't need a second code path.
   const config = state.config || {};
-  // Infra surfaces (Duplicati, Portainer) live at their own subdomains
-  // in domain mode (backup.<domain>, portainer.<domain>) — never path-
-  // routed off the tunnel hostname, since they're admin tooling and
-  // path-routing them would make them tunnel-public.
-  const infraDomainHost = (config.mode === 'domain' && config.domain)
-    ? config.domain : null;
+  // Infra surfaces (Duplicati, Portainer) are admin tooling — never
+  // exposed off-LAN, in any mode. The `backup.<domain>` /
+  // `portainer.<domain>` subdomains were a domain-mode convenience but
+  // aren't reachable on the public Cloudflare tunnel (see admin.html
+  // "Admin and infra subdomains are LAN/Tailscale-only") and require
+  // split-DNS otherwise. Use the host LAN IP + emergency-proxy port
+  // (UFW-gated to RFC1918 + Tailscale CGNAT) so the link works on the
+  // LAN regardless of mode or DNS setup.
   const infraLanBase = config.host_ip ? `http://${config.host_ip}` : null;
   const infraExtras = [];
 
@@ -4632,9 +4644,7 @@ app.get('/api/v1/first-login', requireAdmin, async (_req, res) => {
       type:     'default-credentials-passive',
       username: 'admin',
       password: dupWebPw,
-      login_url: infraDomainHost ? `https://backup.${infraDomainHost}/`
-               : infraLanBase ? `${infraLanBase}:5198/`
-               : '/backup/',
+      login_url: infraLanBase ? `${infraLanBase}:5198/` : '/backup/',
       enabled:  true,
       status:   dupRunning ? 'running' : 'stopped',
       changed:  false,
@@ -4665,9 +4675,7 @@ app.get('/api/v1/first-login', requireAdmin, async (_req, res) => {
       type:     'default-credentials-passive',
       username: 'admin',
       password: portainerPw,
-      login_url: infraDomainHost ? `https://portainer.${infraDomainHost}/`
-               : infraLanBase ? `${infraLanBase}:5197/`
-               : '/portainer/',
+      login_url: infraLanBase ? `${infraLanBase}:5197/` : '/portainer/',
       enabled:  true,
       status:   portRunning ? 'running' : 'stopped',
       changed:  false,
