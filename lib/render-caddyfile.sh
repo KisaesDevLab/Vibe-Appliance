@@ -289,6 +289,16 @@ def render_domain_app_vhost(domain, tunnel_subdomain, enabled, tls_internal=Fals
     served by Caddy:443 but never registered with the tunnel ingress —
     reachable from LAN (split DNS to the host IP) or Tailscale only.
 
+    userFacing=false apps (e.g. vibe-glm-ocr) are also excluded from this
+    public vhost. They're internal services consumed server-to-server
+    over vibe_net by other Vibe apps — exposing them via Caddy would
+    publish unauthenticated inference / OCR / etc. endpoints to the
+    internet. Cross-app callers reach them by container DNS
+    (`http://vibe-glm-ocr:8090`) directly, not via Caddy, so dropping
+    the public path handler doesn't break the integration. The
+    LAN-gated :80 catch-all (rendered separately below in main()) still
+    includes these apps for on-host admin debugging.
+
     tls_internal: see render_apex_vhost.
     """
     if not domain or not tunnel_subdomain:
@@ -310,7 +320,10 @@ def render_domain_app_vhost(domain, tunnel_subdomain, enabled, tls_internal=Fals
     lines.append("")
 
     # Splice in per-app path handlers (tab-indented to match this block).
+    # userFacing=false apps are intentionally skipped here; see docstring.
     for slug, manifest in enabled:
+        if manifest.get("userFacing") is False:
+            continue
         lines.append(render_path_handler(slug, manifest).rstrip("\n"))
         lines.append("")
 
