@@ -445,6 +445,18 @@ Race between the Caddy reload and the compose stop.
 **Diagnose:** `sudo docker ps --filter name=<slug>-`
 **Fix:** `sudo docker compose -f /opt/vibe/appliance/docker-compose.yml -f /opt/vibe/appliance/apps/<slug>.yml stop`
 
+### Empty `/opt/vibe/data/apps/vibe-glm-ocr/cache/` after upgrade
+
+Pre-existing operators may notice this directory on their host. It was
+created by an earlier overlay that bind-mounted `/app/cache` into the
+container; the upstream image never wrote to it, so the directory is
+empty. The mount has been removed from `apps/vibe-glm-ocr.yml` because
+the upstream image bakes model weights into `/models/` at build time
+and uses no runtime cache.
+
+**Diagnose:** `sudo ls -la /opt/vibe/data/apps/vibe-glm-ocr/cache/` — if it's empty, this is the situation.
+**Fix (optional, cosmetic):** `sudo rm -rf /opt/vibe/data/apps/vibe-glm-ocr/cache`. The appliance does not auto-remove it because deleting under `/opt/vibe/data/` without explicit operator action is a precedent we don't want to set.
+
 ---
 
 ## Cert / DNS issues

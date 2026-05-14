@@ -15,27 +15,16 @@
   "ports":      { "server": 8090 },
 
   "routing": {
-    "default_upstream": "vibe-glm-ocr:8090",
-    "matchers": [
-      { "name": "stream", "path": "/api/ocr/stream*", "upstream": "vibe-glm-ocr:8090", "streaming": true }
-    ]
+    "default_upstream": "vibe-glm-ocr:8090"
   },
-
-  "depends": ["redis"],
 
   "env": {
-    "required": [
-      { "name": "JWT_SECRET",      "from": "shared:JWT_SECRET" },
-      { "name": "ALLOWED_ORIGIN",  "from": "subdomain-url" },
-      { "name": "REDIS_URL",       "from": "redis-url" }
-    ]
+    "required": []
   },
-
-  "redis": { "db": 5 },
 
   "firstLogin": {
     "type": "no-auth",
-    "note": "Internal stateless service — exposes /v1/chat/completions on vibe_net for server-to-server calls from other Vibe apps (Vibe-MyBooks attachments, etc.). No user model, no login. Health: /health.",
+    "note": "Internal stateless service — exposes the OpenAI-compatible /v1/chat/completions endpoint on vibe_net for server-to-server calls from other Vibe apps (e.g. vibe-tx-converter via GLM_OCR_URL=http://vibe-glm-ocr:8090). userFacing=false keeps the path out of the public Caddy vhost. No user model, no login, no database, no Redis — the upstream image is llama.cpp's llama-server with the GLM-OCR F16 GGUF baked in. Health: /health.",
     "url":  ""
   },
 

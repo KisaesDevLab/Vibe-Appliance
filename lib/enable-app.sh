@@ -204,7 +204,10 @@ enable_app() {
     ( cd "$APPLIANCE_DIR" && docker compose -f docker-compose.yml -f "apps/${slug}.yml" logs --tail=50 --no-color $services ) \
       2>&1 | tee -a "$VIBE_LOG_FILE" >&2 || true
     printf '========================================\n\n' >&2
-    die "App $slug did not become healthy within 120s. See container logs above."
+    local _health_timeout
+    _health_timeout="$(_manifest_field "$manifest" 'data.get("health_timeout_s", 120)')"
+    _health_timeout="${_health_timeout:-120}"
+    die "App $slug did not become healthy within ${_health_timeout}s. See container logs above."
   fi
 
   # 6b. Run the manifest's seed command (if any) once. Some upstream

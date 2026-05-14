@@ -1,11 +1,14 @@
 # apps/vibe-glm-ocr.yml — Vibe GLM-OCR overlay.
 #
-# Single self-contained image — no Ollama sidecar (the upstream
-# Dockerfile bundles its own VLM pipeline; an external Ollama
-# would shadow whatever the image already does).
+# Single self-contained image. Upstream serves the GLM-OCR F16 GGUF
+# (~1.8 GB, 0.9B params) via llama.cpp's llama-server. Model weights
+# are baked into the image at /models/; no runtime download, no
+# HuggingFace cache, no Postgres. The image is built CPU-only
+# (-DGGML_CUDA=OFF) and the entrypoint forces --n-gpu-layers 0, so
+# GPU passthrough at the docker layer cannot improve inference — only
+# rebuilding upstream with CUDA enabled would.
 #
-# The image listens on :8090 and exposes /health. No database; uses
-# Redis (db 5) for the OCR job queue.
+# The image listens on :8090 and exposes /health.
 
 name: vibe
 
@@ -21,17 +24,28 @@ services:
       - /opt/vibe/env/vibe-glm-ocr.env
     networks:
       - vibe_net
-    depends_on:
-      redis:
-        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8090/health || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 12
-      start_period: 30s
-    volumes:
-      # OCR cache — model weights / temp scan artefacts. Standardized
-      # under /opt/vibe/data/apps/<slug>/ so the appliance's data tree
-      # is uniform per app (matches vibe-mybooks/vibe-payroll/etc.).
-      - /opt/vibe/data/apps/vibe-glm-ocr/cache:/app/cache
+      # Cold start loads the bundled vision-language model into memory;
+      # on CPU-only hosts this commonly takes 60–120s. The manifest's
+      # health_timeout_s (300) is the appliance's own deadline for /health
+      # returning 200; this is docker's internal grace before failing
+      # probes start counting toward the unhealthy state.
+      start_period: 180s
+    # Soft memory floor — `mem_reservation` is honored by `docker compose up`
+    # (unlike `deploy.resources.reservations`, which is swarm-only).
+    # Upstream README's resource table: ~2 GB idle (model loaded), ~3 GB
+    # peak during inference. 2g is the floor we guarantee; the kernel
+    # provides up to peak from spare host RAM. No hard `mem_limit`:
+    # capping at peak would OOM-kill mid-inference, which is worse than
+    # slow inference.
+    #
+    # Sizing implication: the appliance's documented 2 GB droplet target
+    # cannot host this app — Postgres / Caddy / console alone consume
+    # ~300 MB before OCR loads, and peak inference needs ~3 GB. Operators
+    # enabling vibe-glm-ocr should be on a 4 GB+ host. See docs/INSTALL.md
+    # droplet sizing for guidance.
+    mem_reservation: 2g
