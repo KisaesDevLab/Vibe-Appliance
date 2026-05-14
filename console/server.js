@@ -2943,25 +2943,18 @@ app.get('/api/v1/infra', requireAdmin, async (_req, res) => {
       // Duplicati and Portainer are admin tooling — deliberately NOT
       // registered with the public Cloudflare tunnel ingress in domain
       // mode (see admin.html "Admin and infra subdomains are
-      // LAN/Tailscale-only"). They're reachable via Caddy's path-prefix
-      // routing on the :80 catch-all, which is wrapped in an @lan
-      // remote_ip matcher and works the same in every mode. Prefer the
-      // host LAN IP — universally reachable from the operator's
-      // network without split-DNS or /etc/hosts entries for the infra
-      // subdomain. The `<slug>.<domain>` subdomain that the prior
-      // domain-mode branch returned was misleading: novice operators
-      // without split-DNS landed on an unresolved host.
-      const tailscaleActive = config.mode === 'tailscale'
-                           || config.tailscale === true
-                           || config.tailscale === 'true';
-      const host = (tailscaleActive && config.tailscale_hostname)
-                 ? config.tailscale_hostname
-                 : (config.host_ip || null);
-      if (host) {
-        const scheme = tailscaleActive ? 'https' : 'http';
-        url = `${scheme}://${host}/${svc.slug}/`;
-      } else {
-        note = `host IP not cached in state — reach via http://<your-server-lan-ip>/${svc.slug}/ on the LAN`;
+      // LAN/Tailscale-only"). Use the host LAN IP + the emergency-proxy
+      // port (UFW-gated to RFC1918 + Tailscale CGNAT) so each service
+      // is served at its own root. Path-prefix routing under
+      // /<slug>/ via Caddy's @lan-gated :80 catch-all breaks Duplicati
+      // — its bundle ships absolute asset paths that don't survive a
+      // `uri strip_prefix` rewrite. The :5197/:5198 ports go through
+      // HAProxy with no path rewrite, so the app sees its own root.
+      const host = config.tailscale_hostname || config.host_ip || null;
+      if (host && svc.emergencyPort) {
+        url = `http://${host}:${svc.emergencyPort}/`;
+      } else if (!host) {
+        note = `host IP not cached in state — reach via http://<your-server-lan-ip>:${svc.emergencyPort}/ on the LAN`;
       }
     }
 
