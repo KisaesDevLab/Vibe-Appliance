@@ -550,10 +550,17 @@ except Exception:
     return 0
   fi
 
-  # Resolve the target container — the server's container_name from
-  # routing.default_upstream (e.g. "vibe-tb-server:3000" → "vibe-tb-server").
+  # Resolve the target container — prefer the api matcher's upstream
+  # (the server tier) over default_upstream, which by convention points
+  # at the client tier (nginx serving the SPA bundle) and doesn't have
+  # node / dist/seed.js on it. Every Vibe app's manifest names its
+  # server-tier matcher `api`; fall back to default_upstream for any
+  # future manifest without that convention so the helper stays generic.
+  # NB: _manifest_field runs the expression through eval(), which only
+  # accepts a single expression — keep this on one line (see the
+  # IndentationError caveat in _wait_for_app_health).
   local upstream container
-  upstream="$(_manifest_field "$manifest" 'data["routing"]["default_upstream"]')"
+  upstream="$(_manifest_field "$manifest" 'next((m["upstream"] for m in (data["routing"].get("matchers") or []) if m.get("name") == "api"), data["routing"]["default_upstream"])')"
   container="${upstream%:*}"
   [[ -n "$container" ]] || { log_warn "could not resolve seed target container" slug="$slug"; return 1; }
 
