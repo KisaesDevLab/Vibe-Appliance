@@ -163,10 +163,22 @@ enable_app() {
   # so the log-dump branch was never reached. Wrapping in `|| { ... }`
   # puts the pipeline in an OR-list, which suppresses errexit, and
   # routes failure into the same handler intentionally.
+  #
+  # --force-recreate: compose's env-file change-detection is unreliable
+  # across versions — we hit this on 2026-05-14 when the URL-prefix
+  # change re-rendered every per-app env (VITE_BASE_PATH=/vibe-tb/ →
+  # /tb/) but the running containers kept the old bundle baked in.
+  # Symptom: blank page, SPA fetching /vibe-<slug>/* paths that no
+  # longer route. _render_app_env always writes a fresh env file
+  # (either changed or byte-identical merge), so we may as well always
+  # recreate — the cost is one container restart per app per bootstrap,
+  # which is the price the addendum-promoted env reconciliation pays
+  # anyway. Without this, recreate happens "sometimes" and operators
+  # can't predict it.
   # shellcheck disable=SC2086
   {
     ( cd "$APPLIANCE_DIR" && \
-        docker compose -f docker-compose.yml -f "apps/${slug}.yml" up -d $services ) \
+        docker compose -f docker-compose.yml -f "apps/${slug}.yml" up -d --force-recreate $services ) \
       2>&1 | tee -a "$VIBE_LOG_FILE" >&2
   } || {
     _state_app_set "$slug" status failed error "compose up failed"
