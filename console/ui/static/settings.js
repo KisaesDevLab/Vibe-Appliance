@@ -1283,7 +1283,7 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
       {
         key: 'domain',
         title: 'Public domain',
-        body:  "Apps at https://<app>.<domain> via Let's Encrypt (requires port 80 + 443 reachable). Tailscale alongside adds tailnet access — admin/console reachable via the tailnet; per-app subdomains stay on the public domain.",
+        body:  "Apps at https://<tunnel-subdomain>.<domain>/<app>/ via Let's Encrypt (requires port 80 + 443 reachable). One hostname fronts every app under path-prefix routes; Tailscale alongside adds tailnet access.",
       },
       {
         key: 'tailscale',
