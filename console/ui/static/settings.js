@@ -14,7 +14,7 @@
 // operators can confirm in DevTools (F12 → Console) that the file
 // they're running is the version they expect, vs. a stale cached
 // copy. Compare against the server's /api/v1/version response.
-const SETTINGS_JS_VERSION = '2026-05-13-custom-landing-cards';
+const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
 
 (function () {
   // eslint-disable-next-line no-console
@@ -38,6 +38,19 @@ const SETTINGS_JS_VERSION = '2026-05-13-custom-landing-cards';
     return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
       '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
     }[c]));
+  }
+
+  // pathPrefix(slug) — URL path prefix for an app: the slug with a
+  // leading `vibe-` stripped. Mirrors lib/render-caddyfile.sh's
+  // _path_prefix() and console/server.js's appPathPrefix(). The
+  // wizard panels build URLs against `wiz.tunnelSubdomain` /
+  // `wiz.domain` rather than current state.config.mode, so they
+  // can't reuse the server-computed `url` field on the apps payload
+  // — they need this client-side helper to stay in sync.
+  function pathPrefix(slug) {
+    return slug && slug.startsWith('vibe-')
+      ? slug.slice('vibe-'.length)
+      : (slug || '');
   }
 
   function el(tag, attrs, children) {
@@ -1648,7 +1661,8 @@ const SETTINGS_JS_VERSION = '2026-05-13-custom-landing-cards';
             .filter(a => a.enabled)
             .map(a => ({ slug: a.slug, displayName: a.displayName, subdomain: a.subdomain }));
           // Single-hostname routing: every enabled app is reachable
-          // through the tunnel via /<slug>/ paths. selectedSlugs is
+          // through the tunnel via /<prefix>/ paths (slug with the
+          // redundant `vibe-` stripped). selectedSlugs is
           // auto-populated with the full list so the operator doesn't
           // have to pick a subset (the per-app subdomain model where
           // that pick mattered is gone — see commit c7a9029).
@@ -2025,18 +2039,18 @@ const SETTINGS_JS_VERSION = '2026-05-13-custom-landing-cards';
 
       // Apps reachable through the tunnel — read-only summary. In the
       // single-hostname routing model every enabled app is reachable
-      // at /<slug>/ under the tunnel hostname; the legacy per-app
-      // subdomain pick is no longer a meaningful choice. Enable /
-      // disable apps from the Apps tab; this list reflects state.apps
-      // directly.
+      // at /<prefix>/ under the tunnel hostname (prefix = slug minus
+      // the redundant `vibe-`); the legacy per-app subdomain pick is
+      // no longer a meaningful choice. Enable / disable apps from the
+      // Apps tab; this list reflects state.apps directly.
       const tunnelHost = (wiz.tunnelSubdomain || 'vibe') + '.' + (wiz.domain || '<your-domain>');
       section.appendChild(el('h3', {
         style: 'margin:1.2rem 0 0.3rem;font-size:0.95rem;text-transform:uppercase;letter-spacing:0.1em;',
       }, ['Apps reachable through this tunnel']));
       section.appendChild(el('p', { class: 'help', style: 'margin:0 0 0.4rem;' }, [
         'Every enabled app is reachable at ',
-        el('span', { class: 'mono' }, ['https://' + tunnelHost + '/<slug>/']),
-        '. Enable or disable apps on the Apps tab to change this list. ',
+        el('span', { class: 'mono' }, ['https://' + tunnelHost + '/<app>/']),
+        ' (e.g. /tb, /mybooks). Enable or disable apps on the Apps tab to change this list. ',
         'Apex/admin/cockpit/portainer/backup are never exposed through the tunnel.',
       ]));
       section.appendChild(renderReachableList());
@@ -2084,7 +2098,7 @@ const SETTINGS_JS_VERSION = '2026-05-13-custom-landing-cards';
         const li = el('li', { style: 'padding:0.15rem 0;' });
         li.appendChild(el('span', { style: 'font-weight:600;' }, [a.displayName]));
         li.appendChild(document.createTextNode(' — '));
-        li.appendChild(el('span', { class: 'mono' }, ['https://' + host + '/' + a.slug + '/']));
+        li.appendChild(el('span', { class: 'mono' }, ['https://' + host + '/' + pathPrefix(a.slug) + '/']));
         wrap.appendChild(li);
       }
       return wrap;
@@ -2635,9 +2649,9 @@ const SETTINGS_JS_VERSION = '2026-05-13-custom-landing-cards';
         el('span', { class: 'mono' }, ['https://' + pausedHost + '/']),
       ]));
       if (wiz.enabledApps.length) {
-        const slugs = wiz.enabledApps.map(a => a.slug).join(', ');
+        const prefixes = wiz.enabledApps.map(a => '/' + pathPrefix(a.slug) + '/').join(', ');
         section.appendChild(el('p', { class: 'help', style: 'margin-top:0.2rem;color:var(--text-muted);' }, [
-          'Enabled apps reachable at /<slug>/ paths: ', slugs,
+          'Enabled apps reachable at: ', prefixes,
         ]));
       }
 
