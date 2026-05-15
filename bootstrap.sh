@@ -122,8 +122,10 @@ FLAGS
   --tunnel-subdomain SUB          Single subdomain label that fronts every app
                                   in --mode domain. Default: vibe. The full
                                   host is ${SUB}.${DOMAIN}; apps live at
-                                  /${slug}/ underneath it (mirroring LAN
-                                  mode). Must be a single DNS label.
+                                  /${prefix}/ underneath it, where ${prefix}
+                                  is the app slug with the redundant `vibe-`
+                                  stripped (e.g. /tb, /mybooks). Mirrors LAN
+                                  routing. Must be a single DNS label.
   --email  EMAIL                  ACME contact email for --mode domain.
   --tailscale                     Also install Tailscale (any mode).
   --tailscale-authkey KEY         Pre-shared authkey for unattended Tailscale up.

@@ -46,7 +46,8 @@ the Caddyfile in LAN mode, and reloads Caddy. Idempotent — safe to run
 even when already in LAN mode.
 
 After it finishes the appliance is reachable at
-`http://<host-ip>/admin`, with apps at `http://<host-ip>/<slug>/`.
+`http://<host-ip>/admin`, with apps at `http://<host-ip>/<prefix>/`
+(`<prefix>` = slug minus the `vibe-` prefix; e.g. `/tb/`, `/mybooks/`).
 
 To return to domain mode when you've fixed the underlying issue:
 

@@ -73,7 +73,7 @@ You will need, before you start:
    `https://vibe.firm.com/`.
 7. **Enable your first app.** In the admin console → **Apps** →
    click **Enable** on Vibe Trial Balance. Wait ~2 minutes for the
-   badge to read **running**. Open `https://vibe.firm.com/vibe-tb/`
+   badge to read **running**. Open `https://vibe.firm.com/tb/`
    in a new tab — you should see the app's login page. The default
    login is `admin` / `admin`; it'll force you to change the password
    immediately.
@@ -106,15 +106,17 @@ domain for clients, tailnet-only for staff admin.
 
 | Mode      | Console at        | An app (e.g. Vibe-TB) at         |
 | --------- | ----------------- | -------------------------------- |
-| Domain    | `https://vibe.firm.com/`           | `https://vibe.firm.com/vibe-tb/`           |
-| LAN       | `http://<host>.local/`             | `http://<host>.local/vibe-tb/`             |
-| Tailscale | `http://<tailnet-ip>/`             | `http://<tailnet-ip>/vibe-tb/`             |
+| Domain    | `https://vibe.firm.com/`           | `https://vibe.firm.com/tb/`           |
+| LAN       | `http://<host>.local/`             | `http://<host>.local/tb/`             |
+| Tailscale | `http://<tailnet-ip>/`             | `http://<tailnet-ip>/tb/`             |
 
 Every mode uses the **same single-hostname + per-app path** shape.
 The `vibe` part of `vibe.firm.com` is the **tunnel subdomain** — a
 single label you choose at install time (default `vibe`, change with
-`--tunnel-subdomain`). All apps live under that one hostname; the
-bare apex (`firm.com`) just redirects there.
+`--tunnel-subdomain`). All apps live under that one hostname (path =
+slug with the redundant `vibe-` stripped — `/tb/`, `/mybooks/`,
+`/tax-research/`, etc.); the bare apex (`firm.com`) just redirects
+there.
 
 ---
 
@@ -184,8 +186,10 @@ If you're not doing domain mode, skip to step 3.
 
 You need a domain — say `firm.com`. The appliance will serve everything
 (console + all apps + the apex redirect) through **one** hostname:
-`vibe.firm.com` by default. Apps live at `/<slug>/` underneath
-(e.g. `vibe.firm.com/vibe-tb/`). You only need DNS records for:
+`vibe.firm.com` by default. Apps live at `/<app>/` underneath (where
+`<app>` is the slug with the redundant `vibe-` stripped — e.g.
+`vibe.firm.com/tb/`, `vibe.firm.com/mybooks/`). You only need DNS
+records for:
 
 - `vibe.firm.com` — the appliance's public hostname (the one record
   that matters)
@@ -494,7 +498,7 @@ Setup:
    If you chose a different `--tunnel-subdomain` (e.g. `apps`), replace
    the `vibe` row's Host value with that label. Apps don't get
    per-subdomain records anymore — they all live under
-   `vibe.firm.com/<slug>/`.
+   `vibe.firm.com/<app>/` (e.g. `/tb/`, `/mybooks/`).
 
 4. Run the appliance installer in domain mode (HTTP-01 — Cloudflare
    DNS-01 is incompatible because it requires Cloudflare nameservers).
@@ -540,7 +544,7 @@ actual values.
 
 > **About `--tunnel-subdomain`.** Domain-mode commands include
 > `--tunnel-subdomain vibe`. That's the single subdomain label that
-> fronts every app (`vibe.firm.com` → console; `vibe.firm.com/vibe-tb/`
+> fronts every app (`vibe.firm.com` → console; `vibe.firm.com/tb/`
 > → an app). Change `vibe` to whatever label you want (`apps`,
 > `cpa`, etc.). Must be a single DNS label — no dots, no underscores.
 > Re-running bootstrap with a different `--tunnel-subdomain` later is
@@ -708,10 +712,10 @@ not-installed → enabling… → running
 ```
 
 Once the status badge says **running**, the card shows the live URL.
-In domain mode this is `https://vibe.firm.com/vibe-tb/` — every app
-lives at `/<slug>/` under the single tunnel hostname. **No new DNS
-record is needed** to enable an app; the existing
-`vibe.firm.com` already covers it.
+In domain mode this is `https://vibe.firm.com/tb/` — every app
+lives at `/<app>/` under the single tunnel hostname (slug minus the
+redundant `vibe-` prefix). **No new DNS record is needed** to enable
+an app; the existing `vibe.firm.com` already covers it.
 
 Click the URL. You should see Vibe-TB's login page. Log in with the
 default credentials shown in the **First-login info** section of
@@ -802,8 +806,8 @@ now**. Same outcome.
 **How do I add a new app subdomain?**
 You don't — apps don't get their own subdomains anymore. Enabling an
 app from the admin **Apps** tab is the whole flow. The app appears
-at `https://vibe.firm.com/<slug>/` immediately. No DNS work, no
-Caddy edit, no Cloudflare re-provision.
+at `https://vibe.firm.com/<app>/` (e.g. `/tb/`) immediately. No DNS
+work, no Caddy edit, no Cloudflare re-provision.
 
 **Can I move the appliance to a bigger server later?**
 Yes. `tar czf vibe.tgz /opt/vibe/data /opt/vibe/env`, copy to the new

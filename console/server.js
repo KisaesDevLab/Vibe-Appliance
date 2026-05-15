@@ -574,7 +574,7 @@ async function ddnsUpdateCycle(force = false) {
   // Host list: bare apex + www + the single tunnel subdomain + the
   // three infra subdomains (cockpit/portainer/backup keep their own
   // subdomains for LAN admin access). Apps no longer get per-subdomain
-  // DNS — they all live at /<slug>/ under the tunnel hostname.
+  // DNS — they all live at /<prefix>/ under the tunnel hostname.
   // Set dedupes if the operator chose 'www' or 'cockpit' as their
   // tunnel_subdomain (unusual but valid).
   const hosts = new Set(['@', 'www', 'cockpit', 'portainer', 'backup']);
@@ -829,7 +829,7 @@ app.get('/api/v1/public/apps', async (_req, res) => {
       const clientLanding = appClientLandingEntries(m, config, live || undefined);
       if (clientLanding.length) out.clientLanding = clientLanding;
       if (showLanFallback) {
-        // http://<host_ip>/<slug>/ via Caddy. Null in domain mode and
+        // http://<host_ip>/<prefix>/ via Caddy. Null in domain mode and
         // when host_ip hasn't been cached yet.
         out.lanFallbackUrl = appLanFallbackUrl(m, config);
       }
@@ -987,11 +987,11 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
         subdomain: m.subdomain,
         defaultTag: m.image && m.image.defaultTag,
         url: appPublicUrl(m, state.config || {}, live),
-        // LAN-fallback URL (http://<host_ip>/<slug>/ via Caddy) — what
+        // LAN-fallback URL (http://<host_ip>/<prefix>/ via Caddy) — what
         // the app card's "backup" row uses. Caddy-routed; works when
         // mDNS / vibe.local is the failure point.
         lanFallbackUrl: appLanFallbackUrl(m, state.config || {}),
-        // Tailnet URL — http://<tailnet-ip>/<slug>/. Works whenever
+        // Tailnet URL — http://<tailnet-ip>/<prefix>/. Works whenever
         // daemon is Running + mode supports path-prefix routes.
         // Plain HTTP, but inside the encrypted WireGuard tunnel.
         tailnetUrl:         appTailnetUrl(m, state.config || {}, live),
@@ -2559,7 +2559,8 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, async
   const domain = typeof body.domain === 'string' ? body.domain.trim().toLowerCase() : '';
   const email  = typeof body.email  === 'string' ? body.email.trim()  : '';
   // Single subdomain that fronts every app in domain mode. Default
-  // 'vibe' — every app lives at https://vibe.<domain>/<slug>/. Reject
+  // 'vibe' — every app lives at https://vibe.<domain>/<prefix>/, where
+  // <prefix> is the slug with the redundant `vibe-` stripped. Reject
   // empty + multi-label values.
   const tunnelSub = typeof body.tunnel_subdomain === 'string'
     ? body.tunnel_subdomain.trim().toLowerCase()
@@ -2716,7 +2717,7 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, async
 
     const warnings = [];
     if (mode === 'domain') {
-      warnings.push(`Apps live at https://${newTunnelSub}.${domain}/<slug>/. The bare apex (https://${domain}) redirects to that host.`);
+      warnings.push(`Apps live at https://${newTunnelSub}.${domain}/<app>/ (e.g. /tb, /mybooks). The bare apex (https://${domain}) redirects to that host.`);
       warnings.push('On the first request Caddy will spend 10–30s issuing a Let\'s Encrypt cert. Subsequent requests are instant.');
       warnings.push('If port 80 isn\'t reachable from the public internet, cert issuance will fail. Use Cloudflare Tunnel or fix DNS first.');
     }
@@ -4788,7 +4789,18 @@ function appEmergencyUrl(manifest, config) {
   return `http://${ip}:${port}/`;
 }
 
-// LAN fallback URL — http://<host_ip>/<slug>/. Goes through Caddy on
+// URL path prefix for an app — the slug with a leading `vibe-` stripped.
+// Mirrors lib/render-caddyfile.sh's _path_prefix() and
+// lib/enable-app.sh's path_prefix derivation. The slug is still the
+// internal identifier (state.json keys, container names, manifest
+// filename) — only the visible URL is shortened. Third-party manifests
+// that don't start with `vibe-` pass through unchanged.
+function appPathPrefix(manifest) {
+  const slug = manifest.slug || '';
+  return slug.startsWith('vibe-') ? slug.slice('vibe-'.length) : slug;
+}
+
+// LAN fallback URL — http://<host_ip>/<prefix>/. Goes through Caddy on
 // :80 with the same path-prefix routing as the primary URL, so it
 // benefits from prefix stripping and per-route splitting (api/* →
 // server tier, default → client tier).
@@ -4806,7 +4818,7 @@ function appEmergencyUrl(manifest, config) {
 function appLanFallbackUrl(manifest, config) {
   const ip = config.host_ip;
   if (!ip) return null;
-  return `http://${ip}/${manifest.slug}/`;
+  return `http://${ip}/${appPathPrefix(manifest)}/`;
 }
 
 // Tailnet URL (plain HTTP via the Tailscale node IP). Always works
@@ -4816,9 +4828,9 @@ function appLanFallbackUrl(manifest, config) {
 function appTailnetUrl(manifest, config, live) {
   if (!live || live.backendState !== 'Running' || !live.ip) return null;
   // Works in domain mode too since commit 60f4e8d: the :80 catch-all's
-  // @lan matcher includes 100.64.0.0/10 (Tailscale CGNAT), so /<slug>/
+  // @lan matcher includes 100.64.0.0/10 (Tailscale CGNAT), so /<prefix>/
   // path-routes from a tailnet client without falling to the console.
-  return `http://${live.ip}/${manifest.slug}/`;
+  return `http://${live.ip}/${appPathPrefix(manifest)}/`;
 }
 
 // Tailnet HTTPS URL (MagicDNS hostname). Only surfaces when the
@@ -4829,26 +4841,27 @@ function appTailnetUrl(manifest, config, live) {
 function appTailnetHostnameUrl(manifest, config, live) {
   if (!live || live.backendState !== 'Running' || !live.hostname) return null;
   if (!live.serve_configured) return null;
-  return `https://${live.hostname}/${manifest.slug}/`;
+  return `https://${live.hostname}/${appPathPrefix(manifest)}/`;
 }
 
 function appPublicUrl(manifest, config, live) {
-  // Domain mode → single tunnel subdomain, path per slug. Mirrors
-  // LAN routing (vibe.local/<slug>/) so the bundled SPA's
-  // base: '/<slug>/' resolves without a host-level redirect. Per-app
+  const prefix = appPathPrefix(manifest);
+  // Domain mode → single tunnel subdomain, path per app. Mirrors
+  // LAN routing (vibe.local/<prefix>/) so the bundled SPA's
+  // base: '/<prefix>/' resolves without a host-level redirect. Per-app
   // subdomains used to live here but broke login flows — see
   // commits 4907588 / 3a6ffee for the history.
   if (config.mode === 'domain' && config.domain) {
     const sub = config.tunnel_subdomain || 'vibe';
-    return `https://${sub}.${config.domain}/${manifest.slug}/`;
+    return `https://${sub}.${config.domain}/${prefix}/`;
   }
 
-  // LAN mode → http://<hostname>.local/<slug>/ via mDNS + Caddy
+  // LAN mode → http://<hostname>.local/<prefix>/ via mDNS + Caddy
   // path-prefix routing. VIBE_HOST_HOSTNAME (set by bootstrap from
   // /etc/hostname) is the host's hostname; falls back to 'vibe'.
   if (config.mode === 'lan') {
     const host = process.env.VIBE_HOST_HOSTNAME || 'vibe';
-    return `http://${host}.local/${manifest.slug}/`;
+    return `http://${host}.local/${prefix}/`;
   }
 
   // Tailscale-primary mode → use the Tailscale IP (plain HTTP via
@@ -4858,10 +4871,10 @@ function appPublicUrl(manifest, config, live) {
   // Fallback chain: live IP → cached hostname (if Serve was set up
   // before, MagicDNS HTTPS may work) → LAN IP → text marker.
   if (config.mode === 'tailscale') {
-    if (live && live.ip) return `http://${live.ip}/${manifest.slug}/`;
+    if (live && live.ip) return `http://${live.ip}/${prefix}/`;
     const host = (config.tailscale_hostname || '').replace(/\.$/, '');
-    if (host) return `https://${host}/${manifest.slug}/`;
-    if (config.host_ip) return `http://${config.host_ip}/${manifest.slug}/`;
+    if (host) return `https://${host}/${prefix}/`;
+    if (config.host_ip) return `http://${config.host_ip}/${prefix}/`;
     return `(tailscale mode without a recorded tailnet hostname — re-Connect from the Tailscale panel)`;
   }
 

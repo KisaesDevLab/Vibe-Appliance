@@ -1358,3 +1358,52 @@ Append to this list as phases complete. Format:
     every enabled app working at the new URL with no manual re-enable.
   - `curl -i -X POST https://vibe.<domain>/vibe-tb/api/auth/login` is
     a 200 (not a 302) — the regression bar.
+
+  > **Superseded 2026-05-14** by the URL-path-prefix shortening below
+  > (`/vibe-tb/` → `/tb/`). The verify URLs in this entry retain the
+  > old `/vibe-<slug>/` form for historical accuracy; the regression
+  > test today is `https://vibe.<domain>/tb/api/auth/login`.
+
+- 2026-05-14 — Shorten user-visible URL path: drop the `vibe-` prefix.
+
+  The slug-as-URL pattern (`/vibe-tb/`, `/vibe-mybooks/`) was redundant
+  on a host already named `vibe.<domain>` — every public URL repeated
+  the brand. Switched the path to the slug with the leading `vibe-`
+  stripped: `/tb/`, `/mybooks/`, `/tax-research/`, etc. Apps whose slug
+  doesn't start with `vibe-` (none today; third-party manifests in the
+  future) pass through unchanged. The slug stays the internal
+  identifier — `state.apps.vibe-tb`, `/opt/vibe/env/vibe-tb.env`,
+  `apps/vibe-tb.yml`, container names, manifest filenames are all
+  unaffected. Only the operator-visible URL shortened.
+
+  Changes:
+  - `lib/render-caddyfile.sh` — new `_path_prefix(slug)` helper used
+    by `render_path_handler()` for `handle /<prefix>/*` blocks and
+    the bare-prefix redirect. Caddy named-matcher IDs still derive
+    from the slug to keep their namespace disambiguated across apps.
+  - `lib/enable-app.sh` — `_render_app_env` derives
+    `path_prefix="${slug#vibe-}"` and uses it in
+    `VITE_BASE_PATH=/${path_prefix}/` (both domain and LAN/Tailscale
+    branches). ALLOWED_ORIGIN is unchanged — it's a host, not a path.
+  - `console/server.js` — `appPathPrefix(manifest)` helper threads
+    through `appLanFallbackUrl`, `appTailnetUrl`,
+    `appTailnetHostnameUrl`, and `appPublicUrl` (all four mode
+    branches). Landing-page links and admin-card URLs both inherit
+    the new shape.
+  - `infra/cloudflared-up.sh` — the "Apps over the tunnel" printed
+    summary uses the stripped prefix so the URLs the operator
+    bookmarks match reality.
+
+  Migration on an existing appliance is automatic: the next
+  `sudo ./bootstrap.sh` re-runs `enable_app` for every enabled app
+  (Phase 8 behavior, unchanged), which re-renders each per-app env
+  file with the new `VITE_BASE_PATH`, bounces the SPA container so
+  the entrypoint substitutes the new sentinel, and re-renders the
+  Caddyfile. Same flow that the 2026-05-12 mode-change entry relies
+  on. State keys stay `vibe-*` so no state.json migration is needed.
+
+  Verify:
+  - `https://vibe.<domain>/tb/` loads the SPA; `/vibe-tb/` 404s.
+  - `curl -i -X POST https://vibe.<domain>/tb/api/auth/login` is 200.
+  - Re-run bootstrap: per-app envs already match new path → no
+    needless container restart on the second pass.

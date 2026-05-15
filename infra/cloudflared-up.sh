@@ -27,8 +27,9 @@
 # Reads domain + tunnel_subdomain + enabled apps from /opt/vibe/state.json.
 # CLOUDFLARE_TUNNEL_PUBLISH is informational only in the single-hostname
 # model — every enabled app is reachable under the one tunnel hostname,
-# Caddy splits paths per slug. The list is still validated to surface
-# typos and to print a per-app reachability summary.
+# Caddy splits paths per app (path = slug with the redundant `vibe-`
+# prefix stripped, e.g. /tb, /mybooks). The list is still validated to
+# surface typos and to print a per-app reachability summary.
 #
 # Side effects:
 #   - one tunnel object created in Cloudflare (idempotent: looked up by name)
@@ -255,10 +256,11 @@ fi
 
 # Read domain + mode + tunnel_subdomain from state.json. The tunnel
 # routes traffic for one hostname: `${TUNNEL_SUBDOMAIN}.${DOMAIN}`.
-# Apps live at /<slug>/ under that host (mirroring LAN routing);
-# Caddy splits paths per app. One ingress rule, one CNAME, one TLS
-# cert — replaces the prior per-app subdomain model that broke login
-# flows (commit 4907588 / revert 3a6ffee).
+# Apps live at /<prefix>/ under that host (mirroring LAN routing),
+# where <prefix> is the slug with the redundant `vibe-` stripped
+# (vibe-tb → /tb/, vibe-tax-research → /tax-research/). One ingress
+# rule, one CNAME, one TLS cert — replaces the prior per-app subdomain
+# model that broke login flows (commit 4907588 / revert 3a6ffee).
 DOMAIN="$(python3 -c "
 import json, sys
 try:
@@ -766,8 +768,12 @@ PUBLISHED_LINES="$(python3 - "$PUBLISHED_SLUGS_JSON" "$TUNNEL_FQDN" <<'PYEOF'
 import json, sys
 items = json.loads(sys.argv[1])
 host = sys.argv[2]
+# URL path prefix mirrors lib/render-caddyfile.sh's _path_prefix():
+# slug with the redundant leading `vibe-` stripped (so vibe-tb → tb).
 for it in items:
-  print(f"  https://{host}/{it['slug']}/  ({it['label']})")
+  slug = it['slug']
+  prefix = slug[len('vibe-'):] if slug.startswith('vibe-') else slug
+  print(f"  https://{host}/{prefix}/  ({it['label']})")
 PYEOF
 2>/dev/null || true)"
 

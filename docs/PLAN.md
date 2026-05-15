@@ -150,13 +150,13 @@ The Caddyfile re-render + reload pattern is the trick that makes this clean. Eve
 
 ## 4. DNS and TLS strategy
 
-Three deployment modes, set by `CONFIG_MODE` at install. **As of 2026-05-12**, domain mode routes every app through a single hostname `${tunnel_subdomain}.${domain}` with path-prefix routing (mirroring LAN); LAN keeps its path-prefix model; Tailscale unchanged. Per-app subdomain routing was removed in domain mode because the bundled SPAs (`base: '/<slug>/'`) couldn't serve from a subdomain root without a catch-all 302, and 302 downgrades login POST→GET — see `docs/PHASES.md` (entry dated 2026-05-12) for the full history and `docs/addenda/mode-change-env-rerender.md` for the automatic env reconciliation that goes with it.
+Three deployment modes, set by `CONFIG_MODE` at install. **As of 2026-05-12**, domain mode routes every app through a single hostname `${tunnel_subdomain}.${domain}` with path-prefix routing (mirroring LAN); LAN keeps its path-prefix model; Tailscale unchanged. The path prefix is the slug with the redundant leading `vibe-` stripped (`vibe-tb` → `/tb/`, `vibe-tax-research` → `/tax-research/`); the slug stays the internal identifier for state, container names, and env files. Per-app subdomain routing was removed in domain mode because the bundled SPAs (built with a path-shaped base) couldn't serve from a subdomain root without a catch-all 302, and 302 downgrades login POST→GET — see `docs/PHASES.md` (entry dated 2026-05-12) for the full history and `docs/addenda/mode-change-env-rerender.md` for the automatic env reconciliation that goes with it.
 
 ### 4.1 Domain mode (`CONFIG_MODE=domain`)
 
 **Required:** A real domain the customer owns, ONE A/CNAME record at `${tunnel_subdomain}.${domain}` pointing at the server (or at the Cloudflare Tunnel CNAME target), and **either** inbound TCP/80 reachable from the internet (Caddy uses HTTP-01 to issue/renew) **or** Cloudflare Tunnel (port 80 not needed; Cloudflare's edge handles public TLS, Caddy uses its internal CA).
 
-**Default path: HTTP-01 for one hostname.** The appliance ships the official `caddy:2-alpine` image — no custom build, no DNS provider plugin to maintain. Customer creates ONE A record at `${tunnel_subdomain}.${domain}` (`vibe.firm.com` by default). Caddy issues a single Let's Encrypt cert covering that host; apps live at `/<slug>/` underneath. The bare apex (`firm.com`) gets a redirect vhost to the tunnel host so accidental hits land somewhere useful.
+**Default path: HTTP-01 for one hostname.** The appliance ships the official `caddy:2-alpine` image — no custom build, no DNS provider plugin to maintain. Customer creates ONE A record at `${tunnel_subdomain}.${domain}` (`vibe.firm.com` by default). Caddy issues a single Let's Encrypt cert covering that host; apps live at `/<prefix>/` underneath, where `<prefix>` is the slug with the redundant `vibe-` stripped (e.g. `/tb/`, `/mybooks/`). The bare apex (`firm.com`) gets a redirect vhost to the tunnel host so accidental hits land somewhere useful.
 
 **Opt-in path: DNS-01 wildcard via Cloudflare.** For operators behind a firewall that can't expose :80, or who want a single `*.firm.com` cert, the repo ships `caddy/Dockerfile.cloudflare` — an xcaddy build with the Cloudflare DNS plugin baked in. See that file's header for the build-and-switch-image steps. This path is opt-in because it adds a custom-image maintenance burden (upstream Go-module drift has bitten the appliance twice), and most installs don't need wildcard certs.
 
@@ -165,11 +165,11 @@ Three deployment modes, set by `CONFIG_MODE` at install. **As of 2026-05-12**, d
 ```
 vibe.firm.com {
     encode gzip
-    # vibe-tb mounted at /vibe-tb/
-    @vibe_tb_bare path /vibe-tb
-    redir @vibe_tb_bare /vibe-tb/ permanent
-    handle /vibe-tb/* {
-        uri strip_prefix /vibe-tb
+    # vibe-tb mounted at /tb/ (slug stripped of redundant `vibe-`)
+    @vibe_tb_bare path /tb
+    redir @vibe_tb_bare /tb/ permanent
+    handle /tb/* {
+        uri strip_prefix /tb
         @api path /api/*
         @mcp path /mcp/*
         handle @api  { reverse_proxy vibe-tb-server:3001 }
@@ -181,7 +181,7 @@ vibe.firm.com {
         }
         handle { reverse_proxy vibe-tb-client:80 }
     }
-    # … additional `handle /<slug>/*` blocks per enabled app …
+    # … additional `handle /<prefix>/*` blocks per enabled app …
     handle { reverse_proxy console:3000 }   # / and /admin
 }
 ```

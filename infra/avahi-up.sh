@@ -11,7 +11,8 @@
 # Avahi advertises `<hostname>.local` on the LAN via mDNS. Per-app
 # subdomains (e.g. `tb.<hostname>.local`) are NOT advertised by this
 # script in Phase 6 — the appliance's Caddy in LAN mode uses
-# path-prefix routes (`<hostname>.local/<slug>/`) instead. Per-subdomain
+# path-prefix routes (`<hostname>.local/<prefix>/`, e.g.
+# `vibe.local/tb/`) instead. Per-subdomain
 # advertising via avahi-publish-cname is a Phase 9 polish item — see
 # docs/PHASES.md Phase 6 completion log.
 

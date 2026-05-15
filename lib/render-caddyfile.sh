@@ -98,12 +98,14 @@ def render_vhost(slug, manifest, mode, domain, tls_internal=False):
     /docker-entrypoint.d/40-base-path.sh which sed-substitutes the
     `VITE_BASE_PATH` env var into the bundle's `__VIBE_BASE_PATH__`
     sentinel before nginx starts. lib/enable-app.sh sets
-    VITE_BASE_PATH=/ in domain mode and /<slug>/ in LAN/Tailscale
-    modes — that's the canonical runtime mechanism. As long as
-    per-app env files are kept in sync with state.config.mode, this
-    block just reverse_proxies at root and the bundle works.
+    VITE_BASE_PATH=/<prefix>/ (slug minus the `vibe-` prefix) in
+    LAN/Tailscale modes and the same value in domain mode under the
+    single-hostname routing model — that's the canonical runtime
+    mechanism. As long as per-app env files are kept in sync with
+    state.config.mode, this block just reverse_proxies at root and
+    the bundle works.
 
-    A prior commit added a /<slug>/* mount + catch-all redirect here
+    A prior commit added a /<prefix>/* mount + catch-all redirect here
     to work around stale env files (apps enabled in LAN mode whose
     VITE_BASE_PATH was never re-rendered after the operator switched
     to domain). That workaround caused real bugs:
@@ -111,7 +113,7 @@ def render_vhost(slug, manifest, mode, domain, tls_internal=False):
         which silently breaks every login / form submission. The SPA
         thinks its POST went through; the backend received GET and
         returned 404.
-      - Visible URL was <sub>.<domain>/<slug>/... instead of clean
+      - Visible URL was <sub>.<domain>/<prefix>/... instead of clean
         <sub>.<domain>/...
     Removed. The correct fix for stale env files is to re-render them
     when state.config.mode changes; that lives in the settings-save /
@@ -270,8 +272,9 @@ def render_domain_app_vhost(domain, tunnel_subdomain, enabled, tls_internal=Fals
 
     Replaces the per-app subdomain layout (`tb.example.com`,
     `mybooks.example.com`, …) with a single hostname where each app is
-    mounted at `/${slug}/`. This is exactly the structure LAN mode uses
-    today — render_path_handler builds the per-app blocks identically.
+    mounted at `/${prefix}/` (slug with the redundant `vibe-` stripped).
+    This is exactly the structure LAN mode uses today —
+    render_path_handler builds the per-app blocks identically.
     One hostname means one TLS cert, one Cloudflare ingress rule, one
     CNAME, one `ALLOWED_ORIGIN` per app.
 
@@ -444,34 +447,48 @@ def _matcher_id(slug, name):
     return f"{slug.replace('-', '_')}_{name}"
 
 
+def _path_prefix(slug):
+    """
+    URL path prefix for an app: the slug with a leading `vibe-` stripped.
+    Keeps the slug as the internal identifier (container names, env
+    filenames, state.json keys, matcher IDs) while shortening the
+    user-visible URL — `/vibe-tb/` becomes `/tb/`, `/vibe-tax-research/`
+    becomes `/tax-research/`. Slugs that don't start with `vibe-` pass
+    through unchanged so third-party manifests stay routable.
+    """
+    return slug[len("vibe-"):] if slug.startswith("vibe-") else slug
+
+
 def render_path_handler(slug, manifest):
     """
-    Emit a `handle /<slug>/*` block (with internal `uri strip_prefix`)
-    so apps are reachable at `<host>/<slug>/...`. Used in LAN, Tailscale,
+    Emit a `handle /<prefix>/*` block (with internal `uri strip_prefix`)
+    so apps are reachable at `<host>/<prefix>/...`, where <prefix> is the
+    slug with the redundant `vibe-` stripped. Used in LAN, Tailscale,
     AND domain modes — domain mode now serves every app from a single
     `${tunnel_subdomain}.${domain}` vhost with the same path-prefix
     routing as LAN, rather than per-app subdomains. (Per-app subdomains
-    forced the bundled SPAs to be mounted at /<slug>/ via a catch-all
+    forced the bundled SPAs to be mounted at /<prefix>/ via a catch-all
     302 that downgraded login POSTs to GET — see commits 3a6ffee /
     4907588.) Sub-path matchers (api, mcp, chat, etc.) live inside the
     route block.
 
-    The bare `/<slug>` path (no trailing slash) gets a redirect to
-    `/<slug>/` so SPAs find their root.
+    The bare `/<prefix>` path (no trailing slash) gets a redirect to
+    `/<prefix>/` so SPAs find their root.
     """
     routing = manifest.get("routing", {})
     matchers = routing.get("matchers", []) or []
     default_upstream = routing["default_upstream"]
+    prefix = _path_prefix(slug)
 
     lines = []
     lines.append(f"\t# {slug}")
     # Bare-prefix redirect.
     bare_id = _matcher_id(slug, "bare")
-    lines.append(f"\t@{bare_id} path /{slug}")
-    lines.append(f"\tredir @{bare_id} /{slug}/ permanent")
+    lines.append(f"\t@{bare_id} path /{prefix}")
+    lines.append(f"\tredir @{bare_id} /{prefix}/ permanent")
     # Main route — strip_prefix happens inside so upstream sees /api etc.
-    lines.append(f"\thandle /{slug}/* {{")
-    lines.append(f"\t\turi strip_prefix /{slug}")
+    lines.append(f"\thandle /{prefix}/* {{")
+    lines.append(f"\t\turi strip_prefix /{prefix}")
     for m in matchers:
         mid = _matcher_id(slug, m['name'])
         lines.append(f"\t\t@{mid} path {m['path']}")

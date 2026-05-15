@@ -709,28 +709,34 @@ _render_app_env() {
   domain="$(python3 -c "import json;print(json.load(open('${VIBE_STATE_FILE}')).get('config',{}).get('domain',''))")"
   tunnel_subdomain="$(python3 -c "import json;print(json.load(open('${VIBE_STATE_FILE}')).get('config',{}).get('tunnel_subdomain','vibe') or 'vibe')")"
 
+  # URL path prefix — slug with redundant `vibe-` stripped. Must match
+  # the prefix lib/render-caddyfile.sh's _path_prefix() produces for
+  # Caddy's `handle /<prefix>/*` blocks, otherwise the SPA's base-path
+  # diverges from Caddy's routing and every asset request 404s.
+  local path_prefix="${slug#vibe-}"
+
   if [[ "$mode" == "domain" && -n "$domain" ]]; then
     # Single-hostname routing: every app lives under
-    # `${tunnel_subdomain}.${domain}/<slug>/`. ALLOWED_ORIGIN is the
+    # `${tunnel_subdomain}.${domain}/<prefix>/`. ALLOWED_ORIGIN is the
     # same single host for every app (the SPA is loaded from that
     # origin, so cookie + CORS need to match it). VITE_BASE_PATH is
-    # `/<slug>/` — same as LAN — because the bundled SPA is built with
-    # `base: '/<slug>/'` and the /docker-entrypoint.d/40-base-path.sh
+    # `/<prefix>/` — same as LAN — because the bundled SPA is built with
+    # `base: '/<prefix>/'` and the /docker-entrypoint.d/40-base-path.sh
     # hook sed-substitutes the sentinel at container start. Per-app
     # subdomains were the prior model and required vite_base_path=/
     # plus a catch-all 302 that downgraded login POSTs (commit 4907588
     # / revert 3a6ffee).
     allowed_origin="https://${tunnel_subdomain}.${domain}"
-    vite_base_path="/${slug}/"
+    vite_base_path="/${path_prefix}/"
   else
     ip="$(_host_lan_ip)"
     allowed_origin="http://${ip:-localhost}"
-    # LAN / Tailscale → Caddy path-prefix /<slug>/. The web image's
+    # LAN / Tailscale → Caddy path-prefix /<prefix>/. The web image's
     # /docker-entrypoint.d/40-base-path.sh reads VITE_BASE_PATH and
     # sed-substitutes the bundle's `/__VIBE_BASE_PATH__/` sentinel
     # before nginx starts. Without this, asset URLs are absolute `/`
     # and Caddy 404s every <host>/assets/... request.
-    vite_base_path="/${slug}/"
+    vite_base_path="/${path_prefix}/"
   fi
 
   # Whether the operator's browser reaches the appliance over HTTPS:

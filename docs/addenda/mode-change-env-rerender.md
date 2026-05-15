@@ -11,8 +11,9 @@
 > Note: the routing change of 2026-05-12 also altered the values
 > `_render_app_env` produces in domain mode —
 > `ALLOWED_ORIGIN=https://${tunnel_subdomain}.${domain}` (single
-> shared origin) and `VITE_BASE_PATH=/<slug>/` (same as LAN). See
-> `docs/PHASES.md` for the rationale.
+> shared origin) and `VITE_BASE_PATH=/<prefix>/` (same as LAN), where
+> `<prefix>` is the slug with the redundant `vibe-` stripped (e.g.
+> `vibe-tb` → `/tb/`). See `docs/PHASES.md` for the rationale.
 
 ## What used to be missing
 
@@ -20,12 +21,14 @@
 values for the appliance's current mode:
 
 ```bash
+local path_prefix="${slug#vibe-}"
+
 if [[ "$mode" == "domain" && -n "$domain" ]]; then
   allowed_origin="https://${tunnel_subdomain}.${domain}"
-  vite_base_path="/${slug}/"
+  vite_base_path="/${path_prefix}/"
 else
   allowed_origin="http://${ip:-localhost}"
-  vite_base_path="/${slug}/"
+  vite_base_path="/${path_prefix}/"
 fi
 ```
 
@@ -44,7 +47,7 @@ enabled app. Their `/opt/vibe/env/<slug>.env` files kept the old
 - Backend rejects login (Origin mismatch): SPA shows "invalid credentials"
 - SPA loads but every absolute asset reference 404s: blank white page
 - API calls go to `/api/...` but the bundle was built assuming
-  `/<slug>/api/...`: silent 4xx
+  `/<prefix>/api/...`: silent 4xx
 
 These look like a fresh CORS bug, a routing bug, and a database bug
 respectively, but they're all the same drift symptom.
