@@ -95,6 +95,48 @@ os.rename(tmp, path)
 PYEOF
 }
 
+# Clear the "failed" status + update_error fields for an app, but only when
+# they're actually stale. Called by --check after a successful up-to-date
+# verification: if the registry matches what's running, whatever caused the
+# prior failure has been resolved (typically: operator fixed the issue
+# manually, like we did for the vibe-console pull bug on cpa2web). Without
+# this, `vibe status` shows "failed" forever even when the app is healthy.
+#
+# Intentionally CONSERVATIVE: only touches status when it's currently
+# "failed". Doesn't downgrade a "running"/"updating" to anything else.
+_state_app_clear_failed_if_stale() {
+  local slug="$1"
+  python3 - "$VIBE_STATE_FILE" "$slug" <<'PYEOF'
+import json, sys, os, datetime, fcntl
+path, slug = sys.argv[1:]
+try:
+    _lk = open(path + ".lock", "w")
+    fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
+except OSError:
+    pass
+try:
+    with open(path) as f:
+        s = json.load(f)
+except (FileNotFoundError, ValueError):
+    sys.exit(0)
+entry = (s.get("apps") or {}).get(slug)
+if not entry:
+    sys.exit(0)
+if entry.get("status") != "failed":
+    sys.exit(0)
+# The registry matched the local digest (caller's invariant); the prior
+# failure is no longer the current state. Clear it.
+entry["status"] = "running"
+entry["update_error"] = None
+entry["at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(s, f, indent=2, sort_keys=True)
+    f.write("\n")
+os.rename(tmp, path)
+PYEOF
+}
+
 _state_app_history_append() {
   local slug="$1" status="$2" from_tag="$3" to_tag="$4" err="${5:-}"
   python3 - "$VIBE_STATE_FILE" "$slug" "$status" "$from_tag" "$to_tag" "$err" <<'PYEOF'
@@ -267,6 +309,7 @@ for slug, e in (s.get('apps',{}) or {}).items():
   for slug in "${slugs[@]}"; do
     log_info "checking $slug"
     local has_update="false"
+    local check_failed="false"
     while IFS= read -r ev; do
       [[ -z "$ev" ]] && continue
       printf '%s\n' "$ev"
@@ -274,8 +317,19 @@ for slug, e in (s.get('apps',{}) or {}).items():
         has_update="true"
         any_update_available="true"
       fi
+      if printf '%s' "$ev" | grep -q '"status":"check_failed"'; then
+        check_failed="true"
+      fi
     done < <(_check_one "$slug")
     _state_app_set "$slug" update_available "$has_update"
+    # If the check succeeded for every image AND no update is available,
+    # the registry matches what's running — any prior "pull failed" /
+    # status=failed marker is stale (operator clearly resolved it or the
+    # transient registry hiccup self-cleared). Reset so the dashboard
+    # reflects reality.
+    if [[ "$check_failed" == "false" && "$has_update" == "false" ]]; then
+      _state_app_clear_failed_if_stale "$slug"
+    fi
   done
 
   log_ok "check complete" any_update_available="$any_update_available"
@@ -408,8 +462,18 @@ cmd_rollback() {
 
 _do_pull() {
   local slug="$1" tag="$2"
+  # Scope the pull to THIS app's services. A bare `docker compose pull`
+  # iterates every service in the merged project, including infrastructure
+  # services like `vibe-console` that have `build:` directives but no
+  # registry-pullable image. Compose treats one un-pullable service as a
+  # whole-project failure, which aborts the update before the actually
+  # pullable app images get swapped in. Per-service scoping limits the
+  # blast radius to images we genuinely expect to be on a registry.
+  local manifest="$(_manifest_path "$slug")"
+  local services
+  services="$(_app_services "$manifest")"
   ( cd "$APPLIANCE_DIR" && \
-    docker compose -f docker-compose.yml -f "apps/${slug}.yml" pull ) >>"$VIBE_LOG_FILE" 2>&1
+    docker compose -f docker-compose.yml -f "apps/${slug}.yml" pull $services ) >>"$VIBE_LOG_FILE" 2>&1
 }
 
 _tag_rollback() {

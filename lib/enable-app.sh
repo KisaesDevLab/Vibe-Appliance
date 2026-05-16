@@ -781,6 +781,19 @@ _render_app_env() {
   fi
   [[ -z "$db_pass" ]] && db_pass="$(openssl rand -hex 32)"
 
+  # Vibe-Connect's Phase 28 intake encryption-at-rest key. 32 raw bytes
+  # encoded as base64 (libsodium secretbox / XChaCha20-Poly1305). Same
+  # preservation pattern as db_pass — rotating this key would brick every
+  # already-encrypted intake row + file on disk. The placeholder is
+  # substituted by the python block below for templates that reference
+  # @CONNECT_INTAKE_ENCRYPTION_KEY@; harmless on slugs whose template
+  # doesn't carry the marker.
+  local intake_key=""
+  if [[ -f "$out" ]]; then
+    intake_key="$(_extract_env_value "$out" "CONNECT_INTAKE_ENCRYPTION_KEY")"
+  fi
+  [[ -z "$intake_key" ]] && intake_key="$(openssl rand -base64 32 | tr -d '\n')"
+
   # DB and redis target details from manifest.
   local db_name db_user
   db_name="$(_manifest_field "$manifest" 'data.get("database",{}).get("name","")')"
@@ -814,11 +827,11 @@ _render_app_env() {
       "$allowed_origin" "$database_url" "$redis_url" \
       "${ENCRYPTION_KEY:-}" "${JWT_SECRET:-}" \
       "$db_name" "$db_user" "$db_pass" \
-      "$vite_base_path" "$session_secure" <<'PYEOF'
+      "$vite_base_path" "$session_secure" "$intake_key" <<'PYEOF'
 import base64, sys
 src, dst, allowed_origin, database_url, redis_url, \
     encryption_key, jwt_secret, db_name, db_user, db_pass, \
-    vite_base_path, session_secure = sys.argv[1:13]
+    vite_base_path, session_secure, intake_key = sys.argv[1:14]
 # Some upstream apps want the appliance's 32-byte AES key as base64 (32
 # raw bytes -> 44-char base64 with padding) rather than the hex form
 # we ship in shared.env. Derive it once here so per-app templates can
@@ -846,6 +859,7 @@ body = body.replace("@DB_HOST@",            "postgres")
 body = body.replace("@DB_PORT@",            "5432")
 body = body.replace("@VITE_BASE_PATH@",     vite_base_path)
 body = body.replace("@SESSION_SECURE@",     session_secure)
+body = body.replace("@CONNECT_INTAKE_ENCRYPTION_KEY@", intake_key)
 with open(dst, "w") as f:
     f.write(body)
 PYEOF
@@ -907,6 +921,19 @@ try:
 except FileNotFoundError:
     pass
 PYEOF
+}
+
+# Extract a bare KEY=value from a per-app env file. Returns empty if
+# absent. Used for preserving secrets that must survive re-renders
+# (rotating them would break already-encrypted data on disk).
+_extract_env_value() {
+  local file="$1" key="$2"
+  [[ -f "$file" ]] || return 0
+  awk -F= -v k="$key" '
+    $0 ~ /^[[:space:]]*#/ { next }
+    NF < 2 { next }
+    $1 == k { sub(/^[^=]+=/, "", $0); print $0; exit }
+  ' "$file"
 }
 
 # Wait for the app's /health endpoint via Caddy's internal route.
