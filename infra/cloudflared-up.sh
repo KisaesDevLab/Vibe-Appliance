@@ -497,29 +497,65 @@ if [[ -z "$PUBLISHED_SLUGS_JSON" ]]; then
   die "publish list validation failed; see the WARN/ERROR lines above."
 fi
 
-# Build the single-rule ingress. Every request to the tunnel hostname
-# forwards to caddy:443 inside vibe_net; noTLSVerify lets Caddy serve
-# its self-signed internal cert (Cloudflare's edge does the public
-# TLS). originServerName=TUNNEL_FQDN makes cloudflared send SNI for
-# the operator-typed hostname so Caddy's named site block matches —
-# without this, SNI defaults to "caddy" and Caddy aborts with "tls:
-# internal error" (commit 06e962a). The catch-all 404 at the end is
-# required by Cloudflare Tunnel.
-log_step "building single-hostname ingress config" host="$TUNNEL_FQDN"
-INGRESS_JSON="$(python3 - "$TUNNEL_FQDN" <<'PYEOF'
-import json, sys
-fqdn = sys.argv[1]
-ingress = [
-  {
-    "hostname": fqdn,
+# Build the ingress rules. The primary tunnel hostname covers every
+# app reachable via path-prefix on the single-host vhost. Apps that
+# declare a `subdomains[]` array in their manifest get one ADDITIONAL
+# ingress rule per non-primary subdomain — that's how vibe-connect
+# exposes its client portal at client.<domain> on a different internal
+# Caddy vhost. Every rule forwards to caddy:443 inside vibe_net;
+# noTLSVerify lets Caddy serve its self-signed internal cert
+# (Cloudflare's edge does the public TLS). originServerName=<hostname>
+# makes cloudflared send SNI for the requested host so Caddy's named
+# site block matches — without this, SNI defaults to "caddy" and Caddy
+# aborts with "tls: internal error" (commit 06e962a). The catch-all
+# 404 at the end is required by Cloudflare Tunnel.
+log_step "building tunnel ingress config" host="$TUNNEL_FQDN"
+INGRESS_JSON="$(python3 - "$TUNNEL_FQDN" "$DOMAIN" "$VIBE_STATE_FILE" "$APPLIANCE_DIR/console/manifests" <<'PYEOF'
+import json, os, sys
+fqdn, domain, state_path, manifests_dir = sys.argv[1:5]
+
+def caddy_rule(host):
+  return {
+    "hostname": host,
     "service":  "https://caddy:443",
     "originRequest": {
       "noTLSVerify":      True,
-      "originServerName": fqdn,
+      "originServerName": host,
     },
-  },
-  { "service": "http_status:404" },
-]
+  }
+
+ingress = [caddy_rule(fqdn)]
+
+# Walk enabled apps for extra subdomains.
+try:
+  with open(state_path) as f:
+    state = json.load(f)
+except (FileNotFoundError, ValueError):
+  state = {}
+
+seen_hosts = {fqdn}
+for slug, entry in (state.get("apps") or {}).items():
+  if not entry.get("enabled"):
+    continue
+  man_path = os.path.join(manifests_dir, f"{slug}.json")
+  try:
+    with open(man_path) as f:
+      manifest = json.load(f)
+  except (FileNotFoundError, ValueError):
+    continue
+  subdomains = manifest.get("subdomains") or []
+  primary = manifest.get("subdomain", "")
+  for sub in subdomains:
+    name = sub.get("name")
+    if not name or name == primary:
+      continue
+    host = f"{name}.{domain}"
+    if host in seen_hosts:
+      continue
+    seen_hosts.add(host)
+    ingress.append(caddy_rule(host))
+
+ingress.append({ "service": "http_status:404" })
 print(json.dumps({ "config": { "ingress": ingress } }))
 PYEOF
 )"

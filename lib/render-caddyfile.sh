@@ -340,6 +340,92 @@ def render_domain_app_vhost(domain, tunnel_subdomain, enabled, tls_internal=Fals
     return "\n".join(lines) + "\n"
 
 
+def render_extra_subdomain_vhosts(enabled, domain, tls_internal=False):
+    """Emit additional per-subdomain vhosts for apps that declare a
+    `subdomains[]` array beyond their primary `subdomain` field.
+
+    Lets a single app expose more than one external surface (e.g.
+    vibe-connect serves the staff app at the primary subdomain via the
+    single-host /connect/ path mount AND the client portal at a
+    dedicated client.<domain>). Each extra subdomain routes to the
+    target named in the entry; if no target is set, fall back to the
+    app's default_upstream. The PRIMARY subdomain (matching
+    manifest['subdomain']) is skipped here — it's already covered by
+    the single-hostname routing (render_domain_app_vhost) in domain
+    mode, and emitting it twice would yield two vhosts fighting for
+    the same hostname.
+
+    Compatible with apps that don't declare subdomains[] (returns
+    empty for them). Tunnel-mode tls_internal flag propagates to the
+    extra vhosts so cloudflared with noTLSVerify still works.
+    """
+    if not domain:
+        return ""
+    blocks = []
+    for slug, manifest in enabled:
+        subdomains = manifest.get("subdomains") or []
+        if not subdomains:
+            continue
+        primary = manifest.get("subdomain", "")
+        default_upstream = (manifest.get("routing", {}) or {}).get("default_upstream", "")
+        for entry in subdomains:
+            name = entry.get("name")
+            if not name or name == primary:
+                continue
+            target = entry.get("target") or default_upstream
+            if not target:
+                print(
+                    f"# WARNING: {slug} subdomain '{name}' has no target and "
+                    f"no default_upstream — vhost skipped",
+                    file=sys.stderr,
+                )
+                continue
+            host = f"{name}.{domain}"
+            # Streaming directive — if the manifest declares a streaming
+            # matcher AND that matcher's path is generic enough to apply
+            # to this subdomain (i.e. `/socket.io/*` or similar), wrap
+            # the reverse_proxy in flush_interval / long read_timeout so
+            # the secondary surface keeps long-lived connections alive.
+            # The matcher's `upstream` field is IGNORED — it's wired for
+            # the primary subdomain and on a secondary subdomain would
+            # route to the wrong internal port (staff socket.io traffic
+            # arriving on client.<domain> shouldn't go to the staff port).
+            # We use the entry's target for streaming too.
+            matchers = (manifest.get("routing", {}) or {}).get("matchers", []) or []
+            streaming_paths = [m.get("path") for m in matchers if m.get("streaming") and m.get("path")]
+            lines = [f"{host} {{"]
+            if tls_internal:
+                lines.append("    tls internal")
+            lines.append("    encode gzip zstd")
+            lines.append("    log {")
+            lines.append("        output stdout")
+            lines.append("        format console")
+            lines.append("    }")
+            lines.append("")
+            for i, path in enumerate(streaming_paths):
+                mid = f"streaming_{i}"
+                lines.append(f"    @{mid} path {path}")
+            if streaming_paths:
+                lines.append("")
+                for i, _path in enumerate(streaming_paths):
+                    mid = f"streaming_{i}"
+                    lines.append(f"    handle @{mid} {{")
+                    lines.append(f"        reverse_proxy {target} {{")
+                    lines.append("            flush_interval -1")
+                    lines.append("            transport http {")
+                    lines.append("                read_timeout 3600s")
+                    lines.append("            }")
+                    lines.append("        }")
+                    lines.append("    }")
+                lines.append("")
+            lines.append("    handle {")
+            lines.append(f"        reverse_proxy {target}")
+            lines.append("    }")
+            lines.append("}")
+            blocks.append("\n".join(lines) + "\n")
+    return "\n".join(blocks)
+
+
 def render_infra_vhost(svc, mode, domain, tls_internal=False):
     """Render a domain-mode site block for an infra service."""
     if mode != "domain" or not domain:
@@ -633,6 +719,12 @@ def main():
                               tls_internal=tunnel_active),
             render_domain_app_vhost(domain, tunnel_subdomain, enabled,
                                     tls_internal=tunnel_active),
+            # Per-app extra subdomains (apps that declare `subdomains[]`
+            # beyond their primary). vibe-connect uses this to expose the
+            # client portal at client.<domain> on a different internal
+            # port than the staff app's /connect/ mount.
+            render_extra_subdomain_vhosts(enabled, domain,
+                                          tls_internal=tunnel_active),
         ]
         # Infra services (Cockpit, Portainer, Duplicati) keep their own
         # subdomain vhosts. They're admin tooling — putting them on the
