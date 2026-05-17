@@ -369,14 +369,28 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
     }
 
     // ---------- data loaders ----------
+    // 401 means the basic-auth credentials cached by the browser are no
+    // longer valid (server restart with rotated CONSOLE_ADMIN_PASSWORD,
+    // most often). fetch() can't re-trigger the browser's auth prompt by
+    // itself, so we surface a clear "refresh" message instead. The
+    // refresh() catch below also stops the polling interval after a 401
+    // so the operator isn't bombarded with banner spam every 15s.
+    function _httpError(prefix, r) {
+      if (r.status === 401) {
+        const e = new Error('Session expired — refresh the page to sign in again.');
+        e.status = 401;
+        return e;
+      }
+      return new Error(prefix + ': HTTP ' + r.status);
+    }
     async function loadStatus() {
       const r = await fetch('/api/v1/admin/status', { credentials: 'same-origin' });
-      if (!r.ok) throw new Error('status: HTTP ' + r.status);
+      if (!r.ok) throw _httpError('status', r);
       return r.json();
     }
     async function loadApps() {
       const r = await fetch('/api/v1/apps', { credentials: 'same-origin' });
-      if (!r.ok) throw new Error('apps: HTTP ' + r.status);
+      if (!r.ok) throw _httpError('apps', r);
       return r.json();
     }
 
@@ -410,8 +424,18 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
         const el = document.getElementById('error');
         el.textContent = 'Could not load: ' + err.message;
         el.hidden = false;
+        // On 401, kill the polling timer — repeating the same 401 banner
+        // every 15s adds noise and burns server cycles. Operator's next
+        // action is a manual refresh, which re-triggers basic auth.
+        if (err.status === 401 && _pollHandle) {
+          clearInterval(_pollHandle);
+          _pollHandle = null;
+        }
       }
     }
+    // Hoisted handle so the catch above can clear the interval. Assigned
+    // at the setInterval call below.
+    let _pollHandle = null;
 
     // First-run banners — show until each critical setting is configured.
     // EMAIL_PROVIDER is the only one substrate-ready today (Connect blocker).
@@ -864,7 +888,7 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
     }
 
     refresh();
-    setInterval(refresh, 15000);
+    _pollHandle = setInterval(refresh, 15000);
 
     // Footer build-info — fetched once at page load. Stable across the
     // session because the process restarts when a new build deploys,

@@ -43,12 +43,23 @@
     $error.textContent = msg;
   }
 
+  // Build a user-friendly Error from a non-OK fetch response. 401 means
+  // the basic-auth credentials cached by the browser are no longer valid
+  // — show the actionable next step ("refresh"), since fetch() can't
+  // re-trigger the browser's WWW-Authenticate prompt by itself.
+  function _httpError(r) {
+    if (r.status === 401) {
+      return new Error('Session expired — refresh the page to sign in again.');
+    }
+    return new Error('HTTP ' + r.status);
+  }
+
   // -------- Log list + tail -------------------------------------------
   async function loadLogList() {
     showError('');
     try {
       const r = await fetch('/api/v1/logs', { credentials: 'same-origin' });
-      if (!r.ok) throw new Error('HTTP ' + r.status);
+      if (!r.ok) throw _httpError(r);
       const data = await r.json();
       const items = (data && data.logs) || [];
       $picker.innerHTML = '';
@@ -93,7 +104,7 @@
       const lines = $lines.value || '300';
       const r = await fetch(`/api/v1/logs/${encodeURIComponent(name)}?lines=${encodeURIComponent(lines)}`,
                             { credentials: 'same-origin' });
-      if (!r.ok) throw new Error('HTTP ' + r.status);
+      if (!r.ok) throw _httpError(r);
       const text = await r.text();
       currentTail = text;
       if (!text.trim()) {
