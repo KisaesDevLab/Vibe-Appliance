@@ -306,7 +306,16 @@ table.containers td.col-name { font-family: var(--mono); }
 .app-card__actions {
   margin-top: auto;
   display: flex;
+  /* Stack buttons vertically so each can claim the full card width.
+     Previous row layout shrank multi-button cards to ~half each.
+     Clients tap one button per visit, not multiple side-by-side, so
+     vertical stacking + full width is the higher-tap-target shape. */
+  flex-direction: column;
   gap: 0.5rem;
+}
+.app-card__actions .btn {
+  width: 100%;
+  text-align: center;
 }
 .app-card__output {
   margin: 0.85rem 0 0;
