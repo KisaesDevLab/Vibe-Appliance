@@ -4,6 +4,7 @@
   "displayName": "Vibe Shield",
   "description": "PII-redacting Anthropic gateway. Every Vibe app routes Claude calls through this to enforce token-vault redaction, audit, quotas, and ZDR.",
   "logo": "vibe-shield.svg",
+  "userFacing": false,
 
   "image": {
     "server":     "ghcr.io/kisaesdevlab/vibe-shield-gateway",
