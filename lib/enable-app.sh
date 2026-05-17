@@ -794,6 +794,31 @@ _render_app_env() {
   fi
   [[ -z "$intake_key" ]] && intake_key="$(openssl rand -base64 32 | tr -d '\n')"
 
+  # Vibe-Shield's AES-256-GCM key-encryption key (VS_KEK). 32 raw bytes
+  # base64-encoded. Same preservation pattern as intake_key — rotating
+  # VS_KEK without the explicit `make rotate-kek-apply` re-wrap dance in
+  # Vibe-Shield unrecoverably bricks every encrypted vault row. Generated
+  # once on first render and preserved on every subsequent re-render.
+  # Harmless on slugs whose template doesn't reference @VS_KEK@.
+  local vs_kek=""
+  if [[ -f "$out" ]]; then
+    vs_kek="$(_extract_env_value "$out" "VS_KEK")"
+  fi
+  [[ -z "$vs_kek" ]] && vs_kek="$(openssl rand -base64 32 | tr -d '\n')"
+
+  # Vibe-Shield's admin API key (GATEWAY_ADMIN_KEY). Surfaced in the
+  # admin login form via X-Admin-Key header; operator copies it from
+  # /opt/vibe/CREDENTIALS.txt. 32 hex chars (128 bits) is overkill for
+  # an HMAC-shaped opaque token but matches the rest of the appliance's
+  # hex32 secret shape. Preserved across re-renders so existing operator
+  # sessions don't break on a re-bootstrap. Harmless on slugs whose
+  # template doesn't reference @GATEWAY_ADMIN_KEY@.
+  local gateway_admin_key=""
+  if [[ -f "$out" ]]; then
+    gateway_admin_key="$(_extract_env_value "$out" "GATEWAY_ADMIN_KEY")"
+  fi
+  [[ -z "$gateway_admin_key" ]] && gateway_admin_key="$(openssl rand -hex 32)"
+
   # DB and redis target details from manifest.
   local db_name db_user
   db_name="$(_manifest_field "$manifest" 'data.get("database",{}).get("name","")')"
@@ -827,11 +852,13 @@ _render_app_env() {
       "$allowed_origin" "$database_url" "$redis_url" \
       "${ENCRYPTION_KEY:-}" "${JWT_SECRET:-}" \
       "$db_name" "$db_user" "$db_pass" \
-      "$vite_base_path" "$session_secure" "$intake_key" <<'PYEOF'
+      "$vite_base_path" "$session_secure" "$intake_key" \
+      "$vs_kek" "$gateway_admin_key" <<'PYEOF'
 import base64, sys
 src, dst, allowed_origin, database_url, redis_url, \
     encryption_key, jwt_secret, db_name, db_user, db_pass, \
-    vite_base_path, session_secure, intake_key = sys.argv[1:14]
+    vite_base_path, session_secure, intake_key, \
+    vs_kek, gateway_admin_key = sys.argv[1:16]
 # Some upstream apps want the appliance's 32-byte AES key as base64 (32
 # raw bytes -> 44-char base64 with padding) rather than the hex form
 # we ship in shared.env. Derive it once here so per-app templates can
@@ -860,6 +887,8 @@ body = body.replace("@DB_PORT@",            "5432")
 body = body.replace("@VITE_BASE_PATH@",     vite_base_path)
 body = body.replace("@SESSION_SECURE@",     session_secure)
 body = body.replace("@CONNECT_INTAKE_ENCRYPTION_KEY@", intake_key)
+body = body.replace("@VS_KEK@",             vs_kek)
+body = body.replace("@GATEWAY_ADMIN_KEY@",  gateway_admin_key)
 with open(dst, "w") as f:
     f.write(body)
 PYEOF
