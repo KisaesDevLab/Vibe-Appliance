@@ -204,9 +204,18 @@ _local_digest() {
     | awk -F'@' '{print $2}'
 }
 
-# Print all server/client image specs from the manifest as `key=image` pairs:
+# Print all image specs from the manifest as `key=image` pairs:
 #   server=ghcr.io/.../foo-server
 #   client=ghcr.io/.../foo-client    (if present)
+#   <extra-name>=ghcr.io/.../foo-extra   (one per image.extras[] entry)
+#
+# extras[] is the escape hatch for apps that ship more than two
+# containers as a versioned set — vibe-shield ships engine + gateway +
+# admin, all rolled forward together. Without extras tracking, the
+# rollback step would re-tag only server + client, leaving the engine
+# pinned to whatever digest was in the new release if a rollback ever
+# fired. Apps that don't declare extras (8/9 today) keep the prior
+# two-image behavior — the loop is just a no-op for them.
 _manifest_images() {
   local file="$1"
   python3 - "$file" <<'PYEOF'
@@ -217,6 +226,11 @@ img = m.get("image", {})
 for key in ("server", "client"):
     if img.get(key):
         print(f"{key}={img[key]}")
+for extra in img.get("extras") or []:
+    name = extra.get("name")
+    spec = extra.get("image")
+    if name and spec:
+        print(f"{name}={spec}")
 PYEOF
 }
 

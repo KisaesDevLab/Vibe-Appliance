@@ -36,7 +36,22 @@
       "properties": {
         "server":     { "type": "string", "minLength": 1 },
         "client":     { "type": "string", "minLength": 1 },
-        "defaultTag": { "type": "string", "minLength": 1 }
+        "defaultTag": { "type": "string", "minLength": 1 },
+        "extras": {
+          "type": "array",
+          "description": "Additional GHCR image refs that ship with this app as a versioned set. Used by apps that need MORE than the server+client pair (e.g. vibe-shield ships engine + gateway + admin, all rolling forward together). update.sh re-tags every image listed here for the rollback path; without this, an app's auxiliary containers would silently stay on the new digest when a rollback fires against server/client only. Apps with only server+client omit this entirely.",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "required": ["name", "image"],
+            "additionalProperties": false,
+            "properties": {
+              "name":  { "type": "string", "pattern": "^[a-z][a-z0-9-]*$", "minLength": 1, "maxLength": 40 },
+              "image": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
       }
     },
 
@@ -84,7 +99,7 @@
       "type": "integer",
       "minimum": 5171,
       "maximum": 5198,
-      "description": "TCP port on the emergency HAProxy proxy (Phase 8.5 Workstream D). Plain HTTP, UFW-gated to RFC1918 + Tailscale CGNAT. Maps to this app's routing.default_upstream. See docs/addenda/emergency-access.md §3 for the canonical port assignments. Apps with userFacing=false MUST NOT declare an emergencyPort."
+      "description": "TCP port on the emergency HAProxy proxy (Phase 8.5 Workstream D). Plain HTTP, UFW-gated to RFC1918 + Tailscale CGNAT. Maps to this app's routing.default_upstream. See docs/addenda/emergency-access.md §3 for the canonical port assignments. The emergency proxy is intrinsically staff-only via UFW; userFacing=false apps with a staff-admin UI (e.g. vibe-shield) MAY declare an emergencyPort so staff retain fallback access when Caddy or TLS is broken. Only truly headless server-to-server services (e.g. vibe-glm-ocr) should omit it entirely."
     },
 
     "emergencyNote": {

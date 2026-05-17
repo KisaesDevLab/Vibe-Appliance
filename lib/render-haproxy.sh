@@ -164,8 +164,19 @@ for slug in all_app_slugs:
             m = json.load(f)
     except (json.JSONDecodeError, OSError):
         continue
-    if m.get("userFacing") is False:
-        continue
+    # userFacing=false used to bail here. Wrong: that flag controls
+    # CUSTOMER-landing visibility (server.js filters those out of
+    # /api/v1/public/apps), not whether STAFF get emergency access.
+    # The emergency proxy is UFW-gated to RFC1918 + Tailscale CGNAT
+    # (lib/ufw-rules.sh) — it's intrinsically staff-only regardless of
+    # what the app is. Apps like vibe-shield (staff-admin UI, NOT
+    # customer-facing) need a fallback path when Caddy / TLS is broken
+    # just as much as customer-facing apps do. The remaining gate is
+    # the emergencyPort declaration itself: apps that don't declare
+    # one (or any subdomains[].emergencyPort) produce an empty
+    # candidates list below and emit no frontend. Truly headless
+    # server-to-server services like vibe-glm-ocr have no port to
+    # declare and stay out automatically.
     upstream = m.get("routing", {}).get("default_upstream")
     if not upstream:
         continue
