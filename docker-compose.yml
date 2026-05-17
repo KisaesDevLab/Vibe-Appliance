@@ -315,6 +315,8 @@ services:
       - "5182:5182"   # vibe-connect (public)
       - "5191:5191"   # vibe-tax-research
       - "5192:5192"   # vibe-payroll
+      - "5193:5193"   # vibe-shield (admin UI)
+      - "5194:5194"   # vibe-shield (gateway API)
       # Phase 8.5 v1.2 — fallback ports for infra services. Same UFW
       # gating, same rate-limit + custom 503 — Duplicati / Portainer
       # become reachable when Caddy / DNS / certs are broken.
