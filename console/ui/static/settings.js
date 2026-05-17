@@ -3441,6 +3441,12 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
         description: c.description || '',
         buttonLabel: c.buttonLabel || '',
         url: c.url || '',
+        // Preserve `order` even though the form has no UI control for
+        // it — operators who set it via direct state.json edit would
+        // otherwise lose the value the next time anyone clicks Save
+        // here. Undefined when absent so JSON.stringify omits the key
+        // and the server's optional-integer validator passes.
+        order: Number.isInteger(c.order) ? c.order : undefined,
       })) : [];
     } catch (err) {
       editor.innerHTML = '';
@@ -3471,7 +3477,7 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
       class: 'btn btn--ghost',
       style: 'margin-right:0.5rem;',
       onclick: () => {
-        cards.push({ id: '', title: '', description: '', buttonLabel: '', url: '' });
+        cards.push({ id: '', title: '', description: '', buttonLabel: '', url: '', order: undefined });
         paint();
       },
     }, ['Add card']);
@@ -3491,6 +3497,11 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
             description: (c.description || '').trim(),
             buttonLabel: (c.buttonLabel || '').trim(),
             url: (c.url || '').trim(),
+            // Round-trip `order` even though no UI control sets it —
+            // preserves operator-set values from state.json edits.
+            // Server-side validator ignores non-integers, so passing
+            // undefined here is safe.
+            ...(Number.isInteger(c.order) ? { order: c.order } : {}),
           }));
           const r = await fetch('/api/v1/admin/custom-cards', {
             method: 'PUT',
@@ -3506,6 +3517,7 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
             description: c.description || '',
             buttonLabel: c.buttonLabel || '',
             url: c.url || '',
+            order: Number.isInteger(c.order) ? c.order : undefined,
           }));
           paint();
           statusEl.style.color = 'var(--good)';
