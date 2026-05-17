@@ -1,0 +1,137 @@
+# apps/vibe-shield.yml — Vibe Shield overlay.
+#
+# Used as a docker-compose overlay on top of the core docker-compose.yml.
+# enable-app.sh and disable-app.sh invoke compose like:
+#
+#   docker compose -f docker-compose.yml -f apps/vibe-shield.yml up -d
+#   docker compose -f docker-compose.yml -f apps/vibe-shield.yml stop
+#
+# Reads /opt/vibe/env/vibe-shield.env (rendered from
+# env-templates/per-app/vibe-shield.env.tmpl).
+#
+# Three services + one one-shot:
+#   - vibe-shield-engine   — Python redaction engine; internal-only
+#                            (NEVER exposed via Caddy). Other services
+#                            on vibe_net reach it as
+#                            http://vibe-shield-engine:8000.
+#   - vibe-shield-gateway  — Anthropic-Messages-compatible API. The
+#                            manifest's image.server. Reached via
+#                            shield.<domain>/v1/* (Caddy) and
+#                            http://vibe-shield-gateway:8080 (in-cluster).
+#   - vibe-shield-admin    — Static React SPA served by nginx. The
+#                            manifest's image.client. Reached at
+#                            shield.<domain>/ (Caddy default upstream).
+#   - vibe-shield-migrate  — One-shot. Profile-gated so `up -d` doesn't
+#                            start it. Run via:
+#                              docker compose ... --profile bootstrap \
+#                                run --rm vibe-shield-migrate
+#                            update.sh invokes this before rolling
+#                            forward the gateway.
+#
+# Single-DB topology — Shield uses the appliance's shared Postgres
+# under database name `vibe_shield_db` (provisioned by db-bootstrap.sh
+# from the manifest's database.{name,user}) and Redis logical DB 7
+# (allocated in the manifest's redis.db).
+
+name: vibe
+
+services:
+
+  # ---- Engine (internal-only) ------------------------------------
+  vibe-shield-engine:
+    image: ghcr.io/kisaesdevlab/vibe-shield-engine:${APP_TAG:-latest}
+    container_name: vibe-shield-engine
+    restart: unless-stopped
+    init: true
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-shield.env
+    environment:
+      # Engine-only env (not in the per-app .env to keep that file
+      # focused on operator-tunable settings).
+      VS_ENGINE_HOST: 0.0.0.0
+      VS_ENGINE_PORT: "8000"
+      VS_ENGINE_SPACY_MODEL: en_core_web_lg
+      VS_ENGINE_IMAGE_OCR_ENABLED: "true"
+      VS_ENGINE_IMAGE_FACE_DETECTION_ENABLED: "true"
+      VS_ENGINE_IMAGE_BARCODE_DETECTION_ENABLED: "true"
+    networks:
+      - vibe_net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=2).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  # ---- Gateway (manifest's image.server) -------------------------
+  vibe-shield-gateway:
+    image: ghcr.io/kisaesdevlab/vibe-shield-gateway:${APP_TAG:-latest}
+    container_name: vibe-shield-gateway
+    restart: unless-stopped
+    init: true
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-shield.env
+    networks:
+      - vibe_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vibe-shield-engine:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # ---- Admin SPA (manifest's image.client) -----------------------
+  vibe-shield-admin:
+    image: ghcr.io/kisaesdevlab/vibe-shield-admin:${APP_TAG:-latest}
+    container_name: vibe-shield-admin
+    restart: unless-stopped
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-shield.env
+    networks:
+      - vibe_net
+    depends_on:
+      vibe-shield-gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider --quiet http://127.0.0.1/ || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+  # ---- Migrate one-shot (profile: bootstrap) ---------------------
+  # Drizzle migrations are idempotent via __drizzle_migrations
+  # tracking. Run from update.sh before rolling forward the gateway;
+  # failures abort the update with rollback. Profile-gated so a
+  # plain `up -d` doesn't spawn it as a long-running container.
+  vibe-shield-migrate:
+    image: ghcr.io/kisaesdevlab/vibe-shield-gateway:${APP_TAG:-latest}
+    container_name: vibe-shield-migrate
+    profiles: ["bootstrap"]
+    command: ["node", "packages/schema/dist/scripts/migrate.js"]
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-shield.env
+    networks:
+      - vibe_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+networks:
+  vibe_net:
+    external: true
+    name: vibe_net
