@@ -1,0 +1,110 @@
+# apps/vibe-shield.yml — Vibe Shield overlay.
+#
+# Three services, all on vibe_net only — no per-app internal network is
+# needed (gateway reaches engine by service name, admin reaches gateway
+# via Caddy on the same subdomain). The gateway image's entrypoint runs
+# `node dist/migrate.js` to completion when MIGRATIONS_AUTO=true (set in
+# the per-app env file), so we do NOT need a separate one-shot migrate
+# service. Drizzle's __drizzle_migrations table keeps re-runs idempotent.
+#
+# Image tag policy: all three services pin to ${APP_TAG:-v1.1.3} so the
+# appliance's update.sh — which bumps manifest.image.defaultTag and then
+# pulls/recreates the named services — moves the whole Vibe Shield
+# release as a unit. Mismatched engine/gateway/admin versions across a
+# release boundary would be a debugging nightmare; this prevents it.
+#
+# No bind-mount volumes: Vibe Shield is fully stateless at the container
+# layer. The token vault, audit log, and policy store all live in the
+# shared Postgres (vs_* tables under vibe_shield_db). KEK + admin key
+# live in /opt/vibe/env/vibe-shield.env which is already inside the
+# appliance's backup set.
+
+name: vibe
+
+services:
+
+  # ---- vibe-shield-engine ----------------------------------------
+  # Internal-only Python redaction service. Gateway reaches it via
+  # vibe-shield-engine:8000 on vibe_net. Cold start loads spaCy
+  # en_core_web_lg (~600 MB RSS); start_period accounts for that.
+  vibe-shield-engine:
+    image: ghcr.io/kisaesdevlab/vibe-shield-engine:${APP_TAG:-v1.1.3}
+    container_name: vibe-shield-engine
+    restart: unless-stopped
+    init: true
+    # Engine reads ONLY VS_ENGINE_* env vars; it doesn't need shared.env
+    # or vibe-shield.env. Image defaults (set in the engine Dockerfile)
+    # cover the production posture: en_core_web_lg model, all image
+    # backends enabled. Keep env_file empty to make that explicit.
+    environment:
+      LOG_LEVEL: ${VIBE_SHIELD_LOG_LEVEL:-info}
+    networks:
+      - vibe_net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=2).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 6
+      # spaCy en_core_web_lg load is the long pole — 60-90s on a 2 vCPU
+      # droplet. Don't fail probes until that's plausibly done.
+      start_period: 90s
+
+  # ---- vibe-shield-gateway ----------------------------------------
+  # Anthropic-Messages-compatible API. Other Vibe apps reach it via
+  # vibe-shield-gateway:8080 (set ANTHROPIC_BASE_URL on those apps).
+  # The entrypoint runs migrations first when MIGRATIONS_AUTO=true.
+  vibe-shield-gateway:
+    image: ghcr.io/kisaesdevlab/vibe-shield-gateway:${APP_TAG:-v1.1.3}
+    container_name: vibe-shield-gateway
+    restart: unless-stopped
+    init: true
+    env_file:
+      - /opt/vibe/env/shared.env
+      # appliance.env supplies ANTHROPIC_API_KEY (Settings → AI). Compose
+      # merges in declared order; later files override earlier — so a
+      # per-app override in vibe-shield.env wins over appliance.env's
+      # shared value if the operator sets one.
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-shield.env
+    networks:
+      - vibe_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vibe-shield-engine:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      # Allow time for the entrypoint's migration step on first boot.
+      # Drizzle's runner takes ~3-5s against an empty DB; bump start
+      # period well past that so any single migration that creates an
+      # index has room.
+      start_period: 30s
+
+  # ---- vibe-shield-admin -----------------------------------------
+  # Static React SPA served by nginx :80. Caddy routes the path-mount
+  # default_upstream here; admin SPA fetches /shield/v1/admin/* same-
+  # origin, which Caddy strip_prefix's to /v1/admin/* and proxies to
+  # vibe-shield-gateway:8080 per the manifest routing matcher.
+  #
+  # env_file only carries VITE_BASE_PATH — the nginx entrypoint
+  # /docker-entrypoint.d/40-base-path.sh reads it and sed-substitutes
+  # the /__VIBE_BASE_PATH__/ sentinel in the bundle. shared.env and
+  # appliance.env carry secrets the admin nginx has no business
+  # reading, so we only load vibe-shield.env here.
+  vibe-shield-admin:
+    image: ghcr.io/kisaesdevlab/vibe-shield-admin:${APP_TAG:-v1.1.3}
+    container_name: vibe-shield-admin
+    restart: unless-stopped
+    env_file:
+      - /opt/vibe/env/vibe-shield.env
+    networks:
+      - vibe_net
+    depends_on:
+      vibe-shield-gateway:
+        condition: service_healthy

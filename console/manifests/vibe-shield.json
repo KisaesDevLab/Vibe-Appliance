@@ -1,0 +1,136 @@
+{
+  "schemaVersion": 1,
+  "slug": "vibe-shield",
+  "displayName": "Vibe Shield",
+  "description": "PII-redacting Anthropic gateway. Every Vibe app routes Claude calls through this to enforce token-vault redaction, audit, quotas, and ZDR.",
+  "logo": "vibe-shield.svg",
+
+  "image": {
+    "server":     "ghcr.io/kisaesdevlab/vibe-shield-gateway",
+    "client":     "ghcr.io/kisaesdevlab/vibe-shield-admin",
+    "defaultTag": "v1.1.3"
+  },
+
+  "subdomain":     "shield",
+  "emergencyPort": 5193,
+  "subdomains": [
+    {
+      "name":          "shield",
+      "audience":      "admin",
+      "emergencyPort": 5193,
+      "target":        "vibe-shield-admin:80"
+    },
+    {
+      "name":          "gateway.shield",
+      "audience":      "Anthropic-shaped API",
+      "emergencyPort": 5194,
+      "target":        "vibe-shield-gateway:8080",
+      "emergencyNote": "Internal Vibe apps should reach the gateway by service name (http://vibe-shield-gateway:8080) over vibe_net — the emergency port is for cross-host debugging only."
+    }
+  ],
+  "ports": { "server": 8080, "client": 80 },
+
+  "routing": {
+    "default_upstream": "vibe-shield-admin:80",
+    "matchers": [
+      { "name": "api", "path": "/v1/admin/*", "upstream": "vibe-shield-gateway:8080" }
+    ]
+  },
+
+  "depends": ["postgres", "redis"],
+
+  "env": {
+    "required": [
+      { "name": "DATABASE_URL",      "from": "database-url" },
+      { "name": "REDIS_URL",         "from": "redis-url" },
+      { "name": "ENGINE_URL",        "from": "static:http://vibe-shield-engine:8000" },
+      { "name": "ANTHROPIC_API_KEY", "from": "appliance:ANTHROPIC_API_KEY" },
+      { "name": "VS_KEK",            "from": "generated:base64-32bytes" },
+      { "name": "GATEWAY_ADMIN_KEY", "from": "generated:hex32" },
+      { "name": "NODE_ENV",          "from": "static:production" },
+      { "name": "HOST",              "from": "static:0.0.0.0" },
+      { "name": "PORT",              "from": "static:8080" },
+      { "name": "MIGRATIONS_AUTO",   "from": "static:true" }
+    ],
+    "optional": [
+      {
+        "name":  "ZDR_ENABLED",
+        "value": "false",
+        "doc":   "Anthropic Zero Data Retention. Requires the ZDR addendum signed on the Anthropic account; the header alone does NOT activate ZDR.",
+        "ui": {
+          "tier":      1,
+          "category":  "Compliance",
+          "label":     "Anthropic ZDR header",
+          "helpText":  "Sets the anthropic-version + ZDR opt-in header on outbound calls. Requires a signed ZDR addendum with Anthropic — the header alone does nothing without it.",
+          "input":     "toggle",
+          "appliance": "per-app",
+          "validate":  "boolean"
+        }
+      },
+      {
+        "name":  "RATE_LIMIT_PER_MINUTE",
+        "value": "60",
+        "doc":   "Per-(tenant, app) request cap per minute. Tune via per-tenant policy overrides.",
+        "ui": {
+          "tier":      1,
+          "category":  "Application",
+          "label":     "Default rate limit (req/min)",
+          "helpText":  "10–600. Default ceiling for any tenant without a custom policy. Per-tenant policies override this.",
+          "input":     "number",
+          "appliance": "per-app",
+          "validate":  "number-range:10:600"
+        }
+      },
+      {
+        "name":  "SPEND_CAP_MICRODOLLARS",
+        "value": "500000000",
+        "doc":   "Per-tenant monthly spend cap in micro-dollars (USD * 1e6). 500_000_000 = $500/month.",
+        "ui": {
+          "tier":      1,
+          "category":  "Application",
+          "label":     "Default monthly spend cap (micro-USD)",
+          "helpText":  "500000000 = $500/mo. Per-tenant policies override this.",
+          "input":     "number",
+          "appliance": "per-app",
+          "validate":  "number-range:0:100000000000"
+        }
+      },
+      {
+        "name":  "ANTHROPIC_REPROBE_INTERVAL_MS",
+        "value": "900000",
+        "doc":   "Periodic Anthropic key re-probe interval (ms). 0 disables; default 15 min. Failures log warn + never crash; the next /v1/messages call fails-closed via the existing 401/503 path."
+      },
+      {
+        "name":  "MAX_REQUEST_BYTES",
+        "value": "1048576",
+        "doc":   "Max request body size (bytes). Anthropic accepts up to 256 KB on /v1/messages; default 1 MB here gives headroom for large tool payloads."
+      },
+      {
+        "name":  "SESSION_TTL_MINUTES",
+        "value": "60",
+        "doc":   "Session idle TTL (minutes). After this, the token vault discards the per-session DEK and stored tokens become unrecoverable. Shorter = tighter security; longer = better re-id continuity across requests."
+      },
+      {
+        "name":  "LOG_LEVEL",
+        "value": "info",
+        "doc":   "Pino log level. fatal | error | warn | info | debug | trace | silent."
+      }
+    ]
+  },
+
+  "database": { "name": "vibe_shield_db", "user": "vibeshield" },
+  "redis":    { "db": 5 },
+
+  "firstLogin": {
+    "type": "setup-wizard",
+    "url":  "/",
+    "note": "Vibe Shield admin has no user model — auth is a single X-Admin-Key header. The appliance generates GATEWAY_ADMIN_KEY at enable time and stores it in /opt/vibe/env/vibe-shield.env (mode 600, root-owned). Retrieve via: sudo grep ^GATEWAY_ADMIN_KEY= /opt/vibe/env/vibe-shield.env. Paste the value into the admin login form. The key never lands in browser storage; refresh = re-prompt."
+  },
+
+  "health": "/health",
+
+  "migrations": {
+    "command":    ["node", "dist/migrate.js"],
+    "autoEnvVar": "MIGRATIONS_AUTO"
+  }
+}
