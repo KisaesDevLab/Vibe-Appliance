@@ -839,14 +839,39 @@ app.get('/api/v1/public/apps', async (_req, res) => {
       if (showTailnetHttps && live) {
         out.tailnetHostnameUrl = appTailnetHostnameUrl(m, config, live);
       }
+      // landingOrder feeds the public-landing sort below; null when the
+      // manifest omits it so the sort comparator treats it as +Infinity
+      // (i.e. unordered cards sink to the end, preserving the prior
+      // alphabetical-by-displayName tiebreaker among them).
+      out.landingOrder = Number.isInteger(m.landingOrder) ? m.landingOrder : null;
       return out;
     })
-    .sort((a, b) => a.displayName.localeCompare(b.displayName));
+    .sort((a, b) => {
+      // landingOrder ascending; missing = end. Tiebreaker: displayName.
+      const ao = a.landingOrder ?? Number.POSITIVE_INFINITY;
+      const bo = b.landingOrder ?? Number.POSITIVE_INFINITY;
+      if (ao !== bo) return ao - bo;
+      return a.displayName.localeCompare(b.displayName);
+    })
+    // landingOrder was a sort handle — strip from the wire payload so
+    // the public response only carries fields the UI consumes.
+    .map((it) => { delete it.landingOrder; return it; });
 
   // Operator-curated custom cards (state.customCards). Sanitized: only
-  // safe http(s) URLs surface. The render layer treats them as cards
-  // alongside manifest apps in the same 2-column grid.
-  const customCards = sanitizeCustomCardsForPublic(state.customCards);
+  // safe http(s) URLs surface. Sorted by the same `order` semantics as
+  // apps so a unified card ordering is achievable across the two
+  // sources. The UI currently renders apps then customCards as
+  // separate flexbox children; within each list `order` controls the
+  // visible sequence.
+  const customCards = sanitizeCustomCardsForPublic(state.customCards)
+    .map((c, idx) => ({ card: c, idx }))
+    .sort((a, b) => {
+      const ao = Number.isInteger(a.card.order) ? a.card.order : Number.POSITIVE_INFINITY;
+      const bo = Number.isInteger(b.card.order) ? b.card.order : Number.POSITIVE_INFINITY;
+      if (ao !== bo) return ao - bo;
+      return a.idx - b.idx;
+    })
+    .map(({ card }) => card);
 
   res.json({ apps: items, customCards, firmName, showStaffSignin });
 });
@@ -899,7 +924,16 @@ function validateCustomCard(raw, idx) {
   const id = (typeof raw.id === 'string' && /^[a-zA-Z0-9_-]{1,40}$/.test(raw.id))
     ? raw.id
     : crypto.randomBytes(8).toString('hex');
-  return { ok: true, card: { id, title, description, buttonLabel, url } };
+  // Optional integer order for landing-page layout. Accepts any
+  // integer 0..9999 (matches manifest landingOrder bounds) and silently
+  // ignores anything else so a legacy customCards entry without `order`
+  // still validates. Missing/invalid → undefined, which the public-apps
+  // sort treats as +Infinity (sorted to end among customCards).
+  const card = { id, title, description, buttonLabel, url };
+  if (Number.isInteger(raw.order) && raw.order >= 0 && raw.order <= 9999) {
+    card.order = raw.order;
+  }
+  return { ok: true, card };
 }
 
 // Sanitize stored cards for public consumption. Defensive — even if
@@ -4890,6 +4924,11 @@ function appPublicUrl(manifest, config, live) {
 // (the path-prefixed root from appPublicUrl). Returns [] when the
 // manifest declares no entries — callers fall back to a single "Open"
 // button. The base URL is computed once per app, not per entry.
+//
+// Entries are sorted by manifest's optional `order` field (ascending;
+// missing entries sort to the end and preserve declaration order via a
+// stable sort). Lets operators / manifest authors pin the most-used
+// surface to the first button slot.
 function appClientLandingEntries(manifest, config, live) {
   const entries = Array.isArray(manifest.clientLanding) ? manifest.clientLanding : [];
   if (!entries.length) return [];
@@ -4899,10 +4938,21 @@ function appClientLandingEntries(manifest, config, live) {
   // the UI surfaces the same diagnostic the default button would.
   if (typeof base !== 'string' || !base.startsWith('http')) return [];
   const root = base.replace(/\/$/, '');
-  return entries.map((e) => ({
-    label: e.label,
-    url:   root + e.path,
-  }));
+  // Decorate with declaration index so Array.prototype.sort (stable in
+  // modern V8) ties consistently when `order` is absent on multiple
+  // entries — manifest author's listed order wins those ties.
+  return entries
+    .map((e, idx) => ({ entry: e, idx }))
+    .sort((a, b) => {
+      const ao = Number.isInteger(a.entry.order) ? a.entry.order : Number.POSITIVE_INFINITY;
+      const bo = Number.isInteger(b.entry.order) ? b.entry.order : Number.POSITIVE_INFINITY;
+      if (ao !== bo) return ao - bo;
+      return a.idx - b.idx;
+    })
+    .map(({ entry }) => ({
+      label: entry.label,
+      url:   root + entry.path,
+    }));
 }
 
 // --- Doctor endpoint --------------------------------------------------

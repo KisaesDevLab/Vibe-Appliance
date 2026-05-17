@@ -99,6 +99,13 @@
       "description": "If false, the app is internal-only (consumed by other Vibe apps, never directly by users). Internal apps do not get an emergency port and may be excluded from the public landing page."
     },
 
+    "landingOrder": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9999,
+      "description": "Optional sort key for the public landing page. Cards (app cards + operator-curated customCards) are rendered in ascending order; ties fall back to displayName for apps and insertion order for customCards. Omit for default behavior (treated as +Infinity, i.e. sorted to the end among manifest apps). Lets the operator pin high-traffic client surfaces (e.g. intake, portal sign-in) to the top of the grid."
+    },
+
     "clientLanding": {
       "type": "array",
       "description": "Optional client-facing entry points surfaced as buttons on the public landing page at /. Each entry produces one button on the app's card under the standard path-prefix base URL (e.g. https://vibe.firm.com/tb<path>, where the prefix is the slug with the redundant `vibe-` stripped). Omit for the default single 'Open' button behavior. Skip entries that require per-client tokens (those are emailed by staff, not surfaceable on a static page).",
@@ -109,7 +116,13 @@
         "additionalProperties": false,
         "properties": {
           "label": { "type": "string", "minLength": 1, "maxLength": 40 },
-          "path":  { "type": "string", "pattern": "^/.*$", "maxLength": 200 }
+          "path":  { "type": "string", "pattern": "^/.*$", "maxLength": 200 },
+          "order": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9999,
+            "description": "Optional sort key for buttons WITHIN this card. Ascending; missing = sorted to end. Lets a manifest declare multiple entries while letting the operator decide which surfaces should appear first to clients."
+          }
         }
       }
     },
