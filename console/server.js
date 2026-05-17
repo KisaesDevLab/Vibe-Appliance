@@ -800,14 +800,16 @@ app.get('/api/v1/public/apps', async (_req, res) => {
   // landing hits shouldn't trigger a docker spawn for no reason.
   const live = (showTailnetIp || showTailnetHttps) ? await _liveTailscaleState() : null;
 
-  // Two-gate filter: app must be `enabled` (running) AND
-  // `visibleToCustomers` (admin opted it in for the client landing).
-  // Default-false on visibleToCustomers makes upgrade safe — a fresh
-  // landing page is empty until the operator explicitly toggles apps
-  // on from /admin → Settings → Customer landing.
+  // Three-gate filter: app must be `enabled` (running), `visibleToCustomers`
+  // (admin opted it in for the client landing), AND not `userFacing:false`
+  // (internal-only services like vibe-glm-ocr and vibe-shield should never
+  // surface on the customer landing — they have admin-only UIs or no UI at
+  // all, and a client clicking through would land on an auth wall they
+  // can't pass). Default-false on visibleToCustomers makes upgrade safe.
   const items = Object.values(MANIFESTS)
     .filter((m) => {
       const s = stateApps[m.slug] || {};
+      if (m.userFacing === false) return false;
       return s.enabled === true && s.visibleToCustomers === true;
     })
     .map((m) => {
@@ -846,6 +848,15 @@ app.get('/api/v1/public/apps', async (_req, res) => {
       out.landingOrder = Number.isInteger(m.landingOrder) ? m.landingOrder : null;
       return out;
     })
+    // Filter out apps whose appPublicUrl couldn't be computed. The
+    // helper returns a parenthesized diagnostic string like
+    // "(mode "domain" without --domain — re-bootstrap)" when the
+    // appliance mode is misconfigured; surfacing that as a card on
+    // the customer landing would let a client click an Open button
+    // that navigates to the literal string and 404s confusingly.
+    // Admin still sees the diagnostic on /admin → Apps panel where
+    // it's actionable.
+    .filter((a) => typeof a.url === 'string' && a.url.startsWith('http'))
     .sort((a, b) => {
       // landingOrder ascending; missing = end. Tiebreaker: displayName.
       const ao = a.landingOrder ?? Number.POSITIVE_INFINITY;
