@@ -30,6 +30,11 @@
   ],
   "ports":         { "server": 4000, "client": 80 },
 
+  "clientLanding": [
+    { "label": "Send us files",     "path": "/intake",        "order": 1 },
+    { "label": "Sign in to portal", "path": "/portal/login",  "order": 2 }
+  ],
+
   "routing": {
     "default_upstream": "vibe-connect-client:80",
     "matchers": [
