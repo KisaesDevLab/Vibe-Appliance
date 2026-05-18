@@ -792,24 +792,48 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
           <dl class="kv app-card__kv">
             <dt>slug</dt><dd>${escapeHtml(a.slug)}</dd>
             <dt>subdomain</dt><dd>${escapeHtml(a.subdomain)}</dd>
-            <dt>tag</dt><dd>${escapeHtml(a.image_tag || a.defaultTag || '—')}</dd>
-            ${a.enabled && (a.image_digest_short || a.image_version) ? `
             <dt>build</dt><dd>${
-              // Prefer OCI version label when the upstream image sets it
-              // (treat it as a friendly semver). Always show the short
-              // digest as ground truth — the registry tag (:latest) is
-              // mutable; the digest isn't. Both together let an operator
-              // confirm "did my update take?" by comparing the digest
-              // before and after.
-              a.image_version
-                ? '<span class="mono">' + escapeHtml(a.image_version) + '</span>'
-                  + (a.image_digest_short
-                      ? ' <span class="muted mono">(' + escapeHtml(a.image_digest_short) + ')</span>'
-                      : '')
-                : (a.image_digest_short
-                    ? '<span class="mono">' + escapeHtml(a.image_digest_short) + '</span>'
-                    : '<span class="muted">—</span>')
-            }${a.image_created ? ' <span class="muted">· built ' + escapeHtml(new Date(a.image_created).toLocaleString()) + '</span>' : ''}</dd>` : ''}
+              // The build row replaces the prior "tag" row (which only
+              // ever showed `latest` — useless for verifying an update
+              // actually took). Priority order:
+              //   1. version + revision SHA  ← ideal: "v0.4.7 · abc1234"
+              //   2. version only            ← "v0.4.7"
+              //   3. revision SHA only       ← "abc1234"
+              //   4. short image digest      ← always available; uniquely
+              //                                identifies the image, even
+              //                                when no version/SHA label is set
+              //   5. registry tag            ← last-resort fallback when
+              //                                the container wasn't running
+              //                                at inspect time (e.g. app
+              //                                disabled or post-bootstrap
+              //                                pre-enable). Shows `latest`
+              //                                but at least the label is
+              //                                correct.
+              // The revision SHA is wrapped in a link to its source repo
+              // when image_source carries the OCI source label (typically
+              // the github repo URL set by docker/build-push-action's
+              // metadata helper).
+              (() => {
+                const rev = a.image_revision_short
+                  ? (a.image_source
+                      ? '<a href="' + escapeHtml(a.image_source) + '/commit/' + encodeURIComponent(a.image_revision) + '" target="_blank" rel="noopener" class="mono">'
+                        + escapeHtml(a.image_revision_short) + '</a>'
+                      : '<span class="mono">' + escapeHtml(a.image_revision_short) + '</span>')
+                  : '';
+                if (a.image_version && rev) {
+                  return '<span class="mono">' + escapeHtml(a.image_version) + '</span> <span class="muted">·</span> ' + rev;
+                }
+                if (a.image_version) {
+                  return '<span class="mono">' + escapeHtml(a.image_version) + '</span>'
+                    + (a.image_digest_short
+                        ? ' <span class="muted mono">(' + escapeHtml(a.image_digest_short) + ')</span>'
+                        : '');
+                }
+                if (rev) return rev;
+                if (a.image_digest_short) return '<span class="mono">' + escapeHtml(a.image_digest_short) + '</span>';
+                return '<span class="muted mono">' + escapeHtml(a.image_tag || a.defaultTag || '—') + '</span>';
+              })()
+            }${a.image_created ? ' <span class="muted">· built ' + escapeHtml(new Date(a.image_created).toLocaleString()) + '</span>' : ''}</dd>
             <dt>url</dt><dd>${a.enabled && a.status === 'running' && a.url.startsWith('http')
                               ? '<a href="' + escapeHtml(a.url) + '">' + escapeHtml(a.url) + '</a>'
                               : '<span class="muted">' + escapeHtml(a.url) + '</span>'}</dd>

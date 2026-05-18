@@ -377,6 +377,25 @@ async function _inspectAppImage(containerName) {
       || envMap.VERSION
       || null;
     if (imageVersion === 'dev' || imageVersion === '') imageVersion = null;
+    // Git commit SHA the image was built from — the "github build
+    // reference" operators want to see on the card. OCI standard label
+    // is org.opencontainers.image.revision; some upstreams also set
+    // BUILD_SHA / GIT_SHA / VCS_REF in env. Truncated to 7 chars on
+    // display (`git log --oneline` convention). When no upstream
+    // sets any of these the field stays null and the card falls back
+    // to the digest as build identifier.
+    let imageRevision =
+      labels['org.opencontainers.image.revision']
+      || envMap.BUILD_SHA
+      || envMap.GIT_SHA
+      || envMap.VCS_REF
+      || null;
+    if (imageRevision === 'dev' || imageRevision === '') imageRevision = null;
+    // Source repo URL — when the upstream image carries
+    // org.opencontainers.image.source (docker/build-push-action sets
+    // this automatically when `metadata-action` is used). Lets the
+    // card link the build reference to a real GitHub commit page.
+    const imageSource = labels['org.opencontainers.image.source'] || null;
     const info = {
       // 12-char prefix matches `docker images` short-id convention; long
       // enough to be unambiguous on a single host, short enough to read
@@ -386,6 +405,9 @@ async function _inspectAppImage(containerName) {
       // pushed this build. NOT the container's start time.
       imageCreated: iInfo.Created || null,
       imageVersion,
+      imageRevision,
+      imageRevisionShort: imageRevision ? imageRevision.slice(0, 7) : null,
+      imageSource,
     };
     _imageInfoCache.set(containerName, { imageId, info, cachedAt: Date.now() });
     return info;
@@ -1219,9 +1241,12 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
         // registry tag (image_tag = "latest" is the same string before
         // and after an update; the digest below changes). Null when
         // the app is disabled or docker inspect failed.
-        image_digest_short: (imageInfoBySlug[m.slug] || {}).imageDigestShort || null,
-        image_created:      (imageInfoBySlug[m.slug] || {}).imageCreated      || null,
-        image_version:      (imageInfoBySlug[m.slug] || {}).imageVersion      || null,
+        image_digest_short:    (imageInfoBySlug[m.slug] || {}).imageDigestShort    || null,
+        image_created:         (imageInfoBySlug[m.slug] || {}).imageCreated        || null,
+        image_version:         (imageInfoBySlug[m.slug] || {}).imageVersion        || null,
+        image_revision:        (imageInfoBySlug[m.slug] || {}).imageRevision       || null,
+        image_revision_short:  (imageInfoBySlug[m.slug] || {}).imageRevisionShort  || null,
+        image_source:          (imageInfoBySlug[m.slug] || {}).imageSource         || null,
       };
     })
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
