@@ -195,7 +195,8 @@
     "optionalDepends": {
       "type": "array",
       "items": { "type": "string", "minLength": 1 },
-      "uniqueItems": true
+      "uniqueItems": true,
+      "description": "Other Vibe app slugs this app benefits from when enabled (e.g. vibe-tx-converter calls vibe-glm-ocr for OCR if available). Informational only — the appliance does NOT enforce these at enable time; an app whose optional dep is disabled will see its dependent features fail at runtime with whatever upstream error path the app itself produces. Consider wiring a preflight WARN in a future iteration."
     },
 
     "env": {
