@@ -2,9 +2,9 @@
 
 The Vibe Appliance is a single Linux server that runs your firm's
 Vibe stack — Trial Balance, MyBooks, Connect, Tax-Research, Payroll &
-Time, GLM-OCR, Transactions Converter, and Calculators — plus the
-supporting infrastructure (database, cache, TLS, backup, monitoring).
-One install. One server. No fleet.
+Time, GLM-OCR, Transactions Converter, Calculators, and Shield — plus
+the supporting infrastructure (database, cache, TLS, backup,
+monitoring). One install. One server. No fleet.
 
 This guide is for whoever is going to do the install. It assumes you
 can copy a command into a terminal and that you know what your firm's
@@ -142,22 +142,25 @@ Pick **one** of these targets. They've all been tested.
 
 #### Droplet sizing
 
-The appliance ships eight apps. The dominant cost is **`vibe-glm-ocr`**,
+The appliance ships nine apps. The dominant cost is **`vibe-glm-ocr`**,
 which runs an on-host vision-language model and reserves 2–3 GiB of RAM
-just for the model. If you only ever use the cloud-hosted Anthropic
-path for OCR (set `LLM_PROVIDER=anthropic` and never enable GLM-OCR),
-you can size much smaller.
+just for the model. Second-biggest is **`vibe-shield`** (~700 MiB —
+spaCy `en_core_web_lg` model in the engine service). If you don't use
+local OCR (set `LLM_PROVIDER=anthropic` and never enable GLM-OCR), you
+can size much smaller; Shield is internal-only and only loaded by apps
+that route their Anthropic calls through it.
 
 | Tier | $ /mo | Verdict |
 | --- | --- | --- |
 | `s-1vcpu-2gb` | $12 | Pre-flight passes; **will OOM with all apps enabled.** Fine for the appliance plus 1–2 light apps. |
 | `s-2vcpu-4gb` | $24 | All apps **except** `vibe-glm-ocr`. Right tier if you do OCR through Anthropic only. |
-| **`s-2vcpu-8gb`** | **$48** | **Minimum for all 8 apps including `vibe-glm-ocr`, with headroom.** Recommended default. |
+| **`s-2vcpu-8gb`** | **$48** | **Minimum for all 9 apps including `vibe-glm-ocr`, with headroom.** Recommended default. |
 | `s-4vcpu-8gb` (Premium) | ~$56 | Same RAM, more cores → noticeably faster OCR on multi-page PDFs. |
 | `s-4vcpu-16gb` | $96 | Multi-user shop with concurrent OCR + TB/MyBooks traffic. |
 
 Idle component breakdown for the recommended tier (rough): infra
-~700 MiB, the seven non-OCR apps ~2 GiB combined, `vibe-glm-ocr`
+~700 MiB, the seven non-OCR-non-Shield apps ~2 GiB combined,
+`vibe-shield` (engine + gateway + admin) ~700 MiB, `vibe-glm-ocr`
 2–3 GiB, kernel + Docker overhead ~500 MiB. That lands around 5–6 GiB
 at idle, leaving 2–3 GiB of headroom for request bursts.
 
@@ -173,8 +176,8 @@ Install Ubuntu 24.04 LTS Server (server, not desktop). Make sure:
 - You can SSH in with sudo access
 
 Minimum hardware: 2 GiB RAM, 2 vCPU equivalents, 20 GiB free disk.
-Recommended for all eight apps **without** `vibe-glm-ocr`: 4+ GiB RAM,
-50 GiB free disk. Recommended for **all eight including `vibe-glm-ocr`**:
+Recommended for all nine apps **without** `vibe-glm-ocr`: 4+ GiB RAM,
+50 GiB free disk. Recommended for **all nine including `vibe-glm-ocr`**:
 8+ GiB RAM, 80 GiB free disk (the OCR app's vision model alone reserves
 2–3 GiB at runtime).
 
@@ -723,9 +726,9 @@ admin (`admin` / `admin` for most apps), and the app will force you
 to set a real password.
 
 Repeat for the other apps you want enabled. On a 2 GiB droplet, two
-apps running comfortably is realistic. For all eight without
+apps running comfortably is realistic. For all nine without
 `vibe-glm-ocr`, plan on at least 4 GiB RAM (`s-2vcpu-4gb`); for all
-eight **with** `vibe-glm-ocr`, plan on at least 8 GiB RAM
+nine **with** `vibe-glm-ocr`, plan on at least 8 GiB RAM
 (`s-2vcpu-8gb` or larger) — see the droplet-sizing table in §1.
 
 ---

@@ -117,6 +117,18 @@ db_bootstrap_for_app() {
   _pg_exec "GRANT CONNECT, TEMP ON DATABASE \"$(_pg_escape "$db")\" TO \"$(_pg_escape "$user")\";" >>"$VIBE_LOG_FILE" 2>&1 \
     || log_warn "grant CONNECT,TEMP failed; the role already had it or the cluster denies the change"
 
+  # 4. Defense-in-depth: revoke the implicit PUBLIC connect grant on
+  # this database. By default Postgres grants CONNECT to PUBLIC on
+  # every database, which means any role on the cluster (including
+  # other Vibe apps' roles like vibemybooks, vibetb, etc.) can open a
+  # connection here. They still can't read the actual data — per-table
+  # GRANTs gate that, and a round-8 live test confirmed isolation
+  # holds — but the noisy "could connect from a sibling tenant" surface
+  # is removed by this revoke. The owner's explicit CONNECT,TEMP grant
+  # above keeps the legitimate connection path open.
+  _pg_exec "REVOKE CONNECT ON DATABASE \"$(_pg_escape "$db")\" FROM PUBLIC;" >>"$VIBE_LOG_FILE" 2>&1 \
+    || log_warn "could not revoke CONNECT from PUBLIC on $db; sibling tenants may still open connections"
+
   log_ok "database ready for $slug" db="$db" user="$user"
 }
 
