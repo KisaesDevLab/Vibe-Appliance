@@ -289,7 +289,14 @@ Fix:      sudo systemctl restart systemd-resolved"
 check_host_outbound() {
   _check_begin "Outbound HTTPS"
   local code
-  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 https://ghcr.io/ 2>/dev/null || echo 000)"
+  # Don't append `|| echo 000` — curl's `-w '%{http_code}'` already
+  # prints "000" on connection failure, and the OR concatenates a
+  # second "000" giving "000000" which then fails to match the `000)`
+  # case below and surfaces as "unexpected HTTP 000000". The
+  # connection-refused exit is non-zero but the substitution still
+  # captures what -w produced.
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 https://ghcr.io/ 2>/dev/null)"
+  [[ -z "$code" ]] && code="000"
   if [[ "$code" == "000" ]]; then
     _check_fail "ghcr.io is unreachable" \
       "Diagnose: curl -v https://ghcr.io 2>&1 | head
@@ -345,7 +352,9 @@ Fix:      sudo docker compose -f /opt/vibe/appliance/docker-compose.yml restart 
 check_postgres_extensions() {
   _check_begin "Postgres extensions (vector + pg_search via ParadeDB)"
   local image
-  image="$(docker inspect vibe-postgres --format '{{.Config.Image}}' 2>/dev/null || echo "")"
+  # `docker inspect` on a missing container exits non-zero and emits
+  # a bare newline to stdout; strip it so the [[ -z ]] guard works.
+  image="$(docker inspect vibe-postgres --format '{{.Config.Image}}' 2>/dev/null | tr -d '\n')"
   if [[ -z "$image" ]]; then
     _check_warn "could not inspect vibe-postgres image"
     return
@@ -633,8 +642,12 @@ check_cockpit_reachability() {
   # hostname. This is the same channel server.js's probeCockpit() uses.
   if _in_container; then
     local code
+    # See check_host_outbound for the `|| echo 000` trap (produces
+    # "000000" on connection failure, which then misroutes through
+    # the `*)` case).
     code="$(curl -ks -o /dev/null -w '%{http_code}' --max-time 3 \
-              https://host.docker.internal:9090/ 2>/dev/null || echo 000)"
+              https://host.docker.internal:9090/ 2>/dev/null)"
+    [[ -z "$code" ]] && code="000"
     case "$code" in
       2*|3*) _check_pass "https://host.docker.internal:9090/ responds (HTTP $code)" ;;
       000)   _check_warn "Cockpit not reachable from console container — may be down on the host, or --no-cockpit was passed" \
@@ -661,7 +674,11 @@ Fix:      sudo systemctl restart cockpit.socket"
 
   # Host-local probe — fastest, doesn't require docker.
   local code
-  code="$(curl -ks -o /dev/null -w '%{http_code}' --max-time 3 https://127.0.0.1:9090/ 2>/dev/null || echo 000)"
+  # See check_host_outbound: curl's `-w '%{http_code}'` already emits
+  # "000" on connection failure; `|| echo 000` would concatenate two
+  # "000"s into "000000" and route through the wrong case.
+  code="$(curl -ks -o /dev/null -w '%{http_code}' --max-time 3 https://127.0.0.1:9090/ 2>/dev/null)"
+  [[ -z "$code" ]] && code="000"
   case "$code" in
     2*|3*) _check_pass "https://127.0.0.1:9090/ responds (HTTP $code)" ;;
     000)   _check_fail "Cockpit on :9090 not responding" \
@@ -766,8 +783,13 @@ db.close()
 check_emergency_proxy() {
   _check_begin "Emergency proxy (HAProxy)"
   local s
+  # On a missing container, `docker inspect` exits non-zero AND emits a
+  # bare '\n' to stdout. Naively `|| echo missing` produces "\nmissing",
+  # which the case below routes to `*)` as "unexpected state". Strip
+  # newlines first, then fall back to "missing".
   s="$(docker inspect --format '{{.State.Status}}/{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
-        vibe-emergency-proxy 2>/dev/null || echo 'missing')"
+        vibe-emergency-proxy 2>/dev/null | tr -d '\n')"
+  [[ -z "$s" ]] && s="missing"
   case "$s" in
     running/healthy)        _check_pass "vibe-emergency-proxy running, healthy" ;;
     running/none|running/starting) _check_pass "vibe-emergency-proxy running" ;;
