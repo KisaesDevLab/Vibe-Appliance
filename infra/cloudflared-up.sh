@@ -287,7 +287,7 @@ except Exception:
 " 2>/dev/null || echo 'vibe')"
 
 if [[ -z "$DOMAIN" ]]; then
-  die "state.config.domain not set in $VIBE_STATE_FILE. Cloudflare Tunnel needs to know the apex domain. Re-run bootstrap.sh with --mode domain --domain <yours> first."
+  die "state.config.domain not set in $VIBE_STATE_FILE. Cloudflare Tunnel needs to know the apex domain. Re-run bootstrap.sh with --mode domain --domain <yours> --email <you@example.com> first."
 fi
 if [[ -z "$TUNNEL_SUBDOMAIN" ]]; then
   die "state.config.tunnel_subdomain is empty in $VIBE_STATE_FILE. The tunnel needs a single subdomain to route. Re-run bootstrap.sh with --mode domain --tunnel-subdomain <label>."
@@ -317,7 +317,7 @@ case "$MODE" in
     1. Open the admin console → Configuration → Network → Primary network
        access → switch to 'Public domain'. Provide a domain + ACME email.
        Re-run this script (or click 'Provision tunnel' in the wizard).
-    2. Or hand: sudo bash /opt/vibe/appliance/bootstrap.sh --mode domain --domain <yours>"
+    2. Or hand: sudo bash /opt/vibe/appliance/bootstrap.sh --mode domain --domain <yours> --email <you@example.com>"
     ;;
   *)
     log_warn "state.config.mode='$MODE' is not one of domain/tailscale/lan — proceeding, but verify Caddy is listening on :443."
@@ -542,6 +542,19 @@ for slug, entry in (state.get("apps") or {}).items():
     with open(man_path) as f:
       manifest = json.load(f)
   except (FileNotFoundError, ValueError):
+    continue
+  # Mirror render-caddyfile.sh's render_extra_subdomain_vhosts() at
+  # line 375: userFacing:false apps (vibe-shield) are internal —
+  # other Vibe apps reach them over vibe_net by service name, never
+  # via the public edge. Publishing their subdomains to the tunnel
+  # would create a proxied CNAME + cloudflared ingress route for
+  # e.g. gateway.shield.<domain>, exposing the Anthropic-shaped
+  # /v1/messages endpoint to the public internet. Caddy would have
+  # no matching named vhost and the request would die with a TLS
+  # error, but the DNS name + edge route still constitute an
+  # unauthenticated attack surface that violates the manifest's
+  # design intent. Skip them here too.
+  if manifest.get("userFacing") is False:
     continue
   subdomains = manifest.get("subdomains") or []
   primary = manifest.get("subdomain", "")
@@ -799,17 +812,42 @@ fi
 
 log_ok "Cloudflare Tunnel is up" tunnel_id="$TUNNEL_ID" tunnel_name="$CF_TUNNEL_NAME" host="$TUNNEL_FQDN"
 
-# Per-app reachable URLs under the single hostname.
-PUBLISHED_LINES="$(python3 - "$PUBLISHED_SLUGS_JSON" "$TUNNEL_FQDN" <<'PYEOF'
-import json, sys
+# Per-app reachable URLs:
+#   - the single-host path-prefix mount on the tunnel FQDN (e.g.
+#     https://vibe.example.com/connect/) — what staff hit
+#   - one URL per manifest.subdomains[] entry that isn't the primary
+#     (e.g. https://client.example.com/) — what clients hit
+# The single-host line is enough for staff-only apps; client-facing
+# apps like vibe-connect need both surfaced or operators wind up
+# sharing the staff URL with clients and hitting the auth wall.
+PUBLISHED_LINES="$(python3 - "$PUBLISHED_SLUGS_JSON" "$TUNNEL_FQDN" "$DOMAIN" "$APPLIANCE_DIR/console/manifests" <<'PYEOF'
+import json, os, sys
 items = json.loads(sys.argv[1])
-host = sys.argv[2]
+host, domain, manifests_dir = sys.argv[2], sys.argv[3], sys.argv[4]
 # URL path prefix mirrors lib/render-caddyfile.sh's _path_prefix():
 # slug with the redundant leading `vibe-` stripped (so vibe-tb → tb).
 for it in items:
   slug = it['slug']
   prefix = slug[len('vibe-'):] if slug.startswith('vibe-') else slug
   print(f"  https://{host}/{prefix}/  ({it['label']})")
+  # Surface each extra (non-primary) subdomain on its own line so the
+  # operator sees the public URL to share with clients. userFacing:false
+  # apps are already absent from `items` per cloudflared-up.sh's
+  # PUBLISHED_SLUGS_JSON build, so we don't need to re-filter.
+  man_path = os.path.join(manifests_dir, f"{slug}.json")
+  try:
+    with open(man_path) as f:
+      manifest = json.load(f)
+  except (FileNotFoundError, ValueError):
+    continue
+  primary = manifest.get("subdomain", "")
+  for sd in (manifest.get("subdomains") or []):
+    name = sd.get("name") or ""
+    if not name or name == primary:
+      continue
+    audience = sd.get("audience") or ""
+    label_suffix = f" - {audience}" if audience else ""
+    print(f"      `-> https://{name}.{domain}/  ({it['label']}{label_suffix})")
 PYEOF
 2>/dev/null || true)"
 

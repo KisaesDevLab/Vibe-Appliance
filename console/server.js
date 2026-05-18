@@ -1030,6 +1030,23 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
         displayName: m.displayName,
         description: m.description,
         subdomain: m.subdomain,
+        // Manifest-declared extra subdomains beyond the primary. Used
+        // by the Cloudflare-Tunnel wizard to surface client-portal
+        // hosts (e.g. client.<domain> for vibe-connect) in the
+        // "Apps reachable through this tunnel" list — the appliance
+        // already provisions these (lib/render-caddyfile.sh::
+        // render_extra_subdomain_vhosts + infra/cloudflared-up.sh),
+        // but the wizard previously listed only the single-host
+        // path-prefix URL, so operators couldn't see the public
+        // client URL to share with clients. Internal-only apps
+        // (userFacing:false, e.g. vibe-shield) get no extra-subdomain
+        // entries — their subdomains[] is for emergency access, not
+        // public routing.
+        extraSubdomains: m.userFacing === false
+          ? []
+          : ((m.subdomains || [])
+              .filter((sd) => sd && sd.name && sd.name !== m.subdomain)
+              .map((sd) => ({ name: sd.name, audience: sd.audience || null }))),
         defaultTag: m.image && m.image.defaultTag,
         url: appPublicUrl(m, state.config || {}, live),
         // LAN-fallback URL (http://<host_ip>/<prefix>/ via Caddy) — what

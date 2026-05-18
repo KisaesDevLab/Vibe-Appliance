@@ -1659,7 +1659,18 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
           const data = await appsResp.json();
           wiz.enabledApps = (data.apps || [])
             .filter(a => a.enabled)
-            .map(a => ({ slug: a.slug, displayName: a.displayName, subdomain: a.subdomain }));
+            .map(a => ({
+              slug:            a.slug,
+              displayName:     a.displayName,
+              subdomain:       a.subdomain,
+              // Non-primary subdomains from the manifest — e.g.
+              // vibe-connect's `client` entry pointing at port 8080.
+              // The provision script (infra/cloudflared-up.sh) already
+              // adds CNAMEs + tunnel ingress rules for these; the
+              // wizard's reachable list pulls them so the operator can
+              // see the public URL to share with clients.
+              extraSubdomains: Array.isArray(a.extraSubdomains) ? a.extraSubdomains : [],
+            }));
           // Single-hostname routing: every enabled app is reachable
           // through the tunnel via /<prefix>/ paths (slug with the
           // redundant `vibe-` stripped). selectedSlugs is
@@ -1795,7 +1806,7 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
       } else if (domainMissing) {
         section.appendChild(el('p', { class: 'help', style: 'color:var(--bad);margin-top:0.6rem;' }, [
           'state.config.domain is not set. Cloudflare Tunnel needs the apex domain so it can create CNAMEs. ',
-          'Re-run ', el('span', { class: 'mono' }, ['sudo bash /opt/vibe/appliance/bootstrap.sh --mode domain --domain <yours>']), ' first.',
+          'Re-run ', el('span', { class: 'mono' }, ['sudo bash /opt/vibe/appliance/bootstrap.sh --mode domain --domain <yours> --email <you@example.com>']), ' first.',
         ]));
       } else if (!modeBlocked) {
         section.appendChild(el('p', { class: 'help' }, [
@@ -2093,13 +2104,36 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
         ]);
       }
       const host = (wiz.tunnelSubdomain || 'vibe') + '.' + (wiz.domain || '<your-domain>');
+      const dom  = wiz.domain || '<your-domain>';
       const wrap = el('ul', { style: 'margin:0.3rem 0 0;padding-left:1.4rem;max-width:36rem;' });
       for (const a of wiz.enabledApps) {
+        // Primary: the single-host path-prefix mount on the tunnel hostname.
         const li = el('li', { style: 'padding:0.15rem 0;' });
         li.appendChild(el('span', { style: 'font-weight:600;' }, [a.displayName]));
         li.appendChild(document.createTextNode(' — '));
         li.appendChild(el('span', { class: 'mono' }, ['https://' + host + '/' + pathPrefix(a.slug) + '/']));
         wrap.appendChild(li);
+
+        // Extra subdomains: one item per manifest.subdomains[] entry
+        // that isn't the primary. The provision script (cloudflared-
+        // up.sh) gives each its own CNAME + tunnel ingress rule, and
+        // render-caddyfile.sh emits a matching :443 vhost. Surface
+        // them here so the operator can copy the public URL to share
+        // with clients (the original vibe-connect /connect/intake/
+        // bug came from operators not knowing client.<domain>
+        // existed).
+        for (const sd of (a.extraSubdomains || [])) {
+          if (!sd || !sd.name) continue;
+          const subLi = el('li', { style: 'padding:0.15rem 0 0.15rem 1rem;' });
+          subLi.appendChild(el('span', { style: 'color:var(--text-muted);' }, ['↳ ']));
+          subLi.appendChild(el('span', { style: 'font-weight:600;' }, [a.displayName]));
+          if (sd.audience) {
+            subLi.appendChild(el('span', { style: 'color:var(--text-muted);' }, [' (' + sd.audience + ')']));
+          }
+          subLi.appendChild(document.createTextNode(' — '));
+          subLi.appendChild(el('span', { class: 'mono' }, ['https://' + sd.name + '.' + dom + '/']));
+          wrap.appendChild(subLi);
+        }
       }
       return wrap;
     }

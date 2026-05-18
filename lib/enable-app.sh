@@ -257,7 +257,75 @@ enable_app() {
   # the running badge after a successful retry, because _state_app_set
   # only merges keys — it never removes them.
   _state_app_clear_keys "$slug" error update_error
+
+  # If the tunnel is active AND this app declares an extra subdomain
+  # (e.g. vibe-connect's client portal at client.<domain>), warn the
+  # operator that the tunnel's ingress + CNAME are stale until
+  # cloudflared-up.sh re-runs. Caddy's vhost for the extra subdomain
+  # IS live (step 7 above re-rendered + reloaded), but the tunnel
+  # only learns about new hostnames at provision time — the wizard
+  # bundles enable-app + cloudflared-up, the per-app toggle on the
+  # admin card does not. Without this hint, the operator sees
+  # "vibe-connect is up" and is then baffled when client.<domain>
+  # 404s at the Cloudflare edge.
+  _warn_if_tunnel_ingress_stale "$slug" "$manifest"
+
   log_ok "$slug is up"
+}
+
+# Emit a recovery hint when an app with extra subdomains is enabled
+# but the tunnel hasn't been re-provisioned yet. No-op when the tunnel
+# isn't active or the manifest declares no extra subdomain. Pure
+# diagnostic: never fails enable, just logs.
+_warn_if_tunnel_ingress_stale() {
+  local slug="$1" manifest="$2"
+  local appliance_env="${VIBE_ENV_DIR}/appliance.env"
+  [[ -f "$appliance_env" ]] || return 0
+
+  # Tunnel only matters if explicitly enabled in appliance.env. Any
+  # other value (false, empty, hand-edited typo) skips the warning.
+  local tunnel_enabled
+  tunnel_enabled="$(grep -m1 '^CLOUDFLARE_TUNNEL_ENABLED=' "$appliance_env" 2>/dev/null | cut -d= -f2- || true)"
+  tunnel_enabled="${tunnel_enabled#\"}"; tunnel_enabled="${tunnel_enabled%\"}"
+  tunnel_enabled="${tunnel_enabled#\'}"; tunnel_enabled="${tunnel_enabled%\'}"
+  [[ "$tunnel_enabled" == "true" ]] || return 0
+
+  # Count manifest subdomains[] entries that aren't the primary.
+  # Zero non-primary subdomains → nothing for the tunnel to learn,
+  # the single-host /<slug>/ path already covers this app.
+  local extra_count
+  extra_count="$(python3 - "$manifest" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+  m = json.load(open(sys.argv[1]))
+except Exception:
+  print(0); sys.exit(0)
+if m.get("userFacing") is False:
+  print(0); sys.exit(0)
+primary = m.get("subdomain", "")
+subs = m.get("subdomains") or []
+extras = [s for s in subs if s.get("name") and s.get("name") != primary]
+print(len(extras))
+PYEOF
+)"
+  [[ "${extra_count:-0}" -gt 0 ]] || return 0
+
+  # Surface the extra-subdomain names so the operator knows exactly
+  # which public hostname(s) won't resolve until they re-provision.
+  local extra_names
+  extra_names="$(python3 - "$manifest" <<'PYEOF' 2>/dev/null
+import json, sys
+m = json.load(open(sys.argv[1]))
+primary = m.get("subdomain", "")
+print(",".join(s["name"] for s in (m.get("subdomains") or [])
+               if s.get("name") and s.get("name") != primary))
+PYEOF
+)"
+
+  log_warn "$slug declares extra subdomain(s) and the Cloudflare Tunnel is active, but the tunnel's ingress + CNAMEs are NOT refreshed automatically by enable-app. Public requests to those subdomains will 404 at the Cloudflare edge until you re-run cloudflared-up.sh." \
+    slug="$slug" \
+    extra_subdomains="$extra_names" \
+    "fix:sudo bash ${APPLIANCE_DIR}/infra/cloudflared-up.sh"
 }
 
 # Pre-flight enable validator. Returns 0 if every check passes; non-
@@ -723,6 +791,7 @@ _render_app_env() {
   local slug="$1" manifest="$2" tmpl="$3" out="$4"
 
   local subdomain mode domain tunnel_subdomain ip allowed_origin vite_base_path session_secure
+  local staff_app_url client_portal_url
   subdomain="$(_manifest_field "$manifest" 'data["subdomain"]')"
   mode="$(python3 -c "import json;print(json.load(open('${VIBE_STATE_FILE}')).get('config',{}).get('mode','lan'))")"
   domain="$(python3 -c "import json;print(json.load(open('${VIBE_STATE_FILE}')).get('config',{}).get('domain',''))")"
@@ -733,6 +802,35 @@ _render_app_env() {
   # Caddy's `handle /<prefix>/*` blocks, otherwise the SPA's base-path
   # diverges from Caddy's routing and every asset request 404s.
   local path_prefix="${slug#vibe-}"
+
+  # The "client portal" subdomain name from the manifest — empty unless
+  # the app declares a second subdomain meant for client (not staff)
+  # access. Convention from console/manifests/vibe-connect.json:16-29:
+  # an entry whose audience contains "client" OR whose name is "client".
+  # Vibe-Connect uses this to expose its intake/portal SPA at
+  # client.<domain> on internal port 8080, separate from the staff app
+  # at the primary subdomain on internal port 80. The Caddy renderer
+  # (lib/render-caddyfile.sh::render_extra_subdomain_vhosts) emits a
+  # matching vhost, and infra/cloudflared-up.sh provisions a CNAME +
+  # ingress rule for it. Apps without a client portal leave this empty.
+  local client_subdomain_name
+  client_subdomain_name="$(python3 - "$manifest" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+  m = json.load(open(sys.argv[1]))
+except Exception:
+  sys.exit(0)
+primary = m.get("subdomain", "")
+for sub in (m.get("subdomains") or []):
+  name = sub.get("name") or ""
+  if not name or name == primary:
+    continue
+  audience = (sub.get("audience") or "").lower()
+  if name == "client" or "client" in audience:
+    print(name)
+    break
+PYEOF
+)"
 
   if [[ "$mode" == "domain" && -n "$domain" ]]; then
     # Single-hostname routing: every app lives under
@@ -747,6 +845,23 @@ _render_app_env() {
     # / revert 3a6ffee).
     allowed_origin="https://${tunnel_subdomain}.${domain}"
     vite_base_path="/${path_prefix}/"
+    # Staff app's full base URL (origin + path prefix, no trailing
+    # slash). Vibe-Connect reads this as SITE_URL and uses it for staff-
+    # facing flows: the admin UI, OIDC callbacks, etc. Anything sent to
+    # a CLIENT must use client_portal_url instead.
+    staff_app_url="${allowed_origin}/${path_prefix}"
+    # Client portal URL — the public-facing host clients reach. Only
+    # populated when the app declares a separate `client`-audience
+    # subdomain AND we're in domain mode (where Caddy + cloudflared
+    # actually route a second subdomain). Vibe-Connect's intake links
+    # and magic-link emails embed this; pointing them at staff_app_url
+    # auth-gates clients into a login screen they can't pass (the
+    # original bug at https://vibe.cpa2web.app/connect/intake/<uuid>).
+    if [[ -n "$client_subdomain_name" ]]; then
+      client_portal_url="https://${client_subdomain_name}.${domain}"
+    else
+      client_portal_url=""
+    fi
   else
     ip="$(_host_lan_ip)"
     allowed_origin="http://${ip:-localhost}"
@@ -756,6 +871,14 @@ _render_app_env() {
     # before nginx starts. Without this, asset URLs are absolute `/`
     # and Caddy 404s every <host>/assets/... request.
     vite_base_path="/${path_prefix}/"
+    staff_app_url="${allowed_origin}/${path_prefix}"
+    # Non-domain modes have no separate client subdomain — Caddy only
+    # routes /<prefix>/ → staff port. The client portal at the app's
+    # second internal port is unreachable from outside the LAN. Leave
+    # client_portal_url empty so Vibe-Connect surfaces "PORTAL_URL not
+    # configured" rather than silently emitting broken intake links
+    # against the LAN IP.
+    client_portal_url=""
   fi
 
   # Whether the operator's browser reaches the appliance over HTTPS:
@@ -853,12 +976,14 @@ _render_app_env() {
       "${ENCRYPTION_KEY:-}" "${JWT_SECRET:-}" \
       "$db_name" "$db_user" "$db_pass" \
       "$vite_base_path" "$session_secure" "$intake_key" \
-      "$vs_kek" "$gateway_admin_key" <<'PYEOF'
+      "$vs_kek" "$gateway_admin_key" \
+      "$staff_app_url" "$client_portal_url" <<'PYEOF'
 import base64, sys
 src, dst, allowed_origin, database_url, redis_url, \
     encryption_key, jwt_secret, db_name, db_user, db_pass, \
     vite_base_path, session_secure, intake_key, \
-    vs_kek, gateway_admin_key = sys.argv[1:16]
+    vs_kek, gateway_admin_key, \
+    staff_app_url, client_portal_url = sys.argv[1:18]
 # Some upstream apps want the appliance's 32-byte AES key as base64 (32
 # raw bytes -> 44-char base64 with padding) rather than the hex form
 # we ship in shared.env. Derive it once here so per-app templates can
@@ -889,6 +1014,8 @@ body = body.replace("@SESSION_SECURE@",     session_secure)
 body = body.replace("@CONNECT_INTAKE_ENCRYPTION_KEY@", intake_key)
 body = body.replace("@VS_KEK@",             vs_kek)
 body = body.replace("@GATEWAY_ADMIN_KEY@",  gateway_admin_key)
+body = body.replace("@STAFF_APP_URL@",      staff_app_url)
+body = body.replace("@CLIENT_PORTAL_URL@",  client_portal_url)
 with open(dst, "w") as f:
     f.write(body)
 PYEOF
