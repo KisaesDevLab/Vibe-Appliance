@@ -73,7 +73,7 @@
   "health": "/api/health",
 
   "migrations": {
-    "command":    ["/nodejs/bin/node", "/app/node_modules/@vibe-calc/db/dist/migrate.js"],
+    "command":    ["/app/node_modules/@vibe-calc/db/dist/migrate.js"],
     "autoEnvVar": "MIGRATIONS_AUTO"
   }
 }

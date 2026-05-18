@@ -69,12 +69,12 @@
   "health": "/api/v1/health",
 
   "migrations": {
-    "command":    ["node", "dist/migrate.js"],
+    "command":    ["node", "server/dist/migrate.js"],
     "autoEnvVar": "MIGRATIONS_AUTO"
   },
 
   "seed": {
-    "command":     ["node", "dist/seed.js"],
-    "description": "Inserts the default admin user (admin / admin1234). Without this step the app starts with no users and the operator can't log in. Run-once via state.apps.vibe-tb.seeded — re-runs would hit a unique-constraint violation."
+    "command":     ["node", "server/dist/seed.js"],
+    "description": "Inserts the default admin user (admin / admin1234). Without this step the app starts with no users and the operator can't log in. Run-once via state.apps.vibe-tb.seeded — re-runs would hit a unique-constraint violation. Paths are relative to the image's WORKDIR (/app); dist/ itself lives at /app/server/dist/ per Dockerfile.server COPY layout."
   }
 }

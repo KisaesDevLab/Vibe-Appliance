@@ -42,14 +42,24 @@ services:
       - /opt/vibe/env/appliance.env
       - /opt/vibe/env/vibe-tb.env
     volumes:
-      # Persistent storage matching upstream prod compose: trial-balance
-      # workpaper uploads, per-app DB-export backups, and the OCR cache
-      # the api shares with the (optional) GLM-OCR sidecar. Without
-      # these, every container recreate (update flow, host reboot,
-      # `compose down/up`) wipes the operator's uploaded PDFs.
-      - /opt/vibe/data/apps/vibe-tb/uploads:/data/uploads
-      - /opt/vibe/data/apps/vibe-tb/backups:/data/backups
-      - /opt/vibe/data/apps/vibe-tb/ocr-cache:/data/ocr-cache
+      # Persistent storage. Container paths match where the upstream
+      # server ACTUALLY writes:
+      #   - documents.ts:61 resolves uploads from `__dirname/../../uploads`,
+      #     i.e. /app/server/uploads (entrypoint cd's to /app/server).
+      #   - backup.ts:76 writes to `process.cwd()/backups`, also
+      #     /app/server/backups.
+      # The Dockerfile (Dockerfile.server:35) pre-creates and chowns both
+      # to uid 10001. Mounting at /data/* (the prior layout) silently
+      # missed the app's writes — uploads landed in the container's
+      # ephemeral fs and vanished on every `compose up --force-recreate`,
+      # which enable-app.sh runs unconditionally.
+      #
+      # No ocr-cache mount: the server source has no consumer for it
+      # (grep -r 'OCR_CACHE\|ocr-cache' server/src returns nothing). The
+      # earlier comment claimed it was shared with the GLM-OCR sidecar
+      # but that wiring was never implemented on the vibe-tb side.
+      - /opt/vibe/data/apps/vibe-tb/uploads:/app/server/uploads
+      - /opt/vibe/data/apps/vibe-tb/backups:/app/server/backups
     networks:
       vibe_net: {}
       vibe-tb-internal:

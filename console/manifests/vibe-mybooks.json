@@ -110,7 +110,7 @@
   "health": "/health",
 
   "migrations": {
-    "command":    ["node", "dist/migrate.js"],
+    "command":    ["npx", "tsx", "packages/api/src/migrate.ts"],
     "autoEnvVar": "MIGRATIONS_AUTO"
   }
 }

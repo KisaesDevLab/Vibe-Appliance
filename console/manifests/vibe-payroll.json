@@ -127,7 +127,7 @@
   "health": "/api/v1/health",
 
   "migrations": {
-    "command":    ["node", "dist/migrate.js"],
+    "command":    ["node", "--import", "tsx/esm", "backend/src/db/migrate.ts"],
     "autoEnvVar": "MIGRATIONS_AUTO"
   }
 }

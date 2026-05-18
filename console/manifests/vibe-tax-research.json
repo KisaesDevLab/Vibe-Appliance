@@ -68,7 +68,7 @@
   "health": "/api/health",
 
   "migrations": {
-    "command":    ["node", "dist/migrate.js"],
+    "command":    ["node", "packages/db/dist/migrate.js"],
     "autoEnvVar": "MIGRATIONS_AUTO"
   }
 }

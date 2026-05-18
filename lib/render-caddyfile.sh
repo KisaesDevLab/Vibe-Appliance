@@ -358,11 +358,22 @@ def render_extra_subdomain_vhosts(enabled, domain, tls_internal=False):
     Compatible with apps that don't declare subdomains[] (returns
     empty for them). Tunnel-mode tls_internal flag propagates to the
     extra vhosts so cloudflared with noTLSVerify still works.
+
+    userFacing=false apps (e.g. vibe-shield) are skipped entirely:
+    their primary subdomain is already withheld from the single-host
+    vhost by render_domain_app_vhost, and their secondary subdomains
+    are equally internal — emitting them as public Caddy vhosts would
+    publish an unauthenticated server-to-server surface (Shield's
+    `gateway.shield.<domain>` would have leaked the Anthropic-shaped
+    /v1/messages endpoint to the internet). Cross-app callers reach
+    these services by container DNS on vibe_net, not via Caddy.
     """
     if not domain:
         return ""
     blocks = []
     for slug, manifest in enabled:
+        if manifest.get("userFacing") is False:
+            continue
         subdomains = manifest.get("subdomains") or []
         if not subdomains:
             continue

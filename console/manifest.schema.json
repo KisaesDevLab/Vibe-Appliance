@@ -18,6 +18,10 @@
   ],
   "additionalProperties": false,
   "properties": {
+    "_doc": {
+      "type": "string",
+      "description": "Free-form documentation/provenance note. Ignored by the renderer; useful for tagging where the manifest was imported from or recording divergence from upstream."
+    },
     "schemaVersion": { "type": "integer", "const": 1 },
     "slug": {
       "type": "string",
@@ -74,9 +78,10 @@
         "properties": {
           "name": {
             "type": "string",
-            "pattern": "^[a-z][a-z0-9-]*$",
+            "pattern": "^[a-z][a-z0-9.-]*$",
             "minLength": 1,
-            "maxLength": 40
+            "maxLength": 60,
+            "description": "DNS label segment to prepend to the appliance domain. Dots allowed so a manifest can declare a multi-label subdomain (e.g. `gateway.shield` → `gateway.shield.<domain>`)."
           },
           "audience": {
             "type": "string",
@@ -90,6 +95,11 @@
           "emergencyNote": {
             "type": "string",
             "maxLength": 200
+          },
+          "target": {
+            "type": "string",
+            "pattern": "^[a-z0-9.-]+:[0-9]+$",
+            "description": "Caddy reverse-proxy target for this secondary subdomain (e.g. `vibe-connect-client:8080`). Consumed by lib/render-caddyfile.sh's render_extra_subdomain_vhosts; falls back to the manifest's routing.default_upstream when absent."
           }
         }
       }
@@ -235,10 +245,11 @@
       "required": ["type"],
       "additionalProperties": false,
       "properties": {
-        "type":     { "enum": ["default-credentials-forced-reset", "default-credentials-passive", "none"] },
+        "type":     { "enum": ["default-credentials-forced-reset", "default-credentials-passive", "setup-wizard", "no-auth", "none"] },
         "username": { "type": "string" },
         "password": { "type": "string" },
-        "url":      { "type": "string" }
+        "url":      { "type": "string" },
+        "note":     { "type": "string", "description": "Operator-facing note rendered in the admin First-login info card. Use for caveats like 'wizard at /install — may 404 on older images'." }
       }
     },
 
@@ -286,14 +297,15 @@
         "name":   { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
         "from":   {
           "type": "string",
-          "description": "Source for the value. See docs/MANIFEST_SCHEMA.md.",
+          "description": "Source for the value. See docs/MANIFEST_SCHEMA.md. Note: this field is descriptive metadata — _render_app_env does literal @MARKER@ substitution against the env template, not lookup against this list.",
           "anyOf": [
             { "pattern": "^shared:[A-Z][A-Z0-9_]*$" },
             { "pattern": "^appliance:[A-Z][A-Z0-9_]*$" },
-            { "const": "generated:hex32" },
+            { "pattern": "^generated:[a-z0-9-]+$" },
             { "const": "subdomain-url" },
             { "const": "database-url" },
             { "const": "redis-url" },
+            { "const": "install-mode-tls" },
             { "pattern": "^static:.*$" }
           ]
         },
@@ -320,7 +332,7 @@
           "description": "Settings page tab. Required for tier 1."
         },
         "label":     { "type": "string", "minLength": 1, "maxLength": 80 },
-        "helpText":  { "type": "string", "maxLength": 200 },
+        "helpText":  { "type": "string", "maxLength": 400 },
         "input": {
           "enum": ["text", "password", "textarea", "number", "toggle", "dropdown", "multi-select", "time-zone", "state-codes", "password-change-flow"],
           "description": "Form input widget. Required for tier 1."
@@ -354,7 +366,7 @@
           "type": "string",
           "description": "Server-side validator name. Constrained to the dispatcher's known set so a typo (e.g. 'anthropic-key') fails schema validation rather than blowing up at save time.",
           "anyOf": [
-            { "enum": ["non-empty", "url", "email", "iana-timezone", "enum", "state-codes", "anthropic-api-key"] },
+            { "enum": ["non-empty", "url", "email", "iana-timezone", "enum", "state-codes", "anthropic-api-key", "boolean"] },
             { "pattern": "^number-range:-?[0-9]+(\\.[0-9]+)?:-?[0-9]+(\\.[0-9]+)?$" },
             { "pattern": "^regex:.+$" }
           ]
