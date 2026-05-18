@@ -810,6 +810,9 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
           ${a.error ? '<div class="error-banner">' + escapeHtml(a.error) + '</div>' : ''}
           ${a.update_error ? '<div class="error-banner">last update error: ' + escapeHtml(a.update_error) + '</div>' : ''}
           <div class="app-card__actions">
+            ${a.enabled && a.update_available
+              ? '<button class="btn"             data-action="update"   data-slug="' + escapeHtml(a.slug) + '" title="Pull the newer tag from GHCR, recreate, and roll back automatically on health failure">Update</button>'
+              : ''}
             ${a.enabled
               ? '<button class="btn btn--ghost" data-action="disable" data-slug="' + escapeHtml(a.slug) + '">Disable</button>'
               : '<button class="btn"             data-action="enable"  data-slug="' + escapeHtml(a.slug) + '"' +
