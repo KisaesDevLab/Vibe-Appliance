@@ -27,9 +27,10 @@
     {
       "name":          "gateway.shield",
       "audience":      "Anthropic-shaped API",
+      "internal":      true,
       "emergencyPort": 5194,
       "target":        "vibe-shield-gateway:8080",
-      "emergencyNote": "Internal Vibe apps should reach the gateway by service name (http://vibe-shield-gateway:8080) over vibe_net — the emergency port is for cross-host debugging only."
+      "emergencyNote": "Internal Vibe apps should reach the gateway by service name (http://vibe-shield-gateway:8080) over vibe_net — the emergency port is for cross-host debugging only. `internal: true` keeps this surface off the public Caddy vhost AND the Cloudflare tunnel ingress."
     }
   ],
   "ports": { "server": 8080, "client": 80 },
@@ -126,9 +127,11 @@
   "redis":    { "db": 5 },
 
   "firstLogin": {
-    "type": "setup-wizard",
-    "url":  "/",
-    "note": "Vibe Shield admin has no user model — auth is a single X-Admin-Key header. The appliance generates GATEWAY_ADMIN_KEY at enable time and stores it in /opt/vibe/env/vibe-shield.env (mode 600, root-owned). Retrieve via: sudo grep ^GATEWAY_ADMIN_KEY= /opt/vibe/env/vibe-shield.env. Paste the value into the admin login form. The key never lands in browser storage; refresh = re-prompt."
+    "type":           "default-credentials-passive",
+    "username":       "(none — paste key into the X-Admin-Key field)",
+    "passwordEnvKey": "GATEWAY_ADMIN_KEY",
+    "url":            "/",
+    "note":           "Vibe Shield admin has no user model — auth is a single X-Admin-Key header. The appliance generated GATEWAY_ADMIN_KEY at enable time and stores it in /opt/vibe/env/vibe-shield.env (mode 600). It is also archived in /opt/vibe/CREDENTIALS.txt. The key never lands in browser storage; refresh = re-prompt."
   },
 
   "health": "/health",

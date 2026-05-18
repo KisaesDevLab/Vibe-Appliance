@@ -323,9 +323,35 @@ def render_domain_app_vhost(domain, tunnel_subdomain, enabled, tls_internal=Fals
     lines.append("")
 
     # Splice in per-app path handlers (tab-indented to match this block).
-    # userFacing=false apps are intentionally skipped here; see docstring.
+    #
+    # Skip rules — both express "not publicly routable":
+    # (a) `userFacing: false` AND no subdomains[] — apps with NO operator
+    #     surface at all (vibe-glm-ocr is the only one today; pure
+    #     server-to-server inference reached by container DNS over
+    #     vibe_net). The wholesale flag stays the contract for these.
+    # (b) The primary subdomain entry in `subdomains[]` carries
+    #     `internal: true` — for apps that mix one PUBLIC surface (admin
+    #     UI) with one or more INTERNAL ones (server-to-server API), the
+    #     manifest expresses per-surface intent. Vibe-Shield's manifest
+    #     uses this: the primary `shield` entry stays public (operator
+    #     admin), `gateway.shield` is marked internal (server-to-server
+    #     Anthropic-shaped API consumed by other Vibe apps).
+    #
+    # userFacing: false ALONE (without subdomains[] saying otherwise) no
+    # longer hides an app's primary surface — that previously broke
+    # Vibe-Shield where `userFacing: false` had been added to keep the
+    # app off the CUSTOMER landing, but inadvertently 404'd the admin
+    # UI on the tunnel-fronted hostname too.
     for slug, manifest in enabled:
-        if manifest.get("userFacing") is False:
+        subdomains = manifest.get("subdomains") or []
+        if manifest.get("userFacing") is False and not subdomains:
+            continue
+        primary = manifest.get("subdomain", "")
+        primary_internal = any(
+            (s.get("name") == primary and s.get("internal") is True)
+            for s in subdomains
+        )
+        if primary_internal:
             continue
         lines.append(render_path_handler(slug, manifest).rstrip("\n"))
         lines.append("")
@@ -359,29 +385,35 @@ def render_extra_subdomain_vhosts(enabled, domain, tls_internal=False):
     empty for them). Tunnel-mode tls_internal flag propagates to the
     extra vhosts so cloudflared with noTLSVerify still works.
 
-    userFacing=false apps (e.g. vibe-shield) are skipped entirely:
-    their primary subdomain is already withheld from the single-host
-    vhost by render_domain_app_vhost, and their secondary subdomains
-    are equally internal — emitting them as public Caddy vhosts would
-    publish an unauthenticated server-to-server surface (Shield's
-    `gateway.shield.<domain>` would have leaked the Anthropic-shaped
-    /v1/messages endpoint to the internet). Cross-app callers reach
-    these services by container DNS on vibe_net, not via Caddy.
+    Per-subdomain `internal: true` entries are skipped: emits no public
+    vhost, no tunnel ingress (cloudflared-up.sh applies the same gate).
+    Used for apps that mix public (admin) and internal (server-to-server)
+    surfaces in one container set — Vibe-Shield's `gateway.shield.<domain>`
+    is `internal: true` so the Anthropic-shaped /v1/messages endpoint
+    stays off the public edge while the admin UI at the primary subdomain
+    routes normally. Cross-app callers reach internal services by
+    container DNS on vibe_net (e.g. http://vibe-shield-gateway:8080),
+    not via Caddy.
     """
     if not domain:
         return ""
     blocks = []
     for slug, manifest in enabled:
-        if manifest.get("userFacing") is False:
-            continue
         subdomains = manifest.get("subdomains") or []
         if not subdomains:
+            continue
+        # App-level userFacing: false STILL blocks all of its secondary
+        # vhosts (covers GLM-OCR-shaped apps that might one day declare
+        # subdomains[]). Per-entry internal: true is the new finer gate.
+        if manifest.get("userFacing") is False:
             continue
         primary = manifest.get("subdomain", "")
         default_upstream = (manifest.get("routing", {}) or {}).get("default_upstream", "")
         for entry in subdomains:
             name = entry.get("name")
             if not name or name == primary:
+                continue
+            if entry.get("internal") is True:
                 continue
             target = entry.get("target") or default_upstream
             if not target:

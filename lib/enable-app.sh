@@ -258,6 +258,23 @@ enable_app() {
   # only merges keys — it never removes them.
   _state_app_clear_keys "$slug" error update_error
 
+  # Refresh /opt/vibe/CREDENTIALS.txt so apps whose first-login secrets
+  # are generated at enable time (e.g. vibe-shield's GATEWAY_ADMIN_KEY)
+  # land in the operator's archived credentials file too. Without this
+  # call, bootstrap's phase_credentials writes CREDENTIALS.txt before any
+  # app is enabled, and post-bootstrap enables (the common case — admin
+  # toggles apps from the console) leave their generated keys only in
+  # /opt/vibe/env/<slug>.env. The admin first-login card always reads
+  # the live env file at request time, but operators expect a single
+  # printed/saved copy of every credential.
+  #
+  # Non-fatal: this is an archival nicety. A re-render failure shouldn't
+  # mark the enable as failed.
+  if declare -F secrets_write_credentials >/dev/null; then
+    secrets_write_credentials \
+      || log_warn "could not refresh ${VIBE_DIR}/CREDENTIALS.txt; re-run sudo bash ${APPLIANCE_DIR}/bootstrap.sh to refresh"
+  fi
+
   # If the tunnel is active AND this app declares an extra subdomain
   # (e.g. vibe-connect's client portal at client.<domain>), warn the
   # operator that the tunnel's ingress + CNAME are stale until
@@ -929,12 +946,15 @@ PYEOF
   fi
   [[ -z "$vs_kek" ]] && vs_kek="$(openssl rand -base64 32 | tr -d '\n')"
 
-  # Vibe-Shield's admin API key (GATEWAY_ADMIN_KEY). Surfaced in the
-  # admin login form via X-Admin-Key header; operator copies it from
-  # /opt/vibe/CREDENTIALS.txt. 32 hex chars (128 bits) is overkill for
-  # an HMAC-shaped opaque token but matches the rest of the appliance's
-  # hex32 secret shape. Preserved across re-renders so existing operator
-  # sessions don't break on a re-bootstrap. Harmless on slugs whose
+  # Vibe-Shield's admin API key (GATEWAY_ADMIN_KEY). Surfaced two ways:
+  # (1) the admin console's First-login info card reads this back from
+  # /opt/vibe/env/vibe-shield.env via the manifest's firstLogin.passwordEnvKey
+  # hook, and (2) /opt/vibe/CREDENTIALS.txt's VIBE SHIELD section, which
+  # lib/secrets.sh re-renders at the end of every enable_app run. 32 hex
+  # chars (128 bits) is overkill for an HMAC-shaped opaque token but
+  # matches the rest of the appliance's hex32 secret shape. Preserved
+  # across re-renders so existing operator sessions don't break on a
+  # re-bootstrap. Harmless on slugs whose
   # template doesn't reference @GATEWAY_ADMIN_KEY@.
   local gateway_admin_key=""
   if [[ -f "$out" ]]; then

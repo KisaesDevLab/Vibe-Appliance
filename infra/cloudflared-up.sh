@@ -543,24 +543,25 @@ for slug, entry in (state.get("apps") or {}).items():
       manifest = json.load(f)
   except (FileNotFoundError, ValueError):
     continue
-  # Mirror render-caddyfile.sh's render_extra_subdomain_vhosts() at
-  # line 375: userFacing:false apps (vibe-shield) are internal —
-  # other Vibe apps reach them over vibe_net by service name, never
-  # via the public edge. Publishing their subdomains to the tunnel
-  # would create a proxied CNAME + cloudflared ingress route for
-  # e.g. gateway.shield.<domain>, exposing the Anthropic-shaped
-  # /v1/messages endpoint to the public internet. Caddy would have
-  # no matching named vhost and the request would die with a TLS
-  # error, but the DNS name + edge route still constitute an
-  # unauthenticated attack surface that violates the manifest's
-  # design intent. Skip them here too.
-  if manifest.get("userFacing") is False:
-    continue
+  # Mirror render-caddyfile.sh's render_extra_subdomain_vhosts(). Two
+  # gates, same semantics as Caddy:
+  # (1) app-level `userFacing: false` AND no subdomains[] → entire app
+  #     is internal (vibe-glm-ocr). Skip wholesale.
+  # (2) per-entry `internal: true` → that specific subdomain is
+  #     internal (vibe-shield's gateway.shield routes /v1/messages
+  #     server-to-server over vibe_net only). Skip that entry.
+  # Otherwise emit one ingress rule per non-primary, non-internal
+  # subdomain. The primary subdomain rides the single tunnel FQDN
+  # already added above.
   subdomains = manifest.get("subdomains") or []
+  if manifest.get("userFacing") is False and not subdomains:
+    continue
   primary = manifest.get("subdomain", "")
   for sub in subdomains:
     name = sub.get("name")
     if not name or name == primary:
+      continue
+    if sub.get("internal") is True:
       continue
     host = f"{name}.{domain}"
     if host in seen_hosts:
@@ -844,6 +845,10 @@ for it in items:
   for sd in (manifest.get("subdomains") or []):
     name = sd.get("name") or ""
     if not name or name == primary:
+      continue
+    # `internal: true` subdomains aren't routed publicly — don't print
+    # a URL the operator can't actually reach.
+    if sd.get("internal") is True:
       continue
     audience = sd.get("audience") or ""
     label_suffix = f" - {audience}" if audience else ""

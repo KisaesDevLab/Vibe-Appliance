@@ -100,6 +100,11 @@
             "type": "string",
             "pattern": "^[a-z0-9.-]+:[0-9]+$",
             "description": "Caddy reverse-proxy target for this secondary subdomain (e.g. `vibe-connect-client:8080`). Consumed by lib/render-caddyfile.sh's render_extra_subdomain_vhosts; falls back to the manifest's routing.default_upstream when absent."
+          },
+          "internal": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, this subdomain is server-to-server only — lib/render-caddyfile.sh emits NO Caddy vhost for it and infra/cloudflared-up.sh adds NO tunnel ingress rule. Cross-app callers reach the service by container DNS over vibe_net (e.g. http://vibe-shield-gateway:8080). Used by apps that mix one PUBLIC surface (the primary subdomain → admin UI) with one or more INTERNAL ones (Vibe-Shield's `gateway.shield` Anthropic-shaped API). Applies independently to the primary subdomain entry too — setting `internal: true` on the entry whose `name` matches the manifest's top-level `subdomain` skips its path handler on the single-host vhost, equivalent to the old `userFacing: false` wholesale block. The emergencyPort frontend still emits regardless (UFW already gates emergency ports to LAN/Tailscale)."
           }
         }
       }
@@ -249,6 +254,11 @@
         "type":     { "enum": ["default-credentials-forced-reset", "default-credentials-passive", "setup-wizard", "no-auth", "none"] },
         "username": { "type": "string" },
         "password": { "type": "string" },
+        "passwordEnvKey": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]*$",
+          "description": "Name of an env-file key whose VALUE is the password the operator pastes into the app's login form. When set, the console reads /opt/vibe/env/<slug>.env at request time and surfaces that key's value as `password` on /api/v1/first-login. Used for credentials that the appliance GENERATES on enable (e.g. vibe-shield's GATEWAY_ADMIN_KEY) rather than bakes into the manifest. Takes precedence over the static `password` field if both are set."
+        },
         "url":      { "type": "string" },
         "note":     { "type": "string", "description": "Operator-facing note rendered in the admin First-login info card. Use for caveats like 'wizard at /install — may 404 on older images'." }
       }
