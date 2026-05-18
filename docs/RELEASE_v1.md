@@ -76,8 +76,17 @@ reversible.
 - **LAN** — Avahi advertises `<hostname>.local`; apps reachable at
   `http://<hostname>.local/<slug>/`.
 - **Tailscale** — `tailscale serve` proxies tailnet HTTPS to local
-  Caddy on `127.0.0.1:80`; apps reachable at
-  `https://<host>.<tailnet>.ts.net/<slug>/`.
+  Caddy on `:80`; apps reachable at
+  `https://<host>.<tailnet>.ts.net/<slug>/`. KNOWN GAP: Caddy's :80
+  is bound to all host interfaces (docker-compose.yml ports
+  `80:80`), so on a public droplet the catch-all is also reachable
+  on plain HTTP at the droplet's public IP. Per-app auth still
+  applies — but if your reason for picking tailscale mode is
+  "don't expose anything publicly," configure UFW (`sudo ufw allow
+  proto tcp to any port 80 from 100.64.0.0/10`) or your cloud
+  firewall to deny :80 from the public internet. v1.1 hardening
+  swaps the docker-compose port directive for a loopback-only bind
+  when tailscale mode is selected.
 - **Domain + Tailscale combo** — public domain serves apps; tailnet
   hostname serves admin (catch-all).
 
