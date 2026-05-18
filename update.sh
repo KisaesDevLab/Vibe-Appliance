@@ -513,10 +513,49 @@ _tag_rollback() {
   local ok="false"
   while IFS='=' read -r key image; do
     [[ -z "$key" ]] && continue
-    local current_id
-    current_id="$(docker image inspect --format '{{.Id}}' "${image}:${default_tag}" 2>/dev/null || true)"
+    local current_id=""
+
+    # Primary source of truth: the running container's image ID, read
+    # straight from the Docker engine. This is what's actually serving
+    # requests right now — by definition a safe rollback target. It
+    # survives the failure mode that previously aborted updates with
+    # "Could not capture rollback tag": the local <image>:<defaultTag>
+    # tag goes missing (operator ran `docker image prune`, a prior
+    # interrupted `compose pull` left the running digest untagged,
+    # registry GC moved `:latest` between sessions). Pre-this-fix the
+    # script refused to proceed; post-fix it tags the actual running
+    # ID and the update continues with a real revert target.
+    #
+    # Container name convention: GHCR-published Vibe images all set
+    # container_name == basename(image) in their compose overlays
+    # (vibe-connect-server, vibe-connect-client, vibe-mybooks-api,
+    # vibe-shield-gateway, etc.). _manifest_images() emits the image
+    # WITHOUT a tag; strip a tag defensively in case a manifest ever
+    # includes one, then take basename to land at the container name.
+    local image_no_tag="${image%:*}"
+    local container_name
+    container_name="$(basename "$image_no_tag")"
+    if [[ -n "$container_name" ]]; then
+      current_id="$(docker inspect --format '{{.Image}}' "$container_name" 2>/dev/null || true)"
+    fi
+
+    # Fallback: inspect the local <image>:<defaultTag> tag — the original
+    # pre-fix behavior. Covers (a) images whose container_name doesn't
+    # follow the basename==image convention (unlikely with GHCR Vibe
+    # apps but cheap insurance), and (b) the case where a container has
+    # been stopped + removed but the image is still locally pulled and
+    # tagged. Belt-and-braces; either branch on its own is enough for
+    # the common case.
+    if [[ -z "$current_id" ]]; then
+      current_id="$(docker image inspect --format '{{.Id}}' "${image}:${default_tag}" 2>/dev/null || true)"
+    fi
+
     if [[ -n "$current_id" ]]; then
       docker tag "$current_id" "${image}:${rollback_tag}" >>"$VIBE_LOG_FILE" 2>&1 && ok="true"
+    else
+      log_warn "no running container and no local ${image}:${default_tag} tag for $slug" \
+        image="$image" container="$container_name" \
+        "diagnose:sudo docker ps -a --filter name=${container_name}; sudo docker image ls ${image}"
     fi
   done < <(_manifest_images "$manifest")
   [[ "$ok" == "true" ]]
