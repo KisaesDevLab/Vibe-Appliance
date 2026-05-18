@@ -692,9 +692,20 @@ phase_core_up() {
   log_phase_banner 7 "Bring up core stack" "core"
   state_set_phase core running
 
-  log_step "docker compose up -d"
+  # `--build` forces a console rebuild when its source changed. phase_pull
+  # already built once, but two paths can skip it:
+  #   - operator runs bootstrap.sh after a `git pull` and the console
+  #     image they have locally is stale relative to console/Dockerfile's
+  #     COPY layer inputs (console/server.js, console/ui/*, etc.)
+  #   - bootstrap is re-invoked from a state where phase_pull is marked
+  #     "ok" and is skipped
+  # Without --build here, a `git pull && bootstrap.sh` cycle would leave
+  # the console serving the previously-baked source — the bug the
+  # operator hit before this fix landed, where /admin showed the old
+  # card layout no matter how many times they restarted.
+  log_step "docker compose up -d (rebuilds console if source changed)"
   if ! ( cd "$APPLIANCE_DIR" && \
-         docker compose up -d ) >>"$VIBE_LOG_FILE" 2>&1; then
+         docker compose up -d --build ) >>"$VIBE_LOG_FILE" 2>&1; then
     state_set_phase core failed "compose up failed"
     log_step "dumping recent compose logs"
     ( cd "$APPLIANCE_DIR" && docker compose logs --tail=50 ) 2>&1 \
