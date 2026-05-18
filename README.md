@@ -1,6 +1,6 @@
 # Vibe Appliance
 
-A self-hosted meta-installer for the Vibe product family on Ubuntu 24.04 LTS. Composes Vibe-Trial-Balance, Vibe-MyBooks, Vibe-Connect, Vibe-Tax-Research-Chat, Vibe-Payroll-Time, and Vibe-GLM-OCR alongside Tailscale, Caddy, Portainer, Cockpit, and Duplicati on a single host.
+A self-hosted meta-installer for the Vibe product family on Ubuntu 24.04 LTS. Composes Vibe-Trial-Balance, Vibe-MyBooks, Vibe-Connect, Vibe-Tax-Research-Chat, Vibe-Payroll-Time, Vibe-GLM-OCR, Vibe-Calculators, Vibe-Transactions-Converter, and Vibe-Shield alongside Tailscale, Caddy, Portainer, Cockpit, and Duplicati on a single host.
 
 **Status:** Pre-v1, in active development. See [`docs/PHASES.md`](docs/PHASES.md) for the build plan.
 
