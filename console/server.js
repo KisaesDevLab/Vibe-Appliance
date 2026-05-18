@@ -345,6 +345,38 @@ async function _inspectAppImage(containerName) {
     }
     const iInfo = await docker.getImage(imageId).inspect();
     const labels = (iInfo.Config && iInfo.Config.Labels) || {};
+    // Image-baked env vars: many Vibe apps' Dockerfiles do
+    //   ARG BUILD_VERSION=dev
+    //   ENV BUILD_VERSION=${BUILD_VERSION}
+    // so the release tag is visible at runtime AND from `docker image
+    // inspect`. Read those out into a key→value map so the version
+    // resolver below can fall back to BUILD_VERSION (Vibe convention),
+    // APP_VERSION, or generic VERSION when an upstream hasn't yet
+    // adopted the OCI label.
+    const envArr = (iInfo.Config && Array.isArray(iInfo.Config.Env)) ? iInfo.Config.Env : [];
+    const envMap = {};
+    for (const entry of envArr) {
+      const eq = entry.indexOf('=');
+      if (eq > 0) envMap[entry.slice(0, eq)] = entry.slice(eq + 1);
+    }
+    // Priority order for the version display:
+    //   1. OCI standard label (org.opencontainers.image.version) — the
+    //      canonical place for "what's the version of this image"
+    //   2. BUILD_VERSION env — Vibe-Connect's existing convention
+    //      (apps/server/src/env.ts:109, infra/docker/Dockerfile:46)
+    //   3. APP_VERSION / VERSION — generic fallbacks for upstreams
+    //      following slightly different conventions
+    // 'dev' is the BUILD_VERSION default when the image was built
+    // outside the release pipeline (local docker build, etc.); treat
+    // it as "no real version" so the card falls back to the digest
+    // rather than showing a meaningless string.
+    let imageVersion =
+      labels['org.opencontainers.image.version']
+      || envMap.BUILD_VERSION
+      || envMap.APP_VERSION
+      || envMap.VERSION
+      || null;
+    if (imageVersion === 'dev' || imageVersion === '') imageVersion = null;
     const info = {
       // 12-char prefix matches `docker images` short-id convention; long
       // enough to be unambiguous on a single host, short enough to read
@@ -353,13 +385,7 @@ async function _inspectAppImage(containerName) {
       // ISO timestamp from the image manifest — when the upstream CI
       // pushed this build. NOT the container's start time.
       imageCreated: iInfo.Created || null,
-      // org.opencontainers.image.version is the standard label for
-      // semver. Vibe-Connect doesn't set it yet (the BUILD_VERSION
-      // ARG is consumed as a runtime env var, not baked as a label) —
-      // so this stays null until upstreams add LABEL directives. When
-      // present, it's the most operator-friendly identifier; when
-      // absent the digest carries that role.
-      imageVersion: labels['org.opencontainers.image.version'] || null,
+      imageVersion,
     };
     _imageInfoCache.set(containerName, { imageId, info, cachedAt: Date.now() });
     return info;
