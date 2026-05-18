@@ -793,6 +793,23 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
             <dt>slug</dt><dd>${escapeHtml(a.slug)}</dd>
             <dt>subdomain</dt><dd>${escapeHtml(a.subdomain)}</dd>
             <dt>tag</dt><dd>${escapeHtml(a.image_tag || a.defaultTag || '—')}</dd>
+            ${a.enabled && (a.image_digest_short || a.image_version) ? `
+            <dt>build</dt><dd>${
+              // Prefer OCI version label when the upstream image sets it
+              // (treat it as a friendly semver). Always show the short
+              // digest as ground truth — the registry tag (:latest) is
+              // mutable; the digest isn't. Both together let an operator
+              // confirm "did my update take?" by comparing the digest
+              // before and after.
+              a.image_version
+                ? '<span class="mono">' + escapeHtml(a.image_version) + '</span>'
+                  + (a.image_digest_short
+                      ? ' <span class="muted mono">(' + escapeHtml(a.image_digest_short) + ')</span>'
+                      : '')
+                : (a.image_digest_short
+                    ? '<span class="mono">' + escapeHtml(a.image_digest_short) + '</span>'
+                    : '<span class="muted">—</span>')
+            }${a.image_created ? ' <span class="muted">· built ' + escapeHtml(new Date(a.image_created).toLocaleString()) + '</span>' : ''}</dd>` : ''}
             <dt>url</dt><dd>${a.enabled && a.status === 'running' && a.url.startsWith('http')
                               ? '<a href="' + escapeHtml(a.url) + '">' + escapeHtml(a.url) + '</a>'
                               : '<span class="muted">' + escapeHtml(a.url) + '</span>'}</dd>

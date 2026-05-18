@@ -310,6 +310,86 @@ async function checkGhcrPublished(image) {
   }
 }
 
+// Per-running-container image identity: short digest, build time, and
+// (when the upstream image set it) the OCI version label. Surfaced on
+// each /admin app card so the operator can verify "the new image is
+// actually running" — Vibe-Connect's blank-page incident was traced to
+// browser caches serving an old client bundle even after update.sh
+// completed, and the only ground-truth signal the card had was
+// `tag: latest` (which never changes). Showing the digest makes a
+// pre-update and post-update card visually distinguishable.
+//
+// Cache key is the canonical container name. The container's image ID
+// is the cache content; if the ID we read now matches what we cached,
+// the metadata can't have changed (image IDs are content-addressed by
+// docker). On image swap (update.sh recreates the container with a
+// new digest), the ID changes and we re-inspect.
+//
+// Failures (container not running yet, docker socket transient blip)
+// return null — the UI treats absent fields as "—" rather than erroring.
+const _imageInfoCache = new Map(); // containerName -> { imageId, info, cachedAt }
+const IMAGE_INFO_CACHE_TTL_MS = 30 * 1000;
+
+async function _inspectAppImage(containerName) {
+  if (!containerName) return null;
+  const cached = _imageInfoCache.get(containerName);
+  // Cheap path: re-inspect the container to confirm the image ID hasn't
+  // shifted (a recreate in the last 30s would change it). Skip the
+  // expensive image-inspect if the ID still matches the cache.
+  try {
+    const container = docker.getContainer(containerName);
+    const cInfo = await container.inspect();
+    const imageId = cInfo.Image; // "sha256:<64hex>"
+    if (cached && cached.imageId === imageId && Date.now() - cached.cachedAt < IMAGE_INFO_CACHE_TTL_MS) {
+      return cached.info;
+    }
+    const iInfo = await docker.getImage(imageId).inspect();
+    const labels = (iInfo.Config && iInfo.Config.Labels) || {};
+    const info = {
+      // 12-char prefix matches `docker images` short-id convention; long
+      // enough to be unambiguous on a single host, short enough to read
+      // on a card row.
+      imageDigestShort: imageId.replace(/^sha256:/, '').slice(0, 12),
+      // ISO timestamp from the image manifest — when the upstream CI
+      // pushed this build. NOT the container's start time.
+      imageCreated: iInfo.Created || null,
+      // org.opencontainers.image.version is the standard label for
+      // semver. Vibe-Connect doesn't set it yet (the BUILD_VERSION
+      // ARG is consumed as a runtime env var, not baked as a label) —
+      // so this stays null until upstreams add LABEL directives. When
+      // present, it's the most operator-friendly identifier; when
+      // absent the digest carries that role.
+      imageVersion: labels['org.opencontainers.image.version'] || null,
+    };
+    _imageInfoCache.set(containerName, { imageId, info, cachedAt: Date.now() });
+    return info;
+  } catch (err) {
+    // Container missing / docker socket down / etc. Cache a negative
+    // result briefly so a stopped app doesn't generate one docker call
+    // per /api/v1/apps poll (every 15s by default).
+    _imageInfoCache.set(containerName, { imageId: null, info: null, cachedAt: Date.now() });
+    return null;
+  }
+}
+
+// Resolve the canonical container name to inspect for a given app
+// manifest. GHCR-published Vibe images set container_name == basename(image)
+// in their compose overlays (vibe-connect-server, vibe-mybooks-api,
+// vibe-shield-gateway, etc.) — same convention update.sh::_tag_rollback
+// relies on. Prefer the server image (it's the API tier, where build
+// version lives); fall back to client for SPA-only apps; fall back to
+// any extras[] entry if neither exists.
+function _appCanonicalContainer(manifest) {
+  const img = (manifest && manifest.image) || {};
+  const pick = img.server || img.client || (Array.isArray(img.extras) && img.extras[0] && img.extras[0].image);
+  if (!pick) return null;
+  // Strip any tag suffix (defensive — manifests typically emit
+  // unsuffixed image strings), then basename.
+  const noTag = String(pick).split(':')[0];
+  const slash = noTag.lastIndexOf('/');
+  return slash >= 0 ? noTag.slice(slash + 1) : noTag;
+}
+
 async function prewarmGhcrCache() {
   const images = new Set();
   for (const m of Object.values(MANIFESTS)) {
@@ -999,6 +1079,20 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
   // mode=tailscale branch of appPublicUrl so app cards reflect
   // daemon reality, not the bootstrap-set state.config.tailscale.
   const live = await _liveTailscaleState();
+  // Inspect the running container for each enabled app in parallel —
+  // the result feeds the card's "build" row (image digest + created
+  // time). Disabled apps skip the inspect (nothing to point at) and
+  // the field stays null. Promise.all so the slowest docker socket
+  // call sets the floor, not the sum.
+  const imageInfoBySlug = {};
+  await Promise.all(
+    Object.values(MANIFESTS).map(async (m) => {
+      const s = stateApps[m.slug] || {};
+      if (!s.enabled) return;
+      const containerName = _appCanonicalContainer(m);
+      imageInfoBySlug[m.slug] = await _inspectAppImage(containerName);
+    }),
+  );
   const items = Object.values(MANIFESTS)
     .map((m) => {
       const s = stateApps[m.slug] || {};
@@ -1094,6 +1188,14 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
         image_client: clientImg || null,
         image_server_published: serverPub,
         image_client_published: clientPub,
+        // Build identity of the RUNNING container — what the operator
+        // actually sees serving traffic right now. Independent of the
+        // registry tag (image_tag = "latest" is the same string before
+        // and after an update; the digest below changes). Null when
+        // the app is disabled or docker inspect failed.
+        image_digest_short: (imageInfoBySlug[m.slug] || {}).imageDigestShort || null,
+        image_created:      (imageInfoBySlug[m.slug] || {}).imageCreated      || null,
+        image_version:      (imageInfoBySlug[m.slug] || {}).imageVersion      || null,
       };
     })
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
