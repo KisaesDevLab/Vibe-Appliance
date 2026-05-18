@@ -37,9 +37,18 @@ services:
     container_name: vibe-caddy
     restart: unless-stopped
     ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"  # HTTP/3
+      # Host bind address is parameterized so tailscale mode can pin to
+      # loopback. Default (0.0.0.0) preserves the LAN/domain-mode behavior
+      # where Caddy answers on every host interface. In tailscale mode
+      # bootstrap.sh (and the console's network-mode-switch handler)
+      # writes HOST_BIND_HTTP=127.0.0.1 / HOST_BIND_HTTPS=127.0.0.1 to
+      # /opt/vibe/appliance/.env, which compose auto-loads. tailscaled
+      # on the host proxies tailnet HTTPS to localhost:80, so 127.0.0.1
+      # bind is sufficient AND removes the public-IP exposure that
+      # operators picking tailscale mode don't want.
+      - "${HOST_BIND_HTTP:-0.0.0.0}:80:80"
+      - "${HOST_BIND_HTTPS:-0.0.0.0}:443:443"
+      - "${HOST_BIND_HTTPS:-0.0.0.0}:443:443/udp"  # HTTP/3
     env_file:
       # shared.env is mounted so the OPTIONAL Cloudflare DNS-01 build
       # path (caddy/Dockerfile.cloudflare) can read CLOUDFLARE_API_TOKEN

@@ -792,18 +792,14 @@ def main():
     #
     # Tailscale mode: tailscaled terminates the public TLS hop on
     # `host.tailnet.ts.net` and proxies into the local Caddy on :80.
-    # KNOWN POSTURE GAP: the docker-compose.yml ports directive binds
-    # the host's `0.0.0.0:80` (not `127.0.0.1:80`), so on a public
-    # droplet the catch-all also answers on the droplet's public IP
-    # on plain HTTP. The exposed surface is the same landing page the
-    # operator already sends to clients (per-app auth still applies),
-    # but the privacy expectation operators have when picking tailscale
-    # mode is broken. Mitigations: (a) configure UFW to allow :80 only
-    # from RFC1918 + 100.64.0.0/10 + 127.0.0.1, or (b) configure the
-    # cloud-provider firewall to deny :80 from the public internet.
-    # v1.1 hardening should swap docker-compose's port directive for
-    # `${HOST_BIND:-0.0.0.0}:80:80` with bootstrap.sh setting
-    # HOST_BIND=127.0.0.1 in tailscale mode.
+    # The docker-compose.yml ports directive uses
+    # `${HOST_BIND_HTTP:-0.0.0.0}:80:80` substitution, and bootstrap.sh's
+    # phase_caddy (plus the console's network-mode-switch handler)
+    # writes HOST_BIND_HTTP=127.0.0.1 to /opt/vibe/appliance/.env in
+    # tailscale mode — so on a public droplet, :80 is bound to the
+    # host's loopback only and the catch-all does NOT answer on the
+    # droplet's public IP. tailscale serve reaches Caddy via localhost,
+    # so the proxy chain still works.
     if mode == "lan":
         listen_addrs = ":80, :443"
         tls_directive = "\ttls internal"
