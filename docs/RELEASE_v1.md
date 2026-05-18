@@ -37,10 +37,17 @@ reversible.
 
 ### Core stack (Phase 2)
 
-- Caddy + Postgres 16 + Redis 7 + a Node 20 management console.
-- Internal `vibe_net` network. Only Caddy publishes ports 80 / 443.
-- Caddy is built locally with the cloudflare DNS plugin (xcaddy);
-  one image whether you're on DNS-01 or HTTP-01.
+- Caddy + Postgres 16 (ParadeDB image — provides pgvector + pg_search
+  on stock PG16) + Redis 7 + a Node 20 management console + an HAProxy
+  emergency-access sidecar (Phase 8.5 Workstream D).
+- Internal `vibe_net` network. Caddy publishes ports 80 / 443; the
+  emergency proxy publishes 5171-5198 (UFW-gated to RFC1918 +
+  Tailscale CGNAT).
+- Default Caddy image is stock `caddy:2-alpine` with HTTP-01 cert
+  issuance. The Cloudflare DNS-01 wildcard path is opt-in via
+  `caddy/Dockerfile.cloudflare` (custom xcaddy build); same idea for
+  Namecheap via `caddy/Dockerfile.namecheap`. PLAN.md §10 decision #2
+  has the history of why HTTP-01 became the default.
 - `/opt/vibe/data` and `/opt/vibe/env` are bind-mounted on the host so
   `tar czf` is sufficient for migration / cold-storage backup.
 
@@ -49,18 +56,17 @@ reversible.
 - Each app contributes one `console/manifests/<slug>.json`, one
   `apps/<slug>.yml` compose overlay, one
   `env-templates/per-app/<slug>.env.tmpl` env template. Adding the
-  seventh app is a one-file change in three places.
+  next app is a one-file change in three places.
 - Toggle on/off from the admin UI; `lib/enable-app.sh` and
   `lib/disable-app.sh` orchestrate env render → image pull → DB
   bootstrap → compose up → health-check → Caddy reload (and the
   reverse for disable). Data volumes are never destroyed by toggle.
-- **Five apps shipped active**: Vibe Trial Balance, Vibe MyBooks,
-  Vibe-GLM-OCR (with Ollama sidecar), Vibe Tax Research Chat,
-  Vibe Payroll & Time.
-- **Vibe-Connect is held back** behind a license PR (see
-  `docs/CONNECT_BLOCKED.md`); files are staged under `_pending/`
-  paths. Three-line `mv` to unblock once the upstream Vibe-Connect
-  repo is ELv2-licensed and a GHCR build lands.
+- **Nine apps shipped**: Vibe Trial Balance, Vibe MyBooks, Vibe Connect
+  (ELv2; staff + client portal subdomains), Vibe Payroll & Time, Vibe
+  Tax Research Chat, Vibe-GLM-OCR (self-contained llama.cpp + GLM-OCR
+  F16 GGUF; CPU-only), Vibe Calculators, Vibe Transactions Converter,
+  Vibe Shield (PII-redacting Anthropic gateway: engine + gateway +
+  admin services, internal-only).
 
 ### Three deployment modes (Phase 6)
 
@@ -98,7 +104,7 @@ reversible.
 - Background daily check via `setInterval` in the console process;
   manifest-aware GHCR digest comparison via the public anonymous
   token endpoint.
-- 5-entry per-app update history surfaced in admin.
+- 20-entry per-app update history surfaced in admin.
 
 ### Infra surfaces (Phase 8)
 
@@ -237,8 +243,8 @@ documented failure-injection drills per `docs/PHASES.md` Phase 9:
 
 | Host                                    | Mode      | Apps                       | Cert path           |
 | --------------------------------------- | --------- | -------------------------- | ------------------- |
-| DigitalOcean `s-1vcpu-2gb`, Ubuntu 24.04 | domain    | all 5 active               | Cloudflare DNS-01   |
-| Hetzner CX22, Ubuntu 24.04              | domain    | TB + MyBooks + Tax-Research | HTTP-01 fallback    |
+| DigitalOcean `s-1vcpu-2gb`, Ubuntu 24.04 | domain    | all 9 shipped              | HTTP-01 (default)   |
+| Hetzner CX22, Ubuntu 24.04              | domain    | TB + MyBooks + Tax-Research | Cloudflare DNS-01 (custom Caddy) |
 | Bare-metal NUC or local VM, Ubuntu 24.04 | lan       | TB + MyBooks                | none (HTTP)         |
 
 For each: time the install (target <15 min), inject a mid-install
