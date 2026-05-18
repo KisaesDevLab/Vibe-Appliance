@@ -196,6 +196,17 @@ parse_flags() {
     *) _pre_die "--mode must be one of: domain, lan, tailscale (got '$CONFIG_MODE')" ;;
   esac
 
+  # --mode domain has hard prerequisites: a real domain the operator owns
+  # AND an ACME contact email. Without these, phase_caddy would silently
+  # render a broken site (empty hostname, no email for Let's Encrypt
+  # subscriber agreement) and phase_core_up would bring up a Caddy that
+  # immediately fails to issue any cert. Catch it at flag parse so the
+  # operator sees the problem before any resource is allocated.
+  if [[ "$CONFIG_MODE" == "domain" ]]; then
+    [[ -n "$CONFIG_DOMAIN" ]] || _pre_die "--mode domain requires --domain DOMAIN (the domain you own and have pointed at this host)"
+    [[ -n "$CONFIG_EMAIL"  ]] || _pre_die "--mode domain requires --email EMAIL (Let's Encrypt ACME contact address)"
+  fi
+
   # Validate the tunnel subdomain label. RFC 1035: 1-63 chars, [a-z0-9],
   # may contain '-' but not at the ends. Reject dots so the operator
   # can't accidentally pass an FQDN here and end up with
@@ -247,16 +258,31 @@ _self_clone_and_exec() {
 
   mkdir -p "$(dirname "$VIBE_APPLIANCE_DIR_DEFAULT")"
 
+  # Surface git failures with an actionable hint instead of letting the
+  # next phase die confusingly on a missing lib/ file. The repo's required
+  # for every subsequent phase — a partial / empty clone is unrecoverable
+  # without an explicit re-fetch.
   if [[ -d "${VIBE_APPLIANCE_DIR_DEFAULT}/.git" ]]; then
     _pre_log "existing checkout found at ${VIBE_APPLIANCE_DIR_DEFAULT}; updating"
-    git -C "$VIBE_APPLIANCE_DIR_DEFAULT" fetch --quiet origin "$VIBE_APPLIANCE_BRANCH"
-    git -C "$VIBE_APPLIANCE_DIR_DEFAULT" checkout --quiet "$VIBE_APPLIANCE_BRANCH"
-    git -C "$VIBE_APPLIANCE_DIR_DEFAULT" reset --hard --quiet "origin/${VIBE_APPLIANCE_BRANCH}"
+    git -C "$VIBE_APPLIANCE_DIR_DEFAULT" fetch --quiet origin "$VIBE_APPLIANCE_BRANCH" \
+      || _pre_die "git fetch failed for ${VIBE_APPLIANCE_REPO} (branch ${VIBE_APPLIANCE_BRANCH}).
+        cause: transient network failure, or the branch was renamed/removed upstream.
+        diagnose: sudo -i git -C ${VIBE_APPLIANCE_DIR_DEFAULT} fetch -v origin ${VIBE_APPLIANCE_BRANCH}
+        fix: re-run the curl|bash one-liner once network connectivity is restored."
+    git -C "$VIBE_APPLIANCE_DIR_DEFAULT" checkout --quiet "$VIBE_APPLIANCE_BRANCH" \
+      || _pre_die "git checkout ${VIBE_APPLIANCE_BRANCH} failed inside ${VIBE_APPLIANCE_DIR_DEFAULT}.
+        fix: rm -rf ${VIBE_APPLIANCE_DIR_DEFAULT} && re-run the installer."
+    git -C "$VIBE_APPLIANCE_DIR_DEFAULT" reset --hard --quiet "origin/${VIBE_APPLIANCE_BRANCH}" \
+      || _pre_die "git reset --hard failed inside ${VIBE_APPLIANCE_DIR_DEFAULT}."
   else
     if [[ -e "$VIBE_APPLIANCE_DIR_DEFAULT" ]]; then
       mv "$VIBE_APPLIANCE_DIR_DEFAULT" "${VIBE_APPLIANCE_DIR_DEFAULT}.bak.$(date -u +%Y%m%d%H%M%S)"
     fi
-    git clone --quiet --depth 1 --branch "$VIBE_APPLIANCE_BRANCH" "$VIBE_APPLIANCE_REPO" "$VIBE_APPLIANCE_DIR_DEFAULT"
+    git clone --quiet --depth 1 --branch "$VIBE_APPLIANCE_BRANCH" "$VIBE_APPLIANCE_REPO" "$VIBE_APPLIANCE_DIR_DEFAULT" \
+      || _pre_die "git clone failed for ${VIBE_APPLIANCE_REPO} (branch ${VIBE_APPLIANCE_BRANCH}).
+        cause: transient network failure, GitHub outage, or DNS misconfiguration.
+        diagnose: sudo -i git clone --depth 1 --branch ${VIBE_APPLIANCE_BRANCH} ${VIBE_APPLIANCE_REPO} /tmp/vibe-test
+        fix: re-run the curl|bash one-liner once network connectivity is restored."
   fi
 
   _pre_log "re-executing $VIBE_APPLIANCE_DIR_DEFAULT/bootstrap.sh"

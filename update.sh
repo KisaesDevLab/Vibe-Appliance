@@ -372,19 +372,22 @@ cmd_update() {
 
   _state_app_set "$slug" status updating
 
-  # Step 1: pull the new image(s).
+  # Step 1: tag the CURRENTLY-RUNNING image as a rollback target BEFORE
+  # we pull. The pull at step 2 replaces `<image>:latest` in the local
+  # cache with the new digest; inspecting `:latest` afterward would
+  # silently tag the new image as the rollback (making rollback a
+  # no-op — the historical bug this ordering fix addresses).
+  log_step "tagging rollback image for $slug (pre-pull)"
+  _tag_rollback "$slug" "$manifest" \
+    || die "Could not capture rollback tag for $slug — refusing to update without a safe rollback path. See $VIBE_LOG_FILE."
+
+  # Step 2: pull the new image(s).
   log_step "pulling new images for $slug"
   if ! _do_pull "$slug" "$default_tag"; then
     _state_app_set "$slug" status failed update_error "pull failed"
     _state_app_history_append "$slug" "failed" "$current_tag" "$default_tag" "pull failed"
     die "Could not pull new images for $slug. See $VIBE_LOG_FILE."
   fi
-
-  # Step 2: tag the currently-running image as a rollback target. This
-  # captures the digest BEFORE we overwrite :latest.
-  log_step "tagging rollback image for $slug"
-  _tag_rollback "$slug" "$manifest" || \
-    log_warn "rollback tag couldn't be created — proceeding without it"
 
   # Step 3: pre-update DB backup (only if the manifest has a database).
   local backup_path=""
@@ -427,8 +430,12 @@ cmd_update() {
     die "Update failed bringing up new images. Rolled back."
   fi
 
-  # Step 7: health check.
-  log_step "waiting for $slug health (timeout 90s)"
+  # Step 7: health check. Per-app override via manifest.health_timeout_s
+  # (vibe-glm-ocr pins this to 300s for the bundled vision-model load).
+  local health_timeout
+  health_timeout="$(_manifest_field "$manifest" 'data.get("health_timeout_s", 90)')"
+  health_timeout="${health_timeout:-90}"
+  log_step "waiting for $slug health (timeout ${health_timeout}s)"
   if ! _wait_for_health "$slug" "$manifest"; then
     log_error "health check timed out; rolling back"
     _do_rollback "$slug" "$manifest" "$backup_path" "health check timeout"
@@ -493,11 +500,21 @@ _do_pull() {
 _tag_rollback() {
   local slug="$1" manifest="$2"
   local rollback_tag="vibe-rollback-${slug}"
+  # The currently-running image is at the manifest's defaultTag — not
+  # hardcoded `:latest`, which breaks apps that pin to a version tag
+  # (vibe-shield ships at v1.1.5; inspecting `:latest` for it returns
+  # nothing and the rollback tag never gets created). We must read this
+  # BEFORE step 2's pull because pull mutates the tag→digest mapping
+  # for mutable tags (`:latest`).
+  local default_tag
+  default_tag="$(_manifest_field "$manifest" 'data["image"]["defaultTag"]')"
+  [[ -n "$default_tag" ]] || { log_error "manifest missing image.defaultTag" slug="$slug"; return 1; }
+
   local ok="false"
   while IFS='=' read -r key image; do
     [[ -z "$key" ]] && continue
     local current_id
-    current_id="$(docker image inspect --format '{{.Id}}' "${image}:latest" 2>/dev/null || true)"
+    current_id="$(docker image inspect --format '{{.Id}}' "${image}:${default_tag}" 2>/dev/null || true)"
     if [[ -n "$current_id" ]]; then
       docker tag "$current_id" "${image}:${rollback_tag}" >>"$VIBE_LOG_FILE" 2>&1 && ok="true"
     fi
