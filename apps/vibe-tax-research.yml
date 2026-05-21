@@ -6,8 +6,10 @@
 # `proxy_pass http://api:4000` and refuses to start without `api`
 # resolution.
 #
-# The /chat/* matcher in the manifest is streaming (SSE) — Caddy emits
-# flush_interval -1 + 3600s read_timeout for that path.
+# The /api/* matcher in the manifest is marked streaming because the
+# app's SSE endpoints (POST /api/chats/:id/messages/, /api/admin/skills
+# /apply) sit under /api. Caddy emits flush_interval -1 + 3600s
+# read_timeout for that path; harmless for plain JSON requests.
 
 name: vibe
 

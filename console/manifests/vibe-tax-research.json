@@ -18,8 +18,7 @@
   "routing": {
     "default_upstream": "vibe-tax-research-web:80",
     "matchers": [
-      { "name": "api",  "path": "/api/*",  "upstream": "vibe-tax-research-api:4000" },
-      { "name": "chat", "path": "/chat/*", "upstream": "vibe-tax-research-api:4000", "streaming": true }
+      { "name": "api", "path": "/api/*", "upstream": "vibe-tax-research-api:4000", "streaming": true }
     ]
   },
 
