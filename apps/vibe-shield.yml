@@ -7,7 +7,7 @@
 # the per-app env file), so we do NOT need a separate one-shot migrate
 # service. Drizzle's __drizzle_migrations table keeps re-runs idempotent.
 #
-# Image tag policy: all three services pin to ${APP_TAG:-v1.1.5} so the
+# Image tag policy: all three services pin to ${APP_TAG:-v1.12.0} so the
 # appliance's update.sh — which bumps manifest.image.defaultTag and then
 # pulls/recreates the named services — moves the whole Vibe Shield
 # release as a unit. Mismatched engine/gateway/admin versions across a
@@ -28,7 +28,7 @@ services:
   # vibe-shield-engine:8000 on vibe_net. Cold start loads spaCy
   # en_core_web_lg (~600 MB RSS); start_period accounts for that.
   vibe-shield-engine:
-    image: ghcr.io/kisaesdevlab/vibe-shield-engine:${APP_TAG:-v1.1.5}
+    image: ghcr.io/kisaesdevlab/vibe-shield-engine:${APP_TAG:-v1.12.0}
     container_name: vibe-shield-engine
     restart: unless-stopped
     init: true
@@ -54,7 +54,7 @@ services:
   # vibe-shield-gateway:8080 (set ANTHROPIC_BASE_URL on those apps).
   # The entrypoint runs migrations first when MIGRATIONS_AUTO=true.
   vibe-shield-gateway:
-    image: ghcr.io/kisaesdevlab/vibe-shield-gateway:${APP_TAG:-v1.1.5}
+    image: ghcr.io/kisaesdevlab/vibe-shield-gateway:${APP_TAG:-v1.12.0}
     container_name: vibe-shield-gateway
     restart: unless-stopped
     init: true
@@ -98,7 +98,7 @@ services:
   # appliance.env carry secrets the admin nginx has no business
   # reading, so we only load vibe-shield.env here.
   vibe-shield-admin:
-    image: ghcr.io/kisaesdevlab/vibe-shield-admin:${APP_TAG:-v1.1.5}
+    image: ghcr.io/kisaesdevlab/vibe-shield-admin:${APP_TAG:-v1.12.0}
     container_name: vibe-shield-admin
     restart: unless-stopped
     env_file:
