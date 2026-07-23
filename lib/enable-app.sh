@@ -814,6 +814,34 @@ _render_app_env() {
   domain="$(python3 -c "import json;print(json.load(open('${VIBE_STATE_FILE}')).get('config',{}).get('domain',''))")"
   tunnel_subdomain="$(python3 -c "import json;print(json.load(open('${VIBE_STATE_FILE}')).get('config',{}).get('tunnel_subdomain','vibe') or 'vibe')")"
 
+  # Effective primary subdomain for this app: the operator's per-app
+  # override (VIBE_APP_SUBDOMAIN in the existing env file, set via
+  # Settings → Network) wins; otherwise the manifest's built-in
+  # `subdomain`. Read from $out — the CURRENT env file, before this
+  # render overwrites it — then persisted to state.apps.<slug>.subdomain
+  # so the Caddy renderer, the Cloudflare Tunnel provisioner, and the
+  # console URL builder all resolve the same value. VIBE_APP_SUBDOMAIN
+  # isn't in the env template, so the render's merge step (below) carries
+  # it forward on every re-render.
+  local app_subdomain_override eff_subdomain routing_mode
+  app_subdomain_override="$(_extract_env_value "$out" VIBE_APP_SUBDOMAIN)"
+  app_subdomain_override="${app_subdomain_override//[[:space:]]/}"
+  if [[ -n "$app_subdomain_override" ]]; then
+    eff_subdomain="$app_subdomain_override"
+  else
+    eff_subdomain="$subdomain"
+  fi
+  _state_app_set "$slug" subdomain "$eff_subdomain" 2>/dev/null || \
+    log_warn "could not persist effective subdomain to state for $slug"
+
+  # Domain-mode routing style — mirrors lib/render-caddyfile.sh. Read
+  # straight from appliance.env (settings-save writes it there). Blank or
+  # unknown → single-host, so a pre-existing install with no
+  # DOMAIN_ROUTING_MODE line is unchanged.
+  routing_mode="$(_extract_env_value "${VIBE_ENV_DIR}/appliance.env" DOMAIN_ROUTING_MODE)"
+  routing_mode="${routing_mode//[[:space:]]/}"
+  [[ "$routing_mode" == "subdomain-per-app" ]] || routing_mode="single-host"
+
   # URL path prefix — slug with redundant `vibe-` stripped. Must match
   # the prefix lib/render-caddyfile.sh's _path_prefix() produces for
   # Caddy's `handle /<prefix>/*` blocks, otherwise the SPA's base-path
@@ -850,30 +878,44 @@ PYEOF
 )"
 
   if [[ "$mode" == "domain" && -n "$domain" ]]; then
-    # Single-hostname routing: every app lives under
-    # `${tunnel_subdomain}.${domain}/<prefix>/`. ALLOWED_ORIGIN is the
-    # same single host for every app (the SPA is loaded from that
-    # origin, so cookie + CORS need to match it). VITE_BASE_PATH is
-    # `/<prefix>/` — same as LAN — because the bundled SPA is built with
-    # `base: '/<prefix>/'` and the /docker-entrypoint.d/40-base-path.sh
-    # hook sed-substitutes the sentinel at container start. Per-app
-    # subdomains were the prior model and required vite_base_path=/
-    # plus a catch-all 302 that downgraded login POSTs (commit 4907588
-    # / revert 3a6ffee).
-    allowed_origin="https://${tunnel_subdomain}.${domain}"
-    vite_base_path="/${path_prefix}/"
-    # Staff app's full base URL (origin + path prefix, no trailing
-    # slash). Vibe-Connect reads this as SITE_URL and uses it for staff-
-    # facing flows: the admin UI, OIDC callbacks, etc. Anything sent to
-    # a CLIENT must use client_portal_url instead.
-    staff_app_url="${allowed_origin}/${path_prefix}"
+    if [[ "$routing_mode" == "subdomain-per-app" ]]; then
+      # Per-app subdomain routing: this app is served at the ROOT of
+      # `${eff_subdomain}.${domain}`. ALLOWED_ORIGIN is that host (the
+      # SPA loads from it, so cookie + CORS must match). VITE_BASE_PATH
+      # is `/` because the app serves at root — the
+      # /docker-entrypoint.d/40-base-path.sh hook rewrites the bundle's
+      # base sentinel to `/` at container start, and enable-app always
+      # --force-recreates so the new base is baked in. No catch-all 302
+      # (that's what downgraded login POSTs in the pre-2026-05-12
+      # per-subdomain design; serving at root needs no redirect).
+      allowed_origin="https://${eff_subdomain}.${domain}"
+      vite_base_path="/"
+      staff_app_url="$allowed_origin"
+    else
+      # Single-hostname routing: every app lives under
+      # `${tunnel_subdomain}.${domain}/<prefix>/`. ALLOWED_ORIGIN is the
+      # same single host for every app (the SPA is loaded from that
+      # origin, so cookie + CORS need to match it). VITE_BASE_PATH is
+      # `/<prefix>/` — same as LAN — because the bundled SPA is built
+      # with `base: '/<prefix>/'` and the /docker-entrypoint.d/
+      # 40-base-path.sh hook sed-substitutes the sentinel at container
+      # start.
+      allowed_origin="https://${tunnel_subdomain}.${domain}"
+      vite_base_path="/${path_prefix}/"
+      # Staff app's full base URL (origin + path prefix, no trailing
+      # slash). Vibe-Connect reads this as SITE_URL and uses it for
+      # staff-facing flows: the admin UI, OIDC callbacks, etc. Anything
+      # sent to a CLIENT must use client_portal_url instead.
+      staff_app_url="${allowed_origin}/${path_prefix}"
+    fi
     # Client portal URL — the public-facing host clients reach. Only
     # populated when the app declares a separate `client`-audience
-    # subdomain AND we're in domain mode (where Caddy + cloudflared
-    # actually route a second subdomain). Vibe-Connect's intake links
-    # and magic-link emails embed this; pointing them at staff_app_url
-    # auth-gates clients into a login screen they can't pass (the
-    # original bug at https://vibe.cpa2web.app/connect/intake/<uuid>).
+    # subdomain. Independent of routing mode: the client portal is
+    # always its own subdomain (Caddy's render_extra_subdomain_vhosts +
+    # cloudflared provision it in both single-host and subdomain-per-app
+    # modes). Vibe-Connect's intake links and magic-link emails embed
+    # this; pointing them at staff_app_url auth-gates clients into a
+    # login screen they can't pass.
     if [[ -n "$client_subdomain_name" ]]; then
       client_portal_url="https://${client_subdomain_name}.${domain}"
     else

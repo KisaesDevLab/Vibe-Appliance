@@ -203,6 +203,25 @@
       }
     },
     {
+      "name":  "DOMAIN_ROUTING_MODE",
+      "value": "single-host",
+      "doc":   "Domain-mode routing layout. 'single-host' fronts every app under one hostname (${tunnel_subdomain}.${domain}) with a path prefix per app (/tb, /mybooks) — one cert, one tunnel CNAME. 'subdomain-per-app' gives each app its own <subdomain>.<domain> served at root, and the Cloudflare Tunnel provisions one CNAME + ingress rule per app. Consumed by lib/render-caddyfile.sh, lib/enable-app.sh, and infra/cloudflared-up.sh. Changing it triggers the routing-reconcile post-save job (re-render every enabled app's env + Caddy, re-provision the tunnel). Default single-host so pre-existing installs are unchanged on upgrade.",
+      "ui": {
+        "tier":         1,
+        "category":     "Network",
+        "label":        "App routing layout",
+        "helpText":     "single-host: apps at vibe.example.com/tb, /mybooks (one cert, one tunnel CNAME). subdomain-per-app: apps at tb.example.com, mybooks.example.com (each its own subdomain + tunnel CNAME). Set each app's subdomain name on its own Settings tab. Switching re-renders routing and re-provisions the Cloudflare Tunnel; enabled apps briefly restart. subdomain-per-app requires each app's web image to serve at a root base path.",
+        "input":        "dropdown",
+        "appliance":    "shared",
+        "validate":     "enum",
+        "options": [
+          { "value": "single-host",       "label": "Single host, path per app (default)" },
+          { "value": "subdomain-per-app", "label": "Subdomain per app" }
+        ],
+        "postSaveJob":  "routing-reconcile"
+      }
+    },
+    {
       "name":  "DDNS_PROVIDER",
       "value": "none",
       "doc":   "Dynamic-DNS provider for non-static-IP installs. When set, the console runs a background updater that pushes the appliance's current public IP to the chosen provider on a regular cadence so A records stay accurate across ISP IP rotations.",

@@ -896,6 +896,14 @@ while IFS= read -r slug; do
   manifest="${APPLIANCE_DIR}/console/manifests/${slug}.json"
   subdomain=""
   [[ -f "$manifest" ]] && subdomain="$(_manifest_field "$manifest" 'data["subdomain"]')"
+  # Prefer the operator's per-app subdomain override
+  # (state.apps.<slug>.subdomain, written from VIBE_APP_SUBDOMAIN by
+  # enable-app.sh) so the DNS + cert checks target the host Caddy and the
+  # Cloudflare Tunnel actually serve in subdomain-per-app mode. Falls back
+  # to the manifest default — equal to the override in single-host mode,
+  # where no override is set.
+  _sub_override="$(_state_get "apps.${slug}.subdomain")"
+  [[ -n "$_sub_override" ]] && subdomain="$_sub_override"
 
   check_app_health "$slug"
 

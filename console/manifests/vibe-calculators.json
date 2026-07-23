@@ -35,6 +35,20 @@
     ],
     "optional": [
       {
+        "name": "VIBE_APP_SUBDOMAIN",
+        "doc":  "Operator override for this app's subdomain label. Empty = the manifest default. Consumed by the appliance routing (Caddy vhost + Cloudflare Tunnel CNAME/ingress) when DOMAIN_ROUTING_MODE=subdomain-per-app; ignored in single-host mode. Single DNS label — lowercase letters, digits, dashes, no dots.",
+        "ui": {
+          "tier":        1,
+          "category":    "Network",
+          "label":       "Subdomain",
+          "helpText":    "The <subdomain> in <subdomain>.<your-domain> for this app when routing is 'subdomain per app' (see Network settings). Leave blank to use the built-in default. Lowercase letters, digits, and dashes; no dots. Saving re-renders routing and re-provisions the Cloudflare Tunnel; the app briefly restarts.",
+          "input":       "text",
+          "appliance":   "per-app",
+          "validate":    "regex:^([a-z][a-z0-9-]*)?$",
+          "postSaveJob": "routing-reconcile"
+        }
+      },
+      {
         "name":   "VIBE_KMS_KEY",
         "from":   "shared:ENCRYPTION_KEY",
         "secret": true,

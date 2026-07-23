@@ -701,14 +701,39 @@ async function ddnsUpdateCycle(force = false) {
 
   // Host list: bare apex + www + the single tunnel subdomain + the
   // three infra subdomains (cockpit/portainer/backup keep their own
-  // subdomains for LAN admin access). Apps no longer get per-subdomain
-  // DNS — they all live at /<prefix>/ under the tunnel hostname.
-  // Set dedupes if the operator chose 'www' or 'cockpit' as their
+  // subdomains for LAN admin access). In single-host mode apps all live
+  // at /<prefix>/ under the tunnel hostname, so they get no per-subdomain
+  // DNS. Set dedupes if the operator chose 'www' or 'cockpit' as their
   // tunnel_subdomain (unusual but valid).
   const hosts = new Set(['@', 'www', 'cockpit', 'portainer', 'backup']);
   const state = readState();
   const tunnelSub = (state.config && state.config.tunnel_subdomain) || 'vibe';
   hosts.add(tunnelSub);
+
+  // subdomain-per-app: each enabled, user-facing app owns its subdomain,
+  // so DDNS must publish an A record per app (plus any non-internal extra
+  // subdomains like vibe-connect's client portal). Mirrors the skip gates
+  // in render-caddyfile.sh / cloudflared-up.sh. Only relevant to the
+  // Namecheap-DDNS path — the Cloudflare Tunnel manages its own CNAMEs.
+  if (applianceRoutingMode() === 'subdomain-per-app') {
+    for (const [slug, entry] of Object.entries((state.apps) || {})) {
+      if (!entry || !entry.enabled) continue;
+      const m = MANIFESTS[slug];
+      if (!m) continue;
+      const subs = Array.isArray(m.subdomains) ? m.subdomains : [];
+      const primary = m.subdomain || '';
+      const fullyInternal = m.userFacing === false && subs.length === 0;
+      const primaryInternal = subs.some((s) => s && s.name === primary && s.internal === true);
+      if (!fullyInternal && !primaryInternal) {
+        const sub = (entry.subdomain || '').trim() || primary;
+        if (sub) hosts.add(sub);
+      }
+      for (const s of subs) {
+        if (!s || !s.name || s.name === primary || s.internal === true) continue;
+        hosts.add(s.name);
+      }
+    }
+  }
 
   const results = {};
   for (const host of hosts) {
@@ -5088,6 +5113,36 @@ function appPathPrefix(manifest) {
   return slug.startsWith('vibe-') ? slug.slice('vibe-'.length) : slug;
 }
 
+// DOMAIN_ROUTING_MODE from appliance.env — 'single-host' (default) or
+// 'subdomain-per-app'. Read fresh each call (admin console, low traffic)
+// so a Settings save is reflected immediately, no console restart needed.
+function applianceRoutingMode() {
+  try {
+    const env = parseEnvFile(path.join(ENV_DIR, 'appliance.env'));
+    return (env.DOMAIN_ROUTING_MODE || '').trim() === 'subdomain-per-app'
+      ? 'subdomain-per-app'
+      : 'single-host';
+  } catch (_e) {
+    return 'single-host';
+  }
+}
+
+// Effective primary subdomain for an app: the operator override persisted
+// to state.apps.<slug>.subdomain (from VIBE_APP_SUBDOMAIN, written by
+// lib/enable-app.sh) wins; else the manifest's built-in subdomain.
+// Mirrors render-caddyfile.sh's _effective_subdomain() and
+// cloudflared-up.sh's eff_subdomain() so the console shows the same host
+// the tunnel + Caddy actually serve.
+function appEffectiveSubdomain(manifest) {
+  try {
+    const st = readState();
+    const entry = ((st.apps || {})[manifest.slug]) || {};
+    return (entry.subdomain || '').trim() || manifest.subdomain;
+  } catch (_e) {
+    return manifest.subdomain;
+  }
+}
+
 // LAN fallback URL — http://<host_ip>/<prefix>/. Goes through Caddy on
 // :80 with the same path-prefix routing as the primary URL, so it
 // benefits from prefix stripping and per-route splitting (api/* →
@@ -5106,6 +5161,14 @@ function appPathPrefix(manifest) {
 function appLanFallbackUrl(manifest, config) {
   const ip = config.host_ip;
   if (!ip) return null;
+  // subdomain-per-app: apps serve at a root base (VITE_BASE_PATH=/), so
+  // a :80 /<prefix>/ path 404s — the catch-all emits no app path
+  // handlers in that mode. LAN access is via the app subdomain
+  // (split-DNS/hosts → host IP → the :443 vhost), so there's no direct
+  // host-IP path fallback to advertise.
+  if (config.mode === 'domain' && applianceRoutingMode() === 'subdomain-per-app') {
+    return null;
+  }
   return `http://${ip}/${appPathPrefix(manifest)}/`;
 }
 
@@ -5115,6 +5178,12 @@ function appLanFallbackUrl(manifest, config) {
 // stays encrypted inside the WireGuard tunnel.
 function appTailnetUrl(manifest, config, live) {
   if (!live || live.backendState !== 'Running' || !live.ip) return null;
+  // subdomain-per-app in domain mode: the :80 catch-all emits no app
+  // path handlers (root-base bundles), so a tailnet /<prefix>/ hit 404s.
+  // Reach apps via their subdomain instead.
+  if (config.mode === 'domain' && applianceRoutingMode() === 'subdomain-per-app') {
+    return null;
+  }
   // Works in domain mode too since commit 60f4e8d: the :80 catch-all's
   // @lan matcher includes 100.64.0.0/10 (Tailscale CGNAT), so /<prefix>/
   // path-routes from a tailnet client without falling to the console.
@@ -5129,17 +5198,24 @@ function appTailnetUrl(manifest, config, live) {
 function appTailnetHostnameUrl(manifest, config, live) {
   if (!live || live.backendState !== 'Running' || !live.hostname) return null;
   if (!live.serve_configured) return null;
+  if (config.mode === 'domain' && applianceRoutingMode() === 'subdomain-per-app') {
+    return null;
+  }
   return `https://${live.hostname}/${appPathPrefix(manifest)}/`;
 }
 
 function appPublicUrl(manifest, config, live) {
   const prefix = appPathPrefix(manifest);
-  // Domain mode → single tunnel subdomain, path per app. Mirrors
-  // LAN routing (vibe.local/<prefix>/) so the bundled SPA's
-  // base: '/<prefix>/' resolves without a host-level redirect. Per-app
-  // subdomains used to live here but broke login flows — see
-  // commits 4907588 / 3a6ffee for the history.
   if (config.mode === 'domain' && config.domain) {
+    // subdomain-per-app → each app at the ROOT of its own subdomain.
+    // Effective subdomain = operator override (state) → manifest default.
+    if (applianceRoutingMode() === 'subdomain-per-app') {
+      const sub = appEffectiveSubdomain(manifest);
+      return `https://${sub}.${config.domain}/`;
+    }
+    // single-host (default) → one tunnel subdomain, path per app.
+    // Mirrors LAN routing (vibe.local/<prefix>/) so the bundled SPA's
+    // base: '/<prefix>/' resolves without a host-level redirect.
     const sub = config.tunnel_subdomain || 'vibe';
     return `https://${sub}.${config.domain}/${prefix}/`;
   }

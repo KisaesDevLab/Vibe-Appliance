@@ -204,6 +204,13 @@ settings_save_apply() {
 
   if [[ -z "$affected_slugs" ]]; then
     log_info "no dependent apps to restart"
+    # Still run post-save jobs. Some are driven by APPLIANCE-scoped keys
+    # that no app manifest declares (DOMAIN_ROUTING_MODE →
+    # routing-reconcile, DNS_PROVIDER → dns-provider-switch), so
+    # affected_slugs is legitimately empty yet there's real downstream
+    # work to do. Best-effort — failures are logged, not rolled back.
+    _settings_run_post_save_jobs "$payload_file" || \
+      log_warn "post-save jobs reported failures; settings persisted but downstream actions may need manual completion"
     _settings_emit_result "saved" "" "$snap_dir" ""
     return 0
   fi
@@ -272,16 +279,28 @@ _settings_run_post_save_jobs() {
 import json, sys
 with open(sys.argv[1]) as f:
     p = json.load(f)
-keys = {c.get("key") for c in p.get("changes", [])}
+changes = p.get("changes", [])
+keys = {c.get("key") for c in changes}
 out = []
 if "DNS_PROVIDER" in keys:
     out.append("dns-provider-switch")
-for c in p.get("changes", []):
+for c in changes:
     if c.get("key") == "ENABLED_STATES" \
        and c.get("scope", "").endswith("vibe-tax-research"):
         out.append("corpus-sync")
         break
-print("\n".join(out))
+# Routing changes: the app routing layout (DOMAIN_ROUTING_MODE) or any
+# per-app subdomain (VIBE_APP_SUBDOMAIN) needs env re-render +
+# force-recreate + Caddy re-render + tunnel re-provision — more than the
+# generic `docker compose restart`. One job covers both triggers.
+if "DOMAIN_ROUTING_MODE" in keys or "VIBE_APP_SUBDOMAIN" in keys:
+    out.append("routing-reconcile")
+# De-dupe, preserve order.
+seen = set(); deduped = []
+for j in out:
+    if j not in seen:
+        seen.add(j); deduped.append(j)
+print("\n".join(deduped))
 PYEOF
 )" || return 1
 
@@ -296,6 +315,9 @@ PYEOF
         ;;
       corpus-sync)
         _post_save_corpus_sync || rc=1
+        ;;
+      routing-reconcile)
+        _post_save_routing_reconcile "$payload_file" || rc=1
         ;;
       *)
         log_warn "unknown postSaveJob; skipping" job="$job"
@@ -336,6 +358,99 @@ _post_save_corpus_sync() {
   log_warn "Tax-Research-Chat corpus sync stub: app restarted with new ENABLED_STATES; full re-index endpoint pending v1.3 in upstream Vibe-Tax-Research-Chat" \
     "diagnose:docker compose -f /opt/vibe/appliance/docker-compose.yml -f /opt/vibe/appliance/apps/vibe-tax-research.yml logs --tail 50"
   return 0
+}
+
+# Routing reconcile — the app routing layout (DOMAIN_ROUTING_MODE) or a
+# per-app subdomain (VIBE_APP_SUBDOMAIN) changed. The generic save path
+# already wrote the new values to the env files, but a routing change
+# needs MORE than a `docker compose restart`:
+#   - each affected app's env must be re-rendered so ALLOWED_ORIGIN and
+#     VITE_BASE_PATH match the new layout (root vs /prefix/),
+#   - the container must be force-recreated so the new SPA base is baked
+#     into the served bundle (`restart` keeps the old bundle — the
+#     2026-05-14 blank-page bug),
+#   - the Caddyfile must be re-rendered + reloaded, and
+#   - if the Cloudflare Tunnel is active, its ingress + CNAMEs must be
+#     re-provisioned to add/rename per-app subdomains.
+# Re-running enable-app.sh for each affected app does the first three
+# (it renders env, force-recreates, re-renders + reloads Caddy, and
+# health-checks); cloudflared-up.sh does the last. Best-effort: failures
+# are logged with a copy-paste fix and reported via rc, but the settings
+# were already persisted so we never roll back here.
+#
+# Affected set:
+#   - DOMAIN_ROUTING_MODE changed → every enabled app (the layout
+#     changes for all of them).
+#   - only VIBE_APP_SUBDOMAIN changed → just the per-app scopes that
+#     changed.
+_post_save_routing_reconcile() {
+  local payload_file="$1"
+
+  local mode_changed
+  mode_changed="$(python3 - "$payload_file" <<'PYEOF'
+import json, sys
+p = json.load(open(sys.argv[1]))
+print("yes" if any(c.get("key") == "DOMAIN_ROUTING_MODE"
+                   for c in p.get("changes", [])) else "no")
+PYEOF
+)"
+
+  local slugs
+  if [[ "$mode_changed" == "yes" ]]; then
+    slugs="$(python3 - "${VIBE_DIR}/state.json" <<'PYEOF'
+import json, sys
+try:
+    s = json.load(open(sys.argv[1]))
+except Exception:
+    s = {}
+for slug, e in (s.get("apps") or {}).items():
+    if e.get("enabled"):
+        print(slug)
+PYEOF
+)"
+  else
+    slugs="$(python3 - "$payload_file" <<'PYEOF'
+import json, sys
+p = json.load(open(sys.argv[1]))
+out = []
+for c in p.get("changes", []):
+    if c.get("key") == "VIBE_APP_SUBDOMAIN":
+        sc = c.get("scope", "")
+        if sc.startswith("per-app:"):
+            out.append(sc[len("per-app:"):])
+print("\n".join(sorted(set(out))))
+PYEOF
+)"
+  fi
+
+  local rc=0 slug
+  while IFS= read -r slug; do
+    [[ -z "$slug" ]] && continue
+    log_step "routing-reconcile: re-enabling $slug (env re-render + force-recreate + Caddy)"
+    if ! bash "${APPLIANCE_DIR}/lib/enable-app.sh" "$slug" >>"$VIBE_LOG_FILE" 2>&1; then
+      log_warn "routing-reconcile: enable-app failed for $slug; its routing may be stale" \
+        "diagnose:sudo tail -50 $VIBE_LOG_FILE" \
+        "fix:sudo bash ${APPLIANCE_DIR}/lib/enable-app.sh $slug"
+      rc=1
+    fi
+  done <<<"$slugs"
+
+  # Re-provision the tunnel so ingress rules + CNAMEs match the new
+  # routing. Only when it's actually on — cloudflared-up.sh would bail
+  # anyway, but skipping the spawn keeps the log clean.
+  local tunnel_enabled
+  tunnel_enabled="$(secrets_get_appliance CLOUDFLARE_TUNNEL_ENABLED 2>/dev/null || true)"
+  if [[ "$tunnel_enabled" == "true" ]]; then
+    log_step "routing-reconcile: re-provisioning Cloudflare Tunnel ingress + CNAMEs"
+    if ! bash "${APPLIANCE_DIR}/infra/cloudflared-up.sh" >>"$VIBE_LOG_FILE" 2>&1; then
+      log_warn "routing-reconcile: cloudflared-up failed; tunnel ingress/CNAMEs may be stale until re-run" \
+        "diagnose:sudo tail -50 $VIBE_LOG_FILE" \
+        "fix:sudo bash ${APPLIANCE_DIR}/infra/cloudflared-up.sh"
+      rc=1
+    fi
+  fi
+
+  return "$rc"
 }
 
 # Internal: apply the payload's `changes` array to the right env files.

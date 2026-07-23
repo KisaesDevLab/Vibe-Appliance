@@ -90,34 +90,30 @@ def list_enabled_apps(state, manifests_dir):
     return out
 
 
-def render_vhost(slug, manifest, mode, domain, tls_internal=False):
+def render_vhost(slug, manifest, domain, subdomain, tls_internal=False):
     """
-    Emit a Caddy site block for the app at <subdomain>.<domain>.
+    Emit a Caddy site block serving the app at the ROOT of
+    <subdomain>.<domain> — the per-app-subdomain routing model
+    (DOMAIN_ROUTING_MODE=subdomain-per-app).
 
-    Subdomain serves the app at root. The Vibe-* web images include
-    /docker-entrypoint.d/40-base-path.sh which sed-substitutes the
-    `VITE_BASE_PATH` env var into the bundle's `__VIBE_BASE_PATH__`
-    sentinel before nginx starts. lib/enable-app.sh sets
-    VITE_BASE_PATH=/<prefix>/ (slug minus the `vibe-` prefix) in
-    LAN/Tailscale modes and the same value in domain mode under the
-    single-hostname routing model — that's the canonical runtime
-    mechanism. As long as per-app env files are kept in sync with
-    state.config.mode, this block just reverse_proxies at root and
-    the bundle works.
+    The app is served at root: no path prefix, no catch-all redirect.
+    The Vibe-* web images include /docker-entrypoint.d/40-base-path.sh
+    which sed-substitutes the `VITE_BASE_PATH` env var into the bundle's
+    base-path sentinel before nginx starts. lib/enable-app.sh sets
+    VITE_BASE_PATH=/ in this mode so the SPA loads its assets from the
+    subdomain root. This is the same shape the appliance used before the
+    2026-05-12 single-host switch, MINUS the catch-all 302 that broke
+    login POSTs: root serving needs no redirect as long as the per-app
+    env file is re-rendered (VITE_BASE_PATH=/) and the container is
+    force-recreated so the new bundle base is baked in — enable-app.sh
+    always --force-recreates, and the settings routing-reconcile job
+    re-runs enable-app on every affected app when the routing mode or a
+    subdomain changes.
 
-    A prior commit added a /<prefix>/* mount + catch-all redirect here
-    to work around stale env files (apps enabled in LAN mode whose
-    VITE_BASE_PATH was never re-rendered after the operator switched
-    to domain). That workaround caused real bugs:
-      - 302 on the catch-all downgrades POST to GET (RFC 7231 §6.4.3),
-        which silently breaks every login / form submission. The SPA
-        thinks its POST went through; the backend received GET and
-        returned 404.
-      - Visible URL was <sub>.<domain>/<prefix>/... instead of clean
-        <sub>.<domain>/...
-    Removed. The correct fix for stale env files is to re-render them
-    when state.config.mode changes; that lives in the settings-save /
-    mode-change path, not here.
+    `subdomain` is the EFFECTIVE subdomain: the operator's per-app
+    override (state.apps.<slug>.subdomain, from VIBE_APP_SUBDOMAIN in the
+    per-app env file) if set, else manifest.subdomain. The caller
+    resolves it via _effective_subdomain().
 
     tls_internal=True makes Caddy use its embedded local CA for the
     cert (self-signed). Required when the appliance is fronted by
@@ -126,10 +122,9 @@ def render_vhost(slug, manifest, mode, domain, tls_internal=False):
     cloudflared's ingress with noTLSVerify=true accepts the self-
     signed cert; Cloudflare's edge handles the real public TLS.
     """
-    if mode != "domain" or not domain:
+    if not domain or not subdomain:
         return ""
 
-    subdomain = manifest["subdomain"]
     host = f"{subdomain}.{domain}"
 
     routing = manifest.get("routing", {})
@@ -143,6 +138,10 @@ def render_vhost(slug, manifest, mode, domain, tls_internal=False):
     lines.append("    log {")
     lines.append("        output stdout")
     lines.append("        format console")
+    lines.append("    }")
+    lines.append("")
+    lines.append("    handle /caddy-health {")
+    lines.append("        respond \"ok\" 200")
     lines.append("    }")
     lines.append("")
 
@@ -364,6 +363,104 @@ def render_domain_app_vhost(domain, tunnel_subdomain, enabled, tls_internal=Fals
     lines.append("\t}")
     lines.append("}")
     return "\n".join(lines) + "\n"
+
+
+def _effective_subdomain(slug, manifest, state):
+    """Resolve an app's effective primary subdomain.
+
+    Precedence: the operator's per-app override — persisted to
+    state.apps.<slug>.subdomain by lib/enable-app.sh from the
+    VIBE_APP_SUBDOMAIN key in the per-app env file — wins; otherwise the
+    manifest's built-in `subdomain`. Every consumer (this renderer,
+    infra/cloudflared-up.sh, the console's appPublicUrl) resolves the
+    subdomain the same way so Caddy vhosts, tunnel ingress, and the URLs
+    shown in the admin UI all agree.
+    """
+    entry = (state.get("apps") or {}).get(slug) or {}
+    sub = (entry.get("subdomain") or "").strip()
+    if sub:
+        return sub
+    return manifest.get("subdomain", "")
+
+
+def render_console_host_vhost(domain, tunnel_subdomain, tls_internal=False):
+    """Render the console (landing + admin) site block for
+    subdomain-per-app mode.
+
+    In single-host mode the console shares `${tunnel_subdomain}.${domain}`
+    with the apps (they path-route underneath it). In subdomain-per-app
+    mode each app owns its subdomain, so the console gets that hostname to
+    itself — landing page at `/`, admin at `/admin`. The apex still
+    redirects here (render_apex_vhost), so `firm.com` → `vibe.firm.com`.
+
+    tls_internal: see render_vhost.
+    """
+    if not domain or not tunnel_subdomain:
+        return ""
+    host = f"{tunnel_subdomain}.{domain}"
+    lines = [f"{host} {{"]
+    if tls_internal:
+        lines.append("    tls internal")
+    lines.append("    encode gzip zstd")
+    lines.append("    log {")
+    lines.append("        output stdout")
+    lines.append("        format console")
+    lines.append("    }")
+    lines.append("")
+    lines.append("    handle /caddy-health {")
+    lines.append("        respond \"ok\" 200")
+    lines.append("    }")
+    lines.append("")
+    lines.append("    handle {")
+    lines.append("        reverse_proxy console:3000 {")
+    lines.append("            header_up X-Real-IP {remote_host}")
+    lines.append("        }")
+    lines.append("    }")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def render_per_app_subdomain_vhosts(enabled, domain, state, tls_internal=False):
+    """Emit one root-served vhost per enabled app at its effective
+    subdomain — the subdomain-per-app routing model.
+
+    Skip rules mirror render_domain_app_vhost so the two routing models
+    hide the same surfaces:
+      (a) `userFacing: false` AND no subdomains[] → no operator surface
+          at all (vibe-glm-ocr); skip wholesale.
+      (b) the primary subdomain entry in `subdomains[]` carries
+          `internal: true` → server-to-server only; skip the primary
+          vhost (its extra subdomains still render via
+          render_extra_subdomain_vhosts).
+
+    Secondary subdomains (subdomains[] beyond the primary — e.g.
+    vibe-connect's client portal) are rendered by
+    render_extra_subdomain_vhosts, same as in single-host mode, so this
+    function only owns each app's PRIMARY subdomain.
+    """
+    if not domain:
+        return ""
+    blocks = []
+    for slug, manifest in enabled:
+        subdomains = manifest.get("subdomains") or []
+        if manifest.get("userFacing") is False and not subdomains:
+            continue
+        primary = manifest.get("subdomain", "")
+        primary_internal = any(
+            (s.get("name") == primary and s.get("internal") is True)
+            for s in subdomains
+        )
+        if primary_internal:
+            continue
+        sub = _effective_subdomain(slug, manifest, state)
+        if not sub:
+            print(
+                f"# WARNING: {slug} has no resolvable subdomain — vhost skipped",
+                file=sys.stderr,
+            )
+            continue
+        blocks.append(render_vhost(slug, manifest, domain, sub, tls_internal))
+    return "\n".join(b for b in blocks if b.strip())
 
 
 def render_extra_subdomain_vhosts(enabled, domain, tls_internal=False):
@@ -718,6 +815,19 @@ def main():
     tunnel_active = (appliance_env.get("CLOUDFLARE_TUNNEL_ENABLED", "")
                      .strip().lower() == "true")
 
+    # Domain-mode routing style. 'single-host' (default) fronts every app
+    # under one hostname (`${tunnel_subdomain}.${domain}`) with path
+    # prefixes; 'subdomain-per-app' gives each app its own
+    # <subdomain>.<domain> served at root. Operator-selectable via
+    # Settings → Network (DOMAIN_ROUTING_MODE in appliance.env). Unknown
+    # or blank falls back to single-host so an empty appliance.env — the
+    # state on every pre-existing install — never changes behavior.
+    routing_mode = (appliance_env.get("DOMAIN_ROUTING_MODE", "") or "").strip() or "single-host"
+    if routing_mode not in ("single-host", "subdomain-per-app"):
+        print(f"# WARNING: DOMAIN_ROUTING_MODE='{routing_mode}' unknown; using single-host",
+              file=sys.stderr)
+        routing_mode = "single-host"
+
     with open(tmpl_path) as f:
         body = f.read()
 
@@ -745,30 +855,50 @@ def main():
     enabled = list_enabled_apps(state, manifests_dir)
 
     if mode == "domain" and domain:
-        # Single-hostname routing: every app + the console live under
-        # `${tunnel_subdomain}.${domain}` with path-prefix routing
-        # (mirroring LAN mode). The apex (and www) redirects to the
-        # tunnel subdomain so a typo on the bare domain still lands
-        # somewhere useful.
+        # Two routing styles, selected by DOMAIN_ROUTING_MODE:
         #
-        # Per-app subdomains were the prior model (commit 4907588 and
-        # before); they broke login flows because the bundled SPAs are
-        # built with `base: '/<slug>/'` and any per-host mount required
-        # a catch-all 302 that downgraded login POSTs to GET (RFC 7231
-        # §6.4.3). One hostname with path routing avoids both the
-        # `base` mismatch and the catch-all redirect entirely.
-        vhost_pieces = [
-            render_apex_vhost(domain, tunnel_subdomain=tunnel_subdomain,
-                              tls_internal=tunnel_active),
-            render_domain_app_vhost(domain, tunnel_subdomain, enabled,
-                                    tls_internal=tunnel_active),
-            # Per-app extra subdomains (apps that declare `subdomains[]`
-            # beyond their primary). vibe-connect uses this to expose the
-            # client portal at client.<domain> on a different internal
-            # port than the staff app's /connect/ mount.
-            render_extra_subdomain_vhosts(enabled, domain,
+        # single-host (default): every app + the console live under
+        #   `${tunnel_subdomain}.${domain}` with path-prefix routing
+        #   (mirroring LAN mode). The apex (and www) redirects there.
+        #   Adopted 2026-05-12 because per-app subdomains had broken
+        #   login flows — the bundled SPAs are built with a base-path
+        #   sentinel and the old per-subdomain code mounted them via a
+        #   catch-all 302 that downgraded login POSTs to GET (RFC 7231
+        #   §6.4.3; commits 4907588 / 3a6ffee).
+        #
+        # subdomain-per-app: each app gets its own <subdomain>.<domain>
+        #   served at ROOT (VITE_BASE_PATH=/, set by enable-app.sh), with
+        #   the console on `${tunnel_subdomain}.${domain}`. No catch-all
+        #   redirect — the 302 that caused the original breakage is gone;
+        #   the SPA base just has to be re-rendered to `/` and the
+        #   container force-recreated, which enable-app.sh and the
+        #   settings routing-reconcile job both do. The Cloudflare Tunnel
+        #   provisions one CNAME + ingress rule per app to match
+        #   (infra/cloudflared-up.sh).
+        if routing_mode == "subdomain-per-app":
+            vhost_pieces = [
+                render_apex_vhost(domain, tunnel_subdomain=tunnel_subdomain,
+                                  tls_internal=tunnel_active),
+                render_console_host_vhost(domain, tunnel_subdomain,
                                           tls_internal=tunnel_active),
-        ]
+                render_per_app_subdomain_vhosts(enabled, domain, state,
+                                                tls_internal=tunnel_active),
+                render_extra_subdomain_vhosts(enabled, domain,
+                                              tls_internal=tunnel_active),
+            ]
+        else:
+            vhost_pieces = [
+                render_apex_vhost(domain, tunnel_subdomain=tunnel_subdomain,
+                                  tls_internal=tunnel_active),
+                render_domain_app_vhost(domain, tunnel_subdomain, enabled,
+                                        tls_internal=tunnel_active),
+                # Per-app extra subdomains (apps that declare `subdomains[]`
+                # beyond their primary). vibe-connect uses this to expose the
+                # client portal at client.<domain> on a different internal
+                # port than the staff app's /connect/ mount.
+                render_extra_subdomain_vhosts(enabled, domain,
+                                              tls_internal=tunnel_active),
+            ]
         # Infra services (Cockpit, Portainer, Duplicati) keep their own
         # subdomain vhosts. They're admin tooling — putting them on the
         # tunnel-fronted hostname would expose them to the public
@@ -790,9 +920,19 @@ def main():
         # public face HTTPS-only. Same render_path_handler /
         # render_infra_path_handler functions LAN mode uses, just
         # wrapped in a remote_ip-gated handle block.
-        app_path_blocks = "\n".join(
-            render_path_handler(slug, m) for slug, m in enabled
-        ) if enabled else ""
+        #
+        # subdomain-per-app: the bundles are built for a root base
+        # (VITE_BASE_PATH=/), so a /<prefix>/ mount would 404 every
+        # asset. Apps are reached on the LAN via their subdomain instead
+        # (split-DNS or /etc/hosts → host IP → the :443 per-app vhost),
+        # the same pattern the infra subdomains use. So emit only the
+        # infra path handlers on :80 in that mode.
+        if routing_mode == "subdomain-per-app":
+            app_path_blocks = ""
+        else:
+            app_path_blocks = "\n".join(
+                render_path_handler(slug, m) for slug, m in enabled
+            ) if enabled else ""
         infra_path_blocks = "\n".join(
             render_infra_path_handler(s) for s in INFRA_SERVICES
         )

@@ -162,6 +162,15 @@ _strip_value() { local v="$1"; v="${v#\"}"; v="${v%\"}"; v="${v#\'}"; v="${v%\'}
 CF_TUNNEL_ENABLED="$(_strip_value "$CF_TUNNEL_ENABLED")"
 CF_TUNNEL_PUBLISH="$(_strip_value "$CF_TUNNEL_PUBLISH")"
 
+# Domain-mode routing style (mirrors lib/render-caddyfile.sh and
+# lib/enable-app.sh). single-host (default) → one tunnel hostname fronts
+# every app with path prefixes, so the tunnel needs ONE CNAME + ingress
+# rule. subdomain-per-app → each app owns `${subdomain}.${domain}`, so
+# the tunnel provisions one CNAME + ingress rule per enabled app (plus
+# the console on the tunnel subdomain). Blank/unknown → single-host.
+ROUTING_MODE="$(_strip_value "$(_get_env_value DOMAIN_ROUTING_MODE)")"
+[[ "$ROUTING_MODE" == "subdomain-per-app" ]] || ROUTING_MODE="single-host"
+
 # --- Diagnostic for the most common first-run failure ----------------
 # If the toggle isn't 'true', tell the operator exactly what was found
 # and how to recover. This is the error that bit operators because the
@@ -509,10 +518,10 @@ fi
 # site block matches — without this, SNI defaults to "caddy" and Caddy
 # aborts with "tls: internal error" (commit 06e962a). The catch-all
 # 404 at the end is required by Cloudflare Tunnel.
-log_step "building tunnel ingress config" host="$TUNNEL_FQDN"
-INGRESS_JSON="$(python3 - "$TUNNEL_FQDN" "$DOMAIN" "$VIBE_STATE_FILE" "$APPLIANCE_DIR/console/manifests" <<'PYEOF'
+log_step "building tunnel ingress config" host="$TUNNEL_FQDN" routing="$ROUTING_MODE"
+INGRESS_JSON="$(python3 - "$TUNNEL_FQDN" "$DOMAIN" "$VIBE_STATE_FILE" "$APPLIANCE_DIR/console/manifests" "$ROUTING_MODE" <<'PYEOF'
 import json, os, sys
-fqdn, domain, state_path, manifests_dir = sys.argv[1:5]
+fqdn, domain, state_path, manifests_dir, routing_mode = sys.argv[1:6]
 
 def caddy_rule(host):
   return {
@@ -524,14 +533,31 @@ def caddy_rule(host):
     },
   }
 
+# The tunnel subdomain (`${TUNNEL_SUBDOMAIN}.${DOMAIN}`) is always the
+# first rule. In single-host mode it fronts every app (Caddy splits
+# paths behind it); in subdomain-per-app mode it fronts the console
+# (landing + admin) while each app gets its own rule below. Every rule
+# forwards to caddy:443 inside vibe_net; noTLSVerify lets Caddy serve
+# its self-signed internal cert (Cloudflare's edge does the public TLS).
+# originServerName=<hostname> makes cloudflared send SNI for the
+# requested host so Caddy's named site block matches — without this, SNI
+# defaults to "caddy" and Caddy aborts with "tls: internal error"
+# (commit 06e962a). The catch-all 404 at the end is required by
+# Cloudflare Tunnel.
 ingress = [caddy_rule(fqdn)]
 
-# Walk enabled apps for extra subdomains.
 try:
   with open(state_path) as f:
     state = json.load(f)
 except (FileNotFoundError, ValueError):
   state = {}
+
+def eff_subdomain(manifest, entry):
+  # Operator override (state.apps.<slug>.subdomain, from
+  # VIBE_APP_SUBDOMAIN) wins; else the manifest's built-in subdomain.
+  # Mirrors render-caddyfile.sh's _effective_subdomain().
+  s = (entry.get("subdomain") or "").strip()
+  return s or manifest.get("subdomain", "")
 
 seen_hosts = {fqdn}
 for slug, entry in (state.get("apps") or {}).items():
@@ -543,20 +569,33 @@ for slug, entry in (state.get("apps") or {}).items():
       manifest = json.load(f)
   except (FileNotFoundError, ValueError):
     continue
-  # Mirror render-caddyfile.sh's render_extra_subdomain_vhosts(). Two
-  # gates, same semantics as Caddy:
-  # (1) app-level `userFacing: false` AND no subdomains[] → entire app
-  #     is internal (vibe-glm-ocr). Skip wholesale.
-  # (2) per-entry `internal: true` → that specific subdomain is
-  #     internal (vibe-shield's gateway.shield routes /v1/messages
-  #     server-to-server over vibe_net only). Skip that entry.
-  # Otherwise emit one ingress rule per non-primary, non-internal
-  # subdomain. The primary subdomain rides the single tunnel FQDN
-  # already added above.
   subdomains = manifest.get("subdomains") or []
+  primary = manifest.get("subdomain", "")
+
+  # subdomain-per-app: add the app's PRIMARY effective subdomain as its
+  # own ingress rule + CNAME. Mirrors render_per_app_subdomain_vhosts'
+  # skip gates so the tunnel exposes exactly what Caddy serves:
+  #   (a) userFacing:false AND no subdomains[] → fully internal; skip.
+  #   (b) the primary subdomains[] entry marked internal:true → skip.
+  if routing_mode == "subdomain-per-app":
+    primary_internal = any(
+      s.get("name") == primary and s.get("internal") is True for s in subdomains
+    )
+    fully_internal = manifest.get("userFacing") is False and not subdomains
+    if not primary_internal and not fully_internal:
+      sub = eff_subdomain(manifest, entry)
+      if sub:
+        host = f"{sub}.{domain}"
+        if host not in seen_hosts:
+          seen_hosts.add(host)
+          ingress.append(caddy_rule(host))
+
+  # Both modes: one rule per non-primary, non-internal subdomains[]
+  # entry (vibe-connect's client portal at client.<domain>; vibe-shield
+  # keeps gateway.shield internal so it's skipped). Skip the whole app
+  # when it's fully internal.
   if manifest.get("userFacing") is False and not subdomains:
     continue
-  primary = manifest.get("subdomain", "")
   for sub in subdomains:
     name = sub.get("name")
     if not name or name == primary:
@@ -821,26 +860,39 @@ log_ok "Cloudflare Tunnel is up" tunnel_id="$TUNNEL_ID" tunnel_name="$CF_TUNNEL_
 # The single-host line is enough for staff-only apps; client-facing
 # apps like vibe-connect need both surfaced or operators wind up
 # sharing the staff URL with clients and hitting the auth wall.
-PUBLISHED_LINES="$(python3 - "$PUBLISHED_SLUGS_JSON" "$TUNNEL_FQDN" "$DOMAIN" "$APPLIANCE_DIR/console/manifests" <<'PYEOF'
+PUBLISHED_LINES="$(python3 - "$PUBLISHED_SLUGS_JSON" "$TUNNEL_FQDN" "$DOMAIN" "$APPLIANCE_DIR/console/manifests" "$ROUTING_MODE" "$VIBE_STATE_FILE" <<'PYEOF'
 import json, os, sys
 items = json.loads(sys.argv[1])
 host, domain, manifests_dir = sys.argv[2], sys.argv[3], sys.argv[4]
+routing_mode, state_path = sys.argv[5], sys.argv[6]
+try:
+  state_apps = (json.load(open(state_path)).get("apps") or {})
+except Exception:
+  state_apps = {}
 # URL path prefix mirrors lib/render-caddyfile.sh's _path_prefix():
 # slug with the redundant leading `vibe-` stripped (so vibe-tb → tb).
 for it in items:
   slug = it['slug']
   prefix = slug[len('vibe-'):] if slug.startswith('vibe-') else slug
-  print(f"  https://{host}/{prefix}/  ({it['label']})")
-  # Surface each extra (non-primary) subdomain on its own line so the
-  # operator sees the public URL to share with clients. userFacing:false
-  # apps are already absent from `items` per cloudflared-up.sh's
-  # PUBLISHED_SLUGS_JSON build, so we don't need to re-filter.
   man_path = os.path.join(manifests_dir, f"{slug}.json")
   try:
     with open(man_path) as f:
       manifest = json.load(f)
   except (FileNotFoundError, ValueError):
-    continue
+    manifest = {}
+  if routing_mode == "subdomain-per-app":
+    # Each app at its own subdomain root. Effective subdomain =
+    # operator override (state) → manifest.
+    entry = state_apps.get(slug) or {}
+    sub = (entry.get("subdomain") or "").strip() or manifest.get("subdomain", "")
+    print(f"  https://{sub}.{domain}/  ({it['label']})")
+  else:
+    # Single-host: path prefix under the tunnel hostname.
+    print(f"  https://{host}/{prefix}/  ({it['label']})")
+  # Surface each extra (non-primary) subdomain on its own line so the
+  # operator sees the public URL to share with clients — same in both
+  # routing modes. userFacing:false apps are already absent from `items`
+  # per the PUBLISHED_SLUGS_JSON build, so we don't need to re-filter.
   primary = manifest.get("subdomain", "")
   for sd in (manifest.get("subdomains") or []):
     name = sd.get("name") or ""

@@ -1407,3 +1407,109 @@ Append to this list as phases complete. Format:
   - `curl -i -X POST https://vibe.<domain>/tb/api/auth/login` is 200.
   - Re-run bootstrap: per-app envs already match new path → no
     needless container restart on the second pass.
+
+- Per-app subdomain routing (opt-in) implemented 2026-07-23 by Claude
+  (Opus 4.8) on the appliance dev clone. Re-introduces per-app
+  subdomains in domain mode as an operator-selectable layout, done the
+  way that avoids the 2026-05-12 breakage.
+
+  What changed:
+  - New appliance setting `DOMAIN_ROUTING_MODE` (Settings → Network →
+    "App routing layout"): `single-host` (default, unchanged) or
+    `subdomain-per-app`. Declared in `console/manifests/_appliance.json`.
+    Default preserves current behavior — pre-existing installs have no
+    such line, and blank/unknown resolves to single-host in every
+    consumer, so upgrade is a no-op until the operator opts in.
+  - New per-app setting `VIBE_APP_SUBDOMAIN` (Settings → Network →
+    "Subdomain", `appliance: per-app`) on all 8 user-facing manifests
+    (every manifest with an `env.optional` array; `vibe-glm-ocr` is
+    internal and excluded). Operator override for the app's subdomain
+    label; blank = manifest default. Not in the env templates — carried
+    across re-renders by `_render_app_env`'s merge step.
+  - Effective subdomain = operator override → manifest default,
+    resolved identically in `lib/render-caddyfile.sh`
+    (`_effective_subdomain`), `infra/cloudflared-up.sh`
+    (`eff_subdomain`), and `console/server.js` (`appEffectiveSubdomain`).
+    `enable-app.sh` persists it to `state.apps.<slug>.subdomain` so the
+    shell/python/node consumers all agree without re-parsing env files.
+  - `lib/render-caddyfile.sh`: in `subdomain-per-app`, `main()` renders
+    the apex redirect + a console-only vhost on the tunnel subdomain +
+    one ROOT-served vhost per enabled app (repurposed `render_vhost`,
+    now taking an explicit effective subdomain) + the existing
+    extra-subdomain vhosts. The :80 LAN catch-all drops app path
+    handlers in this mode (root-base bundles can't serve under
+    `/<prefix>/`); apps are reached on the LAN via their subdomain
+    (split-DNS/hosts → host IP → :443 vhost), same as infra subdomains.
+    `single-host` path is byte-identical to before (verified in tests).
+  - `lib/enable-app.sh`: `_render_app_env` reads `VIBE_APP_SUBDOMAIN`
+    from the existing env file, resolves the effective subdomain,
+    persists it to state, and in `subdomain-per-app` sets
+    `ALLOWED_ORIGIN=https://<sub>.<domain>` + `VITE_BASE_PATH=/`
+    (root serving, no 302). `single-host` branch unchanged.
+  - `infra/cloudflared-up.sh`: reads `DOMAIN_ROUTING_MODE`; in
+    `subdomain-per-app` the ingress builder adds one `caddy_rule` per
+    enabled app's effective subdomain (same skip gates as Caddy —
+    userFacing:false + no subdomains[], or internal primary — are
+    excluded), and the existing CNAME loop creates a proxied CNAME per
+    ingress host automatically. Stale-CNAME prune already handles
+    un-ticked apps. The reachability summary prints
+    `https://<sub>.<domain>/` per app in this mode.
+  - `lib/settings-save.sh`: new `routing-reconcile` post-save job,
+    triggered when `DOMAIN_ROUTING_MODE` or any `VIBE_APP_SUBDOMAIN`
+    changes. Re-runs `enable-app.sh` for the affected app(s) (all
+    enabled apps on a mode change; just the changed apps on a subdomain
+    change) — env re-render + force-recreate + Caddy — then re-provisions
+    the tunnel if active. Best-effort with copy-paste fix hints; the
+    settings were already persisted so no rollback here.
+  - `console/server.js`: `appPublicUrl` returns `https://<sub>.<domain>/`
+    in `subdomain-per-app`; the path-based LAN/tailnet fallback URLs
+    return null in that mode (no :80 app path handlers to hit); the
+    Namecheap-DDNS host list adds one A-record host per enabled app
+    subdomain. All self-sufficient via `applianceRoutingMode()` +
+    `appEffectiveSubdomain()` (read appliance.env + state fresh) — no
+    URL-builder call-site signature changes.
+  - `doctor.sh`: the per-app DNS + cert-expiry checks now prefer the
+    effective subdomain from state (override → manifest).
+
+  Deviations / decisions:
+  1. Opt-in with `single-host` default, NOT a silent global flip. A
+     routing change on upgrade could black out an existing tunnel until
+     re-provisioned — exactly the cascading-novice-failure this project
+     exists to prevent (rules #1, #5). The capability ships on; the
+     operator turns it on when ready.
+  2. Root serving (`VITE_BASE_PATH=/`), not `<sub>.<domain>/<prefix>/`.
+     Root is what "a subdomain per app" means, and it's the pre-2026-05-12
+     design done right — no catch-all 302, so no POST→GET login break.
+     The one hard dependency is that each app's web image serve at a
+     root base; flagged in the PLAN §4 caveat and the setting helpText.
+     Where an image can't, that's an upstream PR, not an appliance
+     workaround.
+  3. Per-app subdomain stored as a per-app env key (`VIBE_APP_SUBDOMAIN`)
+     surfaced via the standard manifest `ui` block — the "settings to
+     define the subdomain for each app" the request asked for, wired
+     through the existing settings-save machinery rather than a new
+     storage layer.
+
+  Tested (dev clone; no droplet):
+  - `tests/routing/subdomain-per-app.test.js` — extracts and runs the
+    REAL embedded Python from `render-caddyfile.sh` and
+    `cloudflared-up.sh` against fixture manifests+state; asserts both
+    routing modes (per-app vhosts + override honored + internal excluded;
+    single-host byte-shape preserved; ingress host sets exact). 4/4 pass.
+  - `bash -n` clean on all edited scripts; `node -c` clean on server.js;
+    all 8 user-facing manifests + `_appliance.json` re-validate against
+    `manifest.schema.json` (pre-existing `vibe-shield` `emergencyNote`
+    length violation is unrelated and untouched); existing
+    `tests/cloudflare/unit/*` still green.
+
+  Owed before ship (needs a real droplet + a domain):
+  - Flip `DOMAIN_ROUTING_MODE=subdomain-per-app`, enable 2 apps, confirm
+    `https://tb.<domain>/` and `https://mybooks.<domain>/` serve the SPAs
+    at root and a login POST returns 200 (the 302 regression guard).
+  - Confirm the Cloudflare Tunnel provisions one CNAME + ingress per app
+    and that un-ticking an app prunes its CNAME on re-provision.
+  - Change one app's `VIBE_APP_SUBDOMAIN` in Settings; confirm the
+    routing-reconcile job re-renders + re-provisions and the new host
+    serves within the health-check window.
+  - Verify an app whose image does NOT serve at a root base is caught
+    (blank page / 404 assets) so the upstream-fix caveat is exercised.
