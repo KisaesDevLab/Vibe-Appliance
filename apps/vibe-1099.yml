@@ -1,0 +1,118 @@
+# apps/vibe-1099.yml — Vibe 1099 overlay.
+#
+# Four services from three GHCR images:
+#   vibe1099-app    → api tier (8210) AND the worker (same image; the
+#                     `command` picks the pnpm filter). The api is the
+#                     "server" image the console inspects for build
+#                     version and update.sh tags for rollback, so its
+#                     container_name is basename(image) = vibe1099-app
+#                     per the appliance convention
+#                     (console/server.js::_appCanonicalContainer,
+#                     update.sh::_tag_rollback).
+#   vibe1099-web    → nginx SPA (8211). Its baked-in config proxies
+#                     /api → http://api:8210, so the api tier needs an
+#                     `api` alias on a per-app network (same pattern as
+#                     vibe-mybooks). This is the Caddy default-route
+#                     target; the appliance also routes /api/* straight
+#                     to the api tier (manifest routing.matchers), which
+#                     is what pulls vibe1099-app into the service set
+#                     enable-app recreates.
+#   vibe1099-render → internal WeasyPrint PDF sidecar (8212), reached by
+#                     api + worker as http://render:8212 over the per-app
+#                     network. Never exposed to Caddy / the tunnel.
+#
+# Shared Postgres + Redis (never per-app). No host port publish — only
+# Caddy fronts the web tier on vibe_net. Migrations auto-run on boot
+# (advisory-locked, safe for the concurrent api+worker start).
+
+name: vibe
+
+services:
+  vibe1099-render:
+    image: ghcr.io/kisaesdevlab/vibe1099-render:${APP_TAG:-latest}
+    container_name: vibe1099-render
+    restart: unless-stopped
+    networks:
+      vibe-1099-internal:
+        aliases: [render]
+    expose:
+      - "8212"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8212/health >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  vibe1099-app:
+    image: ghcr.io/kisaesdevlab/vibe1099-app:${APP_TAG:-latest}
+    container_name: vibe1099-app
+    restart: unless-stopped
+    init: true
+    command: ["pnpm", "--filter", "@vibe1099/api", "start"]
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-1099.env
+    networks:
+      vibe_net: {}
+      vibe-1099-internal:
+        aliases: [api]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vibe1099-render:
+        condition: service_started
+    healthcheck:
+      # Liveness on the api's own port. The appliance's readiness gate is
+      # manifest.health = /api/status (503 until deps green), probed via
+      # Caddy; this container-level check just needs the process up.
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8210/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  vibe1099-worker:
+    image: ghcr.io/kisaesdevlab/vibe1099-app:${APP_TAG:-latest}
+    container_name: vibe1099-worker
+    restart: unless-stopped
+    init: true
+    command: ["pnpm", "--filter", "@vibe1099/worker", "start"]
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-1099.env
+    networks:
+      vibe_net: {}
+      vibe-1099-internal: {}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vibe1099-render:
+        condition: service_started
+
+  vibe1099-web:
+    image: ghcr.io/kisaesdevlab/vibe1099-web:${APP_TAG:-latest}
+    container_name: vibe1099-web
+    restart: unless-stopped
+    networks:
+      vibe_net: {}
+      vibe-1099-internal: {}
+    depends_on:
+      vibe1099-app:
+        condition: service_healthy
+      # Pull the worker into the `up` set even though nothing proxies to
+      # it — otherwise `compose up vibe1099-web` (the routing-derived
+      # service) wouldn't start the background worker.
+      vibe1099-worker:
+        condition: service_started
+
+networks:
+  vibe-1099-internal:
+    name: vibe-1099-internal
+    driver: bridge

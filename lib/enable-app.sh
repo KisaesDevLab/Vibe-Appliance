@@ -1004,6 +1004,18 @@ PYEOF
   fi
   [[ -z "$gateway_admin_key" ]] && gateway_admin_key="$(openssl rand -hex 32)"
 
+  # Vibe-1099's MASTER_KEY — 32 raw bytes, base64. Same shape and
+  # generate-once-preserve-forever contract as VS_KEK: it derives every
+  # purpose key that encrypts TINs, JWKs, and W-9 PDFs, so regenerating
+  # it would unrecoverably brick all encrypted data. Preserved across
+  # re-renders by reading the MASTER_KEY line back from the existing env
+  # file. Harmless on slugs whose template doesn't reference @MASTER_KEY@.
+  local master_key=""
+  if [[ -f "$out" ]]; then
+    master_key="$(_extract_env_value "$out" "MASTER_KEY")"
+  fi
+  [[ -z "$master_key" ]] && master_key="$(openssl rand -base64 32 | tr -d '\n')"
+
   # DB and redis target details from manifest.
   local db_name db_user
   db_name="$(_manifest_field "$manifest" 'data.get("database",{}).get("name","")')"
@@ -1039,13 +1051,15 @@ PYEOF
       "$db_name" "$db_user" "$db_pass" \
       "$vite_base_path" "$session_secure" "$intake_key" \
       "$vs_kek" "$gateway_admin_key" \
-      "$staff_app_url" "$client_portal_url" <<'PYEOF'
+      "$staff_app_url" "$client_portal_url" \
+      "$master_key" <<'PYEOF'
 import base64, sys
 src, dst, allowed_origin, database_url, redis_url, \
     encryption_key, jwt_secret, db_name, db_user, db_pass, \
     vite_base_path, session_secure, intake_key, \
     vs_kek, gateway_admin_key, \
-    staff_app_url, client_portal_url = sys.argv[1:18]
+    staff_app_url, client_portal_url, \
+    master_key = sys.argv[1:19]
 # Some upstream apps want the appliance's 32-byte AES key as base64 (32
 # raw bytes -> 44-char base64 with padding) rather than the hex form
 # we ship in shared.env. Derive it once here so per-app templates can
@@ -1076,6 +1090,7 @@ body = body.replace("@SESSION_SECURE@",     session_secure)
 body = body.replace("@CONNECT_INTAKE_ENCRYPTION_KEY@", intake_key)
 body = body.replace("@VS_KEK@",             vs_kek)
 body = body.replace("@GATEWAY_ADMIN_KEY@",  gateway_admin_key)
+body = body.replace("@MASTER_KEY@",         master_key)
 body = body.replace("@STAFF_APP_URL@",      staff_app_url)
 body = body.replace("@CLIENT_PORTAL_URL@",  client_portal_url)
 with open(dst, "w") as f:

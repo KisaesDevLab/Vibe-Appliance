@@ -51,7 +51,7 @@
           "helpText":    "The <subdomain> in <subdomain>.<your-domain> for this app when routing is 'subdomain per app' (see Network settings). Leave blank to use the built-in default. Lowercase letters, digits, and dashes; no dots. Saving re-renders routing and re-provisions the Cloudflare Tunnel; the app briefly restarts.",
           "input":       "text",
           "appliance":   "per-app",
-          "validate":    "regex:^([a-z][a-z0-9-]*)?$",
+          "validate":    "regex:^([a-z0-9][a-z0-9-]*)?$",
           "postSaveJob": "routing-reconcile"
         }
       },

@@ -1,0 +1,91 @@
+{
+  "schemaVersion": 1,
+  "slug": "vibe-1099",
+  "displayName": "Vibe 1099",
+  "description": "1099 preparation, recipient delivery, and IRS IRIS A2A e-filing.",
+  "logo": "vibe-1099.svg",
+  "_doc": "Imported from KisaesDevLab/Vibe-1099 appliance/manifest.yaml (Addendum A). Upstream ships no .appliance/manifest.json yet, so this in-tree copy is authoritative until it does (Phase 5 convention).",
+
+  "image": {
+    "server":     "ghcr.io/kisaesdevlab/vibe1099-app",
+    "client":     "ghcr.io/kisaesdevlab/vibe1099-web",
+    "defaultTag": "latest",
+    "extras": [
+      { "name": "render", "image": "ghcr.io/kisaesdevlab/vibe1099-render" }
+    ]
+  },
+
+  "subdomain":     "1099",
+  "ports":         { "server": 8210, "client": 8211 },
+
+  "routing": {
+    "default_upstream": "vibe1099-web:8211",
+    "matchers": [
+      { "name": "api", "path": "/api/*", "upstream": "vibe1099-app:8210" }
+    ]
+  },
+
+  "depends": ["postgres", "redis"],
+
+  "env": {
+    "required": [
+      { "name": "MASTER_KEY",      "from": "generated:base64-32bytes" },
+      { "name": "DATABASE_URL",    "from": "database-url" },
+      { "name": "REDIS_URL",       "from": "redis-url" },
+      { "name": "APP_BASE_URL",    "from": "subdomain-url" },
+      { "name": "PORTAL_BASE_URL", "from": "subdomain-url" }
+    ],
+    "optional": [
+      {
+        "name": "VIBE_APP_SUBDOMAIN",
+        "doc":  "Operator override for this app's subdomain label. Empty = the manifest default (\"1099\"). Consumed by the appliance routing (Caddy vhost + Cloudflare Tunnel CNAME/ingress) when DOMAIN_ROUTING_MODE=subdomain-per-app; ignored in single-host mode. Single DNS label — lowercase letters, digits, dashes, no dots.",
+        "ui": {
+          "tier":        1,
+          "category":    "Network",
+          "label":       "Subdomain",
+          "helpText":    "The <subdomain> in <subdomain>.<your-domain> when routing is 'subdomain per app'. Blank = default (\"1099\"). Vibe 1099's web SPA is built for a root base, so it REQUIRES subdomain-per-app routing (single-host path-mounting 404s its assets). Saving re-renders routing and re-provisions the tunnel; the app briefly restarts.",
+          "input":       "text",
+          "appliance":   "per-app",
+          "validate":    "regex:^([a-z0-9][a-z0-9-]*)?$",
+          "postSaveJob": "routing-reconcile"
+        }
+      },
+      {
+        "name": "STAFF_IP_ALLOWLIST",
+        "doc":  "Comma-separated IPs/CIDRs allowed to reach staff APIs. Belt-and-braces for the split-exposure model: staff endpoints refuse tunnel-origin traffic even if a route leaks. Empty = no IP restriction (rely on auth). See the app's docs/appliance-integration.md.",
+        "ui": {
+          "tier":      1,
+          "category":  "Network",
+          "label":     "Staff API IP allowlist",
+          "helpText":  "Comma-separated IPs or CIDRs (e.g. 203.0.113.0/24, 198.51.100.7). Staff APIs reject any source not on this list — recommended when the recipient portal is public via the tunnel so a leaked staff route still can't be reached from the internet. Leave blank to disable IP gating.",
+          "input":     "text",
+          "appliance": "per-app"
+        }
+      },
+      {
+        "name": "TAXBANDITS_ENABLED",
+        "value": "0",
+        "doc":   "Enable the TaxBandits e-file provider path (1099 batch e-filing). Requires provider credentials; leave 0 until the firm is onboarded (TCC/ATS).",
+        "ui": {
+          "tier":      1,
+          "category":  "Application",
+          "label":     "TaxBandits e-file",
+          "helpText":  "Turn on to route 1099 e-filing through TaxBandits. Requires firm onboarding + provider credentials (see the app's docs/firm-onboarding.md). Default off.",
+          "input":     "toggle",
+          "appliance": "per-app",
+          "validate":  "boolean"
+        }
+      }
+    ]
+  },
+
+  "database": { "name": "vibe_1099_db", "user": "vibe1099" },
+  "redis":    { "db": 7 },
+
+  "firstLogin": {
+    "type": "none",
+    "note": "Vibe 1099 has no appliance-provisioned default login yet. Its `pnpm seed` script (inside vibe-1099-api) creates admin@demo.firm / vibe1099-demo-password ALONG WITH demo firm/payer/recipient data — for evaluation only; do NOT run it on a production install. Firm onboarding (first admin, TCC/ATS): see the app's docs/firm-onboarding.md."
+  },
+
+  "health": "/api/status"
+}

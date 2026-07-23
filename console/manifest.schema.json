@@ -61,9 +61,10 @@
 
     "subdomain": {
       "type": "string",
-      "pattern": "^[a-z][a-z0-9-]*$",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
       "minLength": 1,
-      "maxLength": 40
+      "maxLength": 40,
+      "description": "DNS label prepended to the appliance domain. May start with a digit (RFC 1123) so apps like vibe-1099 can use `1099` as their subdomain."
     },
 
     "subdomains": {
@@ -78,10 +79,10 @@
         "properties": {
           "name": {
             "type": "string",
-            "pattern": "^[a-z][a-z0-9.-]*$",
+            "pattern": "^[a-z0-9][a-z0-9.-]*$",
             "minLength": 1,
             "maxLength": 60,
-            "description": "DNS label segment to prepend to the appliance domain. Dots allowed so a manifest can declare a multi-label subdomain (e.g. `gateway.shield` → `gateway.shield.<domain>`)."
+            "description": "DNS label segment to prepend to the appliance domain. May start with a digit (RFC 1123). Dots allowed so a manifest can declare a multi-label subdomain (e.g. `gateway.shield` → `gateway.shield.<domain>`)."
           },
           "audience": {
             "type": "string",

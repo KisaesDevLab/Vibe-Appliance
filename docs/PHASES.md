@@ -1513,3 +1513,113 @@ Append to this list as phases complete. Format:
     serves within the health-check window.
   - Verify an app whose image does NOT serve at a root base is caught
     (blank page / 404 assets) so the upstream-fix caveat is exercised.
+
+- Vibe-1099 app integration + update-readiness verification, 2026-07-23
+  by Claude (Opus 4.8) on the appliance dev clone.
+
+  **Part A — Vibe 1099 as an installable app.** Sourced from
+  KisaesDevLab/Vibe-1099's `appliance/manifest.yaml` (Addendum A) +
+  `docs/appliance-integration.md`. New files, no console-code change
+  (the "seventh-app rule" holds — manifest + overlay + env template):
+  - `console/manifests/vibe-1099.json` — slug `vibe-1099`, subdomain
+    `1099`, images server `vibe1099-app` (api+worker) / client
+    `vibe1099-web` / extra `vibe1099-render`, health `/api/status`
+    (readiness; 503 until deps green), redis db 7 (3 was taken by
+    tax-research), db `vibe_1099_db`. routing: default → web:8211,
+    `/api/*` → app:8210 (the matcher pulls the api tier into
+    `_app_services` so enable-app pulls/recreates it, not just web).
+    firstLogin `none` with a note (upstream ships only a DEMO seed —
+    admin@demo.firm / vibe1099-demo-password + demo data — not a
+    production admin bootstrap). Tier-1 settings: VIBE_APP_SUBDOMAIN,
+    STAFF_IP_ALLOWLIST, TAXBANDITS_ENABLED.
+  - `apps/vibe-1099.yml` — 4 services from 3 images (app runs api and
+    worker via different `command`s). Container names = basename(image)
+    (`vibe1099-app/-web/-render`) per the appliance convention
+    (`_appCanonicalContainer`, `_tag_rollback`). Per-app internal net
+    gives the api tier an `api` alias (web nginx proxies /api→api:8210)
+    and the render sidecar a `render` alias (api/worker →
+    http://render:8212). Shared Postgres/Redis; no host port publish.
+    web depends_on {app, worker} so the routing-derived `up vibe1099-web`
+    starts the whole graph.
+  - `env-templates/per-app/vibe-1099.env.tmpl` — MASTER_KEY (new marker,
+    below), DATABASE_URL/REDIS_URL, APP_BASE_URL/PORTAL_BASE_URL
+    (subdomain-url), RENDER_URL, INAPP_TUNNEL_ENABLED=0 (appliance Caddy
+    owns ingress), TRUST_PROXY_HOPS=2, LICENSE_REQUIRED=0. Documents the
+    two email var-name mismatches (SMTP_PASS vs appliance SMTP_PASSWORD;
+    SMTP_FROM vs EMAIL_FROM).
+  - `lib/enable-app.sh` — new `@MASTER_KEY@` marker: openssl rand
+    base64 32, generate-once + preserve-across-re-renders (reads the
+    MASTER_KEY line back from the existing env file), exactly mirroring
+    VS_KEK. Reusing @VS_KEK@ would have regenerated MASTER_KEY every
+    render (preservation keys off the literal env-key name) and
+    destroyed all encrypted data.
+  - `console/manifest.schema.json` — relaxed `subdomain` and
+    `subdomains[].name` patterns to allow a leading digit (RFC 1123) so
+    `1099` validates; relaxed the VIBE_APP_SUBDOMAIN override regex in
+    the 8 PR-#3 manifests to match.
+
+  Deviations / decisions:
+  1. **Vibe-1099's web SPA is root-base only** (no `base` in
+     vite.config, no `40-base-path.sh` hook). It serves at a subdomain
+     ROOT, so it needs `DOMAIN_ROUTING_MODE=subdomain-per-app` (this
+     branch). single-host path-mounting renders structurally but would
+     404 the SPA assets — documented in the manifest helpText + this
+     entry. A single-host fix is upstream work (add a base-path hook),
+     not an appliance workaround. This is why the integration lands on
+     the subdomain-routing branch.
+  2. **GHCR images not published yet** — Vibe-1099 has only `ci.yml`, no
+     image-publish workflow. The manifest uses the conventional
+     `ghcr.io/kisaesdevlab/vibe1099-{app,web,render}` refs; enable/update
+     can't pull until upstream publishes them (owed, below).
+  3. **Split public/private exposure deferred.** Upstream wants the
+     staff app private and only the recipient-portal paths public via
+     the tunnel (path-restricted). The appliance's per-subdomain tunnel
+     ingress can't path-restrict yet, so v1 exposes the app at one
+     subdomain and relies on the app's own STAFF_IP_ALLOWLIST
+     (surfaced as a Tier-1 setting) as the belt-and-braces the upstream
+     doc prescribes. A path-restricted tunnel ingress is future work.
+  4. **Worker/render recreate only on full enable**, not on every
+     settings-save (they're not routing-referenced, so absent from
+     `_app_services`). Same limitation vibe-shield's engine already has.
+     Matters only for a subdomain change that alters PORTAL_BASE_URL
+     used by the worker's email links; noted for a future
+     overlay-derived service-set enhancement.
+
+  **Part B — update-readiness verification (all apps).** The update path
+  is fully manifest-driven and generic — `runUpdateCheckBackground()`
+  (setInterval "nightly cron") runs `update.sh --check` over every
+  enabled app; `/api/v1/update/check`, `/api/v1/update/:slug`, and
+  `/api/v1/update/:slug/rollback` carry no per-app code. Audited all 9
+  existing manifests: every one declares `image.server` + `defaultTag`
+  + `health`, and every image its overlay runs is covered by the
+  manifest (server/client/extras) so rollback re-tags all of them —
+  vibe-shield's 3rd image is declared via `extras:[engine]`; no overlay
+  runs an image absent from its manifest. So all apps already
+  check-for-updates + update + roll back "similar to MyBooks" with **no
+  changes needed**. vibe-1099 was built to the same contract (3 images
+  declared, container names = basename(image)); `update.sh --check`
+  covers all three and `_tag_rollback` finds each container.
+
+  Tested (dev clone; no droplet, no published images):
+  - Real vibe-1099 manifest through the actual Caddy renderer:
+    subdomain-per-app → `1099.firm.com {` root vhost with `/api/*` →
+    vibe1099-app:8210 + default → vibe1099-web:8211; single-host →
+    `handle /1099/*` (structurally valid; SPA-asset caveat per decision
+    #1). Tunnel ingress builder → `1099.firm.com` rule. `_app_services`
+    → `vibe1099-web vibe1099-app`. `_manifest_images` → all 3 with
+    container names matching basename(image).
+  - All manifests schema-valid (pre-existing vibe-shield `emergencyNote`
+    length violation untouched — unrelated). `bash -n` + embedded-python
+    compile clean on enable-app.sh; overlay YAML parses (4 services);
+    the committed `tests/routing/*` still 4/4.
+
+  Owed before verification (needs a droplet + published images):
+  - Upstream: publish `vibe1099-app/-web/-render` to GHCR (add an
+    image-publish workflow) and a `.appliance/manifest.json`.
+  - Enable vibe-1099 in subdomain-per-app mode; confirm `1099.<domain>/`
+    serves the SPA at root, `/api/status` health passes, api/worker/
+    render/web all come up via the depends_on cascade, and MASTER_KEY
+    persists across a re-enable (no data loss).
+  - `update.sh --check vibe-1099` flags a newer `latest`; run the update
+    and confirm rollback re-tags all three images.
+  - Confirm the demo seed is NOT auto-run on a production enable.
