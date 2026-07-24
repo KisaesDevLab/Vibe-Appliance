@@ -251,6 +251,24 @@ table.containers td.col-name { font-family: var(--mono); }
   margin-bottom: 1rem;
 }
 
+/* Support-the-project notice (Ko-fi) in the admin notification region.
+   Informational + warm — uses the accent tint, not the error red. */
+.support-notice {
+  background: rgba(184,110,44,0.08);
+  border: 1px solid rgba(184,110,44,0.28);
+  color: var(--text-muted);
+  padding: 0.7rem 1rem;
+  border-radius: 4px;
+  margin-bottom: 1rem;
+  font-size: 0.92rem;
+}
+.support-notice a {
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: none;
+}
+.support-notice a:hover { text-decoration: underline; }
+
 /* ---------- App cards ---------- */
 
 .apps-list {
