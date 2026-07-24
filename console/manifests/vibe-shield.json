@@ -30,7 +30,7 @@
       "internal":      true,
       "emergencyPort": 5194,
       "target":        "vibe-shield-gateway:8080",
-      "emergencyNote": "Internal Vibe apps should reach the gateway by service name (http://vibe-shield-gateway:8080) over vibe_net — the emergency port is for cross-host debugging only. `internal: true` keeps this surface off the public Caddy vhost AND the Cloudflare tunnel ingress."
+      "emergencyNote": "Internal apps reach it at vibe-shield-gateway:8080 over vibe_net; the emergency port is cross-host debug only. `internal: true` keeps it off the public vhost + tunnel ingress."
     }
   ],
   "ports": { "server": 8080, "client": 80 },

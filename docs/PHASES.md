@@ -1623,3 +1623,49 @@ Append to this list as phases complete. Format:
   - `update.sh --check vibe-1099` flags a newer `latest`; run the update
     and confirm rollback re-tags all three images.
   - Confirm the demo seed is NOT auto-run on a production enable.
+
+- Pre-deployment audit + fixes + runbook, 2026-07-24 by Claude (Opus 4.8)
+  on the appliance dev clone. Static-only (no droplet).
+
+  Audit performed:
+  1. **Env-template marker integrity** — every `@MARKER@` used in a
+     per-app env template is substituted by lib/enable-app.sh
+     (`_render_app_env`), including the new `@MASTER_KEY@`. No
+     literal-render bugs.
+  2. **Overlay ↔ manifest ↔ routing ↔ container consistency** — every
+     routing upstream resolves to an overlay `container_name`; every
+     overlay image is declared in the manifest (rollback coverage); every
+     `basename(image.server)` matches a container (console build-version +
+     update `_tag_rollback` primary path).
+  3. **GHCR image availability** — probed `:latest` for all images via the
+     anonymous-token path the console uses. All 9 existing apps published
+     (installable). `vibe-1099` unpublished (blocker, already tracked).
+
+  Bugs found + fixed:
+  - **vibe-tax-research container/image mismatch.** Its published images
+    are `vibe-tax-api` / `vibe-tax-web`, but the overlay named the
+    containers/services `vibe-tax-research-{api,web}` and routing pointed
+    at those. So `basename(image)` ≠ `container_name`: the console's
+    `_appCanonicalContainer` couldn't find the container to read the build
+    version, and `update.sh::_tag_rollback` fell to its image-tag fallback
+    instead of the primary container path — the one app not fully "update
+    like MyBooks." Renamed services/containers/routing to
+    `vibe-tax-api` / `vibe-tax-web` (kept the `api` alias, the
+    `vibe-tax-research-internal` network, and the `/data/apps/
+    vibe-tax-research/` paths). Migration note: on an install that already
+    ran the old names, `compose down` the app once (or `up
+    --remove-orphans`) to drop the old containers. Full consistency audit
+    is clean across all apps after this.
+  - **vibe-shield emergencyNote schema violation** (pre-existing, 260 >
+    200 chars) — trimmed to 175. **All 10 manifests now schema-valid.**
+
+  Added: `docs/DEPLOYMENT_CHECKLIST.md` — a turnkey, checkbox-driven
+  pre-deploy runbook derived from the Phase 9 matrix + every phase's owed
+  bullets + this PR's routing/vibe-1099 specifics + the audit's known
+  blockers. This is what a first real droplet test should follow; a clean
+  pass of its §7 (failure drills) and §9 (sign-off) is the ship gate.
+
+  Validation: `bash -n` on all edited scripts, `node -c` server.js, all
+  manifests schema-valid, `tests/routing/*` 4/4, tax-research overlay YAML
+  parses. Still owed: the actual droplet run (the whole point of the
+  runbook).

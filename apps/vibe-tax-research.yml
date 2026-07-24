@@ -14,9 +14,9 @@
 name: vibe
 
 services:
-  vibe-tax-research-api:
+  vibe-tax-api:
     image: ghcr.io/kisaesdevlab/vibe-tax-api:${APP_TAG:-latest}
-    container_name: vibe-tax-research-api
+    container_name: vibe-tax-api
     restart: unless-stopped
     init: true
     env_file:
@@ -47,9 +47,9 @@ services:
       retries: 12
       start_period: 30s
 
-  vibe-tax-research-web:
+  vibe-tax-web:
     image: ghcr.io/kisaesdevlab/vibe-tax-web:${APP_TAG:-latest}
-    container_name: vibe-tax-research-web
+    container_name: vibe-tax-web
     restart: unless-stopped
     env_file:
       - /opt/vibe/env/shared.env
@@ -59,7 +59,7 @@ services:
       vibe_net: {}
       vibe-tax-research-internal: {}
     depends_on:
-      vibe-tax-research-api:
+      vibe-tax-api:
         condition: service_healthy
 
 networks:
