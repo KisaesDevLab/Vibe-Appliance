@@ -1669,3 +1669,51 @@ Append to this list as phases complete. Format:
   manifests schema-valid, `tests/routing/*` 4/4, tax-research overlay YAML
   parses. Still owed: the actual droplet run (the whole point of the
   runbook).
+
+- Removed Vibe-GLM-OCR and Vibe-Shield from the appliance, 2026-07-24 by
+  Claude (Opus 4.8) on request.
+
+  Deleted (7 files): `console/manifests/{vibe-glm-ocr,vibe-shield}.json`,
+  `apps/{vibe-glm-ocr,vibe-shield}.yml`,
+  `env-templates/per-app/{vibe-glm-ocr,vibe-shield}.env.tmpl`,
+  `console/ui/static/logos/vibe-shield.svg`. The appliance now composes 8
+  apps (tb, mybooks, connect, tax-research, payroll, calculators,
+  tx-converter, 1099).
+
+  Cross-references scrubbed (the rest of the appliance is manifest-driven,
+  so removing the manifests removed the apps from Caddy, the tunnel,
+  HAProxy, doctor, and update automatically — these were the few
+  HARDCODED spots):
+  - `docker-compose.yml` — dropped the emergency-proxy host publishes for
+    Shield's ports 5193/5194 (GLM-OCR is `userFacing:false`, had no
+    emergency port).
+  - `lib/secrets.sh` — removed the hardcoded "VIBE SHIELD (admin API key)"
+    section from `secrets_write_credentials` (was already self-guarding on
+    the env file's existence, but now gone entirely).
+  - `console/manifests/vibe-tb.json`, `vibe-tx-converter.json` — dropped
+    `optionalDepends: ["vibe-glm-ocr"]`.
+  - `env-templates/per-app/vibe-tx-converter.env.tmpl` — commented out the
+    `GLM_OCR_URL` default (it pointed at the now-absent `vibe-glm-ocr:8090`)
+    with a hint for operators who self-host an OCR service. The
+    Convertor's OCR path is unconfigured by default now; its other
+    features are unaffected.
+  - `console/server.js` — dropped `vibe-glm-ocr` from the diagnostic
+    assistant's hardcoded app-family string.
+  - Docs: `CLAUDE.md` "what this is" line, `docs/DEPLOYMENT_CHECKLIST.md`
+    image table.
+
+  Left as harmless (no functional effect): illustrative mentions of
+  vibe-glm-ocr / vibe-shield in code docstrings + comments (render-caddyfile,
+  render-haproxy, cloudflared-up, update.sh, manifest.schema.json
+  descriptions), the `@VS_KEK@` / `@GATEWAY_ADMIN_KEY@` generation in
+  enable-app.sh (dead now that no template consumes them — kept to avoid
+  reshuffling the render's positional argv), historical PHASES/addenda
+  entries, and the `vibe-glm-ocr` fixture inside
+  `tests/routing/subdomain-per-app.test.js` (self-contained; exercises the
+  `userFacing:false` exclusion generically). Redis DB indices 5 (glm-ocr)
+  and 6 (shield) are now free.
+
+  Validation: 8 manifests schema-valid; `bash -n` secrets.sh, `node -c`
+  server.js, docker-compose.yml YAML parses; consistency + marker audits
+  clean; `tests/routing/*` 4/4; no functional references to the removed
+  slugs remain.

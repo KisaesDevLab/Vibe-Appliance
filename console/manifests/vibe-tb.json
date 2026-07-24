@@ -24,7 +24,6 @@
   },
 
   "depends": ["postgres", "redis"],
-  "optionalDepends": ["vibe-glm-ocr"],
 
   "env": {
     "required": [

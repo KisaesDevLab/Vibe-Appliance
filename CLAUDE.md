@@ -4,7 +4,7 @@ Operational notes for Claude Code working in this repo. Read this first every se
 
 ## What this is
 
-The Vibe Appliance is a meta-installer for Kurt's Vibe product family. It runs on Ubuntu 24.04 LTS (DigitalOcean droplet or bare metal/VM, equally) and composes Vibe-Trial-Balance, Vibe-MyBooks, Vibe-Connect, Vibe-Tax-Research-Chat, Vibe-Payroll-Time, and Vibe-GLM-OCR alongside Tailscale, Caddy, Portainer, Cockpit, and Duplicati on a single host.
+The Vibe Appliance is a meta-installer for Kurt's Vibe product family. It runs on Ubuntu 24.04 LTS (DigitalOcean droplet or bare metal/VM, equally) and composes Vibe-Trial-Balance, Vibe-MyBooks, Vibe-Connect, Vibe-Tax-Research-Chat, and Vibe-Payroll-Time alongside Tailscale, Caddy, Portainer, Cockpit, and Duplicati on a single host. (Vibe-GLM-OCR and Vibe-Shield were removed 2026-07-24.)
 
 The audience is novice CPAs installing this on their own infrastructure. **Failure recovery is more important than the happy path.** Past attempts failed on cascading novice failures — that is the single problem this design exists to solve.
 

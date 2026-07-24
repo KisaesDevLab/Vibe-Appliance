@@ -1,5 +1,5 @@
 {
-  "_doc": "Translated from Vibe-Transaction-Convertor/appliance.manifest.json (upstream uses an older flat schema and depends on a `llm-gateway` service the appliance does not yet ship). This manifest reroutes LLM access through the appliance's existing ANTHROPIC_API_KEY plumbing — operator picks the model via Settings → AI; no local LLM gateway required. GLM-OCR access uses the in-network address of vibe-glm-ocr when that app is also enabled. Open an upstream PR to align Vibe-Transaction-Convertor/appliance.manifest.json with this schema once the appliance side is verified.",
+  "_doc": "Translated from Vibe-Transaction-Convertor/appliance.manifest.json (upstream uses an older flat schema and depends on a `llm-gateway` service the appliance does not yet ship). This manifest reroutes LLM access through the appliance's existing ANTHROPIC_API_KEY plumbing — operator picks the model via Settings → AI; no local LLM gateway required. OCR is no longer bundled (vibe-glm-ocr was removed from the appliance); set GLM_OCR_URL in the per-app env to a self-hosted OCR service to re-enable the OCR path. Open an upstream PR to align Vibe-Transaction-Convertor/appliance.manifest.json with this schema once the appliance side is verified.",
 
   "schemaVersion": 1,
   "slug": "vibe-tx-converter",
@@ -21,7 +21,6 @@
   },
 
   "depends":         ["postgres", "redis"],
-  "optionalDepends": ["vibe-glm-ocr"],
 
   "env": {
     "required": [

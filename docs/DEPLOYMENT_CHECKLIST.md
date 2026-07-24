@@ -137,11 +137,11 @@ GHCR and update-ready (audited 2026-07-24):
 | vibe-connect | vibe-connect-server | vibe-connect-client | — | ✅ |
 | vibe-payroll | vibe-payroll-api | vibe-payroll-web | — | ✅ |
 | vibe-tax-research | vibe-tax-api | vibe-tax-web | — | ✅ |
-| vibe-shield | vibe-shield-gateway | vibe-shield-admin | engine | ✅ |
 | vibe-calculators | vibe-calculators-server | vibe-calculators-client | — | ✅ |
 | vibe-tx-converter | vibe-tx-converter | — | — | ✅ |
-| vibe-glm-ocr | vibe-glm-ocr | — | — | ✅ |
 | **vibe-1099** | vibe1099-app | vibe1099-web | render | **❌ not published** |
+
+(`vibe-glm-ocr` and `vibe-shield` were removed from the appliance — 2026-07-24.)
 
 - [ ] /admin → Apps → an "Update available" badge appears after
       `update.sh --check` (nightly, or POST `/api/v1/update/check`).
