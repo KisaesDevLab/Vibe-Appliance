@@ -79,7 +79,11 @@ Reserved range: `:5171–:5199`. Within that, app categories get blocks with gap
 |---|---|---|---|
 | Vibe-MyBooks | default | `:5171` | Finance |
 | Vibe-Trial-Balance | default | `:5172` | Finance |
-| *(reserved)* | | `:5173–:5180` | Future finance apps |
+| *(never assign)* | | `:5173` | Vite dev-server default — see below |
+| Vibe-Calculators | default | `:5174` | Finance |
+| Vibe-Transactions-Converter | default | `:5175` | Finance |
+| Vibe-1099 | default | `:5176` | Finance — 1099 prep / IRIS e-filing |
+| *(reserved)* | | `:5177–:5180` | Future finance apps |
 | Vibe-Connect | staff | `:5181` | Messaging |
 | Vibe-Connect | client portal | `:5182` | Messaging — staff emergency only, client features won't work |
 | *(reserved)* | | `:5183–:5190` | Future messaging apps |
@@ -89,8 +93,14 @@ Reserved range: `:5171–:5199`. Within that, app categories get blocks with gap
 | Portainer | (admin tool) | `:5197` | v1.2 — infra fallback; UI for container ops when Caddy/DNS/cert is broken |
 | Duplicati | (admin tool) | `:5198` | v1.2 — infra fallback; UI for backup config when Caddy/DNS/cert is broken |
 | Cockpit | (admin tool) | native `:9090` | Already binds the host port directly (separate UFW allow); not behind HAProxy |
-| Vibe-GLM-OCR | n/a (`userFacing: false`) | none | Internal service, no emergency port |
 | *(reserved for HAProxy stats UI)* | | `:5199` | Optional, admin-only — loopback bind, SSH-tunnel only |
+
+Vibe-GLM-OCR (`:none`, internal-only) and Vibe-Shield (`:5193`/`:5194`) were
+removed from the appliance on 2026-07-24; their ports returned to the
+reserved pool. Adding an app means: `emergencyPort` in its manifest **and**
+a matching publish line in `docker-compose.yml`'s `emergency-proxy` service.
+`tests/manifests/validate-manifests.test.js` fails the build if those two
+ever disagree.
 
 Why not `:5173`? Vite cemented it as the dev-server default. Customers debugging will stumble over it. Not worth the muscle-memory collision.
 

@@ -320,6 +320,7 @@ services:
       - "5172:5172"   # vibe-tb
       - "5174:5174"   # vibe-calculators
       - "5175:5175"   # vibe-tx-converter
+      - "5176:5176"   # vibe-1099
       - "5181:5181"   # vibe-connect (main)
       - "5182:5182"   # vibe-connect (public)
       - "5191:5191"   # vibe-tax-research

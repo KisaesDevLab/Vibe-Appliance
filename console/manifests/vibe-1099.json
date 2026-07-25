@@ -16,6 +16,7 @@
   },
 
   "subdomain":     "1099",
+  "emergencyPort": 5176,
   "ports":         { "server": 8210, "client": 8211 },
 
   "routing": {
