@@ -458,6 +458,51 @@ secrets_write_credentials() {
   fi
   [[ -z "${ts_ip:-}" ]] && ts_ip="N/A (Tailscale not configured)"
 
+  # Emergency-port table, generated from the manifests rather than
+  # hardcoded. The previous hardcoded list drifted as apps came and went
+  # — it was missing Calculators (5174) and TX-Converter (5175), so the
+  # operator's canonical credentials file didn't mention those fallback
+  # URLs at all. Mirrors the frontends lib/render-haproxy.sh emits:
+  # top-level emergencyPort, or one line per subdomains[] entry that
+  # declares its own. Apps with no emergencyPort (e.g. vibe-1099 today)
+  # correctly produce no line.
+  local app_emergency_lines
+  app_emergency_lines="$(python3 - "${APPLIANCE_DIR:-/opt/vibe/appliance}/console/manifests" "$lan_ip" <<'PYEOF' 2>/dev/null || true
+import json, os, sys
+manifests_dir, lan_ip = sys.argv[1:3]
+rows = []
+try:
+    names = sorted(os.listdir(manifests_dir))
+except OSError:
+    names = []
+for fname in names:
+    if not fname.endswith(".json") or fname.startswith("_"):
+        continue
+    try:
+        m = json.load(open(os.path.join(manifests_dir, fname)))
+    except Exception:
+        continue
+    label = m.get("displayName") or m.get("slug", fname[:-5])
+    subs = m.get("subdomains") or []
+    if subs:
+        for s in subs:
+            port = s.get("emergencyPort")
+            if not isinstance(port, int) or isinstance(port, bool):
+                continue
+            suffix = s.get("audience") or s.get("name") or ""
+            rows.append((port, f"{label} ({suffix})" if suffix else label))
+    else:
+        port = m.get("emergencyPort")
+        if isinstance(port, int) and not isinstance(port, bool):
+            rows.append((port, label))
+for port, label in sorted(rows):
+    print(f"  http://{lan_ip}:{port}   {label}")
+PYEOF
+)"
+  if [[ -z "$app_emergency_lines" ]]; then
+    app_emergency_lines="  (could not read console/manifests — see the admin console's Emergency Access panel)"
+  fi
+
   cat >"$tmp" <<EOF
 ================================================================
  Vibe Appliance — credentials
@@ -494,14 +539,7 @@ that's expected.
   Server Tailscale IP:  ${ts_ip}
 
 Canonical port assignments (active only when the matching app is enabled):
-  http://${lan_ip}:5171   Vibe MyBooks
-  http://${lan_ip}:5172   Vibe Trial Balance
-  http://${lan_ip}:5181   Vibe Connect (staff)
-  http://${lan_ip}:5182   Vibe Connect (client portal — STAFF ONLY,
-                          magic-link flows do not work over HTTP)
-  http://${lan_ip}:5191   Vibe Tax Research Chat
-  http://${lan_ip}:5192   Vibe Payroll Time
-
+${app_emergency_lines}
 Infra fallback ports (admin tools — always-up with the core stack):
   http://${lan_ip}:5197   Portainer (container management)
   http://${lan_ip}:5198   Duplicati (backup configuration)
@@ -516,8 +554,14 @@ panel at ${server_url}/admin.
 ================================================================
  DUPLICATI (backup configuration UI)
 ================================================================
-URL:           ${server_url}/backup/  (also: http://${lan_ip}:5198/ fallback)
+URL:           http://${lan_ip}:5198/
 Web username:  admin
+
+Duplicati is admin tooling and is deliberately NOT routed on the public
+domain — reach it from the LAN or over Tailscale on the port above.
+(Its bundle ships absolute asset paths that don't survive Caddy's
+path-prefix rewrite, which is why there is no ${server_url}/backup/ —
+the admin console links to this same host:port form.)
 Web password:  ${dup_web_pw}
 
 Backup-job AES-256 passphrase — type this into the destination form
@@ -547,9 +591,13 @@ from \$SETTINGS_ENCRYPTION_KEY at startup.
 ================================================================
  PORTAINER (container management UI)
 ================================================================
-URL:       ${server_url}/portainer/  (also: http://${lan_ip}:5197/ fallback)
+URL:       http://${lan_ip}:5197/
 Username:  admin
 Password:  ${portainer_pw}
+
+Like Duplicati, Portainer is admin tooling and is not published on the
+public domain — reach it from the LAN or over Tailscale on the port
+above. The admin console links to this same host:port form.
 
 Pre-seeded by lib/secrets.sh into /opt/vibe/data/portainer/.admin-pw
 (plain text — Portainer hashes it itself). If you've already created

@@ -469,9 +469,49 @@ Fix:      restart the app via the admin Apps tab (Disable, then Enable)"
   fi
 }
 
-check_dns_subdomain() {
-  local slug="$1" domain="$2" subdomain="$3" expected_ip="$4"
-  local host="${subdomain}.${domain}"
+# Read a key from /opt/vibe/env/appliance.env. Empty when the file or
+# key is absent. Used to learn DOMAIN_ROUTING_MODE, which decides which
+# public hostnames actually exist — see the domain-mode block in main.
+_appliance_env_get() {
+  local key="$1" file="${VIBE_DIR}/env/appliance.env"
+  [[ -r "$file" ]] || return 0
+  awk -F= -v k="$key" '
+    $0 ~ /^[[:space:]]*#/ { next }
+    NF < 2 { next }
+    $1 == k { sub(/^[^=]+=/, "", $0); print $0; exit }
+  ' "$file"
+}
+
+# Extra public hostnames from an app's manifest `subdomains[]`: entries
+# that aren't the primary and aren't `internal: true`. These get their
+# own Caddy vhost + tunnel CNAME in BOTH routing modes. Mirrors the
+# gates in lib/render-caddyfile.sh::render_extra_subdomain_vhosts and
+# infra/cloudflared-up.sh. One bare label per line.
+_extra_public_subdomains() {
+  local manifest="$1"
+  [[ -f "$manifest" ]] || return 0
+  python3 - "$manifest" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    m = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+subs = m.get("subdomains") or []
+if m.get("userFacing") is False and not subs:
+    sys.exit(0)
+primary = m.get("subdomain", "")
+for s in subs:
+    name = s.get("name")
+    if not name or name == primary:
+        continue
+    if s.get("internal") is True:
+        continue
+    print(name)
+PYEOF
+}
+
+check_dns_host() {
+  local host="$1" expected_ip="$2"
   _check_begin "DNS · ${host}"
   local got
   got="$(getent hosts "$host" 2>/dev/null | awk '{print $1; exit}')"
@@ -489,7 +529,7 @@ check_dns_subdomain() {
 }
 
 check_cert_expiry() {
-  local slug="$1" host="$2"
+  local host="$1"
   _check_begin "Cert · ${host}"
   local end_date days_left
   end_date="$(timeout 8 openssl s_client -servername "$host" -connect "${host}:443" </dev/null 2>/dev/null \
@@ -893,25 +933,69 @@ fi
 
 while IFS= read -r slug; do
   [[ -z "$slug" ]] && continue
-  manifest="${APPLIANCE_DIR}/console/manifests/${slug}.json"
-  subdomain=""
-  [[ -f "$manifest" ]] && subdomain="$(_manifest_field "$manifest" 'data["subdomain"]')"
-  # Prefer the operator's per-app subdomain override
-  # (state.apps.<slug>.subdomain, written from VIBE_APP_SUBDOMAIN by
-  # enable-app.sh) so the DNS + cert checks target the host Caddy and the
-  # Cloudflare Tunnel actually serve in subdomain-per-app mode. Falls back
-  # to the manifest default — equal to the override in single-host mode,
-  # where no override is set.
-  _sub_override="$(_state_get "apps.${slug}.subdomain")"
-  [[ -n "$_sub_override" ]] && subdomain="$_sub_override"
-
   check_app_health "$slug"
-
-  if [[ "$mode" == "domain" && -n "$domain" && -n "$subdomain" ]]; then
-    check_dns_subdomain  "$slug" "$domain" "$subdomain" "$server_ip"
-    check_cert_expiry    "$slug" "${subdomain}.${domain}"
-  fi
 done < <(_enabled_slugs)
+
+# --- domain-mode public hostname checks -------------------------------
+#
+# WHICH hostnames actually exist depends on DOMAIN_ROUTING_MODE, so this
+# has to mirror lib/render-caddyfile.sh's branch exactly. Checking every
+# app's <subdomain>.<domain> unconditionally — as doctor did before —
+# produced two guaranteed FAILs per enabled app on a healthy single-host
+# install (the default), because in that mode no per-app subdomain vhost
+# is rendered and cloudflared provisions no CNAME for one. On an 8-app
+# install that was 16 false failures and a `doctor` exit code of 1.
+#
+#   single-host (default): one public host, ${tunnel_subdomain}.${domain},
+#     serving every app under a path prefix. Only that host — plus any
+#     manifest subdomains[] extras — has DNS and a cert.
+#   subdomain-per-app: each enabled app is served at the root of its own
+#     effective subdomain (state.apps.<slug>.subdomain override, else
+#     manifest.subdomain), and the console keeps the tunnel host.
+#
+# subdomains[] extras (e.g. vibe-connect's client portal) get their own
+# vhost + CNAME in BOTH modes, so they're checked either way.
+if [[ "$mode" == "domain" && -n "$domain" ]]; then
+  tunnel_subdomain="$(_state_get config.tunnel_subdomain)"
+  [[ -z "$tunnel_subdomain" ]] && tunnel_subdomain="vibe"
+
+  routing_mode="$(_appliance_env_get DOMAIN_ROUTING_MODE)"
+  routing_mode="${routing_mode//\"/}"
+  case "$routing_mode" in
+    subdomain-per-app|single-host) ;;
+    *) routing_mode="single-host" ;;   # matches the renderer's fallback
+  esac
+  _human_out "$(printf '\n%sDomain routing mode: %s%s\n' "${_C_DIM:-}" "$routing_mode" "${_C_RESET:-}")"
+
+  # The console host is public in both modes (apex redirects to it).
+  check_dns_host    "${tunnel_subdomain}.${domain}" "$server_ip"
+  check_cert_expiry "${tunnel_subdomain}.${domain}"
+
+  while IFS= read -r slug; do
+    [[ -z "$slug" ]] && continue
+    manifest="${APPLIANCE_DIR}/console/manifests/${slug}.json"
+
+    if [[ "$routing_mode" == "subdomain-per-app" ]]; then
+      subdomain=""
+      [[ -f "$manifest" ]] && subdomain="$(_manifest_field "$manifest" 'data["subdomain"]')"
+      # Operator's per-app override wins — written to
+      # state.apps.<slug>.subdomain from VIBE_APP_SUBDOMAIN by
+      # enable-app.sh, and it's what Caddy and the tunnel actually serve.
+      _sub_override="$(_state_get "apps.${slug}.subdomain")"
+      [[ -n "$_sub_override" ]] && subdomain="$_sub_override"
+      if [[ -n "$subdomain" ]]; then
+        check_dns_host    "${subdomain}.${domain}" "$server_ip"
+        check_cert_expiry "${subdomain}.${domain}"
+      fi
+    fi
+
+    while IFS= read -r extra_sub; do
+      [[ -z "$extra_sub" ]] && continue
+      check_dns_host    "${extra_sub}.${domain}" "$server_ip"
+      check_cert_expiry "${extra_sub}.${domain}"
+    done < <(_extra_public_subdomains "$manifest")
+  done < <(_enabled_slugs)
+fi
 
 check_recent_errors
 

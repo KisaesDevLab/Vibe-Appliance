@@ -1004,7 +1004,11 @@ def main():
     body = body.replace("@VIBE_ACME_EMAIL@",    email or "admin@example.com")
     body = body.replace("@VIBE_DOMAIN@",        domain)
 
-    with open(out_path, "w") as f:
+    # Explicit encoding for the same reason as render-haproxy.sh: the
+    # locale decides Python's default, and a non-UTF-8 locale would turn
+    # any non-ASCII byte reaching the output into a UnicodeEncodeError
+    # that aborts the render.
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write(body)
 
 main()

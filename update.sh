@@ -58,7 +58,7 @@ _manifest_field() {
 import json, sys
 with open(sys.argv[1]) as f:
     data = json.load(f)
-v = eval(sys.argv[2], {"data": data})
+v = eval(sys.argv[2], {"data": data, "json": json})
 if v is None:
     sys.exit(0)
 print(v)

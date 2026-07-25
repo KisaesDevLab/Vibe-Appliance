@@ -396,7 +396,14 @@ else:
         lines.append(f"  http-check expect status 100-499")
         lines.append(f"  server {fe['name']} {fe['upstream']} check inter 30s fall 3 rise 1 resolvers docker init-addr last,libc,none")
 
-with open(out_path, "w") as f:
+# encoding pinned explicitly: several emitted comment lines contain
+# non-ASCII (em-dashes, an arrow), and manifest displayName / note values
+# are interpolated into the frontend headers. Python picks the write
+# encoding from the locale, so on a host running under a non-UTF-8
+# locale (LC_ALL=C in a cron/systemd context that escapes PEP 538's
+# coercion) this write raises UnicodeEncodeError and the render dies —
+# leaving the stats-only seed config in place with no frontends.
+with open(out_path, "w", encoding="utf-8") as f:
     f.write("\n".join(lines) + "\n")
 
 print(f"rendered {len(frontends)} frontend(s)")

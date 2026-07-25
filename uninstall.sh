@@ -127,7 +127,13 @@ confirm() {
 # Cloudflare-side state by hand.
 cleanup_cloudflare() {
   local down_script="${APPLIANCE_DIR}/infra/cloudflared-down.sh"
-  if [[ ! -x "$down_script" ]]; then
+  # Test -f, not -x: the script is invoked through `bash "$down_script"`
+  # below, so the exec bit is irrelevant. Requiring it meant a checkout
+  # that lost file modes (a copied tree, an archive extract, a Windows
+  # clone with core.fileMode off) silently skipped Cloudflare cleanup and
+  # left an orphaned tunnel + CNAMEs in the operator's account with no
+  # local record of them.
+  if [[ ! -f "$down_script" ]]; then
     note "cloudflared-down.sh not present — Cloudflare-side cleanup skipped"
     return 0
   fi
@@ -171,8 +177,14 @@ remove_images() {
       | grep -E ':vibe-rollback-' | xargs -r docker rmi -f 2>/dev/null || true
     # Pulled Vibe images (best-effort — operator can `docker image prune`
     # afterwards if they want a fully clean image cache).
+    #
+    # Match `vibe` with no trailing hyphen: not every app's images are
+    # named `vibe-<slug>-<tier>`. Vibe 1099 publishes
+    # `vibe1099-app` / `vibe1099-web` / `vibe1099-render`, which the
+    # old `vibe-` pattern skipped entirely, leaving ~3 images behind on
+    # a --remove-data or --full uninstall.
     docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
-      | grep -E '^ghcr.io/kisaesdevlab/vibe-' \
+      | grep -E '^ghcr\.io/kisaesdevlab/vibe' \
       | xargs -r docker rmi -f 2>/dev/null || true
     ok "vibe images gone (use 'docker image prune -a' for a deeper sweep)"
   fi
@@ -276,7 +288,12 @@ remove_docker() {
       docker-buildx-plugin docker-compose-plugin 2>/dev/null || true
     rm -f /etc/apt/sources.list.d/docker.list
     rm -f /etc/apt/keyrings/docker.asc
-    ok "docker removed (data under /var/lib/docker NOT deleted — `rm -rf` it manually if you really want a clean slate)"
+    # NOTE: no backticks in this string. Inside double quotes bash treats
+    # them as command substitution — the previous wording embedded
+    # `rm -rf` literally, which meant the uninstall actually EXECUTED
+    # `rm -rf` (harmless with no operands, but it also ate the text and
+    # is one edit away from being genuinely destructive).
+    ok "docker removed (data under /var/lib/docker NOT deleted — 'sudo rm -rf /var/lib/docker' manually if you really want a clean slate)"
   else
     note "docker not installed"
   fi

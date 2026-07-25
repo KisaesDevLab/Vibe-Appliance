@@ -568,13 +568,21 @@ _run_migrations() {
 # --- helpers -----------------------------------------------------------
 
 # _manifest_field <path> <python expression operating on `data`>
+#
+# The expression is eval'd with an explicit globals dict. `json` is
+# included because several call sites need json.dumps to round-trip a
+# list out of the manifest (see _run_app_seed_if_needed). Without it
+# those raise NameError, the command substitution yields an empty
+# string, and the caller silently degrades — which is how the vibe-tb
+# admin-user seed stopped running, making the documented first login
+# return "invalid credentials".
 _manifest_field() {
   local file="$1" expr="$2"
   python3 - "$file" "$expr" <<'PYEOF'
 import json, sys
 with open(sys.argv[1]) as f:
     data = json.load(f)
-result = eval(sys.argv[2], {"data": data})
+result = eval(sys.argv[2], {"data": data, "json": json})
 if result is None:
     sys.exit(0)
 print(result)

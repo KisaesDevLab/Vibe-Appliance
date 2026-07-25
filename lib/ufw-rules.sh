@@ -128,6 +128,19 @@ except Exception:
   log_step "applying ufw rules" mode="$mode" tailscale_enabled="$tailscale_enabled"
 
   # ---- Workstream D — emergency-access ports --------------------------
+  #
+  # UFW evaluates rules in insertion order and the FIRST match wins, so
+  # the catch-all deny has to sit after every allow. `ufw allow` appends,
+  # which means an allow added on a LATER run lands behind an existing
+  # deny and never matches. That silently broke tailnet emergency access
+  # for anyone who turned Tailscale on after the first bootstrap: the
+  # 100.64.0.0/10 allow was appended below the deny installed earlier.
+  #
+  # Drop the deny first (no-op when absent), add every allow, then
+  # re-append the deny last. Idempotent and order-correct on every run,
+  # whichever allows apply this time.
+  _ufw_drop_deny "$_EMERGENCY_PORT_RANGE" "tcp"
+
   _ufw_allow_silent "10.0.0.0/8"     "$_EMERGENCY_PORT_RANGE" "tcp" "emergency RFC1918"
   _ufw_allow_silent "172.16.0.0/12"  "$_EMERGENCY_PORT_RANGE" "tcp" "emergency RFC1918"
   _ufw_allow_silent "192.168.0.0/16" "$_EMERGENCY_PORT_RANGE" "tcp" "emergency RFC1918"
@@ -136,9 +149,8 @@ except Exception:
     _ufw_allow_silent "100.64.0.0/10" "$_EMERGENCY_PORT_RANGE" "tcp" "emergency CGNAT/Tailscale"
   fi
 
-  # Deny all other sources on the emergency port range. UFW is order-
-  # sensitive but allow-rules from specific sources match before this
-  # generic deny.
+  # Deny every other source. Added last so all the allows above precede
+  # it in UFW's first-match evaluation order.
   _ufw_deny_silent "$_EMERGENCY_PORT_RANGE" "tcp" "emergency public deny"
 
   # ---- Workstream A — LAN-mode Cockpit --------------------------------
@@ -173,6 +185,22 @@ _ufw_deny_silent() {
     log_info "ufw deny already present" ports="$ports" comment="$comment"
   else
     log_info "ufw deny added" ports="$ports" comment="$comment"
+  fi
+}
+
+# Internal: remove the catch-all deny for a port range if present, so
+# the allow rules added afterwards land ahead of the re-added deny.
+# `ufw delete` on a non-existent rule prints "Could not delete
+# non-existent rule" and exits non-zero — swallowed, since "already
+# absent" is the desired end state either way.
+_ufw_drop_deny() {
+  local ports="$1" proto="$2"
+  local out
+  out="$(ufw --force delete deny "$ports/$proto" 2>&1)" || true
+  if [[ "$out" == *"Could not delete"* || "$out" == *"non-existent"* ]]; then
+    log_info "no pre-existing ufw deny to reorder" ports="$ports"
+  else
+    log_info "removed ufw deny for re-ordering" ports="$ports"
   fi
 }
 

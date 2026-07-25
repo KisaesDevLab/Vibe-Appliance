@@ -89,7 +89,7 @@ preflight_root() {
       "bootstrap.sh must be run as root. Re-run with sudo." \
       "cause:You ran the script directly as a regular user." \
       "diagnose:id" \
-      "fix:sudo $0 $*" \
+      "fix:sudo ${BASH_SOURCE[1]:-/opt/vibe/appliance/bootstrap.sh}" \
       "fix:Or pipe the installer through sudo: curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash"
     return 1
   fi
@@ -318,17 +318,58 @@ preflight_port() {
   log_check_pass "$title"
 }
 
-# Phase 8.5 Workstream D — emergency-access port range (5171:5198).
-# The HAProxy sidecar binds 5171, 5172, 5181, 5182, 5191, 5192 on the
-# host and 5199 on loopback. Each can be held by `vibe-emergency-proxy`
-# on a re-bootstrap (idempotent) or by an unrelated process (conflict).
-# The check is a soft loop — if any single port has a non-our-proxy
-# listener, log it but do NOT fail the whole bootstrap (the operator
-# may want to opt out of one port; emergency access is a fallback).
+# Phase 8.5 Workstream D — emergency-access ports.
+#
+# The port list is READ FROM docker-compose.yml rather than hardcoded.
+# A hardcoded list drifts the moment an app is added: the previous
+# version checked only 5171 5172 5181 5182 5191 5192 5199 while compose
+# had grown to also publish 5174 5175 5193 5194 5197 5198, so a conflict
+# on any of those slipped past pre-flight and surfaced much later as an
+# opaque `docker compose up` "port is already allocated".
+#
+# Parsing is deliberately regex-based, not `docker compose config`:
+# pre-flight runs as bootstrap phase 1, BEFORE Docker is installed in
+# phase 2. python3 is guaranteed present (checked in main()).
+#
+# Each port can legitimately be held by `vibe-emergency-proxy` on a
+# re-bootstrap (idempotent) or by an unrelated process (a real conflict).
+_emergency_ports_from_compose() {
+  local compose="${APPLIANCE_DIR:-/opt/vibe/appliance}/docker-compose.yml"
+  [[ -f "$compose" ]] || return 0
+  python3 - "$compose" <<'PYEOF' 2>/dev/null
+import re, sys
+# Only the emergency-proxy service block. Service keys sit at two-space
+# indentation under `services:`; the block ends at the next such key.
+text = open(sys.argv[1]).read()
+m = re.search(r"^  emergency-proxy:\s*$", text, re.M)
+if not m:
+    sys.exit(0)
+rest = text[m.end():]
+nxt = re.search(r"^  [a-zA-Z0-9_.-]+:\s*$", rest, re.M)
+block = rest[:nxt.start()] if nxt else rest
+# Publish lines look like `- "5171:5171"` or `- "127.0.0.1:5199:5199"`.
+# Caddy's `${HOST_BIND_HTTP:-0.0.0.0}:80:80` form deliberately does not
+# match, and :80/:443 are checked separately anyway.
+seen = []
+for host_port in re.findall(r'^\s*-\s*"(?:\d{1,3}(?:\.\d{1,3}){3}:)?(\d+):\d+"', block, re.M):
+    if host_port not in seen:
+        seen.append(host_port)
+print(" ".join(seen))
+PYEOF
+}
+
 preflight_emergency_ports() {
   local errors=0
-  local p
-  for p in 5171 5172 5181 5182 5191 5192 5199; do
+  local ports p
+  ports="$(_emergency_ports_from_compose)"
+  if [[ -z "$ports" ]]; then
+    # Fall back to the documented canonical range endpoints rather than
+    # skipping the check entirely if the compose file can't be parsed.
+    log_check_warn "Emergency-access ports" \
+      "Could not read the emergency-proxy port list from docker-compose.yml; falling back to the known set. If bootstrap later fails with 'port is already allocated', that's the cause."
+    ports="5171 5172 5174 5175 5181 5182 5191 5192 5193 5194 5197 5198 5199"
+  fi
+  for p in $ports; do
     if ! preflight_port "$p" vibe-emergency-proxy; then
       ((errors++)) || true
     fi

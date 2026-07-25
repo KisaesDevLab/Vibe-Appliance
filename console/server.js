@@ -19,7 +19,7 @@ const fs          = require('fs');
 const path        = require('path');
 const crypto      = require('crypto');
 const http        = require('http');
-const { spawn }   = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const Docker      = require('dockerode');
 const Database    = require('better-sqlite3');
 
@@ -174,6 +174,66 @@ function readState() {
     return JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
   } catch (err) {
     return { phases: {}, apps: {}, config: {}, _error: err.code || err.message };
+  }
+}
+
+// --- state.json mutation, cross-process safe ---------------------------
+//
+// Every bash writer (lib/state.sh, lib/enable-app.sh, lib/disable-app.sh,
+// update.sh) serialises its read-modify-write behind an fcntl.flock on
+// <state.json>.lock. The JS writers here used to do an UNLOCKED
+// read-modify-write through a shared, fixed `state.json.tmp` path, so:
+//   - the 5-minute host-IP refresh landing between an enable-app.sh read
+//     and its write silently dropped that app's state update (including
+//     the per-app `subdomain` the routing work now persists there);
+//   - two concurrent JS writers raced on the same temp filename.
+// Node has no flock without a native dependency, so route JS mutations
+// through the same python3 + flock path the bash side uses. python3 is
+// present in the console image (console/Dockerfile installs it for the
+// enable/disable scripts).
+//
+// `patch` is shallow: a plain-object value is merged one level deep (so
+// { config: { host_ip } } touches only that key, and a null value inside
+// it deletes the key), anything else replaces wholesale (customCards).
+const STATE_PATCH_PY = `
+import json, os, sys, fcntl
+path, patch_path = sys.argv[1:3]
+with open(patch_path) as f:
+    patch = json.load(f)
+lk = open(path + ".lock", "w")
+fcntl.flock(lk.fileno(), fcntl.LOCK_EX)
+try:
+    with open(path) as f:
+        s = json.load(f)
+except (FileNotFoundError, ValueError):
+    s = {"schemaVersion": 1, "config": {}, "phases": {}, "apps": {}}
+for k, v in patch.items():
+    if isinstance(v, dict) and isinstance(s.get(k), dict):
+        for kk, vv in v.items():
+            if vv is None:
+                s[k].pop(kk, None)
+            else:
+                s[k][kk] = vv
+    else:
+        s[k] = v
+tmp = path + ".tmp." + str(os.getpid())
+with open(tmp, "w") as f:
+    json.dump(s, f, indent=2, sort_keys=True)
+    f.write("\\n")
+os.rename(tmp, path)
+`;
+
+function applyStatePatch(patch) {
+  const dataDir = path.join(VIBE_DIR, 'data');
+  fs.mkdirSync(dataDir, { recursive: true });
+  const tmpPatch = path.join(dataDir,
+    `.state-patch-${process.pid}-${crypto.randomBytes(6).toString('hex')}.json`);
+  fs.writeFileSync(tmpPatch, JSON.stringify(patch), { mode: 0o600 });
+  try {
+    execFileSync('python3', ['-c', STATE_PATCH_PY, STATE_PATH, tmpPatch],
+      { stdio: ['ignore', 'ignore', 'pipe'] });
+  } finally {
+    try { fs.unlinkSync(tmpPatch); } catch { /* best effort */ }
   }
 }
 
@@ -533,14 +593,12 @@ async function refreshHostIp(force = false) {
   if (!force && previous === newIp) {
     return { ok: true, host_ip: newIp, changed: false, previous };
   }
-  state.config.host_ip = newIp;
-  // Atomic write — write to a tempfile, then rename. Same pattern
-  // bootstrap uses; means a crash mid-write doesn't truncate
-  // state.json.
-  const tmp = STATE_PATH + '.tmp';
+  // Patch just config.host_ip under the shared flock rather than
+  // rewriting the whole document: this runs on a 5-minute timer and
+  // used to clobber concurrent apps[] writes from a spawned
+  // enable-app.sh.
   try {
-    fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
-    fs.renameSync(tmp, STATE_PATH);
+    applyStatePatch({ config: { host_ip: newIp } });
   } catch (err) {
     log('error', 'host-ip refresh: state.json write failed', { err: err.message });
     return { ok: false, error: 'could not write state.json: ' + err.message };
@@ -862,6 +920,13 @@ function adminChallenge(res) {
 
 const app = express();
 app.disable('x-powered-by');
+// One trusted hop: Caddy. Without this, req.ip is Caddy's container
+// address for every request, so testRateLimit bucketed all clients
+// together — one operator's Save attempts could 429 another's. Caddy
+// sets X-Forwarded-For on every reverse_proxy, and the console's :3000
+// is not published to the host (vibe_net only), so the header can only
+// come from Caddy.
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '64kb' }));
 
 app.get('/health', (_req, res) => {
@@ -971,11 +1036,15 @@ app.get('/api/v1/public/apps', async (_req, res) => {
         displayName: m.displayName,
         description: m.description,
         url:         appPublicUrl(m, config, live || undefined),
-        // HAProxy emergency-port URL — used only by the Emergency Access
-        // admin panel ("Caddy itself is down" failure mode). Kept on the
-        // public payload so the panel can build its list from one fetch.
-        emergencyUrl:  appEmergencyUrl(m, config),
-        emergencyNote: m.emergencyNote || null,
+        // NOTE: emergencyUrl / emergencyNote are deliberately NOT on this
+        // payload. This endpoint is unauthenticated, and in domain mode
+        // the landing page it feeds is published through the Cloudflare
+        // tunnel — emitting `http://<host_ip>:<port>/` disclosed the
+        // host's internal LAN address and the whole emergency-port map
+        // to any visitor. The ports are UFW-gated so this was disclosure
+        // rather than access, but the client landing never rendered the
+        // fields. The Emergency Access admin panel reads them from the
+        // admin-only /api/v1/apps instead (see admin.html).
       };
       // Per-app client entry buttons from manifest.clientLanding[]. Omit
       // the field entirely when the manifest declares none — the UI
@@ -2414,22 +2483,11 @@ function tsHost(...args) {
   });
 }
 
-// setStateConfigKey — atomic update of a single key under
-// state.config in /opt/vibe/state.json. Mirrors lib/state.sh's
-// state_set_config_kv.
+// setStateConfigKey — atomic, lock-serialised update of a single key
+// under state.config in /opt/vibe/state.json. Mirrors lib/state.sh's
+// state_set_config_kv, including the flock it takes.
 function setStateConfigKey(key, value) {
-  let state;
-  try {
-    state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
-  } catch (err) {
-    if (err.code === 'ENOENT') state = {};
-    else throw err;
-  }
-  state.config = state.config || {};
-  state.config[key] = value;
-  const tmp = STATE_PATH + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
-  fs.renameSync(tmp, STATE_PATH);
+  applyStatePatch({ config: { [key]: value } });
 }
 
 // Atomic whole-list replace for state.customCards. Operator-curated
@@ -2438,17 +2496,7 @@ function setStateConfigKey(key, value) {
 // are structured data, not flags, and survive bootstrap re-runs the
 // same way app state does.
 function setStateCustomCards(cards) {
-  let state;
-  try {
-    state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
-  } catch (err) {
-    if (err.code === 'ENOENT') state = {};
-    else throw err;
-  }
-  state.customCards = cards;
-  const tmp = STATE_PATH + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
-  fs.renameSync(tmp, STATE_PATH);
+  applyStatePatch({ customCards: cards });
 }
 
 // setApplianceEnv — convenience wrapper around writeEnvKey for the
@@ -2872,10 +2920,18 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, async
     // Keep tunnel_subdomain across mode flips so flipping LAN→domain
     // remembers the operator's last choice.
   }
+  // Patch only the config keys we changed, under the shared flock, so a
+  // concurrent apps[] write from a spawned enable/disable script isn't
+  // clobbered by writing back the whole document we read above.
   try {
-    const tmp = STATE_PATH + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
-    fs.renameSync(tmp, STATE_PATH);
+    applyStatePatch({
+      config: {
+        mode:             state.config.mode,
+        domain:           state.config.domain,
+        email:            state.config.email,
+        tunnel_subdomain: state.config.tunnel_subdomain,
+      },
+    });
   } catch (err) {
     return res.status(500).json({ ok: false, error: 'state.json write failed: ' + err.message });
   }
@@ -3047,8 +3103,18 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, async
   log('error', 'network mode switch failed; rolling back', { code: render.code });
   let rollbackErr = null;
   try {
-    fs.copyFileSync(stateBak, STATE_PATH);
-    if (fs.existsSync(caddyBak)) fs.copyFileSync(caddyBak, caddyfile);
+    // copyFileSync truncates the destination and streams into it, so a
+    // concurrent reader can observe a half-written state.json. Stage to
+    // a unique temp path and rename — rename is atomic on the same
+    // filesystem, matching how every other writer installs this file.
+    const stateRestoreTmp = STATE_PATH + '.restore.' + process.pid;
+    fs.copyFileSync(stateBak, stateRestoreTmp);
+    fs.renameSync(stateRestoreTmp, STATE_PATH);
+    if (fs.existsSync(caddyBak)) {
+      const caddyRestoreTmp = caddyfile + '.restore.' + process.pid;
+      fs.copyFileSync(caddyBak, caddyRestoreTmp);
+      fs.renameSync(caddyRestoreTmp, caddyfile);
+    }
   } catch (err) { rollbackErr = 'restore failed: ' + err.message; }
 
   const rollbackReload = await new Promise((resolve) => {
@@ -3459,7 +3525,16 @@ function buildSettingsRegistry() {
   }
 
   for (const m of Object.values(MANIFESTS)) {
-    const entries = [...(m.env.required || []), ...(m.env.optional || [])];
+    // `m.env` is schema-required, but loadManifests() only validates the
+    // slug. A manifest missing the block would throw a TypeError here at
+    // module scope and take the whole console down — the operator can't
+    // even reach /admin to fix it. Degrade to "declares no Tier-1
+    // settings" instead.
+    const env = m.env || {};
+    if (!m.env) {
+      log('warn', 'manifest has no env block; no settings registered', { slug: m.slug });
+    }
+    const entries = [...(env.required || []), ...(env.optional || [])];
     for (const e of entries) {
       if (!e.ui || e.ui.tier !== 1) continue;
       const f = _fieldDescriptor(e, m.slug);

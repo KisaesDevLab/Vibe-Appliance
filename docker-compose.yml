@@ -333,8 +333,22 @@ services:
       # exposed off-host. See docs/addenda/emergency-access.md §4.1.
       - "127.0.0.1:5199:5199"
     volumes:
-      - /opt/vibe/data/emergency-proxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-      - /opt/vibe/data/emergency-proxy/503.http:/usr/local/etc/haproxy/503.http:ro
+      # Mount the PARENT directory, not haproxy.cfg itself — same reason
+      # the caddy service mounts /opt/vibe/data/caddy rather than the
+      # Caddyfile. lib/render-haproxy.sh installs the config via atomic
+      # `mv`, which changes the file's inode. A file-level bind mount is
+      # pinned to the inode present at container-create time, so the
+      # container would keep reading the ORIGINAL file forever: every
+      # re-render would land on disk, the `docker kill -s HUP` reload
+      # would report success, and HAProxy would silently keep serving
+      # the stale frontends. A directory mount re-resolves on every
+      # open(), so SIGHUP always picks up the current config.
+      #
+      # The directory holds exactly the two files HAProxy needs
+      # (haproxy.cfg + 503.http, both seeded by render_haproxy before
+      # phase_core_up), so overmounting the image's default
+      # /usr/local/etc/haproxy is safe.
+      - /opt/vibe/data/emergency-proxy:/usr/local/etc/haproxy:ro
     networks:
       - vibe_net
     depends_on: []

@@ -9,7 +9,10 @@
 #   4. `docker compose config` to validate the resulting compose state.
 #   5. Atomic-rename .tmp → real env files.
 #   6. Identify dependent apps via manifest scan.
-#   7. `docker compose restart <services>` in dependency order.
+#   7. `docker compose up -d --force-recreate --no-deps <services>` for
+#      each dependent app. Recreate, not restart: compose bakes env_file
+#      values in at container-create time, so `restart` would keep the
+#      old config (see _settings_restart_app).
 #   8. Poll /health for each restarted app, default 90s, manifest override.
 #   9. On any failure: restore env from snapshot, restart with old config,
 #      poll again, audit-log rollback.
@@ -584,13 +587,74 @@ for fname in sorted(os.listdir(manifests_dir)):
 PYEOF
 }
 
-# Internal: docker compose restart for one app's services.
+# Internal: every service the overlay contributes — the merged service
+# set minus the core set. Same technique as
+# lib/disable-app.sh::_overlay_services, duplicated for the same reason:
+# each script has to stand alone on the console's exec path.
+#
+# Needed because a bare `docker compose ... restart` (no service args)
+# restarts EVERY service in the merged project — caddy, postgres, redis,
+# duplicati, portainer, emergency-proxy AND the console itself. Since
+# settings-save.sh runs as a child of the console process inside
+# vibe-console, restarting the console kills this script mid-flight: the
+# HTTP response never returns, _settings_wait_health never runs, and the
+# rollback path never fires. lib/disable-app.sh carries the identical
+# warning about bare `compose stop`.
+_settings_app_services() {
+  local slug="$1"
+  local core_compose="${APPLIANCE_DIR}/docker-compose.yml"
+  local overlay="${APPLIANCE_DIR}/apps/${slug}.yml"
+  local all_svc core_svc
+  all_svc="$(docker compose -f "$core_compose" -f "$overlay" config --services 2>/dev/null | sort -u)"
+  core_svc="$(docker compose -f "$core_compose" config --services 2>/dev/null | sort -u)"
+  comm -23 <(printf '%s\n' "$all_svc") <(printf '%s\n' "$core_svc") | tr '\n' ' '
+}
+
+# Internal: recreate one app's containers so they pick up the new env.
+#
+# `docker compose restart` is NOT usable here. Compose resolves env_file
+# into the container's environment at CREATE time; `restart` only stops
+# and starts the existing container, so it keeps the OLD values. Docker
+# documents this, and it meant every Settings save reported success
+# while the app carried on running the previous config.
+# `up -d --force-recreate` re-reads the env files and rebuilds the
+# container — the same reason lib/enable-app.sh always force-recreates.
+#
+# --no-deps keeps postgres/redis (depends_on targets) from being
+# recreated alongside the app.
+#
+# APP_TAG must be exported before the compose call: the overlays declare
+# `image: ...:${APP_TAG:-latest}`, so without it a version-pinned app
+# would be silently recreated on :latest.
 _settings_restart_app() {
   local slug="$1"
   local overlay="${APPLIANCE_DIR}/apps/${slug}.yml"
   [[ -f "$overlay" ]] || { log_warn "no overlay for $slug; skipping restart"; return 0; }
+
+  local services
+  services="$(_settings_app_services "$slug")"
+  if [[ -z "$services" ]]; then
+    log_warn "could not derive service names for $slug; refusing to recreate" \
+      "diagnose:docker compose -f ${APPLIANCE_DIR}/docker-compose.yml -f ${overlay} config --services"
+    return 1
+  fi
+
+  local manifest="${APPLIANCE_DIR}/console/manifests/${slug}.json"
+  local tag=""
+  if [[ -f "$manifest" ]]; then
+    tag="$(python3 - "$manifest" <<'PYEOF' 2>/dev/null
+import json, sys
+print((json.load(open(sys.argv[1])).get("image") or {}).get("defaultTag", "") or "")
+PYEOF
+)"
+  fi
+  export APP_TAG="${tag:-latest}"
+
+  log_step "recreating $slug services for settings save" services="$services" tag="$APP_TAG"
+  # shellcheck disable=SC2086
   ( cd "${APPLIANCE_DIR}" && \
-    docker compose -f docker-compose.yml -f "$overlay" restart \
+    docker compose -f docker-compose.yml -f "$overlay" \
+      up -d --force-recreate --no-deps $services \
     >>"$VIBE_LOG_FILE" 2>&1 )
 }
 
