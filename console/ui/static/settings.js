@@ -3405,8 +3405,10 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
   // schema flow and uses its own admin endpoints.
   //
   // UX: optimistic toggle, revert on error. Apps with userFacing=false
-  // (vibe-glm-ocr today) are excluded server-side AND would be again
-  // here in case the server contract drifts.
+  // are excluded server-side AND would be again here in case the server
+  // contract drifts. (No shipped app sets the flag today — the two that
+  // did, vibe-glm-ocr and vibe-shield, were removed before release —
+  // but the gate stays for future internal-only services.)
   async function renderCustomerLandingPanel() {
     panelEl.appendChild(el('p', { class: 'muted' }, ['Loading…']));
     let data;

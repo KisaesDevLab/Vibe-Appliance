@@ -220,16 +220,14 @@
         <textarea id="claude-what" placeholder="e.g. clicked Enable on Vibe Tax Research; install fresh on a clean droplet"></textarea>
 
         <label for="claude-slug">Related app (optional)</label>
+        <!-- Populated at load from /api/v1/apps (see logs.js
+             loadAppSlugs). Deliberately NOT a hardcoded list: per
+             CLAUDE.md rule 3 the console is manifest-driven, and the
+             hardcoded version had already drifted — it still offered
+             vibe-glm-ocr after that app was removed and never gained
+             vibe-1099 after it was added. -->
         <select id="claude-slug">
           <option value="">(none)</option>
-          <option value="vibe-tb">vibe-tb</option>
-          <option value="vibe-mybooks">vibe-mybooks</option>
-          <option value="vibe-connect">vibe-connect</option>
-          <option value="vibe-tax-research">vibe-tax-research</option>
-          <option value="vibe-payroll">vibe-payroll</option>
-          <option value="vibe-glm-ocr">vibe-glm-ocr</option>
-          <option value="vibe-calculators">vibe-calculators</option>
-          <option value="vibe-tx-converter">vibe-tx-converter</option>
         </select>
       </div>
 

@@ -87,6 +87,34 @@
     }
   }
 
+  // Populate the "Related app" picker from the live manifest registry
+  // rather than a hardcoded <option> list. The markup used to carry the
+  // list inline, which drifted the moment the app roster changed — it
+  // still offered vibe-glm-ocr after that app was removed and never
+  // gained vibe-1099. /api/v1/apps is admin-authenticated (same session
+  // as this page) and returns one entry per loaded manifest.
+  //
+  // Failure is non-fatal: the picker just stays at "(none)", which is
+  // already an accepted value — the app slug is optional context for
+  // the analyze-log call, not a required field.
+  async function loadAppSlugs() {
+    try {
+      const r = await fetch('/api/v1/apps', { credentials: 'same-origin' });
+      if (!r.ok) return;
+      const data = await r.json();
+      const apps = (data && data.apps) || [];
+      for (const a of apps) {
+        if (!a || !a.slug) continue;
+        const opt = document.createElement('option');
+        opt.value = a.slug;
+        // Show the human name alongside the slug — the operator picked
+        // this page from an error message that names one or the other.
+        opt.textContent = a.displayName ? `${a.slug} — ${a.displayName}` : a.slug;
+        $slug.appendChild(opt);
+      }
+    } catch { /* leave the picker at "(none)" */ }
+  }
+
   async function loadTail() {
     const name = $picker.value;
     if (!name) {
@@ -383,4 +411,5 @@
   $askBtn.addEventListener('click', askClaude);
 
   loadLogList();
+  loadAppSlugs();
 })();
