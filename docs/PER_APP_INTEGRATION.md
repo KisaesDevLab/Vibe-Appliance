@@ -42,10 +42,12 @@ must satisfy. Pull the shape from there:
 | ----------------------------------- | --------------------------------------------------------------------------- |
 | `KisaesDevLab/Vibe-Trial-Balance`   | [`console/manifests/vibe-tb.json`](../console/manifests/vibe-tb.json)       |
 | `KisaesDevLab/Vibe-MyBooks`         | [`console/manifests/vibe-mybooks.json`](../console/manifests/vibe-mybooks.json) |
-| `KisaesDevLab/Vibe-GLM-OCR`         | [`console/manifests/vibe-glm-ocr.json`](../console/manifests/vibe-glm-ocr.json) |
 | `KisaesDevLab/Vibe-Tax-Research-Chat` | [`console/manifests/vibe-tax-research.json`](../console/manifests/vibe-tax-research.json) |
 | `KisaesDevLab/Vibe-Payroll-Time`    | [`console/manifests/vibe-payroll.json`](../console/manifests/vibe-payroll.json) |
-| `KisaesDevLab/Vibe-Connect`         | [`console/manifests/_pending/vibe-connect.json`](../console/manifests/_pending/vibe-connect.json) (license-blocked — see [`docs/CONNECT_BLOCKED.md`](CONNECT_BLOCKED.md)) |
+| `KisaesDevLab/Vibe-Connect`         | [`console/manifests/vibe-connect.json`](../console/manifests/vibe-connect.json) (ELv2 relicensing landed — the `_pending/` staging path in [`docs/CONNECT_BLOCKED.md`](CONNECT_BLOCKED.md) is historical) |
+| `KisaesDevLab/Vibe-Calculators`     | [`console/manifests/vibe-calculators.json`](../console/manifests/vibe-calculators.json) |
+| `KisaesDevLab/Vibe-Transaction-Convertor` | [`console/manifests/vibe-tx-converter.json`](../console/manifests/vibe-tx-converter.json) |
+| `KisaesDevLab/Vibe-1099`            | [`console/manifests/vibe-1099.json`](../console/manifests/vibe-1099.json) |
 
 Each upstream repo, when it adds `.appliance/manifest.json`, should
 copy the file from `console/manifests/<slug>.json` here as the

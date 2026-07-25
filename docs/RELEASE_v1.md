@@ -61,12 +61,13 @@ reversible.
   `lib/disable-app.sh` orchestrate env render → image pull → DB
   bootstrap → compose up → health-check → Caddy reload (and the
   reverse for disable). Data volumes are never destroyed by toggle.
-- **Nine apps shipped**: Vibe Trial Balance, Vibe MyBooks, Vibe Connect
+- **Eight apps shipped**: Vibe Trial Balance, Vibe MyBooks, Vibe Connect
   (ELv2; staff + client portal subdomains), Vibe Payroll & Time, Vibe
-  Tax Research Chat, Vibe-GLM-OCR (self-contained llama.cpp + GLM-OCR
-  F16 GGUF; CPU-only), Vibe Calculators, Vibe Transactions Converter,
-  Vibe Shield (PII-redacting Anthropic gateway: engine + gateway +
-  admin services, internal-only).
+  Tax Research Chat, Vibe Calculators, Vibe Transactions Converter, and
+  Vibe 1099.
+  Vibe-GLM-OCR and Vibe Shield were removed before release (see
+  `docs/PHASES.md`): OCR now goes to Anthropic over the API rather than
+  a local vision model, which drops the recommended droplet a tier.
 
 ### Three deployment modes (Phase 6)
 
