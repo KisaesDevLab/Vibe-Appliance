@@ -89,7 +89,7 @@ Reserved range: `:5171–:5199`. Within that, app categories get blocks with gap
 | *(reserved)* | | `:5183–:5190` | Future messaging apps |
 | Vibe-Tax-Research-Chat | default | `:5191` | AI/research |
 | Vibe-Payroll-Time | default | `:5192` | AI/operations |
-| Vibe-AI-Router | staff admin console | `:5193` | AI/operations — **primary** access path, not a fallback (no public vhost by design) |
+| Vibe-AI-Router | staff admin console | `:5193` | AI/operations — **primary** access path in LAN/Tailscale mode (see below), a fallback in domain mode |
 | *(reserved)* | | `:5194–:5196` | Future AI/operations apps |
 | Portainer | (admin tool) | `:5197` | v1.2 — infra fallback; UI for container ops when Caddy/DNS/cert is broken |
 | Duplicati | (admin tool) | `:5198` | v1.2 — infra fallback; UI for backup config when Caddy/DNS/cert is broken |
@@ -103,6 +103,31 @@ concept — reclaimed `:5193` on 2026-07-27 for its admin console (its `/v1`
 gateway runs as a separate container that is never published). Adding an app
 means: `emergencyPort` in its manifest **and** a matching publish line in
 `docker-compose.yml`'s `emergency-proxy` service.
+
+### When an emergency port is the primary path: `rootServedOnly`
+
+Most Vibe web images ship `/docker-entrypoint.d/40-base-path.sh`, which
+rewrites the SPA bundle's base sentinel from `VITE_BASE_PATH` at container
+start. That is what lets the appliance mount them at `/tb/`, `/connect/`,
+and so on. An image *without* that switch emits absolute asset URLs
+(`/assets/index-*.js`): mount it under a path prefix and the shell loads,
+then every asset request resolves against the host root — the console —
+so the operator gets a blank page with a `200`.
+
+Manifests declare this with `"rootServedOnly": true`. The appliance then:
+
+- emits **no** `/<prefix>/` handler for the app, in any mode;
+- gives it a root-served vhost at `<subdomain>.<domain>` in domain mode —
+  in **both** routing modes, including single-host, where everything else
+  is path-mounted (`lib/render-caddyfile.sh::render_root_served_vhosts`),
+  with a matching tunnel ingress rule + CNAME;
+- shows the emergency-port URL as the app's URL in LAN/Tailscale mode,
+  because there is no per-app hostname to offer there (mDNS publishes one
+  name; sub-labels of `.local` don't resolve).
+
+Vibe-AI-Router's console is the only app using this today. The durable fix
+is upstream — teach the image a base path and drop the flag — so treat
+`rootServedOnly` as a compatibility shim, not a design pattern.
 `tests/manifests/validate-manifests.test.js` fails the build if those two
 ever disagree.
 

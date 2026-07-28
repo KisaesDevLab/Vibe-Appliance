@@ -13,7 +13,11 @@
 #   vibe-ai-router-console  → ROUTER_ROLE=console, :8222. Staff admin UI + /admin-api.
 #                             Session-authenticated and CSRF-guarded, so it is safe behind
 #                             Caddy/TLS — this is the manifest's routing.default_upstream and
-#                             the emergency-port (:5193) backend.
+#                             the emergency-port (:5193) backend. Its bundle asks for assets
+#                             at absolute /assets/*, so the manifest marks it
+#                             `rootServedOnly`: Caddy serves it at the root of
+#                             airouter.<domain> (both routing modes) and never under a path
+#                             prefix. In LAN/Tailscale mode :5193 is the only way in.
 #
 # Both processes talk to the same shared Postgres database and hold the same MASTER_KEY (the
 # console needs it to store credentials; the gateway needs it to use them). Redis is unused —
@@ -62,6 +66,12 @@ services:
       PORT: "8222"
       # Migrations already ran in the gateway container; the console only serves.
       SKIP_MIGRATIONS: "1"
+      # Empty disables the nightly catalog sync HERE. The cron lives in the
+      # shared env file and the scheduler is not role-gated, so without this
+      # both containers would run the same 03:15 upsert against the same
+      # tables. The gateway keeps it (it is the one that serves /v1 and so
+      # cares about fresh pricing); `environment:` wins over `env_file:`.
+      CATALOG_SYNC_CRON: ""
     env_file:
       - /opt/vibe/env/shared.env
       - /opt/vibe/env/appliance.env

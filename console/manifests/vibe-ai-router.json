@@ -3,7 +3,7 @@
   "slug": "vibe-ai-router",
   "displayName": "Vibe AI Router",
   "description": "Sole AI egress point for the suite: task-class policy, data protection, and cost accounting.",
-  "_doc": "In-tree manifest for KisaesDevLab/Vibe-AI-Router (github.com/KisaesDevLab/Vibe-AI-Router), first public release v0.0.1. Replaces the scrapped Vibe-Shield concept with routing-layer enforcement; inherits Shield's :5193 emergency port (returned to the pool 2026-07-24). TWO containers from one image (ROUTER_ROLE): the CONSOLE (8222) is the staff admin UI and is the only surface Caddy fronts; the GATEWAY (8220) serves /v1 for other Vibe apps and is never routed publicly — apps reach it by container DNS on vibe_net. Splitting the roles is what allows the console to have TLS without publishing the gateway with it.",
+  "_doc": "In-tree manifest for KisaesDevLab/Vibe-AI-Router (github.com/KisaesDevLab/Vibe-AI-Router), first public release v0.0.1. Replaces the scrapped Vibe-Shield concept with routing-layer enforcement; inherits Shield's :5193 emergency port (returned to the pool 2026-07-24). TWO containers from one image (ROUTER_ROLE): the CONSOLE (8222) is the staff admin UI and is the only surface Caddy fronts; the GATEWAY (8220) serves /v1 for other Vibe apps and is never routed publicly — apps reach it by container DNS on vibe_net. Splitting the roles is what allows the console to have TLS without publishing the gateway with it. NOT YET WIRED: no other app's env template points at the gateway (they still carry their own ANTHROPIC_API_KEY), so the router is installed and usable from its own console but is not yet the suite's actual egress path — that needs per-app support for the app-token + X-Vibe-Task-Class contract in each app's image. See docs/PHASES.md.",
 
   "image": {
     "server":     "ghcr.io/kisaesdevlab/vibe-ai-router",
@@ -16,38 +16,51 @@
       "name":          "airouter",
       "audience":      "staff",
       "emergencyPort": 5193,
-      "emergencyNote": "Admin console fallback. In domain mode cookies are Secure, so sign-in over plain HTTP won't work — use this to confirm the service is up, then fix TLS/DNS. The /v1 gateway is never published."
+      "emergencyNote": "The ONLY way in on LAN/Tailscale (rootServedOnly: no path mount). In domain mode cookies are Secure, so plain-HTTP sign-in fails here — use it to confirm the service is up, then fix TLS/DNS."
     }
   ],
+  "emergencyPort": 5193,
   "userFacing":    false,
   "ports":         { "server": 8220, "client": 8222 },
 
+  "rootServedOnly": true,
+
   "routing": {
-    "default_upstream": "vibe-ai-router-console:8222"
+    "default_upstream": "vibe-ai-router-console:8222",
+    "deny_paths":       ["/metrics"]
   },
 
   "depends": ["postgres"],
+
+  "health_extra": [
+    {
+      "name":     "gateway",
+      "upstream": "vibe-ai-router:8220",
+      "path":     "/healthz",
+      "doc":      "The /v1 surface other apps call. It has no Caddy vhost, so without this entry nothing would ever probe it — the console can be healthy while the gateway is down."
+    }
+  ],
 
   "env": {
     "required": [
       { "name": "DATABASE_URL",          "from": "database-url" },
       { "name": "MASTER_KEY",            "from": "generated:base64-32bytes", "secret": true,
         "doc": "Vault master key. Wraps every per-credential data key; losing it means re-entering every provider API key. Generated once and preserved across re-renders. EXCLUDED from the Vault backup set by design — escrow separately (the app's docs/runbook.md)." },
-      { "name": "SESSION_SECRET",        "from": "generated:hex32", "secret": true,
-        "doc": "Signs admin console session cookies. Rotating it invalidates open sessions (harmless)." },
+      { "name": "SESSION_SECRET",        "from": "shared:JWT_SECRET", "secret": true,
+        "doc": "Signs admin console session cookies. Rendered from the appliance-wide JWT_SECRET in shared.env (the same convention vibe-connect / vibe-tx-converter use for their SESSION_SECRET), not a per-app value. Rotating shared.env's JWT_SECRET just signs everyone out here." },
       { "name": "ROUTER_ADMIN_PASSWORD", "from": "generated:hex32", "secret": true,
-        "doc": "First-login password for the admin console, generated on enable and surfaced in CREDENTIALS.txt / the console's first-login card." }
+        "doc": "First-login password for the admin console, generated on enable and surfaced in the console's first-login card and in /opt/vibe/CREDENTIALS.txt (the per-app first-login section, written from firstLogin.passwordEnvKey)." }
     ],
     "optional": [
       {
         "name": "ROUTER_ADMIN_EMAIL",
         "value": "admin@appliance.local",
-        "doc": "Login for the router's admin console. Change before enabling if you want a real address; the bootstrap resets the password to ROUTER_ADMIN_PASSWORD on every re-enable.",
+        "doc": "Login for the router's admin console. Set this BEFORE first enable if you want a real address — the bootstrap that creates the admin runs exactly once (state.apps.<slug>.seeded gates it), so changing this later creates nothing and the original login stays. To adopt a new address afterwards, add the admin from inside the router's console.",
         "ui": {
           "tier":      1,
           "category":  "AI",
           "label":     "Router admin email",
-          "helpText":  "The email you sign in with at the AI Router console. Changing it creates a second admin rather than renaming the first.",
+          "helpText":  "The email you sign in with at the AI Router console. Set it before you enable the app — after that the first-run bootstrap has already created the admin and won't run again.",
           "input":     "text",
           "appliance": "per-app",
           "validate":  "email"
@@ -96,12 +109,12 @@
     "username": "admin@appliance.local",
     "passwordEnvKey": "ROUTER_ADMIN_PASSWORD",
     "url": "/",
-    "note": "Sign in at the app's own subdomain over HTTPS. The username is whatever ROUTER_ADMIN_EMAIL was set to at enable time. Change the password in the console after first sign-in; the appliance only resets it if the app is re-enabled. NOTE: only the ADMIN CONSOLE is published — the /v1 gateway other apps call runs in a separate container that is never routed publicly."
+    "note": "In domain mode, sign in at https://airouter.<your-domain>/ — this app is served at the ROOT of its own subdomain in BOTH routing modes (its bundle can't be path-mounted; see rootServedOnly). In LAN/Tailscale mode there is no such hostname: use http://<server-ip>:5193/ from the LAN or tailnet. The username is whatever ROUTER_ADMIN_EMAIL was at enable time. Change the password inside the router's console after first sign-in — the appliance's first-run bootstrap runs once and will not reset it again (not even on disable/re-enable). NOTE: only the ADMIN CONSOLE is published — the /v1 gateway other apps call runs in a separate container that is never routed publicly."
   },
 
   "seed": {
     "command": ["node", "dist/src/ops/bootstrap-firm.js"],
-    "description": "Production first-run bootstrap: creates the firm, the admin login (ROUTER_ADMIN_PASSWORD), registers the appliance's local model server, populates the model catalog from the image's vendored pricing snapshot, and applies the local-first default policy pack. Idempotent — re-running only resets the admin password. This is NOT the app's dev seed (which creates a demo firm with a published password)."
+    "description": "Production first-run bootstrap: creates the firm, the admin login (ROUTER_ADMIN_PASSWORD), registers the appliance's local model server, populates the model catalog from the image's vendored pricing snapshot, and applies the local-first default policy pack. The script itself is idempotent (a re-run only re-applies the admin password), but the appliance runs it EXACTLY ONCE — state.apps.<slug>.seeded gates it and disable-app never clears that flag. To re-run by hand: sudo docker exec vibe-ai-router-console node dist/src/ops/bootstrap-firm.js. This is NOT the app's dev seed (which creates a demo firm with a published password)."
   },
 
   "health": "/healthz",
