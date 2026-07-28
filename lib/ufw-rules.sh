@@ -160,8 +160,92 @@ except Exception:
     _ufw_allow_silent "192.168.0.0/16" "9090" "tcp" "cockpit RFC1918 (LAN mode)"
   fi
 
+  # ---- DOCKER-USER — make the rules above actually apply to containers -
+  _apply_docker_user_rules "$tailscale_enabled"
+
   state_set_host_service ufw "active" "rules applied" 2>/dev/null || true
   log_ok "ufw rules applied"
+}
+
+# Emergency ports are published by DOCKER (the emergency-proxy service), and
+# Docker-published ports DO NOT traverse the INPUT chain that `ufw allow/deny`
+# writes to: they are DNAT'd in nat/PREROUTING and filtered via FORWARD →
+# DOCKER. The allow/deny pairs above therefore never see that traffic, so on a
+# host with a public IP (every DO droplet) ports 5171-5198 were reachable from
+# the internet even though `ufw status` showed them denied.
+#
+# Docker consults the DOCKER-USER chain first and never flushes it, so that is
+# where container-bound policy belongs. Writing it into /etc/ufw/after.rules
+# (rather than calling iptables directly) means the rules reload with UFW at
+# boot — raw iptables rules would vanish on reboot.
+#
+# Matching uses conntrack's ORIGINAL destination port: the port the client
+# actually asked for, before DNAT rewrote it to the container's port.
+_UFW_AFTER_RULES="${_UFW_AFTER_RULES:-/etc/ufw/after.rules}"
+_VIBE_BLOCK_BEGIN="# BEGIN VIBE DOCKER-USER (managed by lib/ufw-rules.sh — do not edit)"
+_VIBE_BLOCK_END="# END VIBE DOCKER-USER"
+
+_apply_docker_user_rules() {
+  local tailscale_enabled="$1"
+
+  if [[ -e "$_UFW_AFTER_RULES" && ! -w "$_UFW_AFTER_RULES" ]]; then
+    log_warn "cannot write $_UFW_AFTER_RULES — docker-published emergency ports stay unfiltered" \
+             ports="$_EMERGENCY_PORT_RANGE"
+    return 0
+  fi
+
+  local tailnet_rule=""
+  if [[ "$tailscale_enabled" == "true" ]]; then
+    tailnet_rule="-A DOCKER-USER -p tcp -m conntrack --ctorigdstport ${_EMERGENCY_PORT_RANGE} -s 100.64.0.0/10 -j RETURN"
+  fi
+
+  local block
+  block="$(cat <<EOF
+${_VIBE_BLOCK_BEGIN}
+# Container-bound policy for the emergency-access ports, mirroring the ufw
+# allow/deny pairs — which cannot see Docker-published traffic.
+*filter
+:DOCKER-USER - [0:0]
+-A DOCKER-USER -p tcp -m conntrack --ctorigdstport ${_EMERGENCY_PORT_RANGE} -s 127.0.0.0/8 -j RETURN
+-A DOCKER-USER -p tcp -m conntrack --ctorigdstport ${_EMERGENCY_PORT_RANGE} -s 10.0.0.0/8 -j RETURN
+-A DOCKER-USER -p tcp -m conntrack --ctorigdstport ${_EMERGENCY_PORT_RANGE} -s 172.16.0.0/12 -j RETURN
+-A DOCKER-USER -p tcp -m conntrack --ctorigdstport ${_EMERGENCY_PORT_RANGE} -s 192.168.0.0/16 -j RETURN
+${tailnet_rule}
+-A DOCKER-USER -p tcp -m conntrack --ctorigdstport ${_EMERGENCY_PORT_RANGE} -j DROP
+COMMIT
+${_VIBE_BLOCK_END}
+EOF
+)"
+  block="$(printf '%s\n' "$block" | sed '/^$/d')"   # drop the gap when tailnet_rule is empty
+
+  local current=""
+  [[ -f "$_UFW_AFTER_RULES" ]] && current="$(cat "$_UFW_AFTER_RULES")"
+
+  # Strip any previously-managed block, then append the current one. Keeps this
+  # idempotent across re-runs and correct when the tailnet rule appears or
+  # disappears (Tailscale toggled after first bootstrap).
+  local stripped desired
+  stripped="$(printf '%s\n' "$current" | sed "\|^${_VIBE_BLOCK_BEGIN}\$|,\|^${_VIBE_BLOCK_END}\$|d")"
+  desired="$(printf '%s\n\n%s' "$(printf '%s\n' "$stripped" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')" "$block")"
+
+  if [[ "$current" == "$desired" ]]; then
+    log_info "DOCKER-USER rules already current" ports="$_EMERGENCY_PORT_RANGE"
+    return 0
+  fi
+
+  if ! printf '%s\n' "$desired" > "$_UFW_AFTER_RULES"; then
+    log_warn "failed writing DOCKER-USER rules to $_UFW_AFTER_RULES"
+    return 0
+  fi
+  log_ok "DOCKER-USER rules written" file="$_UFW_AFTER_RULES" ports="$_EMERGENCY_PORT_RANGE"
+
+  # Reload so the rules take effect now rather than at next boot. Failure is
+  # non-fatal (the file is still correct for the next boot) but must be visible.
+  if ufw reload >/dev/null 2>&1; then
+    log_ok "ufw reloaded — docker-published emergency ports are now filtered"
+  else
+    log_warn "ufw reload failed; DOCKER-USER rules apply after the next reboot or 'ufw reload'"
+  fi
 }
 
 # Internal: ufw allow with deduped logging. Returns 0 even if rule
