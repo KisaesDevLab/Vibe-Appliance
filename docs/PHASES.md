@@ -1789,3 +1789,37 @@ Append to this list as phases complete. Format:
   Validation: 9 manifests pass the invariant tests; routing tests extended
   for the new flag; `bash -n` clean on enable-app/secrets/doctor/ufw-rules/
   render-caddyfile/cloudflared-up; `node --check` clean on server.js.
+
+- Vibe-1099 image publication verified + enable-path QA, 2026-07-28 by
+  Claude (Opus 5). Upstream's v0.1.0 release (Release workflow, run
+  30369661501) published all three images — vibe1099-app / -web / -render,
+  `0.1.0` + `latest`, public, anonymously pullable — clearing the "no GHCR
+  build" blocker recorded 2026-07-24. Live enable simulation against those
+  images (shared ParadeDB + Redis db 7, all four services) found three
+  things:
+
+  1. **LAN/Tailscale enable is blocked by upstream boot validation** — the
+     api and worker crash-loop on `APP_BASE_URL must be https:// in
+     production`, which is exactly what those modes render. Domain mode is
+     fully green: migrations advisory-locked across the concurrent
+     api+worker start, `/api/status` 200 with postgres/redis/render/queues
+     all ok, nginx `/api` proxy and the internal `render` alias wired.
+     Upstream Vibe-1099 PR #4 adds `ALLOW_HTTP_BASE_URLS=1` (base URLs
+     only; IRS/provider endpoints stay https-only unconditionally, with
+     tests pinning that). The appliance template sets the flag already —
+     v0.1.0 ignores the unknown key, so nothing changes until a release
+     containing it ships. Until then: DOMAIN MODE ONLY, per
+     DEPLOYMENT_CHECKLIST.
+  2. **The render sidecar's healthcheck could never pass** — the image
+     ships neither wget nor curl, so the overlay's wget probe failed every
+     tick and the container sat permanently "unhealthy" (never blocking
+     enable — depends_on only asks service_started — but alarming every
+     surface that reads docker health). Now probes with the image's own
+     python3/urllib; verified healthy live.
+  3. **vibe-1099 is the second rootServedOnly app** — vibe1099-web ships
+     stock nginx entrypoints and absolute /assets/* URLs (verified in the
+     image), which the env template had warned about since import without
+     anything enforcing it. Manifest now declares the flag: root-served
+     vhost at 1099.<domain> in BOTH domain routing modes, :5176 as the
+     LAN/Tailscale path, renderer emits no /1099/ mount anywhere
+     (verified across all three mode renders).

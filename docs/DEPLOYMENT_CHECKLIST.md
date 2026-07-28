@@ -22,9 +22,13 @@ Everything here is doable by one operator with a droplet, a domain, and
 - [ ] For **DNS-01 wildcard** (opt-in, firewalled :80): same token but
       **Zone:DNS:Edit** only, plus the custom Caddy build (see PLAN §4.1).
 - [ ] Confirm the app images you plan to enable are published (they are —
-      see §8 image-availability table). **`vibe-1099` is NOT installable
-      yet — its GHCR images are unpublished; skip it until upstream ships
-      them.**
+      see §8 image-availability table; `vibe-1099`'s three images published
+      2026-07-28 with the upstream v0.1.0 release). **`vibe-1099` currently
+      requires DOMAIN mode**: the v0.1.0 api/worker refuse plain-http base
+      URLs at boot, which is what LAN/Tailscale modes render. Upstream
+      Vibe-1099 PR #4 (`ALLOW_HTTP_BASE_URLS`) lifts that once it ships in
+      a tagged release — the appliance's env template already sets the
+      flag, which v0.1.0 ignores.
 
 ## 1. Provision the host (canonical target)
 
@@ -98,8 +102,10 @@ For each app you want (`vibe-tb`, `vibe-mybooks`, …) in **/admin → Apps**:
   (e.g. `vibe.firm.example/tb/`). One cert, one tunnel CNAME.
 - **subdomain-per-app:** apps at `https://<subdomain>.<domain>/` (root),
   one CNAME + tunnel ingress rule per app; per-app subdomain editable in
-  Settings → Network. **Required** for apps whose SPA is root-base only
-  (e.g. `vibe-1099`).
+  Settings → Network. Root-base-only SPAs (`vibe-1099`, `vibe-ai-router`)
+  no longer force this mode: their manifests declare `rootServedOnly`,
+  which gives them a root-served vhost at their own subdomain in BOTH
+  routing modes (see docs/addenda/emergency-access.md).
 
 If you switch modes or change a subdomain:
 
@@ -139,7 +145,7 @@ GHCR and update-ready (audited 2026-07-24):
 | vibe-tax-research | vibe-tax-api | vibe-tax-web | — | ✅ |
 | vibe-calculators | vibe-calculators-server | vibe-calculators-client | — | ✅ |
 | vibe-tx-converter | vibe-tx-converter | — | — | ✅ |
-| **vibe-1099** | vibe1099-app | vibe1099-web | render | **❌ not published** |
+| vibe-1099 | vibe1099-app | vibe1099-web | render | ✅ (2026-07-28, v0.1.0 — LAN/Tailscale enable blocked until upstream PR #4 ships; see Known blockers) |
 | vibe-ai-router | vibe-ai-router | — | — | ✅ |
 
 (`vibe-glm-ocr` and `vibe-shield` were removed from the appliance — 2026-07-24.)
@@ -173,10 +179,15 @@ alone being healthy is not enough.
 
 ## Known blockers & gotchas (from the 2026-07-24 pre-deploy audit)
 
-- **`vibe-1099` can't install** until its GHCR images publish (upstream has
-  only `ci.yml`, no image-publish workflow) — and it needs
-  `DOMAIN_ROUTING_MODE=subdomain-per-app` (root-base SPA). Its demo `pnpm
-  seed` injects demo data + `admin@demo.firm` — do NOT run it in production.
+- **`vibe-1099` is DOMAIN-mode-only for now** (images published 2026-07-28,
+  v0.1.0 + latest, verified anonymously pullable). The v0.1.0 api/worker
+  crash-loop on the plain-http base URLs LAN/Tailscale modes render
+  ("APP_BASE_URL must be https:// in production") — upstream PR #4
+  (`ALLOW_HTTP_BASE_URLS`) fixes it; the appliance env template already
+  sets the flag for when that release ships. Routing mode no longer
+  matters: the manifest's `rootServedOnly` serves it at `1099.<domain>` in
+  both modes. Its demo `pnpm seed` injects demo data + `admin@demo.firm` —
+  do NOT run it in production.
 - **Per-app subdomain routing (PR #3) is unmerged** — merge it before relying
   on `subdomain-per-app`.
 - **`vibe-tax-research` container rename (this branch):** containers/services

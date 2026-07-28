@@ -38,7 +38,13 @@ services:
     expose:
       - "8212"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8212/health >/dev/null 2>&1 || exit 1"]
+      # python3, not wget/curl: the v0.1.0 render image (python-slim +
+      # WeasyPrint) ships NEITHER, so the previous wget probe failed on
+      # every tick and the container sat permanently "unhealthy" — never
+      # blocking enable (depends_on only asks for service_started) but
+      # alarming every operator and tool that reads docker health.
+      # Verified against the published image: /health answers 200.
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8212/health',timeout=4).status==200 else 1)\""]
       interval: 10s
       timeout: 5s
       retries: 12

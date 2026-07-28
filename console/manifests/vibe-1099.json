@@ -4,7 +4,7 @@
   "displayName": "Vibe 1099",
   "description": "1099 preparation, recipient delivery, and IRS IRIS A2A e-filing.",
   "logo": "vibe-1099.svg",
-  "_doc": "Imported from KisaesDevLab/Vibe-1099 appliance/manifest.yaml (Addendum A). Upstream ships no .appliance/manifest.json yet, so this in-tree copy is authoritative until it does (Phase 5 convention).",
+  "_doc": "Imported from KisaesDevLab/Vibe-1099 appliance/manifest.yaml (Addendum A). Upstream ships no .appliance/manifest.json yet, so this in-tree copy is authoritative until it does (Phase 5 convention). ROOT-SERVED ONLY (flag set 2026-07-28, v0.1.0 images): vibe1099-web ships stock nginx entrypoints (no 40-base-path.sh) and its bundle asks for /assets/* at absolute root, so a /1099/ path mount serves a blank page — the env template warned about this since import; the flag is what enforces it. Root-served vhost at 1099.<domain> in BOTH domain routing modes; :5176 is the access path in LAN/Tailscale. Drop the flag if upstream adds base-path support (same condition as vibe-ai-router).",
 
   "image": {
     "server":     "ghcr.io/kisaesdevlab/vibe1099-app",
@@ -15,9 +15,10 @@
     ]
   },
 
-  "subdomain":     "1099",
-  "emergencyPort": 5176,
-  "ports":         { "server": 8210, "client": 8211 },
+  "subdomain":      "1099",
+  "emergencyPort":  5176,
+  "rootServedOnly": true,
+  "ports":          { "server": 8210, "client": 8211 },
 
   "routing": {
     "default_upstream": "vibe1099-web:8211",
