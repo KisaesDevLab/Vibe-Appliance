@@ -1024,6 +1024,19 @@ PYEOF
   fi
   [[ -z "$master_key" ]] && master_key="$(openssl rand -base64 32 | tr -d '\n')"
 
+  # Vibe-AI-Router's first-login admin password (ROUTER_ADMIN_PASSWORD). Same
+  # generate-once-preserve-forever shape as gateway_admin_key, surfaced the same
+  # two ways: the console's First-login card (manifest firstLogin.passwordEnvKey)
+  # and /opt/vibe/CREDENTIALS.txt. Preserved so a re-enable doesn't silently
+  # invalidate the password the operator wrote down — the router's bootstrap
+  # re-applies whatever value is here on every run. Harmless on slugs whose
+  # template doesn't reference @ROUTER_ADMIN_PASSWORD@.
+  local router_admin_password=""
+  if [[ -f "$out" ]]; then
+    router_admin_password="$(_extract_env_value "$out" "ROUTER_ADMIN_PASSWORD")"
+  fi
+  [[ -z "$router_admin_password" ]] && router_admin_password="$(openssl rand -hex 32)"
+
   # DB and redis target details from manifest.
   local db_name db_user
   db_name="$(_manifest_field "$manifest" 'data.get("database",{}).get("name","")')"
@@ -1060,14 +1073,14 @@ PYEOF
       "$vite_base_path" "$session_secure" "$intake_key" \
       "$vs_kek" "$gateway_admin_key" \
       "$staff_app_url" "$client_portal_url" \
-      "$master_key" <<'PYEOF'
+      "$master_key" "$router_admin_password" <<'PYEOF'
 import base64, sys
 src, dst, allowed_origin, database_url, redis_url, \
     encryption_key, jwt_secret, db_name, db_user, db_pass, \
     vite_base_path, session_secure, intake_key, \
     vs_kek, gateway_admin_key, \
     staff_app_url, client_portal_url, \
-    master_key = sys.argv[1:19]
+    master_key, router_admin_password = sys.argv[1:20]
 # Some upstream apps want the appliance's 32-byte AES key as base64 (32
 # raw bytes -> 44-char base64 with padding) rather than the hex form
 # we ship in shared.env. Derive it once here so per-app templates can
@@ -1099,6 +1112,7 @@ body = body.replace("@CONNECT_INTAKE_ENCRYPTION_KEY@", intake_key)
 body = body.replace("@VS_KEK@",             vs_kek)
 body = body.replace("@GATEWAY_ADMIN_KEY@",  gateway_admin_key)
 body = body.replace("@MASTER_KEY@",         master_key)
+body = body.replace("@ROUTER_ADMIN_PASSWORD@", router_admin_password)
 body = body.replace("@STAFF_APP_URL@",      staff_app_url)
 body = body.replace("@CLIENT_PORTAL_URL@",  client_portal_url)
 with open(dst, "w") as f:

@@ -89,7 +89,8 @@ Reserved range: `:5171–:5199`. Within that, app categories get blocks with gap
 | *(reserved)* | | `:5183–:5190` | Future messaging apps |
 | Vibe-Tax-Research-Chat | default | `:5191` | AI/research |
 | Vibe-Payroll-Time | default | `:5192` | AI/operations |
-| *(reserved)* | | `:5193–:5196` | Future AI/operations apps |
+| Vibe-AI-Router | staff admin console | `:5193` | AI/operations — **primary** access path, not a fallback (no public vhost by design) |
+| *(reserved)* | | `:5194–:5196` | Future AI/operations apps |
 | Portainer | (admin tool) | `:5197` | v1.2 — infra fallback; UI for container ops when Caddy/DNS/cert is broken |
 | Duplicati | (admin tool) | `:5198` | v1.2 — infra fallback; UI for backup config when Caddy/DNS/cert is broken |
 | Cockpit | (admin tool) | native `:9090` | Already binds the host port directly (separate UFW allow); not behind HAProxy |
@@ -97,10 +98,40 @@ Reserved range: `:5171–:5199`. Within that, app categories get blocks with gap
 
 Vibe-GLM-OCR (`:none`, internal-only) and Vibe-Shield (`:5193`/`:5194`) were
 removed from the appliance on 2026-07-24; their ports returned to the
-reserved pool. Adding an app means: `emergencyPort` in its manifest **and**
-a matching publish line in `docker-compose.yml`'s `emergency-proxy` service.
+reserved pool. Vibe-AI-Router — the routing-layer replacement for the Shield
+concept — reclaimed `:5193` on 2026-07-27 for its admin console (its `/v1`
+gateway runs as a separate container that is never published). Adding an app
+means: `emergencyPort` in its manifest **and** a matching publish line in
+`docker-compose.yml`'s `emergency-proxy` service.
 `tests/manifests/validate-manifests.test.js` fails the build if those two
 ever disagree.
+
+### UFW does not cover these ports on its own
+
+Docker publishes the emergency ports, and **Docker-published traffic never
+traverses the INPUT chain** that `ufw allow`/`ufw deny` writes to: it is
+DNAT'd in `nat/PREROUTING` and filtered through `FORWARD → DOCKER`. Until
+2026-07-27 that meant `:5171–:5198` were reachable from the internet on any
+host with a public IP — every DO droplet — while `ufw status` displayed them
+as denied.
+
+`lib/ufw-rules.sh` now also writes a managed `DOCKER-USER` block into
+`/etc/ufw/after.rules` (so it reloads at boot, unlike raw `iptables` rules)
+applying the same RFC1918 + loopback + optional Tailscale-CGNAT allow-list
+and a catch-all `DROP`, matched on conntrack's ORIGINAL destination port so
+it is correct regardless of host→container port mapping. The block is
+regenerated idempotently and tracks the Tailscale toggle.
+
+Verify on a live host:
+
+```bash
+sudo iptables -L DOCKER-USER -n --line-numbers   # allow-list then DROP
+sudo ss -tlnp | grep 519                          # what is actually bound
+```
+
+If you do not run UFW, `after.rules` is never loaded — use a cloud-provider
+firewall instead, or these ports stay open to anything that can route to the
+host.
 
 Why not `:5173`? Vite cemented it as the dev-server default. Customers debugging will stumble over it. Not worth the muscle-memory collision.
 

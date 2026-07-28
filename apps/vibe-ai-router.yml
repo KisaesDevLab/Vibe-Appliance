@@ -1,0 +1,84 @@
+# apps/vibe-ai-router.yml — Vibe AI Router overlay.
+#
+# TWO services from ONE image, split by ROUTER_ROLE so the two surfaces can have different
+# exposure. They previously shared a port, which meant publishing the console also published
+# the gateway — the reason the app was internal-only before this split:
+#
+#   vibe-ai-router          → ROUTER_ROLE=gateway, :8220. The app-facing /v1 API. Authenticates
+#                             with app tokens and spends the firm's AI budget, so it is NEVER
+#                             routed through Caddy or the tunnel. Other Vibe apps reach it at
+#                             http://vibe-ai-router:8220 on vibe_net. This is the "server"
+#                             image the console inspects for build version and update.sh tags
+#                             for rollback, hence container_name = basename(image).
+#   vibe-ai-router-console  → ROUTER_ROLE=console, :8222. Staff admin UI + /admin-api.
+#                             Session-authenticated and CSRF-guarded, so it is safe behind
+#                             Caddy/TLS — this is the manifest's routing.default_upstream and
+#                             the emergency-port (:5193) backend.
+#
+# Both processes talk to the same shared Postgres database and hold the same MASTER_KEY (the
+# console needs it to store credentials; the gateway needs it to use them). Redis is unused —
+# breaker/rate-limit/cache state is per-process by design.
+#
+# Migrations run in the GATEWAY's CMD before it serves; the console waits for the gateway to be
+# healthy so two processes never race the same migration. The manifest's `seed` block then runs
+# the production bootstrap against the gateway container.
+
+name: vibe
+
+services:
+  vibe-ai-router:
+    image: ghcr.io/kisaesdevlab/vibe-ai-router:${APP_TAG:-latest}
+    container_name: vibe-ai-router
+    restart: unless-stopped
+    init: true
+    environment:
+      ROUTER_ROLE: gateway
+      PORT: "8220"
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-ai-router.env
+    networks:
+      vibe_net: {}
+    expose:
+      - "8220"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8220/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  vibe-ai-router-console:
+    image: ghcr.io/kisaesdevlab/vibe-ai-router:${APP_TAG:-latest}
+    container_name: vibe-ai-router-console
+    restart: unless-stopped
+    init: true
+    environment:
+      ROUTER_ROLE: console
+      PORT: "8222"
+      # Migrations already ran in the gateway container; the console only serves.
+      SKIP_MIGRATIONS: "1"
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-ai-router.env
+    networks:
+      vibe_net: {}
+    expose:
+      - "8222"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # also serialises migrations: the gateway is healthy (hence migrated) before this starts
+      vibe-ai-router:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8222/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 30s

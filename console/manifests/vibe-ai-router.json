@@ -1,0 +1,109 @@
+{
+  "schemaVersion": 1,
+  "slug": "vibe-ai-router",
+  "displayName": "Vibe AI Router",
+  "description": "Sole AI egress point for the suite: task-class policy, data protection, and cost accounting.",
+  "_doc": "In-tree manifest for KisaesDevLab/Vibe-AI-Router v1.0.0. Replaces the scrapped Vibe-Shield concept with routing-layer enforcement; inherits Shield's :5193 emergency port (returned to the pool 2026-07-24). TWO containers from one image (ROUTER_ROLE): the CONSOLE (8222) is the staff admin UI and is the only surface Caddy fronts; the GATEWAY (8220) serves /v1 for other Vibe apps and is never routed publicly — apps reach it by container DNS on vibe_net. Splitting the roles is what allows the console to have TLS without publishing the gateway with it.",
+
+  "image": {
+    "server":     "ghcr.io/kisaesdevlab/vibe-ai-router",
+    "defaultTag": "latest"
+  },
+
+  "subdomain":     "airouter",
+  "subdomains": [
+    {
+      "name":          "airouter",
+      "audience":      "staff",
+      "emergencyPort": 5193,
+      "emergencyNote": "Admin console fallback. In domain mode cookies are Secure, so sign-in over plain HTTP won't work — use this to confirm the service is up, then fix TLS/DNS. The /v1 gateway is never published."
+    }
+  ],
+  "userFacing":    false,
+  "ports":         { "server": 8220, "client": 8222 },
+
+  "routing": {
+    "default_upstream": "vibe-ai-router-console:8222"
+  },
+
+  "depends": ["postgres"],
+
+  "env": {
+    "required": [
+      { "name": "DATABASE_URL",          "from": "database-url" },
+      { "name": "MASTER_KEY",            "from": "generated:base64-32bytes", "secret": true,
+        "doc": "Vault master key. Wraps every per-credential data key; losing it means re-entering every provider API key. Generated once and preserved across re-renders. EXCLUDED from the Vault backup set by design — escrow separately (the app's docs/runbook.md)." },
+      { "name": "SESSION_SECRET",        "from": "generated:hex32", "secret": true,
+        "doc": "Signs admin console session cookies. Rotating it invalidates open sessions (harmless)." },
+      { "name": "ROUTER_ADMIN_PASSWORD", "from": "generated:hex32", "secret": true,
+        "doc": "First-login password for the admin console, generated on enable and surfaced in CREDENTIALS.txt / the console's first-login card." }
+    ],
+    "optional": [
+      {
+        "name": "ROUTER_ADMIN_EMAIL",
+        "value": "admin@appliance.local",
+        "doc": "Login for the router's admin console. Change before enabling if you want a real address; the bootstrap resets the password to ROUTER_ADMIN_PASSWORD on every re-enable.",
+        "ui": {
+          "tier":      1,
+          "category":  "AI",
+          "label":     "Router admin email",
+          "helpText":  "The email you sign in with at the AI Router console. Changing it creates a second admin rather than renaming the first.",
+          "input":     "text",
+          "appliance": "per-app",
+          "validate":  "email"
+        }
+      },
+      {
+        "name": "LOCAL_MODEL_BASE_URL",
+        "value": "http://vibellm:11434/v1",
+        "doc": "OpenAI-compatible endpoint of the appliance's own model server. Must stay a LAN/docker address — the router rejects a 'local' provider pointed at a public host (that would be a covert cloud route around the data boundary).",
+        "ui": {
+          "tier":      1,
+          "category":  "AI",
+          "label":     "Local model server URL",
+          "helpText":  "Where the on-appliance model server listens, e.g. http://vibellm:11434/v1. Every local-only task class is served from here and never leaves the appliance.",
+          "input":     "text",
+          "appliance": "per-app",
+          "validate":  "url"
+        }
+      },
+      {
+        "name": "LOCAL_MODEL_ID",
+        "value": "ollama/qwen3:14b",
+        "doc": "Canonical id (family/native-name) of the model the local server actually serves. Registered as a custom catalog entry at $0 and used as the default for every local-only task class.",
+        "ui": {
+          "tier":      1,
+          "category":  "AI",
+          "label":     "Local model",
+          "helpText":  "The model your local server serves, as family/name (e.g. ollama/qwen3:14b). This is what classification, extraction, and other local-only tasks run on.",
+          "input":     "text",
+          "appliance": "per-app",
+          "validate":  "regex:^[a-z0-9_-]+/[A-Za-z0-9_.:-]+$"
+        }
+      },
+      {
+        "name": "SCRUBBER_MODE_NOTE",
+        "value": "",
+        "doc": "Placeholder: the scrubber mode is firm state, edited in the router's own console (Firm settings), not an env var. Listed here so operators searching Settings for it are pointed at the right place."
+      }
+    ]
+  },
+
+  "database": { "name": "vibe_ai_router_db", "user": "vibeairouter" },
+
+  "firstLogin": {
+    "type": "default-credentials-passive",
+    "username": "admin@appliance.local",
+    "passwordEnvKey": "ROUTER_ADMIN_PASSWORD",
+    "url": "/",
+    "note": "Sign in at the app's own subdomain over HTTPS. The username is whatever ROUTER_ADMIN_EMAIL was set to at enable time. Change the password in the console after first sign-in; the appliance only resets it if the app is re-enabled. NOTE: only the ADMIN CONSOLE is published — the /v1 gateway other apps call runs in a separate container that is never routed publicly."
+  },
+
+  "seed": {
+    "command": ["node", "dist/src/ops/bootstrap-firm.js"],
+    "description": "Production first-run bootstrap: creates the firm, the admin login (ROUTER_ADMIN_PASSWORD), registers the appliance's local model server, populates the model catalog from the image's vendored pricing snapshot, and applies the local-first default policy pack. Idempotent — re-running only resets the admin password. This is NOT the app's dev seed (which creates a demo firm with a published password)."
+  },
+
+  "health": "/healthz",
+  "health_timeout_s": 180
+}
