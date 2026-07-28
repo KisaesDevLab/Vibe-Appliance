@@ -503,6 +503,85 @@ PYEOF
     app_emergency_lines="  (could not read console/manifests — see the admin console's Emergency Access panel)"
   fi
 
+  # Per-app first-login credentials. lib/enable-app.sh re-runs this
+  # function after every successful enable precisely so that app
+  # passwords the APPLIANCE generates (rather than bakes into a
+  # manifest) reach the operator's one archived file — but until now
+  # nothing here read them, so the promise in those manifests was
+  # false and the values lived only in /opt/vibe/env/<slug>.env.
+  #
+  # Manifest-driven, no per-app branching: any manifest whose
+  # firstLogin block names a `passwordEnvKey` gets its live value read
+  # out of the rendered env file at write time; a static `password`
+  # is printed as-is. Apps that are not enabled are skipped — their
+  # env file may not exist yet, and an unenabled app has no login.
+  local app_login_lines
+  app_login_lines="$(python3 - \
+      "${APPLIANCE_DIR:-/opt/vibe/appliance}/console/manifests" \
+      "$VIBE_ENV_DIR" "$VIBE_STATE_FILE" <<'PYEOF' 2>/dev/null || true
+import json, os, sys
+manifests_dir, env_dir, state_path = sys.argv[1:4]
+
+try:
+    apps_state = (json.load(open(state_path)).get("apps") or {})
+except Exception:
+    apps_state = {}
+
+
+def env_value(slug, key):
+    """First assignment of `key` in the app's rendered env file."""
+    path = os.path.join(env_dir, f"{slug}.env")
+    try:
+        with open(path) as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip() == key:
+                    return v
+    except OSError:
+        pass
+    return ""
+
+
+rows = []
+try:
+    names = sorted(os.listdir(manifests_dir))
+except OSError:
+    names = []
+for fname in names:
+    if not fname.endswith(".json") or fname.startswith("_"):
+        continue
+    try:
+        m = json.load(open(os.path.join(manifests_dir, fname)))
+    except Exception:
+        continue
+    slug = m.get("slug") or fname[:-5]
+    if not (apps_state.get(slug) or {}).get("enabled"):
+        continue
+    fl = m.get("firstLogin") or {}
+    if fl.get("type") in (None, "no-auth", "none", "setup-wizard"):
+        continue
+    key = fl.get("passwordEnvKey")
+    password = env_value(slug, key) if key else (fl.get("password") or "")
+    if not password:
+        # Declared but unreadable — say so rather than printing a blank
+        # line the operator would read as "no password needed".
+        password = f"(not found in {slug}.env — re-run the app's Enable)"
+    rows.append((m.get("displayName") or slug, fl.get("username") or "(see the app)", password))
+
+for label, user, pw in rows:
+    print(f"  {label}")
+    print(f"    Username:  {user}")
+    print(f"    Password:  {pw}")
+    print()
+PYEOF
+)"
+  if [[ -z "$app_login_lines" ]]; then
+    app_login_lines="  (no enabled app declares default credentials — check the admin console's First-login panel)"
+  fi
+
   cat >"$tmp" <<EOF
 ================================================================
  Vibe Appliance — credentials
@@ -551,6 +630,15 @@ Infra fallback ports (admin tools — always-up with the core stack):
 For live per-app status, open the admin console "Emergency Access"
 panel at ${server_url}/admin.
 
+================================================================
+ PER-APP FIRST LOGIN (enabled apps only)
+================================================================
+Sign in with these the first time you open each app, then change the
+password inside the app. Values are read live from /opt/vibe/env/ at
+the moment this file was written — re-run bootstrap.sh (or enable
+another app) to refresh it.
+
+${app_login_lines}
 ================================================================
  DUPLICATI (backup configuration UI)
 ================================================================
