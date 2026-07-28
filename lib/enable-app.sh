@@ -1038,7 +1038,20 @@ PYEOF
   # SESSION_SECURE) must be told the truth: marking a cookie Secure when
   # the user is on plain HTTP makes the browser refuse to send it back,
   # which 401s every authenticated request immediately after login.
+  #
+  # rootServedOnly exception in TAILSCALE mode: such an app has no HTTPS
+  # path there at all — `tailscale serve` fronts the :80 catch-all, which
+  # path-mounts apps, and rootServedOnly apps are exactly the ones that
+  # can't be path-mounted. Their ONLY surface is the plain-HTTP emergency
+  # port, so Secure cookies would make sign-in impossible in that mode
+  # (the browser accepts the Set-Cookie and then never sends it back).
+  # `false` is also the honest value: the cookie's only transport is
+  # inside the WireGuard tunnel. Domain mode keeps `true` — there the
+  # app has a real HTTPS vhost and the plain-HTTP port is a status-check
+  # fallback, as its emergencyNote documents.
   if [[ "$mode" == "lan" ]]; then
+    session_secure="false"
+  elif [[ "$mode" == "tailscale" && "$root_served" == "true" ]]; then
     session_secure="false"
   else
     session_secure="true"

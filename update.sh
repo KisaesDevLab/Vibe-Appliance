@@ -623,11 +623,54 @@ _wait_for_health() {
   while (( $(date +%s) < deadline )); do
     if docker exec vibe-console curl -fsS -o /dev/null --max-time 5 \
          "http://${upstream}${health}" >>"$VIBE_LOG_FILE" 2>&1; then
-      return 0
+      # Main surface is up; now every manifest.health_extra[] target must
+      # answer too. This is the UPDATE-path counterpart of enable-app.sh's
+      # _wait_for_extra_health, and it matters more here: the routing
+      # upstream is the only tier the caller checks before declaring the
+      # update a success, so a new image whose unproxied tier is broken
+      # (vibe-ai-router's /v1 gateway) would otherwise pass the health
+      # gate and NEVER trigger the rollback that is this script's whole
+      # safety story. Failing here routes into _do_rollback like any
+      # other health timeout.
+      _wait_for_extra_health "$slug" "$manifest" && return 0
+      return 1
     fi
     sleep 3
   done
   return 1
+}
+
+# Probe every manifest.health_extra[] target. Runs after the main health
+# probe succeeds, so these containers — dependencies of the proxied tier —
+# have already had the full window to come up; 60s of additional grace
+# mirrors the enable-side helper. Duplicated from lib/enable-app.sh rather
+# than sourced, same policy as _app_services: update.sh stays standalone.
+_wait_for_extra_health() {
+  local slug="$1" manifest="$2"
+  local targets
+  # Plain join, not an f-string — escaped quotes inside an f-string reach
+  # _manifest_field's eval() as an illegal escape and the whole check
+  # silently disappears (see the note in lib/enable-app.sh).
+  targets="$(_manifest_field "$manifest" '"\n".join(" ".join([e["name"], e["upstream"], e["path"]]) for e in (data.get("health_extra") or []))')"
+  [[ -n "$targets" ]] || return 0
+
+  local name upstream path deadline rc=0
+  while read -r name upstream path; do
+    [[ -n "$name" ]] || continue
+    log_step "waiting for $slug/$name health" upstream="$upstream" path="$path"
+    deadline=$(( $(date +%s) + 60 ))
+    while (( $(date +%s) < deadline )); do
+      if docker exec vibe-console curl -fsS -o /dev/null --max-time 5 \
+           "http://${upstream}${path}" >>"$VIBE_LOG_FILE" 2>&1; then
+        log_ok "$slug/$name is healthy"
+        continue 2
+      fi
+      sleep 3
+    done
+    log_error "$slug/$name did not answer http://${upstream}${path} within 60s"
+    rc=1
+  done <<< "$targets"
+  return "$rc"
 }
 
 _do_rollback() {
