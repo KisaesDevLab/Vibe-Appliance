@@ -176,6 +176,13 @@
           "type": "string",
           "pattern": "^[a-z0-9.-]+:[0-9]+$"
         },
+        "deny_paths": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^/.*$", "maxLength": 200 },
+          "description": "Paths Caddy answers with 404 instead of proxying, emitted ahead of every other handler for this app. For endpoints an app serves that are fine on vibe_net and on the UFW-gated emergency port but should not be world-readable once the app is fronted by Caddy — vibe-ai-router's unauthenticated /metrics (per-task-class request counts, provider names, breaker state) is the motivating case. NOT an authorization mechanism: it only closes the public edge, so anything reachable from inside vibe_net stays reachable there."
+        },
         "matchers": {
           "type": "array",
           "items": {
@@ -276,6 +283,30 @@
       "minimum": 30,
       "maximum": 900,
       "description": "How long to wait for the app's /health endpoint to respond 200 during enable / update before declaring failure. Default 120. Apps that load large models (e.g. Vibe-GLM-OCR's vision model) may need 300+."
+    },
+
+    "health_extra": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "description": "Additional containers to health-check on enable and in doctor.sh, beyond the routing-derived one. `health` alone probes routing.matchers[0].upstream (or default_upstream), which is the surface Caddy fronts — an app whose other tier is never proxied (vibe-ai-router's /v1 gateway) would otherwise be reported healthy while that tier is down. Each entry must name a container the app's own overlay declares.",
+      "items": {
+        "type": "object",
+        "required": ["name", "upstream", "path"],
+        "additionalProperties": false,
+        "properties": {
+          "name":     { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$", "maxLength": 40 },
+          "upstream": { "type": "string", "pattern": "^[a-z0-9.-]+:[0-9]+$" },
+          "path":     { "type": "string", "pattern": "^/.*$", "maxLength": 200 },
+          "doc":      { "type": "string", "maxLength": 400 }
+        }
+      }
+    },
+
+    "rootServedOnly": {
+      "type": "boolean",
+      "default": false,
+      "description": "Set true when the app's web bundle requests assets from absolute root paths and its image has no base-path switch (no /docker-entrypoint.d/40-base-path.sh, no VITE_BASE_PATH). Such an app CANNOT be mounted at /<prefix>/: the shell loads and every asset request resolves against the host root — the appliance console — so the operator gets a blank page with a 200. The renderer then emits no path handler for it in any mode and gives it a root-served vhost at its own subdomain in domain mode, in BOTH routing modes. LAN/Tailscale has no per-app hostname to offer, so its emergency port becomes the access path and the console advertises that instead. Prefer fixing the app: adding base-path support upstream lets it path-mount like every other Vibe app and this flag can be dropped."
     },
 
     "migrations": {

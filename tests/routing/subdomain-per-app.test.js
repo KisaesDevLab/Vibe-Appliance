@@ -71,6 +71,18 @@ function mkFixtures() {
     env: { required: [] }, health: '/h',
   });
 
+  // An app whose bundle can't live under a path prefix: root-served in
+  // BOTH routing modes, and it declares a denied path.
+  write(path.join(manifests, 'vibe-router.json'), {
+    schemaVersion: 1, slug: 'vibe-router', displayName: 'Router', description: 'd',
+    image: { server: 'x', defaultTag: 'latest' }, subdomain: 'airouter',
+    ports: { server: 8220, client: 8222 }, userFacing: false,
+    rootServedOnly: true,
+    subdomains: [{ name: 'airouter', audience: 'staff', emergencyPort: 5193 }],
+    routing: { default_upstream: 'vibe-router-console:8222', deny_paths: ['/metrics'] },
+    env: { required: [] }, health: '/h',
+  });
+
   // vibe-mybooks carries an operator subdomain override ("books").
   const state = {
     schemaVersion: 1,
@@ -80,6 +92,7 @@ function mkFixtures() {
       'vibe-mybooks':  { enabled: true, status: 'running', subdomain: 'books' },
       'vibe-connect':  { enabled: true, status: 'running' },
       'vibe-glm-ocr':  { enabled: true, status: 'running' },
+      'vibe-router':   { enabled: true, status: 'running' },
     },
   };
   const stateFile = path.join(dir, 'state.json');
@@ -139,6 +152,7 @@ test('subdomain-per-app: each app gets its own root-served vhost; override honor
   // Apps serve at ROOT — no strip_prefix in their vhosts, and the :80
   // catch-all carries no app path handlers in this mode.
   assert.doesNotMatch(caddy, /uri strip_prefix \/tb/, 'root serving: no /tb path mount');
+  assert.match(caddy, /airouter\.firm\.com \{/, 'rootServedOnly app served at its subdomain root');
 });
 
 test('single-host: apps stay path-mounted under the tunnel subdomain', () => {
@@ -149,6 +163,41 @@ test('single-host: apps stay path-mounted under the tunnel subdomain', () => {
   assert.match(caddy, /uri strip_prefix \/tb/, 'single-host strips the /tb prefix');
   assert.doesNotMatch(caddy, /\ntb\.firm\.com \{/, 'no dedicated per-app subdomain vhost');
   assert.doesNotMatch(caddy, /\nbooks\.firm\.com \{/, 'override ignored in single-host mode');
+  // rootServedOnly is the exception to single-host path routing: that
+  // bundle asks for /assets/* at the host root, so a path mount would
+  // serve the shell and 404 every asset (a blank page with a 200). It
+  // gets a subdomain vhost here even though nobody else does.
+  assert.doesNotMatch(caddy, /handle \/router\/\*/, 'rootServedOnly app is NOT path-mounted');
+  assert.match(caddy, /airouter\.firm\.com \{/, 'rootServedOnly app gets its own vhost in single-host mode');
+});
+
+test('deny_paths 404 ahead of the app, in both routing modes', () => {
+  const fx = mkFixtures();
+  for (const mode of ['single-host', 'subdomain-per-app']) {
+    const caddy = renderCaddy(fx, mode);
+    const vhost = caddy.split('airouter.firm.com {')[1].split('\n}')[0];
+    assert.match(vhost, /@deny path \/metrics/, `${mode}: deny matcher emitted`);
+    assert.match(vhost, /handle @deny \{[\s\S]*respond "Not found" 404/,
+      `${mode}: denied path answered with 404`);
+    // Must precede the catch-all proxy, or the app answers first.
+    assert.ok(vhost.indexOf('@deny') < vhost.indexOf('reverse_proxy'),
+      `${mode}: deny handler comes before the reverse_proxy`);
+  }
+});
+
+test('deny_paths also apply to path-mounted apps', () => {
+  // vibe-router is rootServedOnly, so exercise the path-handler branch
+  // with a fixture that IS path-mounted and denies a path.
+  const fx = mkFixtures();
+  const mpath = path.join(fx.manifests, 'vibe-tb.json');
+  const m = JSON.parse(fs.readFileSync(mpath, 'utf8'));
+  m.routing.deny_paths = ['/metrics'];
+  fs.writeFileSync(mpath, JSON.stringify(m));
+  const caddy = renderCaddy(fx, 'single-host');
+  const block = caddy.split('handle /tb/*')[1].split('\n\t}')[0];
+  assert.match(block, /@vibe_tb_deny path \/metrics/, 'matcher id is namespaced per app');
+  assert.ok(block.indexOf('@vibe_tb_deny') < block.indexOf('reverse_proxy'),
+    'deny precedes the proxy inside the path handler');
 });
 
 // --- Tunnel ingress ---------------------------------------------------
@@ -162,6 +211,7 @@ test('ingress subdomain-per-app: one rule per app subdomain + console + extras, 
     'books.firm.com',   // vibe-mybooks override
     'connect.firm.com', // vibe-connect primary
     'client.firm.com',  // vibe-connect extra
+    'airouter.firm.com',// rootServedOnly app
   ]));
   assert.ok(!hosts.includes('ocr.firm.com'), 'userFacing:false excluded from ingress');
 });
@@ -172,6 +222,9 @@ test('ingress single-host: only the tunnel subdomain + non-primary extras', () =
   assert.deepEqual(new Set(hosts), new Set([
     'vibe.firm.com',    // fronts every app via path routing
     'client.firm.com',  // vibe-connect extra still gets its own rule
+    // rootServedOnly app: Caddy serves it at its own hostname in this mode
+    // too, so the tunnel needs the matching ingress rule + CNAME.
+    'airouter.firm.com',
   ]));
   assert.ok(!hosts.includes('tb.firm.com'), 'no per-app primary rule in single-host');
 });

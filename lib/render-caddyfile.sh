@@ -73,6 +73,76 @@ def load_json(p, default):
         return default
 
 
+def root_served_only(manifest):
+    """True when the app CANNOT be mounted under a URL path prefix.
+
+    Most Vibe web images ship /docker-entrypoint.d/40-base-path.sh, which
+    rewrites the SPA bundle's base sentinel from `VITE_BASE_PATH` at
+    container start — that is what makes `/tb/`, `/connect/` etc. work.
+    An app whose image has no such switch emits absolute asset URLs
+    (`/assets/index-*.js`). Mount it at `/<prefix>/` and the shell loads
+    but every asset request lands at the host root — on the appliance
+    that is the console, so the operator gets a blank page with a 200.
+
+    `rootServedOnly: true` says "serve me at the root of a hostname or
+    not at all". The renderer then:
+      - emits NO `/<prefix>/` handler for the app (any mode), and
+      - gives it a root-served vhost at its own subdomain in domain mode,
+        in BOTH routing modes (single-host normally path-mounts).
+    On LAN/Tailscale there is no per-app hostname to give it, so its
+    emergency port (root-served through HAProxy, UFW-gated to
+    RFC1918 + CGNAT) is the access path — that is what the console
+    advertises for these apps.
+    """
+    return manifest.get("rootServedOnly") is True
+
+
+def _emergency_port(manifest):
+    """The app's emergency port: top-level, else the primary
+    subdomains[] entry, else the first entry that declares one. Same
+    precedence lib/render-haproxy.sh uses to pick frontends."""
+    port = manifest.get("emergencyPort")
+    if isinstance(port, int) and not isinstance(port, bool):
+        return port
+    primary = manifest.get("subdomain", "")
+    subs = manifest.get("subdomains") or []
+    for s in sorted(subs, key=lambda s: s.get("name") != primary):
+        p = s.get("emergencyPort")
+        if isinstance(p, int) and not isinstance(p, bool):
+            return p
+    return None
+
+
+def deny_path_lines(manifest, indent, matcher_prefix=""):
+    """Emit `handle` blocks that 404 the manifest's routing.deny_paths.
+
+    Paths an app serves that must not be reachable from the public edge
+    even though the rest of the app is (vibe-ai-router's unauthenticated
+    /metrics is the motivating case: operational telemetry that is fine
+    on vibe_net and on the UFW-gated emergency port, but should not be
+    world-readable once Caddy fronts the app).
+
+    Emitted BEFORE the app's own matchers so it wins: Caddy evaluates
+    `handle` blocks in order and only the first match runs.
+
+    `matcher_prefix` disambiguates the named matcher when several apps
+    share one site block (the single-host / LAN catch-all case).
+    """
+    paths = (manifest.get("routing", {}) or {}).get("deny_paths") or []
+    if not paths:
+        return []
+    mid = f"{matcher_prefix}deny" if matcher_prefix else "deny"
+    # Match the caller's indent style — vhosts are space-indented, the
+    # catch-all path handlers are tab-indented, and mixing the two in one
+    # rendered file reads as damage to an operator.
+    step = "\t" if "\t" in indent else "    "
+    lines = [f"{indent}@{mid} path " + " ".join(paths)]
+    lines.append(f"{indent}handle @{mid} {{")
+    lines.append(f'{indent}{step}respond "Not found" 404')
+    lines.append(f"{indent}}}")
+    return lines
+
+
 def list_enabled_apps(state, manifests_dir):
     out = []
     for slug, entry in (state.get("apps", {}) or {}).items():
@@ -144,6 +214,12 @@ def render_vhost(slug, manifest, domain, subdomain, tls_internal=False):
     lines.append("        respond \"ok\" 200")
     lines.append("    }")
     lines.append("")
+
+    # Denied paths first — `handle` blocks are first-match-wins.
+    deny = deny_path_lines(manifest, "    ")
+    if deny:
+        lines.extend(deny)
+        lines.append("")
 
     # Matcher declarations.
     for m in matchers:
@@ -352,6 +428,12 @@ def render_domain_app_vhost(domain, tunnel_subdomain, enabled, tls_internal=Fals
         )
         if primary_internal:
             continue
+        # (c) rootServedOnly — a path mount would serve the SPA shell and
+        # 404 every asset (they'd resolve against this host's root, which
+        # is the console). render_root_served_vhosts gives these apps
+        # their own hostname instead; see root_served_only().
+        if root_served_only(manifest):
+            continue
         lines.append(render_path_handler(slug, manifest).rstrip("\n"))
         lines.append("")
 
@@ -418,6 +500,52 @@ def render_console_host_vhost(domain, tunnel_subdomain, tls_internal=False):
     lines.append("    }")
     lines.append("}")
     return "\n".join(lines) + "\n"
+
+
+def render_root_served_vhosts(enabled, domain, state, tls_internal=False):
+    """Root-served vhosts for `rootServedOnly` apps in SINGLE-HOST mode.
+
+    Single-host normally path-mounts every app under the one tunnel
+    hostname. An app that can't be path-mounted (see root_served_only())
+    gets the treatment subdomain-per-app gives everyone: its own
+    `<subdomain>.<domain>` served at root. The two models therefore
+    agree on where such an app lives, which keeps the console's URL,
+    the tunnel ingress, and doctor's DNS/cert checks consistent.
+
+    Only called on the single-host branch — in subdomain-per-app mode
+    render_per_app_subdomain_vhosts already emits these hosts, and
+    emitting both would give Caddy two site blocks for one hostname.
+
+    Same skip gates as the other renderers: a primary marked
+    `internal: true` stays off the edge, and an app with no resolvable
+    subdomain is reported rather than silently dropped.
+    """
+    if not domain:
+        return ""
+    blocks = []
+    for slug, manifest in enabled:
+        if not root_served_only(manifest):
+            continue
+        subdomains = manifest.get("subdomains") or []
+        # Same "no operator surface at all" gate the other two renderers
+        # apply — rootServedOnly doesn't make a headless service public.
+        if manifest.get("userFacing") is False and not subdomains:
+            continue
+        primary = manifest.get("subdomain", "")
+        if any((s.get("name") == primary and s.get("internal") is True)
+               for s in subdomains):
+            continue
+        sub = _effective_subdomain(slug, manifest, state)
+        if not sub:
+            print(
+                f"# WARNING: {slug} is rootServedOnly but has no resolvable "
+                f"subdomain — vhost skipped; it stays reachable on its "
+                f"emergency port only",
+                file=sys.stderr,
+            )
+            continue
+        blocks.append(render_vhost(slug, manifest, domain, sub, tls_internal))
+    return "\n".join(b for b in blocks if b.strip())
 
 
 def render_per_app_subdomain_vhosts(enabled, domain, state, tls_internal=False):
@@ -542,6 +670,13 @@ def render_extra_subdomain_vhosts(enabled, domain, tls_internal=False):
             lines.append("        format console")
             lines.append("    }")
             lines.append("")
+            # deny_paths is an app-level statement about what must not be
+            # reachable from the edge, so it holds on secondary surfaces
+            # too — the client portal is no less public than the primary.
+            deny = deny_path_lines(manifest, "    ")
+            if deny:
+                lines.extend(deny)
+                lines.append("")
             for i, path in enumerate(streaming_paths):
                 mid = f"streaming_{i}"
                 lines.append(f"    @{mid} path {path}")
@@ -715,6 +850,8 @@ def render_path_handler(slug, manifest):
     # Main route — strip_prefix happens inside so upstream sees /api etc.
     lines.append(f"\thandle /{prefix}/* {{")
     lines.append(f"\t\turi strip_prefix /{prefix}")
+    # Denied paths (post-strip, so they match what the app would see).
+    lines.extend(deny_path_lines(manifest, "\t\t", matcher_prefix=_matcher_id(slug, "")))
     for m in matchers:
         mid = _matcher_id(slug, m['name'])
         lines.append(f"\t\t@{mid} path {m['path']}")
@@ -892,6 +1029,11 @@ def main():
                                   tls_internal=tunnel_active),
                 render_domain_app_vhost(domain, tunnel_subdomain, enabled,
                                         tls_internal=tunnel_active),
+                # Apps that can't be path-mounted (rootServedOnly) get the
+                # subdomain-per-app treatment even here — they're absent
+                # from the path handlers above.
+                render_root_served_vhosts(enabled, domain, state,
+                                          tls_internal=tunnel_active),
                 # Per-app extra subdomains (apps that declare `subdomains[]`
                 # beyond their primary). vibe-connect uses this to expose the
                 # client portal at client.<domain> on a different internal
@@ -927,21 +1069,42 @@ def main():
         # (split-DNS or /etc/hosts → host IP → the :443 per-app vhost),
         # the same pattern the infra subdomains use. So emit only the
         # infra path handlers on :80 in that mode.
+        #
+        # rootServedOnly apps are excluded in BOTH modes for the same
+        # reason (absolute asset paths); on the LAN they're reached on
+        # their emergency port, or via their subdomain with split DNS.
         if routing_mode == "subdomain-per-app":
             app_path_blocks = ""
         else:
+            path_mountable = [(s, m) for s, m in enabled if not root_served_only(m)]
             app_path_blocks = "\n".join(
-                render_path_handler(slug, m) for slug, m in enabled
-            ) if enabled else ""
+                render_path_handler(slug, m) for slug, m in path_mountable
+            ) if path_mountable else ""
         infra_path_blocks = "\n".join(
             render_infra_path_handler(s) for s in INFRA_SERVICES
         )
         combined = (app_path_blocks + ("\n" if app_path_blocks and infra_path_blocks else "") + infra_path_blocks)
         path_blocks = render_lan_gated_handlers(combined)
     elif mode in ("lan", "tailscale"):
+        # rootServedOnly apps get no path mount here either. There is no
+        # per-app hostname to give them in LAN/Tailscale mode (mDNS
+        # publishes one name, and sub-labels of .local don't resolve), so
+        # their access path is the emergency port — root-served through
+        # HAProxy and UFW-gated to the same LAN/tailnet audience this
+        # catch-all serves. A comment marks them so an operator reading
+        # the rendered Caddyfile isn't left wondering.
+        path_mountable = [(s, m) for s, m in enabled if not root_served_only(m)]
+        root_only = [(s, m) for s, m in enabled if root_served_only(m)]
         app_path_blocks = "\n".join(
-            render_path_handler(slug, m) for slug, m in enabled
-        ) if enabled else "\t# (no apps enabled yet)"
+            render_path_handler(slug, m) for slug, m in path_mountable
+        ) if path_mountable else "\t# (no path-mountable apps enabled yet)"
+        for slug, m in root_only:
+            port = _emergency_port(m)
+            where = f"port {port}" if port else "its emergency port"
+            app_path_blocks += (
+                f"\n\t# {slug} — rootServedOnly: served at the root of "
+                f"{where}, not under a path prefix."
+            )
         infra_path_blocks = "\n".join(
             render_infra_path_handler(s) for s in INFRA_SERVICES
         )

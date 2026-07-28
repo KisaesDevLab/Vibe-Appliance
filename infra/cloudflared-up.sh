@@ -577,7 +577,13 @@ for slug, entry in (state.get("apps") or {}).items():
   # skip gates so the tunnel exposes exactly what Caddy serves:
   #   (a) userFacing:false AND no subdomains[] → fully internal; skip.
   #   (b) the primary subdomains[] entry marked internal:true → skip.
-  if routing_mode == "subdomain-per-app":
+  #
+  # rootServedOnly apps need the same rule in SINGLE-HOST mode too:
+  # lib/render-caddyfile.sh::render_root_served_vhosts gives them their
+  # own vhost there (they can't be path-mounted), so without a matching
+  # ingress rule + CNAME the hostname Caddy serves would 404 at the
+  # Cloudflare edge.
+  if routing_mode == "subdomain-per-app" or manifest.get("rootServedOnly") is True:
     primary_internal = any(
       s.get("name") == primary and s.get("internal") is True for s in subdomains
     )
@@ -880,9 +886,10 @@ for it in items:
       manifest = json.load(f)
   except (FileNotFoundError, ValueError):
     manifest = {}
-  if routing_mode == "subdomain-per-app":
+  if routing_mode == "subdomain-per-app" or manifest.get("rootServedOnly") is True:
     # Each app at its own subdomain root. Effective subdomain =
-    # operator override (state) → manifest.
+    # operator override (state) → manifest. rootServedOnly apps land
+    # here in single-host mode too — that's where Caddy serves them.
     entry = state_apps.get(slug) or {}
     sub = (entry.get("subdomain") or "").strip() or manifest.get("subdomain", "")
     print(f"  https://{sub}.{domain}/  ({it['label']})")

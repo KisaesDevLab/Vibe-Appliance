@@ -98,6 +98,20 @@ enable_app() {
   services="$(_app_services "$manifest")"
   [[ -n "$services" ]] || die "could not derive service names from manifest routing for $slug"
 
+  # Every service the overlay contributes, not just the proxied ones.
+  # `compose up <proxied>` starts the rest via depends_on, so `$services`
+  # is the right argument for pull/up — but it is the WRONG argument for
+  # `compose logs` on failure. vibe-ai-router is the case that proved it:
+  # its migrations run in the gateway container, which nothing proxies,
+  # so a bad DATABASE_URL failed the enable with "dependency failed to
+  # start" and the log dump (scoped to the console) printed nothing at
+  # all, hiding the actual `password authentication failed` error.
+  # Falls back to the routing-derived list if compose can't parse the
+  # merged file — an empty log list would be worse than a partial one.
+  local log_services
+  log_services="$(_overlay_services "$slug")"
+  [[ -n "$log_services" ]] || log_services="$services"
+
   # 1. Render per-app env file (idempotent, preserves existing secrets).
   log_step "rendering ${slug}.env"
   _render_app_env "$slug" "$manifest" "$env_tmpl" "$env_out" \
@@ -186,11 +200,11 @@ enable_app() {
       printf '\n========================================\n'
       printf '== Container logs (last 50 lines)\n'
       printf '== from: docker compose -f %s -f apps/%s.yml logs --tail=50 %s\n' \
-        "docker-compose.yml" "$slug" "$services"
+        "docker-compose.yml" "$slug" "$log_services"
       printf '========================================\n'
     } >&2
     # shellcheck disable=SC2086
-    ( cd "$APPLIANCE_DIR" && docker compose -f docker-compose.yml -f "apps/${slug}.yml" logs --tail=50 --no-color $services ) \
+    ( cd "$APPLIANCE_DIR" && docker compose -f docker-compose.yml -f "apps/${slug}.yml" logs --tail=50 --no-color $log_services ) \
       2>&1 | tee -a "$VIBE_LOG_FILE" >&2 || true
     printf '========================================\n\n' >&2
     die "Could not bring up $slug. See compose output and container logs above."
@@ -209,17 +223,37 @@ enable_app() {
       printf '\n========================================\n'
       printf '== Container logs (last 50 lines)\n'
       printf '== from: docker compose -f %s -f apps/%s.yml logs --tail=50 %s\n' \
-        "docker-compose.yml" "$slug" "$services"
+        "docker-compose.yml" "$slug" "$log_services"
       printf '========================================\n'
     } >&2
     # shellcheck disable=SC2086
-    ( cd "$APPLIANCE_DIR" && docker compose -f docker-compose.yml -f "apps/${slug}.yml" logs --tail=50 --no-color $services ) \
+    ( cd "$APPLIANCE_DIR" && docker compose -f docker-compose.yml -f "apps/${slug}.yml" logs --tail=50 --no-color $log_services ) \
       2>&1 | tee -a "$VIBE_LOG_FILE" >&2 || true
     printf '========================================\n\n' >&2
     local _health_timeout
     _health_timeout="$(_manifest_field "$manifest" 'data.get("health_timeout_s", 120)')"
     _health_timeout="${_health_timeout:-120}"
     die "App $slug did not become healthy within ${_health_timeout}s. See container logs above."
+  fi
+
+  # 6a. Probe any manifest-declared extra health targets (tiers that
+  # nothing reverse-proxies, so step 6 never touches them). Fatal for
+  # the same reason step 6 is: the appliance does not report an app as
+  # running until every surface it declares answers.
+  if ! _wait_for_extra_health "$slug" "$manifest"; then
+    _state_app_set "$slug" status failed error "extra health check timeout"
+    {
+      printf '\n========================================\n'
+      printf '== Container logs (last 50 lines)\n'
+      printf '== from: docker compose -f %s -f apps/%s.yml logs --tail=50 %s\n' \
+        "docker-compose.yml" "$slug" "$log_services"
+      printf '========================================\n'
+    } >&2
+    # shellcheck disable=SC2086
+    ( cd "$APPLIANCE_DIR" && docker compose -f docker-compose.yml -f "apps/${slug}.yml" logs --tail=50 --no-color $log_services ) \
+      2>&1 | tee -a "$VIBE_LOG_FILE" >&2 || true
+    printf '========================================\n\n' >&2
+    die "App $slug came up but one of its declared health targets never answered. See container logs above."
   fi
 
   # 6b. Run the manifest's seed command (if any) once. Some upstream
@@ -259,14 +293,16 @@ enable_app() {
   _state_app_clear_keys "$slug" error update_error
 
   # Refresh /opt/vibe/CREDENTIALS.txt so apps whose first-login secrets
-  # are generated at enable time (e.g. vibe-shield's GATEWAY_ADMIN_KEY)
-  # land in the operator's archived credentials file too. Without this
-  # call, bootstrap's phase_credentials writes CREDENTIALS.txt before any
-  # app is enabled, and post-bootstrap enables (the common case — admin
-  # toggles apps from the console) leave their generated keys only in
-  # /opt/vibe/env/<slug>.env. The admin first-login card always reads
-  # the live env file at request time, but operators expect a single
-  # printed/saved copy of every credential.
+  # are generated at enable time (e.g. vibe-ai-router's
+  # ROUTER_ADMIN_PASSWORD) land in the operator's archived credentials
+  # file too. Without this call, bootstrap's phase_credentials writes
+  # CREDENTIALS.txt before any app is enabled, and post-bootstrap enables
+  # (the common case — admin toggles apps from the console) leave their
+  # generated keys only in /opt/vibe/env/<slug>.env. The admin
+  # first-login card always reads the live env file at request time, but
+  # operators expect a single printed/saved copy of every credential —
+  # secrets_write_credentials' PER-APP FIRST LOGIN section is what makes
+  # that true (it reads each manifest's firstLogin.passwordEnvKey).
   #
   # Non-fatal: this is an archival nicety. A re-render failure shouldn't
   # mark the enable as failed.
@@ -535,6 +571,24 @@ for matcher in routing.get("matchers", []) or []:
     add(matcher.get("upstream", ""))
 print(" ".join(seen))
 PYEOF
+}
+
+# Every service the overlay contributes — the merged service list minus
+# the core one. Same helper (and same rationale) as the copy in
+# lib/disable-app.sh: duplicated rather than cross-sourced so each script
+# stays standalone for the console's exec path. Used here only for
+# diagnostics, so a failure to parse degrades to the routing-derived
+# list rather than aborting the enable.
+_overlay_services() {
+  local slug="$1"
+  local core_compose="${APPLIANCE_DIR}/docker-compose.yml"
+  local overlay="${APPLIANCE_DIR}/apps/${slug}.yml"
+  [[ -f "$overlay" ]] || return 0
+  local all_svc core_svc
+  all_svc="$(docker compose -f "$core_compose" -f "$overlay" config --services 2>/dev/null | sort -u)"
+  core_svc="$(docker compose -f "$core_compose" config --services 2>/dev/null | sort -u)"
+  [[ -n "$all_svc" && -n "$core_svc" ]] || return 0
+  comm -23 <(printf '%s\n' "$all_svc") <(printf '%s\n' "$core_svc") | tr '\n' ' '
 }
 
 _manifest_has_migrations() {
@@ -885,8 +939,18 @@ for sub in (m.get("subdomains") or []):
 PYEOF
 )"
 
+  # rootServedOnly apps are served at the root of their own subdomain in
+  # BOTH routing modes (lib/render-caddyfile.sh::render_root_served_vhosts
+  # covers them in single-host, where everyone else is path-mounted), so
+  # their origin + base path must follow the subdomain-per-app branch
+  # regardless of the operator's DOMAIN_ROUTING_MODE.
+  local root_served="false"
+  if [[ "$(_manifest_field "$manifest" '"true" if data.get("rootServedOnly") is True else ""')" == "true" ]]; then
+    root_served="true"
+  fi
+
   if [[ "$mode" == "domain" && -n "$domain" ]]; then
-    if [[ "$routing_mode" == "subdomain-per-app" ]]; then
+    if [[ "$routing_mode" == "subdomain-per-app" || "$root_served" == "true" ]]; then
       # Per-app subdomain routing: this app is served at the ROOT of
       # `${eff_subdomain}.${domain}`. ALLOWED_ORIGIN is that host (the
       # SPA loads from it, so cookie + CORS must match). VITE_BASE_PATH
@@ -929,6 +993,24 @@ PYEOF
     else
       client_portal_url=""
     fi
+  elif [[ "$root_served" == "true" ]]; then
+    # LAN / Tailscale with no path mount available: the app is reachable
+    # only at the root of its emergency port (HAProxy, UFW-gated), so
+    # that host:port IS the browser's origin. Anything else would put a
+    # mismatched value in ALLOWED_ORIGIN and break CORS / cookies for the
+    # one path that does work.
+    ip="$(_host_lan_ip)"
+    local _emg_port
+    _emg_port="$(_manifest_field "$manifest" 'data.get("emergencyPort") or next((s.get("emergencyPort") for s in (data.get("subdomains") or []) if s.get("emergencyPort")), "")')"
+    if [[ -n "$_emg_port" ]]; then
+      allowed_origin="http://${ip:-localhost}:${_emg_port}"
+    else
+      allowed_origin="http://${ip:-localhost}"
+      log_warn "$slug is rootServedOnly with no emergencyPort — it has no reachable URL in ${mode} mode" slug="$slug"
+    fi
+    vite_base_path="/"
+    staff_app_url="$allowed_origin"
+    client_portal_url=""
   else
     ip="$(_host_lan_ip)"
     allowed_origin="http://${ip:-localhost}"
@@ -1255,6 +1337,46 @@ _wait_for_app_health() {
     sleep 3
   done
   return 1
+}
+
+# Probe every manifest.health_extra[] target. The main health wait covers
+# the surface Caddy fronts; an app tier nothing proxies (vibe-ai-router's
+# /v1 gateway) would otherwise never be checked, so the enable could
+# report success with that tier crash-looping.
+#
+# Runs AFTER _wait_for_app_health, so the app has already had its full
+# health_timeout_s to come up; these targets get a shorter grace window
+# because their containers started first (the proxied tier depends_on
+# them). Returns non-zero naming the first target that never answered.
+_wait_for_extra_health() {
+  local slug="$1" manifest="$2"
+  local targets
+  # NB: no f-string here. _manifest_field passes this through eval() and
+  # the shell hands the quotes over verbatim, so a `f"{e[\"name\"]}"`
+  # reaches Python as an illegal escape and the expression dies silently
+  # (empty output → the probe is skipped, which is exactly the failure
+  # this function exists to prevent). Plain join, plain quotes.
+  targets="$(_manifest_field "$manifest" '"\n".join(" ".join([e["name"], e["upstream"], e["path"]]) for e in (data.get("health_extra") or []))')"
+  [[ -n "$targets" ]] || return 0
+
+  local name upstream path deadline rc=0
+  while read -r name upstream path; do
+    [[ -n "$name" ]] || continue
+    log_step "waiting for $slug/$name health" upstream="$upstream" path="$path"
+    deadline=$(( $(date +%s) + 60 ))
+    while (( $(date +%s) < deadline )); do
+      if docker exec vibe-console curl -fsS -o /dev/null --max-time 5 \
+           "http://${upstream}${path}" >>"$VIBE_LOG_FILE" 2>&1; then
+        log_ok "$slug/$name is healthy"
+        continue 2
+      fi
+      sleep 3
+    done
+    log_error "$slug/$name did not answer http://${upstream}${path} within 60s"
+    log_error "         Diagnose: sudo docker logs --tail 50 ${upstream%:*}"
+    rc=1
+  done <<< "$targets"
+  return "$rc"
 }
 
 # Update state.json's apps.<slug> object. Pairs of key=value follow the

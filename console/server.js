@@ -4139,7 +4139,7 @@ app.get('/api/v1/admin/anthropic-models', requireAdmin, async (_req, res) => {
 // pay ~10% of the input price for this block. Keep it stable — every
 // edit invalidates the cache.
 const ANALYZE_LOG_SYSTEM_PROMPT = [
-  'You are the diagnostic assistant for the Vibe Appliance — a Docker-Compose-based meta-installer that runs a family of accounting apps (vibe-tb, vibe-mybooks, vibe-connect, vibe-tax-research, vibe-payroll) on a single Ubuntu 24.04 host alongside Tailscale, Caddy, Portainer, Cockpit, and Duplicati.',
+  'You are the diagnostic assistant for the Vibe Appliance — a Docker-Compose-based meta-installer that runs a family of accounting apps (vibe-tb, vibe-mybooks, vibe-connect, vibe-tax-research, vibe-payroll, vibe-calculators, vibe-tx-converter, vibe-1099, vibe-ai-router) on a single Ubuntu 24.04 host alongside Tailscale, Caddy, Portainer, Cockpit, and Duplicati.',
   '',
   'Your audience is a NOVICE CPA, not a sysadmin. You are READ-ONLY ADVICE. You never executed anything; you cannot execute anything. The operator runs commands themselves via Cockpit Terminal or SSH after reading your suggestion.',
   '',
@@ -5171,10 +5171,26 @@ function trim(s, max = 16 * 1024) {
 // down" failure mode). App cards' "backup" row uses appLanFallbackUrl
 // instead — see that function for the rationale.
 function appEmergencyUrl(manifest, config) {
-  const port = manifest.emergencyPort;
+  const port = appEmergencyPort(manifest);
   const ip = config.host_ip;
   if (!port || !ip) return null;
   return `http://${ip}:${port}/`;
+}
+
+// The app's emergency port. Top-level `emergencyPort` first, then the
+// primary subdomains[] entry, then any entry that declares one — the
+// same precedence lib/render-haproxy.sh uses when it picks which
+// frontend to bind, so the URL shown always matches a real frontend.
+// (Reading only the top-level field meant an app that declared its port
+// solely under subdomains[] reported no emergency URL at all while
+// HAProxy was happily serving it.)
+function appEmergencyPort(manifest) {
+  if (Number.isInteger(manifest.emergencyPort)) return manifest.emergencyPort;
+  const subs = Array.isArray(manifest.subdomains) ? manifest.subdomains : [];
+  const primary = subs.find((s) => s && s.name === manifest.subdomain && Number.isInteger(s.emergencyPort));
+  if (primary) return primary.emergencyPort;
+  const any = subs.find((s) => s && Number.isInteger(s.emergencyPort));
+  return any ? any.emergencyPort : null;
 }
 
 // URL path prefix for an app — the slug with a leading `vibe-` stripped.
@@ -5244,6 +5260,8 @@ function appLanFallbackUrl(manifest, config) {
   if (config.mode === 'domain' && applianceRoutingMode() === 'subdomain-per-app') {
     return null;
   }
+  // rootServedOnly: no path handler exists in any mode — see appPublicUrl.
+  if (manifest.rootServedOnly === true) return null;
   return `http://${ip}/${appPathPrefix(manifest)}/`;
 }
 
@@ -5259,6 +5277,10 @@ function appTailnetUrl(manifest, config, live) {
   if (config.mode === 'domain' && applianceRoutingMode() === 'subdomain-per-app') {
     return null;
   }
+  // rootServedOnly: no path handler exists in any mode — see appPublicUrl.
+  // The emergency port answers on the tailnet too (UFW allows CGNAT), and
+  // appEmergencyUrl already reports it.
+  if (manifest.rootServedOnly === true) return null;
   // Works in domain mode too since commit 60f4e8d: the :80 catch-all's
   // @lan matcher includes 100.64.0.0/10 (Tailscale CGNAT), so /<prefix>/
   // path-routes from a tailnet client without falling to the console.
@@ -5276,6 +5298,8 @@ function appTailnetHostnameUrl(manifest, config, live) {
   if (config.mode === 'domain' && applianceRoutingMode() === 'subdomain-per-app') {
     return null;
   }
+  // rootServedOnly: no path handler exists in any mode — see appPublicUrl.
+  if (manifest.rootServedOnly === true) return null;
   return `https://${live.hostname}/${appPathPrefix(manifest)}/`;
 }
 
@@ -5284,7 +5308,10 @@ function appPublicUrl(manifest, config, live) {
   if (config.mode === 'domain' && config.domain) {
     // subdomain-per-app → each app at the ROOT of its own subdomain.
     // Effective subdomain = operator override (state) → manifest default.
-    if (applianceRoutingMode() === 'subdomain-per-app') {
+    // rootServedOnly apps get the same treatment in single-host mode —
+    // lib/render-caddyfile.sh::render_root_served_vhosts emits their
+    // vhost there because a path mount would serve a blank page.
+    if (applianceRoutingMode() === 'subdomain-per-app' || manifest.rootServedOnly === true) {
       const sub = appEffectiveSubdomain(manifest);
       return `https://${sub}.${config.domain}/`;
     }
@@ -5293,6 +5320,20 @@ function appPublicUrl(manifest, config, live) {
     // base: '/<prefix>/' resolves without a host-level redirect.
     const sub = config.tunnel_subdomain || 'vibe';
     return `https://${sub}.${config.domain}/${prefix}/`;
+  }
+
+  // rootServedOnly outside domain mode: there is no per-app hostname to
+  // serve at (mDNS publishes one name; sub-labels of .local don't
+  // resolve), and Caddy emits no path handler for these apps because a
+  // path mount 404s every asset. The emergency port is root-served
+  // through HAProxy to the same UFW-gated LAN/tailnet audience, so it is
+  // the real URL here — not a fallback. Advertising the /<prefix>/ form
+  // would send the operator to a blank page.
+  if (manifest.rootServedOnly === true) {
+    const port = appEmergencyPort(manifest);
+    if (port && config.host_ip) return `http://${config.host_ip}:${port}/`;
+    if (port) return `(reachable at http://<your-server-ip>:${port}/ from the LAN or tailnet — host IP not cached in state)`;
+    return `(no reachable URL in ${config.mode || 'this'} mode: this app must be served at a hostname root, so it needs domain mode or an emergency port)`;
   }
 
   // LAN mode → http://<hostname>.local/<prefix>/ via mDNS + Caddy

@@ -209,6 +209,74 @@ test('routing upstreams are <service>:<port> and resolvable to services', () => 
   }
 });
 
+test('a rootServedOnly app declares a subdomain and an emergency port', () => {
+  // rootServedOnly means "no path mount anywhere" (its bundle asks for
+  // assets at the host root). That leaves exactly two ways to reach it:
+  // a per-app hostname in domain mode, and the emergency port everywhere
+  // else. A manifest missing either one describes an app the operator
+  // simply cannot open in one of the appliance's modes.
+  for (const { file, data } of manifests) {
+    if (data.rootServedOnly !== true) continue;
+    assert.ok(data.subdomain, `${file}: rootServedOnly needs a subdomain to be served at`);
+    const ports = [data.emergencyPort, ...(data.subdomains || []).map((s) => s && s.emergencyPort)];
+    assert.ok(ports.some(Number.isInteger),
+      `${file}: rootServedOnly with no emergencyPort is unreachable in LAN/Tailscale mode`);
+  }
+});
+
+test('emergencyPort is mirrored at the top level when subdomains[] declares one', () => {
+  // console/server.js::appEmergencyPort and lib/render-haproxy.sh agree on
+  // the fallback order, but the top-level field is what every consumer
+  // reads first and what the docs quote. vibe-connect established the
+  // mirroring pattern; a manifest that declares its port ONLY under
+  // subdomains[] silently reported no emergency URL from the API.
+  for (const { file, data } of manifests) {
+    const subPorts = (data.subdomains || [])
+      .filter((s) => s && s.name === data.subdomain && Number.isInteger(s.emergencyPort))
+      .map((s) => s.emergencyPort);
+    if (!subPorts.length) continue;
+    assert.strictEqual(data.emergencyPort, subPorts[0],
+      `${file}: primary subdomain declares emergencyPort ${subPorts[0]} but the top-level field is ${data.emergencyPort}`);
+  }
+});
+
+test('health_extra entries are well-formed and name a service the overlay declares', () => {
+  // lib/enable-app.sh and doctor.sh both probe these; a typo'd container
+  // name would fail the enable of an otherwise healthy app.
+  const root = path.join(__dirname, '..', '..');
+  const UPSTREAM_RE = /^[a-z0-9.-]+:\d+$/;
+  for (const { file, data } of manifests) {
+    const extras = data.health_extra;
+    if (extras === undefined) continue;
+    assert.ok(Array.isArray(extras) && extras.length > 0,
+      `${file}: health_extra must be a non-empty array`);
+    const overlay = fs.readFileSync(path.join(root, 'apps', `${data.slug}.yml`), 'utf8');
+    for (const e of extras) {
+      assert.ok(e && e.name, `${file}: a health_extra entry has no name`);
+      assert.match(e.upstream || '', UPSTREAM_RE,
+        `${file}: health_extra "${e.name}" upstream "${e.upstream}" is not <service>:<port>`);
+      assert.match(e.path || '', /^\//,
+        `${file}: health_extra "${e.name}" path must start with /`);
+      const service = e.upstream.split(':')[0];
+      assert.match(overlay, new RegExp(`^\\s{2}${service}:\\s*$`, 'm'),
+        `${file}: health_extra "${e.name}" targets ${service}, which apps/${data.slug}.yml does not declare`);
+    }
+  }
+});
+
+test('routing.deny_paths entries are absolute paths', () => {
+  for (const { file, data } of manifests) {
+    const denied = (data.routing || {}).deny_paths;
+    if (denied === undefined) continue;
+    assert.ok(Array.isArray(denied) && denied.length > 0,
+      `${file}: routing.deny_paths must be a non-empty array`);
+    for (const p of denied) {
+      assert.strictEqual(typeof p, 'string', `${file}: deny_paths entries must be strings`);
+      assert.match(p, /^\//, `${file}: deny_paths entry "${p}" must start with /`);
+    }
+  }
+});
+
 test('a manifest declaring a seed block declares a runnable command array', () => {
   // lib/enable-app.sh::_run_app_seed_if_needed json.dumps()es this and
   // mapfiles it into a bash array. A non-array (or empty) value means

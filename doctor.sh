@@ -467,6 +467,32 @@ check_app_health() {
       "Diagnose: docker compose -f /opt/vibe/appliance/docker-compose.yml -f /opt/vibe/appliance/apps/${slug}.yml logs --tail 40
 Fix:      restart the app via the admin Apps tab (Disable, then Enable)"
   fi
+
+  # manifest.health_extra[] — tiers nothing reverse-proxies, so the probe
+  # above never reaches them. vibe-ai-router's /v1 gateway is the case
+  # this exists for: every other Vibe app will call it, but it has no
+  # Caddy vhost, so without this the console could be green while the
+  # gateway crash-loops.
+  local extra
+  # Plain join, not an f-string — see the note in lib/enable-app.sh's
+  # _wait_for_extra_health: escaped quotes inside an f-string reach
+  # eval() as an illegal escape and the check silently disappears.
+  extra="$(_manifest_field "$manifest" '"\n".join(" ".join([e["name"], e["upstream"], e["path"]]) for e in (data.get("health_extra") or []))')"
+  [[ -n "$extra" ]] || return
+  local x_name x_upstream x_path
+  while read -r x_name x_upstream x_path; do
+    [[ -n "$x_name" ]] || continue
+    _check_begin "App health · $slug/$x_name"
+    if docker run --rm --network vibe_net curlimages/curl:latest \
+         -fsS -o /dev/null --max-time 5 "http://${x_upstream}${x_path}" \
+         >>"$VIBE_LOG_FILE" 2>&1; then
+      _check_pass "$x_upstream$x_path responds 200"
+    else
+      _check_fail "$x_upstream$x_path did not respond 200" \
+        "Diagnose: docker logs --tail 40 ${x_upstream%:*}
+Fix:      restart the app via the admin Apps tab (Disable, then Enable)"
+    fi
+  done <<< "$extra"
 }
 
 # Read a key from /opt/vibe/env/appliance.env. Empty when the file or
@@ -975,7 +1001,13 @@ if [[ "$mode" == "domain" && -n "$domain" ]]; then
     [[ -z "$slug" ]] && continue
     manifest="${APPLIANCE_DIR}/console/manifests/${slug}.json"
 
-    if [[ "$routing_mode" == "subdomain-per-app" ]]; then
+    # rootServedOnly apps get a per-app hostname in single-host mode too
+    # (render_root_served_vhosts) — check theirs in both modes, or the
+    # one host the operator actually visits goes unverified.
+    _root_served=""
+    [[ -f "$manifest" ]] && _root_served="$(_manifest_field "$manifest" '"yes" if data.get("rootServedOnly") is True else ""')"
+
+    if [[ "$routing_mode" == "subdomain-per-app" || "$_root_served" == "yes" ]]; then
       subdomain=""
       [[ -f "$manifest" ]] && subdomain="$(_manifest_field "$manifest" 'data["subdomain"]')"
       # Operator's per-app override wins — written to
