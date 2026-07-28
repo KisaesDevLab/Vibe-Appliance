@@ -1823,3 +1823,21 @@ Append to this list as phases complete. Format:
      vhost at 1099.<domain> in BOTH domain routing modes, :5176 as the
      LAN/Tailscale path, renderer emits no /1099/ mount anywhere
      (verified across all three mode renders).
+
+  Follow-up, same day: upstream merged PR #4 and released v0.1.1 within the
+  hour; a live appliance (LAN mode, 192.168.68.x) enabled vibe-1099 on the
+  0.1.1 image and the full surface was verified reachable on :5176 from a
+  second LAN machine (SPA shell, JS bundle, /api/status all 200, every
+  dependency check green) — so the DOMAIN-MODE-ONLY restriction above is
+  lifted for images ≥ v0.1.1. That live install also surfaced the next gap:
+  NO first login exists, because upstream's only user-creating code path
+  was the demo seed (fake TINs, published password, forbidden in
+  production). Upstream PR #5 adds `pnpm bootstrap:firm` (real firm + one
+  admin from VIBE1099_ADMIN_EMAIL/_PASSWORD, no demo rows, idempotent,
+  password re-applied on re-run — verified live against postgres+redis
+  with a real api login 200/401). The appliance wires it ahead of the
+  release: manifest seed block + firstLogin.passwordEnvKey, the
+  @VIBE1099_ADMIN_PASSWORD@ generate-once marker in enable-app.sh, and the
+  env-template block. On pre-PR#5 images the seed exits 254 (missing
+  script, verified), enable-app warns without failing, `seeded` stays
+  unset, and the next enable after the image update runs it automatically.

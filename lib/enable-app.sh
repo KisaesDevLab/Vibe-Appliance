@@ -1132,6 +1132,13 @@ PYEOF
   fi
   [[ -z "$router_admin_password" ]] && router_admin_password="$(openssl rand -hex 32)"
 
+  # Vibe-1099's first-login admin password — same pattern, same rationale.
+  local vibe1099_admin_password=""
+  if [[ -f "$out" ]]; then
+    vibe1099_admin_password="$(_extract_env_value "$out" "VIBE1099_ADMIN_PASSWORD")"
+  fi
+  [[ -z "$vibe1099_admin_password" ]] && vibe1099_admin_password="$(openssl rand -hex 32)"
+
   # DB and redis target details from manifest.
   local db_name db_user
   db_name="$(_manifest_field "$manifest" 'data.get("database",{}).get("name","")')"
@@ -1168,14 +1175,14 @@ PYEOF
       "$vite_base_path" "$session_secure" "$intake_key" \
       "$vs_kek" "$gateway_admin_key" \
       "$staff_app_url" "$client_portal_url" \
-      "$master_key" "$router_admin_password" <<'PYEOF'
+      "$master_key" "$router_admin_password" "$vibe1099_admin_password" <<'PYEOF'
 import base64, sys
 src, dst, allowed_origin, database_url, redis_url, \
     encryption_key, jwt_secret, db_name, db_user, db_pass, \
     vite_base_path, session_secure, intake_key, \
     vs_kek, gateway_admin_key, \
     staff_app_url, client_portal_url, \
-    master_key, router_admin_password = sys.argv[1:20]
+    master_key, router_admin_password, vibe1099_admin_password = sys.argv[1:21]
 # Some upstream apps want the appliance's 32-byte AES key as base64 (32
 # raw bytes -> 44-char base64 with padding) rather than the hex form
 # we ship in shared.env. Derive it once here so per-app templates can
@@ -1208,6 +1215,7 @@ body = body.replace("@VS_KEK@",             vs_kek)
 body = body.replace("@GATEWAY_ADMIN_KEY@",  gateway_admin_key)
 body = body.replace("@MASTER_KEY@",         master_key)
 body = body.replace("@ROUTER_ADMIN_PASSWORD@", router_admin_password)
+body = body.replace("@VIBE1099_ADMIN_PASSWORD@", vibe1099_admin_password)
 body = body.replace("@STAFF_APP_URL@",      staff_app_url)
 body = body.replace("@CLIENT_PORTAL_URL@",  client_portal_url)
 with open(dst, "w") as f:

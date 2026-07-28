@@ -23,12 +23,12 @@ Everything here is doable by one operator with a droplet, a domain, and
       **Zone:DNS:Edit** only, plus the custom Caddy build (see PLAN §4.1).
 - [ ] Confirm the app images you plan to enable are published (they are —
       see §8 image-availability table; `vibe-1099`'s three images published
-      2026-07-28 with the upstream v0.1.0 release). **`vibe-1099` currently
-      requires DOMAIN mode**: the v0.1.0 api/worker refuse plain-http base
-      URLs at boot, which is what LAN/Tailscale modes render. Upstream
-      Vibe-1099 PR #4 (`ALLOW_HTTP_BASE_URLS`) lifts that once it ships in
-      a tagged release — the appliance's env template already sets the
-      flag, which v0.1.0 ignores.
+      2026-07-28). **`vibe-1099` needs image ≥ v0.1.1** — v0.1.0 refuses the
+      plain-http base URLs LAN/Tailscale modes render; v0.1.1 ships
+      `ALLOW_HTTP_BASE_URLS` (the appliance env template sets it), verified
+      working in LAN mode on a live appliance. Its first-login bootstrap
+      needs the release containing upstream PR #5 — on older images the
+      seed fails soft and no login exists yet.
 
 ## 1. Provision the host (canonical target)
 
@@ -145,7 +145,7 @@ GHCR and update-ready (audited 2026-07-24):
 | vibe-tax-research | vibe-tax-api | vibe-tax-web | — | ✅ |
 | vibe-calculators | vibe-calculators-server | vibe-calculators-client | — | ✅ |
 | vibe-tx-converter | vibe-tx-converter | — | — | ✅ |
-| vibe-1099 | vibe1099-app | vibe1099-web | render | ✅ (2026-07-28, v0.1.0 — LAN/Tailscale enable blocked until upstream PR #4 ships; see Known blockers) |
+| vibe-1099 | vibe1099-app | vibe1099-web | render | ✅ (2026-07-28; use ≥ v0.1.1 — see Known blockers) |
 | vibe-ai-router | vibe-ai-router | — | — | ✅ |
 
 (`vibe-glm-ocr` and `vibe-shield` were removed from the appliance — 2026-07-24.)
@@ -179,15 +179,17 @@ alone being healthy is not enough.
 
 ## Known blockers & gotchas (from the 2026-07-24 pre-deploy audit)
 
-- **`vibe-1099` is DOMAIN-mode-only for now** (images published 2026-07-28,
-  v0.1.0 + latest, verified anonymously pullable). The v0.1.0 api/worker
-  crash-loop on the plain-http base URLs LAN/Tailscale modes render
-  ("APP_BASE_URL must be https:// in production") — upstream PR #4
-  (`ALLOW_HTTP_BASE_URLS`) fixes it; the appliance env template already
-  sets the flag for when that release ships. Routing mode no longer
-  matters: the manifest's `rootServedOnly` serves it at `1099.<domain>` in
-  both modes. Its demo `pnpm seed` injects demo data + `admin@demo.firm` —
-  do NOT run it in production.
+- **`vibe-1099` needs image ≥ v0.1.1** (images published 2026-07-28; v0.1.0
+  crash-loops on the plain-http base URLs LAN/Tailscale modes render —
+  fixed by `ALLOW_HTTP_BASE_URLS` in v0.1.1, which the appliance env
+  template sets; LAN mode verified live on :5176 the same day). Routing
+  mode doesn't matter: the manifest's `rootServedOnly` serves it at
+  `1099.<domain>` in both domain modes. **First login needs the release
+  containing upstream PR #5** (`pnpm bootstrap:firm`): on older images the
+  seed exits non-zero (missing script), enable-app warns and continues,
+  and NO login exists — update the app once that release ships and
+  re-enable; the seed retries automatically. Its demo `pnpm seed` injects
+  demo data + `admin@demo.firm` — do NOT run it in production.
 - **Per-app subdomain routing (PR #3) is unmerged** — merge it before relying
   on `subdomain-per-app`.
 - **`vibe-tax-research` container rename (this branch):** containers/services

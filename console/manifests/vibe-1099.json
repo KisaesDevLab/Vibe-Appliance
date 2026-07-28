@@ -35,9 +35,25 @@
       { "name": "DATABASE_URL",    "from": "database-url" },
       { "name": "REDIS_URL",       "from": "redis-url" },
       { "name": "APP_BASE_URL",    "from": "subdomain-url" },
-      { "name": "PORTAL_BASE_URL", "from": "subdomain-url" }
+      { "name": "PORTAL_BASE_URL", "from": "subdomain-url" },
+      { "name": "VIBE1099_ADMIN_PASSWORD", "from": "generated:hex32", "secret": true,
+        "doc": "First-login password for the staff app, generated on enable and preserved across re-renders. Surfaced in the console's First-login card and /opt/vibe/CREDENTIALS.txt via firstLogin.passwordEnvKey. Applied by the seed (pnpm bootstrap:firm) — which needs a Vibe-1099 release containing upstream PR #5; on older images the seed fails soft and retries at the next enable." }
     ],
     "optional": [
+      {
+        "name": "VIBE1099_ADMIN_EMAIL",
+        "value": "admin@appliance.local",
+        "doc": "Login for the staff app's first admin. Set BEFORE first enable if you want a real address — the bootstrap creates the admin once (state.apps.<slug>.seeded gates it); afterwards add users from inside the app instead.",
+        "ui": {
+          "tier":      1,
+          "category":  "Application",
+          "label":     "Admin email",
+          "helpText":  "The email you sign in with at Vibe 1099. Set it before you enable the app — after that the first-run bootstrap has already created the admin and won't run again.",
+          "input":     "text",
+          "appliance": "per-app",
+          "validate":  "email"
+        }
+      },
       {
         "name": "VIBE_APP_SUBDOMAIN",
         "doc":  "Operator override for this app's subdomain label. Empty = the manifest default (\"1099\"). Consumed by the appliance routing (Caddy vhost + Cloudflare Tunnel CNAME/ingress) when DOMAIN_ROUTING_MODE=subdomain-per-app; ignored in single-host mode. Single DNS label — lowercase letters, digits, dashes, no dots.",
@@ -85,8 +101,16 @@
   "redis":    { "db": 7 },
 
   "firstLogin": {
-    "type": "none",
-    "note": "Vibe 1099 has no appliance-provisioned default login yet. Its `pnpm seed` script (inside vibe-1099-api) creates admin@demo.firm / vibe1099-demo-password ALONG WITH demo firm/payer/recipient data — for evaluation only; do NOT run it on a production install. Firm onboarding (first admin, TCC/ATS): see the app's docs/firm-onboarding.md."
+    "type": "default-credentials-passive",
+    "username": "admin@appliance.local",
+    "passwordEnvKey": "VIBE1099_ADMIN_PASSWORD",
+    "url": "/",
+    "note": "The username is whatever VIBE1099_ADMIN_EMAIL was at enable time. Created by the production bootstrap (pnpm bootstrap:firm) — NOT the demo seed, which injects demo data and must never run in production. Requires a Vibe-1099 release containing upstream PR #5; on older images the seed fails soft (warning in the enable log), no login exists yet, and the next enable retries it. Change the password inside the app after first sign-in; the appliance won't reset it (the bootstrap runs once). Firm onboarding (TCC/ATS, EIN, address): the app's docs/firm-onboarding.md."
+  },
+
+  "seed": {
+    "command": ["pnpm", "bootstrap:firm"],
+    "description": "Production first-run bootstrap: creates the real firm (FIRM_NAME) and the admin login (VIBE1099_ADMIN_EMAIL / VIBE1099_ADMIN_PASSWORD). No demo data — this is NOT `pnpm seed`. Idempotent; re-running only re-applies the admin password. Runs in the vibe1099-app container (the api matcher's upstream). Needs a release containing KisaesDevLab/Vibe-1099 PR #5; on older images pnpm exits non-zero (missing script) and enable-app logs a warning without failing the enable."
   },
 
   "health": "/api/status"
