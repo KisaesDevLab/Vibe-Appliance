@@ -2,8 +2,9 @@
 
 The Vibe Appliance is a single Linux server that runs your firm's
 Vibe stack — Trial Balance, MyBooks, Connect, Tax-Research, Payroll &
-Time, Transactions Converter, Calculators, and 1099 — plus the
-supporting infrastructure (database, cache, TLS, backup, monitoring).
+Time, Transactions Converter, Calculators, 1099, and the AI Router —
+plus the supporting infrastructure (database, cache, TLS, backup,
+monitoring).
 One install. One server. No fleet.
 
 This guide is for whoever is going to do the install. It assumes you

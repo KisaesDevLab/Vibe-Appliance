@@ -34,7 +34,10 @@ Vibe-Appliance/
 │   ├── vibe-connect.yml
 │   ├── vibe-tax-research.yml
 │   ├── vibe-payroll.yml
-│   └── vibe-glm-ocr.yml
+│   ├── vibe-calculators.yml
+│   ├── vibe-tx-converter.yml
+│   ├── vibe-1099.yml
+│   └── vibe-ai-router.yml       # two services from one image (ROUTER_ROLE)
 ├── caddy/
 │   ├── Caddyfile.tmpl           # rendered by bootstrap from CONFIG_MODE
 │   └── snippets/

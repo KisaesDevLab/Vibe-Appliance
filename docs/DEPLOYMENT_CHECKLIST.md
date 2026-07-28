@@ -140,8 +140,16 @@ GHCR and update-ready (audited 2026-07-24):
 | vibe-calculators | vibe-calculators-server | vibe-calculators-client | — | ✅ |
 | vibe-tx-converter | vibe-tx-converter | — | — | ✅ |
 | **vibe-1099** | vibe1099-app | vibe1099-web | render | **❌ not published** |
+| vibe-ai-router | vibe-ai-router | — | — | ✅ |
 
 (`vibe-glm-ocr` and `vibe-shield` were removed from the appliance — 2026-07-24.)
+
+`vibe-ai-router` runs **two containers from that one image**, split by
+`ROUTER_ROLE`: `vibe-ai-router` (gateway, `:8220`, internal-only `/v1`) and
+`vibe-ai-router-console` (admin UI, `:8222`, the surface Caddy fronts). Only
+the console is routed; the gateway is reached by container DNS on `vibe_net`.
+Its manifest declares `health_extra` so both tiers get probed — the console
+alone being healthy is not enough.
 
 - [ ] /admin → Apps → an "Update available" badge appears after
       `update.sh --check` (nightly, or POST `/api/v1/update/check`).

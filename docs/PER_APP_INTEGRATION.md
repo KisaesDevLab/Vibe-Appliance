@@ -48,6 +48,7 @@ must satisfy. Pull the shape from there:
 | `KisaesDevLab/Vibe-Calculators`     | [`console/manifests/vibe-calculators.json`](../console/manifests/vibe-calculators.json) |
 | `KisaesDevLab/Vibe-Transaction-Convertor` | [`console/manifests/vibe-tx-converter.json`](../console/manifests/vibe-tx-converter.json) |
 | `KisaesDevLab/Vibe-1099`            | [`console/manifests/vibe-1099.json`](../console/manifests/vibe-1099.json) |
+| `KisaesDevLab/Vibe-AI-Router`       | [`console/manifests/vibe-ai-router.json`](../console/manifests/vibe-ai-router.json) — two containers from one image (`ROUTER_ROLE`); `rootServedOnly` until the console bundle learns a base path |
 
 Each upstream repo, when it adds `.appliance/manifest.json`, should
 copy the file from `console/manifests/<slug>.json` here as the

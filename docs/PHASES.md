@@ -1717,3 +1717,75 @@ Append to this list as phases complete. Format:
   server.js, docker-compose.yml YAML parses; consistency + marker audits
   clean; `tests/routing/*` 4/4; no functional references to the removed
   slugs remain.
+
+- Vibe-AI-Router added as the ninth appliance app, 2026-07-27/28 by Claude
+  (Opus 5), on the Windows dev host with a live container harness (real GHCR
+  image + ParadeDB + Caddy + HAProxy). Not a numbered phase — an app
+  integration on top of Phase 8.5.
+
+  Shape: TWO containers from ONE image, split by `ROUTER_ROLE`.
+  `vibe-ai-router` (gateway, `:8220`) serves `/v1` for other Vibe apps and is
+  never routed publicly; `vibe-ai-router-console` (`:8222`) is the staff admin
+  UI and the only surface Caddy fronts. The gateway runs migrations in its
+  CMD; the console sets `SKIP_MIGRATIONS=1` and waits on the gateway's health
+  check, so two processes never race the same schema (verified: gateway
+  "3 migration(s) up", console "skipping migrations", re-up "nothing to do").
+
+  Deviations from the plan, and the appliance changes they forced:
+
+  1. **`rootServedOnly` (new manifest flag).** The router's console bundle
+     asks for `/assets/*` at absolute root and its image has no base-path
+     switch — no `40-base-path.sh`, no `VITE_BASE_PATH`. Path-mounting it at
+     `/ai-router/` therefore served the SPA shell and resolved every asset
+     against the host root (the appliance console), i.e. a blank page with a
+     200, in LAN mode AND single-host domain mode — both defaults. The
+     renderer now emits no path handler for such apps and gives them a
+     root-served vhost at their own subdomain in BOTH routing modes
+     (`render_root_served_vhosts`), with matching tunnel ingress + CNAME and
+     doctor DNS/cert checks. LAN/Tailscale has no per-app hostname, so the
+     console advertises the emergency port there instead of a URL that
+     doesn't work. **The durable fix is upstream**: teach the image a base
+     path and drop the flag. Tracked as a compatibility shim, not a pattern.
+  2. **`health_extra` (new manifest field).** `health` only probes what
+     Caddy fronts, so the gateway — the tier every other app will call — was
+     never checked by enable or doctor. Both now probe declared extra
+     targets, and enable fails if one never answers.
+  3. **`routing.deny_paths` (new manifest field).** Publishing the console
+     also published its unauthenticated `/metrics` (per-task-class request
+     counts, provider names, breaker state). Caddy now 404s declared paths
+     ahead of every other handler. Not authorization — vibe_net and the
+     UFW-gated emergency port still reach it.
+  4. **Enable-time diagnostics.** The failure log dump was scoped to the
+     routing-derived service list, which for this app is the console only —
+     a gateway failure printed an EMPTY log block (reproduced with a bad
+     `DATABASE_URL`: the real `password authentication failed` was invisible).
+     It now dumps the overlay's full service set, as disable-app already did.
+  5. **CREDENTIALS.txt per-app first-login section.** enable-app has always
+     re-run `secrets_write_credentials` so appliance-generated app passwords
+     get archived, but nothing in that function ever read them — the promise
+     in several manifests was false. It is now manifest-driven off
+     `firstLogin.passwordEnvKey` for every enabled app, not just this one.
+  6. **`CATALOG_SYNC_CRON=""` on the console container.** The scheduler is
+     not role-gated upstream, so both containers scheduled the same nightly
+     catalog upsert.
+
+  Verified live, not just read: role split (`/v1` → 403 policy on the
+  gateway, JSON 404 on the console; `/role` reports each); migrations exactly
+  once; enable does not recreate shared Postgres; update recreates BOTH
+  containers when the digest changes under an unchanged tag; a crash-looping
+  gateway self-recovers once its cause is fixed; seed (firm, admin, local
+  provider, 280-model catalog, 14 task classes / 11 policies) succeeds and
+  first login works with the generated password.
+
+  **Not yet wired — next step.** No other app's env template points at
+  `vibe-ai-router:8220`; the rest of the suite still carries its own
+  `ANTHROPIC_API_KEY`. The router is installed and usable from its own
+  console, but it is NOT yet the suite's egress path. Wiring it needs each
+  app's image to support the app-token + `X-Vibe-Task-Class` contract, which
+  is upstream work per app — appliance-side it is one env block per template
+  once those images ship it. Do not read "sole AI egress point" in the
+  manifest as a description of today's traffic.
+
+  Validation: 9 manifests pass the invariant tests; routing tests extended
+  for the new flag; `bash -n` clean on enable-app/secrets/doctor/ufw-rules/
+  render-caddyfile/cloudflared-up; `node --check` clean on server.js.
