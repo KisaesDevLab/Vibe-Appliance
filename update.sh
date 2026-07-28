@@ -442,9 +442,73 @@ cmd_update() {
     die "Update failed at health check. Rolled back."
   fi
 
+  # Step 8: run the manifest's seed if it never completed. Enable-app owns
+  # first-run seeding, but a seed can be BORN in an update: vibe-1099's
+  # first-login bootstrap shipped in an image release after the app was
+  # already enabled on real installs. Without this, the operator's natural
+  # action — clicking Update — pulls the fixed image and still creates no
+  # login; only a Disable→Enable would, and nothing tells them that.
+  # state.apps.<slug>.seeded gates it exactly like the enable path, so an
+  # already-seeded app skips instantly on every subsequent update.
+  # Non-fatal: the update itself succeeded and rolled-forward containers
+  # are healthy; a seed failure logs a warning and retries next time.
+  _run_app_seed_if_needed "$slug" "$manifest" \
+    || log_warn "seed for $slug did not complete; check container logs and re-run manually if login fails" slug="$slug"
+
   _state_app_set "$slug" status running update_available false image_tag "$default_tag"
   _state_app_history_append "$slug" "succeeded" "$current_tag" "$default_tag" ""
   log_ok "update succeeded for $slug" tag="$default_tag"
+}
+
+# Run the manifest's optional `seed` command once per install — the
+# update-path twin of lib/enable-app.sh::_run_app_seed_if_needed, duplicated
+# rather than sourced (same standalone policy as _app_services). Semantics
+# are identical: skip when state.apps.<slug>.seeded is true, exec in the
+# api matcher's upstream container (fall back to default_upstream), set
+# seeded=true only on success.
+_run_app_seed_if_needed() {
+  local slug="$1" manifest="$2"
+
+  local has_seed
+  has_seed="$(_manifest_field "$manifest" '"yes" if "seed" in data and isinstance(data["seed"], dict) and data["seed"].get("command") else ""')"
+  [[ "$has_seed" != "yes" ]] && return 0
+
+  local seeded
+  seeded="$(python3 -c "
+import json
+try:
+    s = json.load(open('${VIBE_STATE_FILE}'))
+    print(s.get('apps', {}).get('${slug}', {}).get('seeded', False))
+except Exception:
+    print(False)
+" 2>/dev/null)"
+  if [[ "$seeded" == "True" ]]; then
+    return 0
+  fi
+
+  local upstream container
+  upstream="$(_manifest_field "$manifest" 'next((m["upstream"] for m in (data["routing"].get("matchers") or []) if m.get("name") == "api"), data["routing"]["default_upstream"])')"
+  container="${upstream%:*}"
+  [[ -n "$container" ]] || { log_warn "could not resolve seed target container" slug="$slug"; return 1; }
+
+  local seed_cmd_json
+  seed_cmd_json="$(_manifest_field "$manifest" 'json.dumps(data["seed"]["command"])')"
+  local -a seed_cmd
+  mapfile -t seed_cmd < <(python3 -c "
+import json, sys
+for x in json.loads(sys.argv[1]):
+    print(x)
+" "$seed_cmd_json")
+  [[ ${#seed_cmd[@]} -gt 0 ]] || { log_warn "seed command is empty" slug="$slug"; return 1; }
+
+  log_step "running first-run seed for $slug (post-update)" container="$container" cmd="${seed_cmd[*]}"
+  if docker exec "$container" "${seed_cmd[@]}" >>"$VIBE_LOG_FILE" 2>&1; then
+    log_ok "seed completed for $slug"
+    _state_app_set "$slug" seeded true
+    return 0
+  fi
+  log_warn "seed exited non-zero — manual recovery: sudo docker exec $container ${seed_cmd[*]}" slug="$slug"
+  return 1
 }
 
 # ---- rollback ----------------------------------------------------------
