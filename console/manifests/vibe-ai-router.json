@@ -3,7 +3,7 @@
   "slug": "vibe-ai-router",
   "displayName": "Vibe AI Router",
   "description": "Sole AI egress point for the suite: task-class policy, data protection, and cost accounting.",
-  "_doc": "In-tree manifest for KisaesDevLab/Vibe-AI-Router v1.0.0. Replaces the scrapped Vibe-Shield concept with routing-layer enforcement; inherits Shield's :5193 emergency port (returned to the pool 2026-07-24). TWO containers from one image (ROUTER_ROLE): the CONSOLE (8222) is the staff admin UI and is the only surface Caddy fronts; the GATEWAY (8220) serves /v1 for other Vibe apps and is never routed publicly — apps reach it by container DNS on vibe_net. Splitting the roles is what allows the console to have TLS without publishing the gateway with it.",
+  "_doc": "In-tree manifest for KisaesDevLab/Vibe-AI-Router (github.com/KisaesDevLab/Vibe-AI-Router), first public release v0.0.1. Replaces the scrapped Vibe-Shield concept with routing-layer enforcement; inherits Shield's :5193 emergency port (returned to the pool 2026-07-24). TWO containers from one image (ROUTER_ROLE): the CONSOLE (8222) is the staff admin UI and is the only surface Caddy fronts; the GATEWAY (8220) serves /v1 for other Vibe apps and is never routed publicly — apps reach it by container DNS on vibe_net. Splitting the roles is what allows the console to have TLS without publishing the gateway with it.",
 
   "image": {
     "server":     "ghcr.io/kisaesdevlab/vibe-ai-router",
