@@ -27,6 +27,9 @@ env/
 console/node_modules/
 console/dist/
 console/*.sqlite
+# No lockfile by convention — the image build runs `npm install` from
+# package.json alone (see console/Dockerfile).
+console/package-lock.json
 console/*.sqlite-journal
 
 # Backup / scratch files Claude or shell may leave behind

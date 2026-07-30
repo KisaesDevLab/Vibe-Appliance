@@ -3445,6 +3445,7 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
     panelEl.appendChild(list);
 
     await renderCustomCardsSection(panelEl);
+    await renderToolsSection(panelEl);
   }
 
   // Operator-curated tiles on /. State lives in /opt/vibe/state.json
@@ -3627,6 +3628,277 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
       onclick: () => { cards.splice(idx, 1); repaint(); },
     }, ['Remove']);
     wrap.appendChild(removeBtn);
+
+    return wrap;
+  }
+
+  // Mini-apps (JSX tools) — admin-uploaded, Claude-generated React
+  // components rendered in-appliance at /tools/<id>. Unlike custom
+  // cards (save-the-whole-list), tools are per-row CRUD because the
+  // source upload is inherently per-tool and can be large.
+  const TOOL_MAX_SOURCE_BYTES = 1024 * 1024;
+
+  async function renderToolsSection(parent) {
+    parent.appendChild(el('h3', {
+      style: 'margin:2rem 0 0.4rem;font-size:1rem;color:#6b4423;',
+    }, ['Mini-apps (JSX tools)']));
+    parent.appendChild(el('p', { class: 'help' }, [
+      'Single-file React components — for example ones Claude builds for you — rendered ',
+      'right on this appliance. Ask Claude for "a single-file React component with a default ',
+      'export, using only react, recharts and lucide-react imports, styled with Tailwind ',
+      'classes", download the .jsx file, and upload it here. Visible tools appear as cards ',
+      'on the public landing page; they run entirely in the visitor\'s browser, sandboxed ',
+      'away from the rest of the appliance.',
+    ]));
+
+    const holder = el('div', { 'data-tools-editor': '1' });
+    parent.appendChild(holder);
+
+    async function reload() {
+      holder.innerHTML = '';
+      holder.appendChild(el('p', { class: 'muted' }, ['Loading…']));
+      let tools;
+      try {
+        const r = await fetch('/api/v1/admin/tools', { credentials: 'same-origin' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const body = await r.json();
+        tools = Array.isArray(body.tools) ? body.tools : [];
+      } catch (err) {
+        holder.innerHTML = '';
+        holder.appendChild(el('p', { class: 'help', style: 'color:#a04040;' }, [
+          "Couldn't load tools: " + _friendlyError(err),
+        ]));
+        return;
+      }
+      holder.innerHTML = '';
+      if (!tools.length) {
+        holder.appendChild(el('p', { class: 'muted', style: 'margin:0.5rem 0;' }, [
+          'No tools yet. Click "Add tool" to create one.',
+        ]));
+      } else {
+        for (const tool of tools) holder.appendChild(renderToolRow(tool, reload));
+      }
+      holder.appendChild(renderToolDraftRow(reload));
+    }
+
+    await reload();
+  }
+
+  // The "Add tool" affordance: a collapsed button that expands into a
+  // small create form (title + description). Source is uploaded on the
+  // row after creation — a tool without source stays off the public
+  // landing, so a half-finished create is harmless.
+  function renderToolDraftRow(reload) {
+    const wrap = el('div', { style: 'margin-top:0.75rem;' });
+    const addBtn = el('button', {
+      type: 'button', class: 'btn btn--ghost',
+      onclick: () => { addBtn.style.display = 'none'; form.style.display = ''; },
+    }, ['Add tool']);
+    const draft = { title: '', description: '' };
+    const statusEl = el('p', { class: 'help', style: 'min-height:1.2em;margin:0.35rem 0 0;' }, ['']);
+    const form = el('div', { class: 'settings-field', style: 'display:none;' }, [
+      el('label', { style: 'display:block;margin-bottom:0.5rem;' }, [
+        el('span', { class: 'help', style: 'display:block;margin-bottom:0.15rem;' }, ['Title']),
+        el('input', {
+          type: 'text', maxlength: '80', placeholder: 'Mileage deduction calculator',
+          style: 'width:100%;',
+          oninput: (e) => { draft.title = e.target.value; },
+        }),
+      ]),
+      el('label', { style: 'display:block;margin-bottom:0.5rem;' }, [
+        el('span', { class: 'help', style: 'display:block;margin-bottom:0.15rem;' }, ['Description']),
+        el('input', {
+          type: 'text', maxlength: '400', placeholder: 'Estimate your business-mileage deduction.',
+          style: 'width:100%;',
+          oninput: (e) => { draft.description = e.target.value; },
+        }),
+      ]),
+      el('button', {
+        type: 'button', class: 'btn',
+        onclick: async (e) => {
+          const btn = e.target;
+          statusEl.style.color = '';
+          statusEl.textContent = 'Creating…';
+          btn.setAttribute('disabled', 'disabled');
+          try {
+            const r = await fetch('/api/v1/admin/tools', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ title: draft.title.trim(), description: draft.description.trim() }),
+            });
+            const body = await r.json().catch(() => ({}));
+            if (!r.ok) throw new Error(body.error || ('HTTP ' + r.status));
+            await reload();
+          } catch (err) {
+            statusEl.style.color = 'var(--bad)';
+            statusEl.textContent = "Couldn't create: " + _friendlyError(err);
+            btn.removeAttribute('disabled');
+          }
+        },
+      }, ['Create tool']),
+      statusEl,
+    ]);
+    wrap.appendChild(addBtn);
+    wrap.appendChild(form);
+    return wrap;
+  }
+
+  function renderToolRow(tool, reload) {
+    const wrap = el('div', { class: 'settings-field', 'data-tool-id': tool.id });
+    const statusEl = el('p', { class: 'help', style: 'min-height:1.2em;margin:0.35rem 0 0;' }, ['']);
+    function setStatus(msg, bad) {
+      statusEl.style.color = bad ? 'var(--bad)' : 'var(--good)';
+      statusEl.textContent = msg;
+    }
+
+    const local = { title: tool.title, description: tool.description };
+
+    wrap.appendChild(el('label', { style: 'display:block;margin-bottom:0.5rem;' }, [
+      el('span', { class: 'help', style: 'display:block;margin-bottom:0.15rem;' }, ['Title']),
+      el('input', {
+        type: 'text', value: local.title, maxlength: '80', style: 'width:100%;',
+        oninput: (e) => { local.title = e.target.value; },
+      }),
+    ]));
+    wrap.appendChild(el('label', { style: 'display:block;margin-bottom:0.5rem;' }, [
+      el('span', { class: 'help', style: 'display:block;margin-bottom:0.15rem;' }, ['Description']),
+      el('input', {
+        type: 'text', value: local.description, maxlength: '400', style: 'width:100%;',
+        oninput: (e) => { local.description = e.target.value; },
+      }),
+    ]));
+
+    // File state line. A tool without source never reaches the public
+    // landing regardless of the visibility toggle — say so explicitly.
+    const fileInfo = tool.has_source
+      ? tool.filename + ' · ' + Math.max(1, Math.round(tool.source_bytes / 1024)) + ' KB · updated '
+        + String(tool.updated_ts).slice(0, 16).replace('T', ' ')
+      : 'No file uploaded yet — this tool stays hidden from clients until you upload one.';
+    wrap.appendChild(el('p', {
+      class: 'help',
+      style: tool.has_source ? '' : 'color:#8a6f3a;',
+    }, [fileInfo]));
+
+    // Visibility toggle — optimistic, reverts on error.
+    const visLabel = el('label', { style: 'display:flex;align-items:center;gap:0.4rem;margin-bottom:0.5rem;' });
+    const visBox = el('input', { type: 'checkbox', 'aria-label': 'Show ' + tool.title + ' on the customer landing' });
+    if (tool.visible) visBox.setAttribute('checked', 'checked');
+    visBox.addEventListener('change', async () => {
+      const want = visBox.checked;
+      try {
+        const r = await fetch('/api/v1/admin/tools/' + encodeURIComponent(tool.id), {
+          method: 'PUT',
+          credentials: 'same-origin',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ visible: want }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(body.error || ('HTTP ' + r.status));
+        setStatus(want ? '✓ Shown on the landing page.' : '✓ Hidden from the landing page.');
+      } catch (err) {
+        visBox.checked = !want;
+        setStatus("Couldn't change visibility: " + _friendlyError(err), true);
+      }
+    });
+    visLabel.appendChild(visBox);
+    visLabel.appendChild(el('span', { class: 'help' }, ['Show on the customer landing page']));
+    wrap.appendChild(visLabel);
+
+    // Hidden file input drives both first upload and replace.
+    const fileInput = el('input', {
+      type: 'file',
+      accept: '.jsx,.tsx,.js,.ts,text/plain',
+      style: 'display:none;',
+    });
+    fileInput.addEventListener('change', () => {
+      const f = fileInput.files && fileInput.files[0];
+      if (!f) return;
+      if (f.size > TOOL_MAX_SOURCE_BYTES) {
+        setStatus('File is larger than 1 MB — that is not a single-file component. Check you picked the right file.', true);
+        fileInput.value = '';
+        return;
+      }
+      const reader = new FileReader();
+      reader.onerror = () => setStatus("Couldn't read the file.", true);
+      reader.onload = async () => {
+        setStatus('Uploading ' + f.name + '…');
+        try {
+          const r = await fetch(
+            '/api/v1/admin/tools/' + encodeURIComponent(tool.id) + '/source?filename=' + encodeURIComponent(f.name),
+            {
+              method: 'PUT',
+              credentials: 'same-origin',
+              headers: { 'content-type': 'text/plain; charset=utf-8' },
+              body: String(reader.result),
+            },
+          );
+          const body = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(body.error || ('HTTP ' + r.status));
+          await reload();
+        } catch (err) {
+          setStatus("Couldn't upload: " + _friendlyError(err), true);
+          fileInput.value = '';
+        }
+      };
+      reader.readAsText(f);
+    });
+    wrap.appendChild(fileInput);
+
+    const actions = el('div', { style: 'display:flex;flex-wrap:wrap;gap:0.5rem;' });
+    actions.appendChild(el('button', {
+      type: 'button', class: 'btn',
+      onclick: async (e) => {
+        const btn = e.target;
+        btn.setAttribute('disabled', 'disabled');
+        setStatus('Saving…');
+        try {
+          const r = await fetch('/api/v1/admin/tools/' + encodeURIComponent(tool.id), {
+            method: 'PUT',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ title: local.title.trim(), description: local.description.trim() }),
+          });
+          const body = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(body.error || ('HTTP ' + r.status));
+          setStatus('✓ Saved.');
+        } catch (err) {
+          setStatus("Couldn't save: " + _friendlyError(err), true);
+        } finally {
+          btn.removeAttribute('disabled');
+        }
+      },
+    }, ['Save details']));
+    actions.appendChild(el('button', {
+      type: 'button', class: 'btn btn--ghost',
+      onclick: () => fileInput.click(),
+    }, [tool.has_source ? 'Replace file…' : 'Upload file…']));
+    if (tool.has_source) {
+      actions.appendChild(el('a', {
+        class: 'btn btn--ghost',
+        href: '/tools/' + encodeURIComponent(tool.id),
+        target: '_blank', rel: 'noopener noreferrer',
+      }, ['Open ↗']));
+    }
+    actions.appendChild(el('button', {
+      type: 'button', class: 'btn btn--ghost',
+      onclick: async () => {
+        if (!window.confirm('Delete "' + tool.title + '"? Clients lose access immediately. The .jsx is not recoverable from the appliance afterwards — keep your own copy if you may want it back.')) return;
+        try {
+          const r = await fetch('/api/v1/admin/tools/' + encodeURIComponent(tool.id), {
+            method: 'DELETE',
+            credentials: 'same-origin',
+          });
+          const body = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(body.error || ('HTTP ' + r.status));
+          await reload();
+        } catch (err) {
+          setStatus("Couldn't delete: " + _friendlyError(err), true);
+        }
+      },
+    }, ['Delete']));
+    wrap.appendChild(actions);
+    wrap.appendChild(statusEl);
 
     return wrap;
   }

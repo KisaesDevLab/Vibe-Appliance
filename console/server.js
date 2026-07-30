@@ -120,6 +120,24 @@ db.exec(`
   -- rows (1-year retention × 100 saves/day → ~36k rows). The composite
   -- lets SQLite walk the index in (category, ts DESC) order.
   CREATE INDEX IF NOT EXISTS idx_audit_category_ts ON settings_audit(category, ts DESC);
+
+  -- Mini-apps (JSX tools) — admin-uploaded, Claude-generated single-file
+  -- React components rendered client-side in a sandboxed iframe (see
+  -- lib/custom-tools.js for the security model). Source lives in the
+  -- row rather than on disk: uploads stay atomic with their metadata,
+  -- there is no filename/path-traversal surface, and the existing
+  -- console.sqlite backup covers them. NULL source = created but no
+  -- file uploaded yet (hidden from the public landing until one is).
+  CREATE TABLE IF NOT EXISTS custom_tools (
+    id          TEXT PRIMARY KEY,               -- 16 hex chars
+    title       TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    filename    TEXT NOT NULL DEFAULT 'tool.jsx', -- picks Babel presets (.tsx → typescript)
+    source      TEXT,                            -- the JSX itself, ≤1 MiB
+    visible     INTEGER NOT NULL DEFAULT 1,      -- 1 = listed on public landing
+    created_ts  TEXT NOT NULL,                   -- ISO 8601
+    updated_ts  TEXT NOT NULL
+  );
 `);
 db.prepare(
   `INSERT INTO meta (key, value) VALUES ('schema_version', '2')
@@ -888,26 +906,32 @@ function verifyAdminPassword(supplied) {
   return constantTimeStringEquals(supplied, ADMIN_PASS_BOOT);
 }
 
-function requireAdmin(req, res, next) {
+// Pure credential check — true iff the request carries valid admin
+// basic auth. Used by requireAdmin (which adds the 401 challenge) and
+// by public-with-admin-preview routes (/tools/:id on a hidden tool)
+// where a 401 challenge would be wrong for ordinary visitors.
+function hasAdminCreds(req) {
   const header = req.headers.authorization || '';
-  if (!header.toLowerCase().startsWith('basic ')) return adminChallenge(res);
+  if (!header.toLowerCase().startsWith('basic ')) return false;
   let decoded;
   try {
     decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
   } catch {
-    return adminChallenge(res);
+    return false;
   }
   const sep = decoded.indexOf(':');
-  if (sep < 0) return adminChallenge(res);
+  if (sep < 0) return false;
   const user = decoded.slice(0, sep);
   const pass = decoded.slice(sep + 1);
-  if (
-    !constantTimeStringEquals(user, ADMIN_USER) ||
-    !verifyAdminPassword(pass)
-  ) {
+  if (!constantTimeStringEquals(user, ADMIN_USER) || !verifyAdminPassword(pass)) {
     log('warn', 'admin auth failed', { user });
-    return adminChallenge(res);
+    return false;
   }
+  return true;
+}
+
+function requireAdmin(req, res, next) {
+  if (!hasAdminCreds(req)) return adminChallenge(res);
   next();
 }
 
@@ -1106,7 +1130,25 @@ app.get('/api/v1/public/apps', async (_req, res) => {
     })
     .map(({ card }) => card);
 
-  res.json({ apps: items, customCards, firmName, showStaffSignin });
+  // Mini-apps (JSX tools) — admin-uploaded components rendered at
+  // /tools/:id (see the jsx-tools section below). Only visible tools
+  // that actually have source surface here; id+title+description is
+  // the whole public payload, never the source itself.
+  let tools = [];
+  try {
+    tools = db.prepare(
+      "SELECT id, title, description FROM custom_tools WHERE visible = 1 AND source IS NOT NULL AND source != '' ORDER BY created_ts, id"
+    ).all().map((t) => ({
+      id: t.id,
+      title: t.title,
+      description: t.description,
+      url: '/tools/' + t.id,
+    }));
+  } catch (err) {
+    log('warn', 'jsx-tools: public list query failed', { err: err.message });
+  }
+
+  res.json({ apps: items, customCards, tools, firmName, showStaffSignin });
 });
 
 // --- Custom cards (operator-curated landing tiles) ---------------------
@@ -1210,6 +1252,221 @@ app.put('/api/v1/admin/custom-cards', requireAdmin, testRateLimit, (req, res) =>
   }
   log('info', 'custom-cards updated', { count: validated.length });
   res.json({ ok: true, cards: validated });
+});
+
+// --- Mini-apps (JSX tools) ---------------------------------------------
+//
+// Admin-uploaded, Claude-generated single-file React components. The
+// admin names + uploads them under Settings → Customer landing; visible
+// tools surface as cards on the public landing page and render at
+// /tools/:id — compiled in the visitor's browser by Babel standalone
+// and mounted inside a sandboxed (opaque-origin) iframe. Validation,
+// HTML builders, and the security-model write-up live in
+// lib/custom-tools.js. Nothing in this feature executes on the server.
+
+const customTools = require('./lib/custom-tools');
+
+// react/react-dom/@babel/standalone/etc. are in package.json solely so
+// their dist bundles can be served below — server.js never require()s
+// them. Resolved once at startup; a missing optional bundle downgrades
+// that import inside tools to a friendly error, a missing required one
+// means the runner can't work at all (image built wrong) so log at
+// error level for the operator.
+const _vendor = customTools.resolveVendorFiles(path.join(__dirname, 'node_modules'));
+if (_vendor.missingRequired.length) {
+  log('error', 'jsx-tools: required vendor bundles missing — /tools pages will not render', {
+    missing: _vendor.missingRequired,
+  });
+} else if (_vendor.missing.length) {
+  log('warn', 'jsx-tools: optional vendor bundles missing', { missing: _vendor.missing });
+}
+const _vendorUrls = customTools.vendorScriptUrls(_vendor.files);
+
+app.get('/vendor/:file', (req, res) => {
+  const abs = _vendor.files.get(req.params.file);
+  if (!abs) return res.status(404).type('text/plain').send('not found\n');
+  // Content only changes on console image rebuild; 1h + revalidate is
+  // plenty and keeps repeat tool loads instant on LAN.
+  res.setHeader('Cache-Control', 'public, max-age=3600, must-revalidate');
+  res.sendFile(abs);
+});
+
+const _toolRowToJson = (row, { withSource = false } = {}) => {
+  const out = {
+    id:          row.id,
+    title:       row.title,
+    description: row.description,
+    filename:    row.filename,
+    visible:     row.visible === 1,
+    has_source:  typeof row.source === 'string' && row.source.length > 0,
+    source_bytes: typeof row.source === 'string' ? Buffer.byteLength(row.source, 'utf8') : 0,
+    created_ts:  row.created_ts,
+    updated_ts:  row.updated_ts,
+  };
+  if (withSource) out.source = row.source || '';
+  return out;
+};
+
+function _getToolOr404(req, res) {
+  const id = String(req.params.id || '');
+  if (!customTools.TOOL_ID_RE.test(id)) {
+    res.status(404).json({ error: 'no such tool' });
+    return null;
+  }
+  const row = db.prepare('SELECT * FROM custom_tools WHERE id = ?').get(id);
+  if (!row) {
+    res.status(404).json({ error: 'no such tool' });
+    return null;
+  }
+  return row;
+}
+
+app.get('/api/v1/admin/tools', requireAdmin, (_req, res) => {
+  const rows = db.prepare('SELECT * FROM custom_tools ORDER BY created_ts, id').all();
+  res.json({ tools: rows.map((r) => _toolRowToJson(r)) });
+});
+
+app.get('/api/v1/admin/tools/:id', requireAdmin, (req, res) => {
+  const row = _getToolOr404(req, res);
+  if (!row) return;
+  res.json({ tool: _toolRowToJson(row, { withSource: true }) });
+});
+
+app.post('/api/v1/admin/tools', requireAdmin, testRateLimit, (req, res) => {
+  const count = db.prepare('SELECT COUNT(*) AS n FROM custom_tools').get().n;
+  if (count >= customTools.TOOL_LIMITS.MAX_TOOLS) {
+    return res.status(400).json({
+      error: `at most ${customTools.TOOL_LIMITS.MAX_TOOLS} tools — delete one you no longer use first`,
+    });
+  }
+  const v = customTools.validateToolMeta(req.body || {});
+  if (!v.ok) return res.status(400).json({ error: v.error });
+  const id = crypto.randomBytes(8).toString('hex');
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO custom_tools (id, title, description, visible, created_ts, updated_ts)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(id, v.meta.title, v.meta.description, v.meta.visible ? 1 : 0, now, now);
+  log('info', 'jsx-tools: created', { id, title: v.meta.title });
+  const row = db.prepare('SELECT * FROM custom_tools WHERE id = ?').get(id);
+  res.json({ ok: true, tool: _toolRowToJson(row) });
+});
+
+app.put('/api/v1/admin/tools/:id', requireAdmin, testRateLimit, (req, res) => {
+  const row = _getToolOr404(req, res);
+  if (!row) return;
+  const v = customTools.validateToolMeta(req.body || {}, { partial: true });
+  if (!v.ok) return res.status(400).json({ error: v.error });
+  const next = {
+    title:       v.meta.title       ?? row.title,
+    description: v.meta.description ?? row.description,
+    visible:     v.meta.visible === undefined ? row.visible : (v.meta.visible ? 1 : 0),
+  };
+  db.prepare(
+    'UPDATE custom_tools SET title = ?, description = ?, visible = ?, updated_ts = ? WHERE id = ?'
+  ).run(next.title, next.description, next.visible, new Date().toISOString(), row.id);
+  log('info', 'jsx-tools: metadata updated', { id: row.id });
+  res.json({ ok: true, tool: _toolRowToJson(db.prepare('SELECT * FROM custom_tools WHERE id = ?').get(row.id)) });
+});
+
+// Source upload rides a text/plain body so it bypasses the global 64 KB
+// JSON parser (which has already declined non-JSON content types by the
+// time this route-level parser runs). ?filename=... carries the original
+// name purely so the runner can pick TypeScript presets for .tsx/.ts.
+app.put(
+  '/api/v1/admin/tools/:id/source',
+  requireAdmin,
+  testRateLimit,
+  express.text({ type: ['text/*', 'application/octet-stream'], limit: '1mb' }),
+  (req, res) => {
+    const row = _getToolOr404(req, res);
+    if (!row) return;
+    if (typeof req.body !== 'string') {
+      return res.status(400).json({
+        error: 'expected the JSX file contents as a text/plain request body',
+      });
+    }
+    const sv = customTools.validateSource(req.body);
+    if (!sv.ok) return res.status(400).json({ error: sv.error });
+    const filename = customTools.normalizeFilename(req.query.filename) || 'tool.jsx';
+    db.prepare(
+      'UPDATE custom_tools SET source = ?, filename = ?, updated_ts = ? WHERE id = ?'
+    ).run(req.body, filename, new Date().toISOString(), row.id);
+    log('info', 'jsx-tools: source uploaded', {
+      id: row.id,
+      filename,
+      bytes: Buffer.byteLength(req.body, 'utf8'),
+    });
+    res.json({ ok: true, tool: _toolRowToJson(db.prepare('SELECT * FROM custom_tools WHERE id = ?').get(row.id)) });
+  },
+);
+
+// Admin-side download of the stored source (review / re-feed to Claude).
+app.get('/api/v1/admin/tools/:id/source', requireAdmin, (req, res) => {
+  const row = _getToolOr404(req, res);
+  if (!row) return;
+  res.type('text/plain; charset=utf-8').send(row.source || '');
+});
+
+app.delete('/api/v1/admin/tools/:id', requireAdmin, testRateLimit, (req, res) => {
+  const row = _getToolOr404(req, res);
+  if (!row) return;
+  db.prepare('DELETE FROM custom_tools WHERE id = ?').run(row.id);
+  log('info', 'jsx-tools: deleted', { id: row.id, title: row.title });
+  res.json({ ok: true });
+});
+
+// Public tool pages. A tool is publicly reachable only when visible AND
+// it has source; the admin can additionally open a hidden/unfinished
+// tool for preview because their browser already carries basic auth
+// from the admin UI. Unknown/hidden ids 404 identically so visitors
+// can't probe which ids exist.
+function _publicToolRow(req) {
+  const id = String(req.params.id || '');
+  if (!customTools.TOOL_ID_RE.test(id)) return null;
+  const row = db.prepare('SELECT * FROM custom_tools WHERE id = ?').get(id);
+  if (!row || !row.source) return null;
+  if (row.visible !== 1 && !hasAdminCreds(req)) return null;
+  return row;
+}
+
+function _toolNotFoundPage(res) {
+  res.status(404).type('html').send(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Tool not found</title></head>
+<body style="font-family:system-ui,sans-serif;max-width:36rem;margin:4rem auto;padding:0 1rem;">
+  <h1 style="font-size:1.2rem;">This tool isn't available.</h1>
+  <p>It may have been removed or hidden by your firm's administrator.</p>
+  <p><a href="/">&larr; Back to the portal</a></p>
+</body></html>
+`);
+}
+
+app.get('/tools/:id', (req, res) => {
+  const row = _publicToolRow(req);
+  if (!row) return _toolNotFoundPage(res);
+  res.setHeader('Cache-Control', 'no-store');
+  res.type('html').send(customTools.buildShellHtml({ id: row.id, title: row.title }));
+});
+
+app.get('/tools/:id/frame', (req, res) => {
+  const row = _publicToolRow(req);
+  if (!row) return _toolNotFoundPage(res);
+  // The load-bearing header: `sandbox` without allow-same-origin gives
+  // the document an opaque origin even when opened directly as a tab,
+  // so uploaded code can't carry the visitor's (or admin's) ambient
+  // credentials to console endpoints. Mirrors the iframe attribute in
+  // the shell page.
+  res.setHeader(
+    'Content-Security-Policy',
+    'sandbox ' + customTools.IFRAME_SANDBOX,
+  );
+  res.setHeader('Cache-Control', 'no-store');
+  res.type('html').send(customTools.buildFrameHtml({
+    title:         row.title,
+    filename:      row.filename || 'tool.jsx',
+    source:        row.source,
+    vendorScripts: _vendorUrls,
+  }));
 });
 
 // --- Apps registry & toggle endpoints ---------------------------------

@@ -58,18 +58,26 @@
         </div>`;
     }
 
-    function renderTiles(apps, customCards) {
+    function renderTiles(apps, customCards, tools) {
       const appTiles = apps.map((a) => renderCard({
         title: a.displayName,
         description: a.description,
         actions: renderActions(a),
+      }));
+      // Mini-apps (JSX tools) uploaded by the firm's admin — rendered
+      // in-appliance at /tools/<id>. Same _blank/noopener treatment as
+      // app links so an open staff-console tab is never navigated away.
+      const toolTiles = tools.map((t) => renderCard({
+        title: t.title,
+        description: t.description,
+        actions: `<a class="btn" href="${escapeHtml(t.url)}" target="_blank" rel="noopener noreferrer">Open</a>`,
       }));
       const customTiles = customCards.map((c) => renderCard({
         title: c.title,
         description: c.description,
         actions: `<a class="btn" href="${escapeHtml(c.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(c.buttonLabel || 'Open')}</a>`,
       }));
-      return `<div class="client-grid">${[...appTiles, ...customTiles].join('')}</div>`;
+      return `<div class="client-grid">${[...appTiles, ...toolTiles, ...customTiles].join('')}</div>`;
     }
 
     function renderCard({ title, description, actions }) {
@@ -122,8 +130,9 @@
         applyStaffSignin(data.showStaffSignin !== false);
         const apps = Array.isArray(data.apps) ? data.apps : [];
         const customCards = Array.isArray(data.customCards) ? data.customCards : [];
-        section.innerHTML = (apps.length || customCards.length)
-          ? renderTiles(apps, customCards)
+        const tools = Array.isArray(data.tools) ? data.tools : [];
+        section.innerHTML = (apps.length || customCards.length || tools.length)
+          ? renderTiles(apps, customCards, tools)
           : renderEmpty();
       } catch (err) {
         section.innerHTML = renderError(err.message || String(err));
