@@ -1139,6 +1139,34 @@ PYEOF
   fi
   [[ -z "$vibe1099_admin_password" ]] && vibe1099_admin_password="$(openssl rand -hex 32)"
 
+  # Vibe AI Router dual-mode wiring (D3, router-option addendum). Only for apps
+  # whose template references @VIBE_AI_TOKEN@. Mint-once-preserve-forever: an
+  # existing token survives re-enable (minting again would orphan the old row).
+  # When the router console is not reachable — not enabled yet, or still
+  # starting — the app is rendered in DIRECT mode with a warning; re-enabling
+  # the app after the router is up flips it to router mode. Never guess: a
+  # router-mode render without a valid token would refuse to boot (by design).
+  local vibe_ai_mode="direct" vibe_ai_token=""
+  if grep -q "@VIBE_AI_TOKEN@" "$tmpl" 2>/dev/null; then
+    if [[ -f "$out" ]]; then
+      vibe_ai_token="$(_extract_env_value "$out" "VIBE_AI_TOKEN")"
+    fi
+    if [[ -n "$vibe_ai_token" ]]; then
+      # keep the operator's mode choice on re-enable; default router since a token exists
+      vibe_ai_mode="$(_extract_env_value "$out" "VIBE_AI_MODE")"
+      [[ -z "$vibe_ai_mode" ]] && vibe_ai_mode="router"
+    else
+      vibe_ai_token="$(_mint_vibe_ai_token "$slug" || true)"
+      if [[ -n "$vibe_ai_token" ]]; then
+        vibe_ai_mode="router"
+        log_ok "vibe-ai-router app token minted" app="$slug"
+      else
+        log_warn "vibe-ai-router console not reachable — rendering $slug in direct AI mode" \
+                 hint="enable vibe-ai-router, then re-run: vibe enable $slug"
+      fi
+    fi
+  fi
+
   # DB and redis target details from manifest.
   local db_name db_user
   db_name="$(_manifest_field "$manifest" 'data.get("database",{}).get("name","")')"
@@ -1175,14 +1203,16 @@ PYEOF
       "$vite_base_path" "$session_secure" "$intake_key" \
       "$vs_kek" "$gateway_admin_key" \
       "$staff_app_url" "$client_portal_url" \
-      "$master_key" "$router_admin_password" "$vibe1099_admin_password" <<'PYEOF'
+      "$master_key" "$router_admin_password" "$vibe1099_admin_password" \
+      "$vibe_ai_mode" "$vibe_ai_token" <<'PYEOF'
 import base64, sys
 src, dst, allowed_origin, database_url, redis_url, \
     encryption_key, jwt_secret, db_name, db_user, db_pass, \
     vite_base_path, session_secure, intake_key, \
     vs_kek, gateway_admin_key, \
     staff_app_url, client_portal_url, \
-    master_key, router_admin_password, vibe1099_admin_password = sys.argv[1:21]
+    master_key, router_admin_password, vibe1099_admin_password, \
+    vibe_ai_mode, vibe_ai_token = sys.argv[1:23]
 # Some upstream apps want the appliance's 32-byte AES key as base64 (32
 # raw bytes -> 44-char base64 with padding) rather than the hex form
 # we ship in shared.env. Derive it once here so per-app templates can
@@ -1216,6 +1246,8 @@ body = body.replace("@GATEWAY_ADMIN_KEY@",  gateway_admin_key)
 body = body.replace("@MASTER_KEY@",         master_key)
 body = body.replace("@ROUTER_ADMIN_PASSWORD@", router_admin_password)
 body = body.replace("@VIBE1099_ADMIN_PASSWORD@", vibe1099_admin_password)
+body = body.replace("@VIBE_AI_MODE@",        vibe_ai_mode)
+body = body.replace("@VIBE_AI_TOKEN@",       vibe_ai_token)
 body = body.replace("@STAFF_APP_URL@",      staff_app_url)
 body = body.replace("@CLIENT_PORTAL_URL@",  client_portal_url)
 with open(dst, "w") as f:
@@ -1279,6 +1311,46 @@ try:
 except FileNotFoundError:
     pass
 PYEOF
+}
+
+# Mint a Vibe-AI-Router app token through the router console's admin API
+# (D3, router-option addendum). Prints the token on success; prints nothing
+# and returns non-zero when the router isn't available — callers degrade to
+# direct mode. Reached via the console container on vibe_net (like the
+# health probes) so this works in every routing mode; credentials are the
+# ones this enable flow itself provisioned into vibe-ai-router.env. The
+# session cookie's Secure attribute is a browser instruction, not a server
+# gate, so plain-HTTP inside the docker network is fine.
+_mint_vibe_ai_token() {
+  local app="$1"
+  local router_env="${VIBE_ENV_DIR}/vibe-ai-router.env"
+  [[ -f "$router_env" ]] || return 1
+  local email pass
+  email="$(_extract_env_value "$router_env" "ROUTER_ADMIN_EMAIL")"
+  pass="$(_extract_env_value "$router_env" "ROUTER_ADMIN_PASSWORD")"
+  [[ -z "$email" ]] && email="admin@appliance.local"
+  [[ -n "$pass" ]] || return 1
+  docker exec -i vibe-ai-router-console node --input-type=module - "$app" "$email" "$pass" <<'NODEEOF' 2>/dev/null
+// stdin scripts get argv = [node, "-", ...args]
+const [app, email, password] = process.argv.slice(2);
+const base = 'http://127.0.0.1:8222';
+const login = await fetch(base + '/admin-api/auth/login', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', 'x-vibe-admin': '1' },
+  body: JSON.stringify({ email, password }),
+});
+if (login.status !== 200) process.exit(1);
+const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0];
+const minted = await fetch(base + '/admin-api/app-tokens', {
+  method: 'POST',
+  headers: { cookie, 'content-type': 'application/json', 'x-vibe-admin': '1' },
+  body: JSON.stringify({ app }),
+});
+if (minted.status >= 300) process.exit(1);
+const body = await minted.json();
+if (!body.token) process.exit(1);
+process.stdout.write(body.token);
+NODEEOF
 }
 
 # Extract a bare KEY=value from a per-app env file. Returns empty if
