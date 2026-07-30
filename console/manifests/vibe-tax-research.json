@@ -31,7 +31,7 @@
       { "name": "ALLOWED_ORIGIN",  "from": "subdomain-url" },
       { "name": "DATABASE_URL",    "from": "database-url" },
       { "name": "REDIS_URL",       "from": "redis-url" },
-      { "name": "MIGRATIONS_AUTO", "from": "static:false" }
+      { "name": "MIGRATIONS_AUTO", "from": "static:true" }
     ],
     "optional": [
       {

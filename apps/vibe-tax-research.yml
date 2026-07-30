@@ -31,6 +31,10 @@ services:
       - /opt/vibe/data/apps/vibe-tax-research/attachments:/app/attachments
       - /opt/vibe/data/apps/vibe-tax-research/workspaces:/app/workspaces
       - /opt/vibe/data/apps/vibe-tax-research/backups:/app/backups
+      # Rendered plan deliverables (PDFs). Without this mount they land
+      # inside the container and are lost on every image update, leaving
+      # the UI listing artifacts whose download 404s.
+      - /opt/vibe/data/apps/vibe-tax-research/deliverables:/app/storage/deliverables
     networks:
       vibe_net: {}
       vibe-tax-research-internal:
