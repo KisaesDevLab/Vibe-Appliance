@@ -1705,6 +1705,95 @@ app.post('/api/v1/admin/prune-images', requireAdmin, testRateLimit, async (_req,
   await runShell(res, [PRUNE_SCRIPT], 'prune-images');
 });
 
+// --- Appliance self-update -------------------------------------------
+//
+// Updates the APPLIANCE itself (this git checkout), as opposed to
+// /api/v1/update/:slug which updates a single app's GHCR image. Closes
+// the last routine operation that required SSH: `git pull` +
+// `bootstrap.sh`. The audience is novice CPAs — an operation only
+// reachable from a terminal may as well not exist.
+//
+// This cannot use runShell. bootstrap.sh recreates the console
+// container, so a child process of THIS process gets SIGTERMed partway
+// through, the response never sends, and the operator is left staring
+// at a spinner with no idea whether their appliance is mid-surgery.
+// Instead lib/self-update.sh is launched DETACHED on the host (setsid,
+// reparented to init, outside every container), and publishes progress
+// to a status file that the poll endpoint below reads. The browser
+// reconnects after the restart and picks the story back up.
+const SELF_UPDATE_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'self-update.sh');
+const SELF_UPDATE_STATUS = path.join(LOGS_DIR, 'self-update.status.json');
+
+app.post('/api/v1/admin/self-update', requireAdmin, testRateLimit, async (_req, res) => {
+  // Refuse while a tunnel provision is in flight. Both re-render the
+  // Caddyfile and bounce containers; interleaving them is how you get a
+  // half-written config on a box nobody can reach. Mirrors the guard the
+  // Network tab already applies to mode switching.
+  try {
+    const c = docker.getContainer('vibe-cloudflared');
+    await c.inspect();   // presence only — provisioning state is the file below
+  } catch { /* no connector is fine */ }
+
+  // Don't stack runs. self-update.sh also holds an flock, so this is the
+  // friendly check rather than the load-bearing one.
+  try {
+    const cur = JSON.parse(fs.readFileSync(SELF_UPDATE_STATUS, 'utf8'));
+    if (cur && cur.state === 'running') {
+      return res.status(409).json({
+        ok: false,
+        error: 'An update is already running (started ' + (cur.started_at || 'recently') + '). Watch its progress instead of starting another.',
+        status: cur,
+      });
+    }
+  } catch { /* no prior run */ }
+
+  // setsid + nohup + & : the alpine helper pod exits immediately, the
+  // updater keeps running under init. Redirect all three streams or the
+  // pod's teardown closes them under the child.
+  const launch =
+    `setsid nohup env VIBE_DIR=${JSON.stringify(VIBE_DIR)} ` +
+    `APPLIANCE_DIR=${JSON.stringify(APPLIANCE_DIR)} ` +
+    `bash ${JSON.stringify(SELF_UPDATE_SCRIPT)} ` +
+    `</dev/null >>${JSON.stringify(path.join(LOGS_DIR, 'self-update.log'))} 2>&1 & echo launched`;
+
+  const result = await runOnHost(launch);
+  if (result.code !== 0) {
+    log('error', 'self-update launch failed', { code: result.code, stderr: trim(result.stderr, 400) });
+    return res.status(500).json({
+      ok: false,
+      error: 'Could not start the update: ' + (trim(result.stderr, 300) || `exit ${result.code}`) +
+             '. SSH path: cd /opt/vibe/appliance && sudo git pull && sudo bash bootstrap.sh',
+    });
+  }
+  log('info', 'self-update launched (detached on host)');
+  res.json({ ok: true, started: true });
+});
+
+// Poll target for the update UI. Deliberately cheap and dependency-free:
+// it reads one small file. That matters because the console is being
+// restarted while this is polled — the browser will hammer it with
+// retries as it comes back, and because the FILE is the source of truth
+// (not process memory) the answer survives the restart that a naive
+// in-memory job registry would lose.
+app.get('/api/v1/admin/self-update/status', requireAdmin, (_req, res) => {
+  let current = null;
+  try {
+    current = JSON.parse(fs.readFileSync(SELF_UPDATE_STATUS, 'utf8'));
+  } catch { /* never run, or mid-write */ }
+  // The commit this console process booted from. After a successful
+  // update the container has been recreated, so this reflects the NEW
+  // code — which is what makes it a usable "did it actually take?"
+  // signal next to the status file's to_sha.
+  let running = null;
+  try { running = _readGitInfo(); } catch { /* not a git checkout */ }
+  res.json({
+    ok: true,
+    running_sha:    running && running.sha ? running.sha.slice(0, 7) : null,
+    running_branch: running ? running.branch : null,
+    status: current,
+  });
+});
+
 // Manual host-LAN-IP refresh — triggered by the "Refresh" button next
 // to the LAN IP on the admin Status panel. The same logic also runs
 // on a background timer (5 min cadence) — this endpoint just lets the

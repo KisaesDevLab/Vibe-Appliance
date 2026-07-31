@@ -196,6 +196,196 @@ const SETTINGS_JS_VERSION = '2026-07-30-tunnel-scope-and-rootserved-urls';
 
     section.appendChild(row);
     host.appendChild(section);
+    renderSelfUpdateRow(section);
+  }
+
+  // ---- Appliance self-update -------------------------------------------
+  //
+  // The last routine operation that required SSH (`git pull` +
+  // `bootstrap.sh`). Everything else — tunnel, apps, modes, doctor,
+  // per-app updates — was already point-and-click; this closes the gap.
+  //
+  // The hard part is that installing the update RESTARTS THE CONSOLE
+  // serving this page. So the panel is built around that rather than
+  // fighting it:
+  //   - the POST only *launches* a detached host process and returns;
+  //   - progress comes from polling a status FILE, not a held-open
+  //     response, so it survives the restart;
+  //   - fetch failures during polling are expected and rendered as
+  //     "restarting", not as errors. Treating them as errors was the
+  //     obvious first cut and it reports failure every single time.
+  function renderSelfUpdateRow(section) {
+    const row = el('div', { class: 'maintenance__row', style: 'margin-top:1.2rem;' });
+    row.appendChild(el('strong', null, ['Update the appliance']));
+    row.appendChild(el('p', { class: 'help' }, [
+      'Downloads the latest appliance software from GitHub and applies it. ',
+      'This updates the installer, the admin console, and the app definitions — ',
+      'not the apps themselves (those update from the Apps tab). ',
+      el('strong', null, ['The admin page will go blank for a minute while it restarts.']),
+      ' Leave this page open; it reconnects on its own.',
+    ]));
+
+    const statusLine = el('p', { class: 'help', style: 'margin:0.4rem 0 0;' }, ['Checking…']);
+    const detail     = el('p', { class: 'help', style: 'margin:0.2rem 0 0;color:var(--text-muted);' });
+    const recovery   = el('pre', { class: 'maintenance__output', hidden: '', style: 'margin-top:0.4rem;' });
+    const btn = el('button', { type: 'button', class: 'btn btn--ghost' }, ['Check for updates']);
+
+    const ctaRow = el('div', { class: 'cta-row', style: 'gap:0.5rem;align-items:center;margin-top:0.4rem;' });
+    ctaRow.appendChild(btn);
+    row.appendChild(ctaRow);
+    row.appendChild(statusLine);
+    row.appendChild(detail);
+    row.appendChild(recovery);
+    section.appendChild(row);
+
+    let polling = false;
+
+    // Phase -> what a non-technical operator should understand is
+    // happening. The script's own `message` is authoritative; these are
+    // the fallback when it's absent.
+    const PHASE_TEXT = {
+      preflight: 'Checking the appliance…',
+      fetch:     'Contacting GitHub…',
+      pull:      'Downloading the update…',
+      bootstrap: 'Installing and restarting services…',
+      health:    'Waiting for the console to come back…',
+      done:      'Finished.',
+    };
+
+    function paintStatus(data, transient) {
+      const s = data && data.status;
+      recovery.hidden = true;
+      if (transient) {
+        statusLine.style.color = 'var(--warn)';
+        statusLine.textContent = '⟳ ' + transient;
+        return;
+      }
+      if (!s) {
+        statusLine.style.color = '';
+        statusLine.textContent = 'No update has been run on this appliance yet.';
+        detail.textContent = data && data.running_sha
+          ? 'Currently running ' + data.running_sha + (data.running_branch ? ' (' + data.running_branch + ')' : '')
+          : '';
+        return;
+      }
+      detail.textContent = [
+        data.running_sha ? 'running ' + data.running_sha : '',
+        s.from_sha && s.to_sha ? s.from_sha.slice(0, 7) + ' → ' + s.to_sha.slice(0, 7) : '',
+        s.started_at ? 'started ' + s.started_at : '',
+      ].filter(Boolean).join('  ·  ');
+
+      if (s.state === 'running') {
+        statusLine.style.color = 'var(--warn)';
+        statusLine.textContent = '⟳ ' + (s.message || PHASE_TEXT[s.phase] || 'Working…');
+      } else if (s.state === 'success') {
+        statusLine.style.color = 'var(--good)';
+        statusLine.textContent = '✓ ' + (s.message || 'Up to date.');
+      } else {
+        statusLine.style.color = 'var(--bad)';
+        statusLine.textContent = '✗ ' + (s.message || 'Update failed.');
+        // The script writes a plain-language `error` plus the exact
+        // rollback command. Surface both — this is the moment the
+        // operator most needs something they can act on.
+        const blob = [s.error, s.rollback_cmd ? 'Roll back with:\n  ' + s.rollback_cmd : '']
+          .filter(Boolean).join('\n\n');
+        if (blob) { recovery.hidden = false; recovery.textContent = blob; }
+      }
+    }
+
+    async function readStatus() {
+      const r = await fetchWithTimeout('/api/v1/admin/self-update/status',
+        { credentials: 'same-origin' }, 8000);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }
+
+    // Poll until terminal. Console-unreachable is the EXPECTED state
+    // mid-update, so it renders as "restarting" and only becomes an
+    // error after ~4 unbroken minutes — well past a normal bootstrap.
+    async function pollUntilDone() {
+      if (polling) return;
+      polling = true;
+      btn.disabled = true;
+      let downFor = 0;
+      for (;;) {
+        try {
+          const data = await readStatus();
+          downFor = 0;
+          paintStatus(data);
+          const st = data && data.status;
+          if (!st || st.state !== 'running') break;
+        } catch {
+          downFor += 1;
+          if (downFor > 80) {   // 80 × 3s ≈ 4 min
+            statusLine.style.color = 'var(--bad)';
+            statusLine.textContent =
+              '✗ Lost contact with the console for several minutes. It may still be updating.';
+            recovery.hidden = false;
+            recovery.textContent =
+              'Reload this page. If it does not come back:\n' +
+              '  sudo docker logs vibe-console --tail 50\n' +
+              '  sudo bash /opt/vibe/appliance/bootstrap.sh';
+            break;
+          }
+          paintStatus(null, 'Console is restarting… (' + (downFor * 3) + 's)');
+        }
+        await new Promise(r => setTimeout(r, 3000));
+      }
+      polling = false;
+      btn.disabled = false;
+      btn.textContent = 'Check for updates';
+    }
+
+    async function startUpdate() {
+      if (!window.confirm(
+        'Update the appliance software?\n\n' +
+        'This downloads the latest version from GitHub and restarts the ' +
+        'appliance services. Apps stay installed and their data is untouched.\n\n' +
+        'The admin page will be unavailable for about a minute.\n\nContinue?'
+      )) return;
+      btn.disabled = true;
+      statusLine.style.color = 'var(--warn)';
+      statusLine.textContent = '⟳ Starting…';
+      recovery.hidden = true;
+      try {
+        const r = await fetchWithTimeout('/api/v1/admin/self-update',
+          { method: 'POST', credentials: 'same-origin' }, 30000);
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || !data.ok) {
+          statusLine.style.color = 'var(--bad)';
+          statusLine.textContent = '✗ ' + (data.error || 'Could not start the update (HTTP ' + r.status + ').');
+          btn.disabled = false;
+          return;
+        }
+      } catch (err) {
+        statusLine.style.color = 'var(--bad)';
+        statusLine.textContent = '✗ ' + _friendlyError(err) + ' — could not start the update.';
+        btn.disabled = false;
+        return;
+      }
+      pollUntilDone();
+    }
+
+    btn.onclick = startUpdate;
+
+    // On load: show the last run's outcome, and re-attach to one that's
+    // still going. That second case is what makes a mid-update page
+    // reload safe — the operator can close the tab, come back, and pick
+    // the same run back up, because the state lives in a file on the
+    // host rather than in this page.
+    (async () => {
+      try {
+        const data = await readStatus();
+        paintStatus(data);
+        if (data && data.status && data.status.state === 'running') {
+          btn.textContent = 'Update in progress…';
+          pollUntilDone();
+        }
+      } catch {
+        statusLine.style.color = '';
+        statusLine.textContent = 'Update status unavailable.';
+      }
+    })();
   }
 
   async function pruneImages(btn, status, output) {
