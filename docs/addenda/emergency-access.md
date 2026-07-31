@@ -434,7 +434,7 @@ Emergency access (LAN or Tailscale only — staff use when primary is down):
   http://<server-ip>:5182   Vibe Connect (client portal) — STAFF ONLY,
                             magic-link flows do not work over HTTP
   http://<server-ip>:5191   Vibe Tax Research Chat
-  http://<server-ip>:5192   Vibe Payroll Time
+  http://<server-ip>:5192   Vibe Time Keeper
 
   Server LAN IP:       <detected-or-prompted>
   Server Tailscale IP: <detected-or-N/A>

@@ -1,4 +1,4 @@
-# apps/vibe-payroll.yml — Vibe Payroll & Time overlay.
+# apps/vibe-payroll.yml — Vibe Time Keeper overlay.
 #
 # Image refs and ports lifted from KisaesDevLab/Vibe-Payroll-Time's
 # prod compose. api listens on BACKEND_PORT=4000 with health at

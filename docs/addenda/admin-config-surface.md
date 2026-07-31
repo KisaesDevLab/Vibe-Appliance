@@ -376,7 +376,7 @@ Tabs:
 Under "Apps," one tab per enabled app showing only that app's Tier 1 settings:
 
 ```
-┌─ Apps / Vibe Payroll Time ──────────────────────────────────────────┐
+┌─ Apps / Vibe Time Keeper ────────────────────────────────────────────┐
 │  Application                                                          │
 │   ├ Firm name             [ Acme Tax LLC                       ]     │
 │   ├ Enabled states        [ TX, CA, NY                       ▾ ]     │

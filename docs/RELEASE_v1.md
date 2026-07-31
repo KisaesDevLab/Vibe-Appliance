@@ -62,7 +62,7 @@ reversible.
   bootstrap → compose up → health-check → Caddy reload (and the
   reverse for disable). Data volumes are never destroyed by toggle.
 - **Eight apps shipped**: Vibe Trial Balance, Vibe MyBooks, Vibe Connect
-  (ELv2; staff + client portal subdomains), Vibe Payroll & Time, Vibe
+  (ELv2; staff + client portal subdomains), Vibe Time Keeper, Vibe
   Tax Research Chat, Vibe Calculators, Vibe Transactions Converter, and
   Vibe 1099.
   Vibe-GLM-OCR and Vibe Shield were removed before release (see
