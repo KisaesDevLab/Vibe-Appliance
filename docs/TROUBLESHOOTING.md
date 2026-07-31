@@ -95,6 +95,69 @@ reloads Caddy. As of 2026-05-12 this step is fatal-on-failure (was
 warn-only), so any future provision that gets to "✓ Tunnel is up" has
 verified Caddy is actually serving tunnel-mode config.
 
+### Symptom: provision fails with "the tunnel is running but N DNS record(s) could NOT be written"
+
+The tunnel object, ingress config, connector and Caddy are all healthy
+— only the DNS write was rejected, so the hostnames don't resolve and
+public requests fail before they ever reach the tunnel.
+
+Almost always a token scope problem: the token has
+`Account.Cloudflare-Tunnel:Edit` (so tunnel creation succeeded) but its
+`Zone.DNS:Edit` covers a different zone than `CLOUDFLARE_ZONE_ID`.
+
+**Diagnose:**
+```
+sudo grep '^CLOUDFLARE_' /opt/vibe/env/appliance.env
+curl -sS -H "Authorization: Bearer <token>" \
+  'https://api.cloudflare.com/client/v4/zones/<CLOUDFLARE_ZONE_ID>' | python3 -m json.tool
+```
+
+**Fix:** re-create the token at
+<https://dash.cloudflare.com/profile/api-tokens> with `Zone.DNS:Edit` on
+your domain, paste it via Configuration → Network → Cloudflare Tunnel →
+**Rotate token**, then re-run the provision.
+
+This case used to be warn-only: the script exited 0 and the wizard
+painted "✓ Tunnel is up" over a tunnel nothing could resolve, and
+**Test connection** agreed because it only inspects connector
+registration. It is now fatal, so "✓ Tunnel is up" means every CNAME
+landed.
+
+### Symptom: an app enabled after setup isn't reachable publicly
+
+Enabling an app re-renders Caddy but does **not** refresh the tunnel.
+Most apps are unaffected — they path-mount under the existing tunnel
+hostname, which the tunnel already routes. But an app that needs its
+**own** hostname has no CNAME and no ingress rule until you re-provision:
+
+- `rootServedOnly` apps (their bundle can't live under a path prefix)
+- apps declaring extra `subdomains[]` (e.g. Connect's client portal)
+
+The Cloudflare Tunnel card flags this with "⚠ Re-provision needed", and
+`enable-app` logs the pending hostnames.
+
+**Fix:** click **Re-provision** on the Cloudflare Tunnel card, or:
+```
+sudo bash /opt/vibe/appliance/infra/cloudflared-up.sh
+```
+
+### Symptom: teardown exits non-zero and the tunnel still exists at Cloudflare
+
+Deliberate. `cloudflared-down.sh` refuses to delete the tunnel object
+when it could not confirm every CNAME pointing at it was removed —
+because a CNAME that outlives its tunnel keeps answering **Cloudflare
+error 1016** forever, with no local state left pointing at what to clean
+up. Leaving the tunnel in place keeps those records valid and makes the
+teardown re-runnable.
+
+**Fix:** resolve the Cloudflare API errors printed above the abort
+(usually a token that lost `Zone.DNS:Edit`), then re-run
+`cloudflared-down.sh` — it is idempotent.
+
+**Manual alternative:** delete the CNAMEs pointing at
+`<tunnel-id>.cfargotunnel.com` at <https://dash.cloudflare.com>, then
+delete the tunnel under Zero Trust → Networks → Tunnels.
+
 ### Symptom: admin / cockpit / portainer / backup don't load via the public domain
 
 **By design.** The tunnel deliberately never publishes apex (`@`),

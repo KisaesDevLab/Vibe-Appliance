@@ -263,11 +263,30 @@ with open(path) as f:
             out.append(s)
 if not found:
     out.append(f"{key}={val}")
-tmp = path + ".tmp"
-with open(tmp, "w") as f:
-    f.write("\n".join(out) + "\n")
-os.chmod(tmp, 0o600)
-os.rename(tmp, path)
+# Unique temp name, not a fixed "<path>.tmp". Two writers racing on the
+# same env file (the console's settings-save and a script it spawned, say)
+# would otherwise share one temp path — the second write clobbers the
+# first's staged content before either rename lands, so one update is
+# silently lost. Every other writer in this repo already pid- or
+# random-suffixes its temp file; this one didn't.
+#
+# os.replace, not os.rename: replace is defined to overwrite an existing
+# destination atomically on every platform. os.rename only guarantees
+# that on POSIX. Matches lib/exit-domain-mode.sh, which already uses
+# os.replace for the same job.
+tmp = f"{path}.tmp.{os.getpid()}"
+try:
+    with open(tmp, "w") as f:
+        f.write("\n".join(out) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+except Exception:
+    # Never leave a partial temp behind for the next run to trip over.
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
 PYEOF
 }
 

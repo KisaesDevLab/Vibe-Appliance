@@ -48,7 +48,18 @@
 #     the tunnel ingress. Reach via split DNS to the host LAN IP or
 #     via Tailscale.
 
-set -uo pipefail
+set -euo pipefail
+
+# Note on `-e` in this script: every Cloudflare call and every python
+# helper below is explicitly guarded with `|| true` (or `|| die`, or an
+# `if`), because their failure paths are HANDLED — each one ends in a
+# `die` carrying a recovery hint, and letting `-e` abort first would
+# replace that hint with silence. `-e` is here as the backstop for the
+# unanticipated failure, not as the primary error handling. That matters
+# more than usual here: an unhandled abort between "tunnel created at
+# Cloudflare" and "CNAMEs written" strands account-side state that only
+# infra/cloudflared-down.sh can clean up. If you add a command that can
+# fail, guard it and say what the operator should do about it.
 
 # --- Flag parsing ------------------------------------------------------
 # Single optional flag for now: --auto-enable forces
@@ -344,8 +355,11 @@ cf_api() {
   local args=( -sS -X "$method"
     -H "Authorization: Bearer $CF_TUNNEL_API_TOKEN"
     -H "Content-Type: application/json" )
-  [[ -n "$body" ]] && args+=( --data "$body" )
-  curl "${args[@]}" "$CF_API$path"
+  if [[ -n "$body" ]]; then args+=( --data "$body" ); fi
+  # `|| true` so a transport failure (DNS, TLS, connection refused)
+  # returns an empty body for the caller's cf_check_success to report,
+  # rather than aborting the script under `set -e` with no diagnosis.
+  curl "${args[@]}" "$CF_API$path" || true
 }
 
 # Returns 0 if the response's success=true, 1 otherwise. Logs the
@@ -391,6 +405,72 @@ verify_check="$(cf_api GET "/user/tokens/verify")"
 cf_check_success "$verify_check" "token verify" \
   || die "Cloudflare rejected the token. Most common causes: (a) token revoked / expired, (b) token typo. Re-create at https://dash.cloudflare.com/profile/api-tokens with 'Account.Cloudflare Tunnel:Edit' AND 'Zone.DNS:Edit' on the target zone."
 
+# --- 1b. Confirm CLOUDFLARE_ZONE_ID actually holds $DOMAIN -----------
+#
+# Every DNS write below is pinned to /zones/$CF_ZONE_ID/... — so the
+# blast radius is exactly one zone no matter what. The remaining risk is
+# that it's the WRONG one: the wizard used to fall back to the first
+# accessible zone when none matched the configured domain, and
+# appliance.env can be hand-edited. Binding to an unrelated domain in
+# the same account is not something the operator would notice until
+# records show up somewhere they didn't expect.
+#
+# Runs BEFORE the tunnel create so a mismatch costs nothing to recover
+# from — no Cloudflare-side object exists yet.
+#
+# Fail-open on API failure, fail-closed on a genuine mismatch. Reading
+# /zones/{id} needs zone read, which zone-scoped tokens normally carry
+# implicitly — but this repo has already been bitten once by assuming a
+# probe endpoint is available to a correctly-scoped token (the
+# GET /accounts/{id} trap documented above). If we can't read the zone
+# we log and continue; the per-record writes still fail closed, because
+# Cloudflare rejects a record whose name falls outside the zone and
+# section 9b now treats that as fatal.
+log_step "verifying zone $CF_ZONE_ID holds $DOMAIN"
+zone_check="$(cf_api GET "/zones/$CF_ZONE_ID")"
+zone_name="$(python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+if not d.get('success'):
+    sys.exit(0)
+print(((d.get('result') or {}).get('name') or ''))
+" "$zone_check" || true)"
+
+if [[ -z "$zone_name" ]]; then
+  log_warn "could not read zone $CF_ZONE_ID to confirm it holds $DOMAIN — continuing; a wrong zone will surface as a failed DNS write below" \
+    "diagnose:curl -sS -H 'Authorization: Bearer <token>' '${CF_API}/zones/${CF_ZONE_ID}'"
+elif [[ "$DOMAIN" != "$zone_name" && "$DOMAIN" != *".${zone_name}" ]]; then
+  die "CLOUDFLARE_ZONE_ID points at the WRONG domain.
+
+  Configured domain (state.config.domain): $DOMAIN
+  Zone $CF_ZONE_ID actually holds:          $zone_name
+
+  Refusing to continue — provisioning would create DNS records for
+  '$DOMAIN' inside the '$zone_name' zone, which is a different domain in
+  your Cloudflare account. No tunnel and no DNS record has been created.
+
+  Common causes:
+    - The setup wizard could not find '$DOMAIN' among the zones your API
+      token can see (usually: its nameservers aren't pointed at
+      Cloudflare yet, or the token is scoped to a different zone), and an
+      unrelated zone got selected.
+    - appliance.env was hand-edited with a zone id copied from the wrong
+      Cloudflare dashboard page.
+
+  Fix:
+    1. Confirm '$DOMAIN' is listed at https://dash.cloudflare.com and
+       that its nameservers point at Cloudflare.
+    2. Re-run the wizard (Configuration → Network → Cloudflare Tunnel)
+       and pick the zone whose name is exactly '$DOMAIN'.
+    3. Or set CLOUDFLARE_ZONE_ID in $VIBE_ENV_APPLIANCE to that zone's
+       id (Cloudflare dashboard → the domain → Overview → Zone ID)."
+else
+  log_ok "zone confirmed" zone="$zone_name" domain="$DOMAIN"
+fi
+
 # --- 2. Find or create the tunnel -------------------------------------
 
 log_step "looking up tunnel '$CF_TUNNEL_NAME'"
@@ -434,12 +514,73 @@ try:
 except (KeyError, TypeError) as e:
     print(f'[cloudflared-up] tunnel create response missing result.id: {e}; body excerpt: {sys.argv[1][:200]!r}', file=sys.stderr)
     sys.exit(1)
-" "$create_resp")"
+" "$create_resp" || true)"
   if [[ -z "$TUNNEL_ID" ]]; then
     die "tunnel create returned no id; see stderr above"
   fi
   log_ok "tunnel created" id="$TUNNEL_ID"
 else
+  # Reusing a tunnel found BY NAME. Cloudflare allows duplicate tunnel
+  # names and this lookup takes the first match, so "same name" does not
+  # mean "same appliance". Two appliances in one Cloudflare account both
+  # left at the default name would silently share a tunnel: this run
+  # would PUT its ingress over the other appliance's, taking that
+  # domain's apps dark, and a later teardown here would delete the
+  # tunnel out from under it — stranding its CNAMEs answering error
+  # 1016 in a zone this script never touches.
+  #
+  # Guard: read the tunnel's current ingress. If it already carries
+  # hostnames and NONE of them belong to our domain, it is someone
+  # else's tunnel — refuse rather than adopt it. A tunnel with no
+  # hostnames yet (freshly created, or never configured) is unclaimed
+  # and safe to take.
+  #
+  # Fail-open if the config can't be read: same reasoning as the zone
+  # probe above — never brick a correctly-scoped token on a diagnostic.
+  log_step "confirming tunnel '$CF_TUNNEL_NAME' belongs to $DOMAIN"
+  existing_cfg="$(cf_api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations")"
+  foreign_hosts="$(python3 - "$existing_cfg" "$DOMAIN" <<'PYEOF' || true
+import json, sys
+raw, domain = sys.argv[1], sys.argv[2]
+try:
+    d = json.loads(raw)
+except Exception:
+    sys.exit(0)          # unreadable -> fail open, print nothing
+if not d.get("success"):
+    sys.exit(0)
+cfg = ((d.get("result") or {}).get("config") or {})
+hosts = [r.get("hostname") for r in (cfg.get("ingress") or []) if r.get("hostname")]
+if not hosts:
+    sys.exit(0)          # unconfigured tunnel -> unclaimed
+# "Belongs to us" = at least one ingress hostname is the domain itself
+# or sits under it. Anything else is another appliance's tunnel.
+if any(h == domain or h.endswith("." + domain) for h in hosts):
+    sys.exit(0)
+print(",".join(sorted(set(hosts))))
+PYEOF
+)"
+  if [[ -n "$foreign_hosts" ]]; then
+    die "a tunnel named '$CF_TUNNEL_NAME' already exists in this Cloudflare account, but it serves a DIFFERENT domain.
+
+  Tunnel id:        $TUNNEL_ID
+  Its ingress:      $foreign_hosts
+  This appliance:   $DOMAIN
+
+  Refusing to continue. Reusing it would overwrite that tunnel's routing
+  and take the other domain's apps offline, and tearing down here would
+  delete it out from under them. Nothing has been changed.
+
+  This happens when two appliances share one Cloudflare account and both
+  keep the default tunnel name.
+
+  Fix — give this appliance its own tunnel name:
+    1. UI:   Configuration → Network → Cloudflare Tunnel → Set up →
+             change 'Tunnel name' (e.g. vibe-appliance-${DOMAIN//./-}).
+    2. Or:   set CLOUDFLARE_TUNNEL_NAME=vibe-appliance-${DOMAIN//./-}
+             in $VIBE_ENV_APPLIANCE and re-run this script.
+
+  Existing tunnels: https://one.dash.cloudflare.com/${CF_ACCOUNT_ID}/networks/tunnels"
+  fi
   log_info "tunnel exists; reusing" id="$TUNNEL_ID"
 fi
 
@@ -456,7 +597,7 @@ TARGET_CONTENT="${TUNNEL_ID}.cfargotunnel.com"
 # a real, enabled app to surface typos and to print a "what's
 # reachable" summary at the end.
 log_step "validating publish list (informational; routing is path-based now)"
-PUBLISHED_SLUGS_JSON="$(python3 - "$VIBE_STATE_FILE" "$APPLIANCE_DIR/console/manifests" "$CF_TUNNEL_PUBLISH" <<'PYEOF'
+PUBLISHED_SLUGS_JSON="$(python3 - "$VIBE_STATE_FILE" "$APPLIANCE_DIR/console/manifests" "$CF_TUNNEL_PUBLISH" <<'PYEOF' || true
 import json, os, sys
 state_file, manifests_dir, publish_csv = sys.argv[1], sys.argv[2], sys.argv[3]
 
@@ -519,7 +660,7 @@ fi
 # aborts with "tls: internal error" (commit 06e962a). The catch-all
 # 404 at the end is required by Cloudflare Tunnel.
 log_step "building tunnel ingress config" host="$TUNNEL_FQDN" routing="$ROUTING_MODE"
-INGRESS_JSON="$(python3 - "$TUNNEL_FQDN" "$DOMAIN" "$VIBE_STATE_FILE" "$APPLIANCE_DIR/console/manifests" "$ROUTING_MODE" <<'PYEOF'
+INGRESS_JSON="$(python3 - "$TUNNEL_FQDN" "$DOMAIN" "$VIBE_STATE_FILE" "$APPLIANCE_DIR/console/manifests" "$ROUTING_MODE" <<'PYEOF' || true
 import json, os, sys
 fqdn, domain, state_path, manifests_dir, routing_mode = sys.argv[1:6]
 
@@ -598,9 +739,18 @@ for slug, entry in (state.get("apps") or {}).items():
 
   # Both modes: one rule per non-primary, non-internal subdomains[]
   # entry (vibe-connect's client portal at client.<domain>; vibe-shield
-  # keeps gateway.shield internal so it's skipped). Skip the whole app
-  # when it's fully internal.
-  if manifest.get("userFacing") is False and not subdomains:
+  # keeps gateway.shield internal so it's skipped).
+  #
+  # `userFacing: false` blocks EVERY secondary subdomain unconditionally,
+  # mirroring lib/render-caddyfile.sh::render_extra_subdomain_vhosts,
+  # which does the same. The gate used to read
+  # `userFacing is False and not subdomains`, which diverged from Caddy:
+  # an app with userFacing:false AND a non-primary subdomain got a
+  # proxied CNAME + ingress rule pointing at a hostname Caddy emits no
+  # site block for, so the edge fails the TLS handshake. The primary
+  # rule above keeps its own (looser) gate on purpose — userFacing:false
+  # no longer hides an app's PRIMARY surface, only its extras.
+  if manifest.get("userFacing") is False:
     continue
   for sub in subdomains:
     name = sub.get("name")
@@ -637,6 +787,16 @@ cf_check_success "$config_resp" "tunnel configurations PUT" \
 # <host>.<domain> pointing at <tunnel-id>.cfargotunnel.com.
 # `host` is always a non-empty subdomain token; the apex (@) and www
 # are deliberately excluded from this script — see header.
+#
+# Records every failure in CNAME_FAILED_HOSTS so the caller can hard-fail
+# the run. A missing CNAME is not a cosmetic problem: the tunnel object,
+# ingress config and connector can all be perfectly healthy while the
+# hostname resolves to nothing, and the wizard reads exit 0 as
+# "✓ Tunnel is up". That combination sent operators hunting a connector
+# fault when the real cause was a token whose Zone.DNS:Edit scope
+# covered the wrong zone.
+CNAME_FAILED_HOSTS=()
+
 create_or_update_cname() {
   local host="$1"
   local fqdn="${host}.${DOMAIN}"
@@ -685,13 +845,21 @@ print(json.dumps({
     if cf_check_success "$r" "DNS record create $fqdn"; then
       log_info "DNS CNAME created" host="$fqdn" target="$TARGET_CONTENT"
     else
-      log_warn "DNS create failed for $fqdn — see errors above. Tunnel will still route via the host pattern, but the public DNS won't resolve until this CNAME exists."
+      log_error "DNS create FAILED for $fqdn — see the Cloudflare errors above. The tunnel ingress knows this hostname but public DNS will not resolve it until the CNAME exists."
+      CNAME_FAILED_HOSTS+=("$fqdn")
     fi
   elif [[ "$existing_content" != "$TARGET_CONTENT" ]]; then
     local r
     r="$(cf_api PUT "/zones/$CF_ZONE_ID/dns_records/$existing_id" "$record_body")"
     if cf_check_success "$r" "DNS record update $fqdn"; then
       log_info "DNS CNAME updated" host="$fqdn" was="$existing_content" target="$TARGET_CONTENT"
+    else
+      # Previously this branch had no `else` at all: a failed PUT logged
+      # nothing and the run continued, leaving the CNAME pointing at a
+      # DEAD tunnel id (the most likely reason we're updating it) with
+      # no trace in the log.
+      log_error "DNS update FAILED for $fqdn — it still points at '${existing_content}' instead of '${TARGET_CONTENT}'. Public requests will reach the wrong (probably deleted) tunnel."
+      CNAME_FAILED_HOSTS+=("$fqdn")
     fi
   else
     log_info "DNS CNAME already correct" host="$fqdn"
@@ -729,25 +897,76 @@ for e in d['config']['ingress']:
   if h:
     print(h)
 " "$INGRESS_JSON")"
-existing="$(cf_api GET "/zones/$CF_ZONE_ID/dns_records?type=CNAME&per_page=200")"
-stale_pairs="$(_CURRENT="$current_fqdns" python3 - "$existing" "$TARGET_CONTENT" <<'PYEOF'
+# Paginate. Cloudflare clamps per_page on the dns_records listing
+# (console/lib/cf-helpers.js documents 50 and paginates for the same
+# reason); the single `per_page=200` request this used to make was
+# either clamped — silently seeing only the first page — or rejected
+# outright, and because the parser below only looked at `result` and
+# never at `success`, an API-level rejection produced an empty list
+# indistinguishable from "nothing stale". Either way the step logged
+# success while pruning nothing. Walk pages explicitly, stop at
+# total_pages, and cap at 10 pages (500 records) as a runaway guard.
+CF_DNS_PAGE_SIZE=50
+CF_DNS_PAGE_LIMIT=10
+stale_pairs=""
+_prune_ok=1
+_hit_cap=0
+_page=1
+while :; do
+  # Cap check inside the loop (rather than as the while condition) so we
+  # can tell "stopped because we ran out of pages" from "stopped because
+  # we hit the cap" — the latter means coverage was incomplete and is
+  # worth saying out loud; the former is the normal path and must not
+  # warn, including when total_pages lands exactly on the cap.
+  if (( _page > CF_DNS_PAGE_LIMIT )); then _hit_cap=1; break; fi
+  existing="$(cf_api GET "/zones/$CF_ZONE_ID/dns_records?type=CNAME&per_page=${CF_DNS_PAGE_SIZE}&page=${_page}")"
+  # Emits "<total_pages>" on line 1, then "<id> <name>" per stale
+  # record. Exits non-zero when the page could not be understood, so a
+  # broken enumeration is loud instead of an empty result set.
+  page_out="$(_CURRENT="$current_fqdns" python3 - "$existing" "$TARGET_CONTENT" "$_page" <<'PYEOF'
 import json, os, sys
-data, target = sys.argv[1], sys.argv[2]
+data, target, page = sys.argv[1], sys.argv[2], sys.argv[3]
 current = set(s for s in os.environ.get('_CURRENT', '').strip().split('\n') if s)
 try:
   d = json.loads(data)
 except Exception as e:
-  # Was: silent sys.exit(0). That left stale CNAMEs in place
-  # without telling the operator the prune step was a no-op.
-  print(f"[cloudflared-up] JSON parse failed for stale-CNAME enumeration: {e}; body excerpt: {data[:200]!r}", file=sys.stderr)
-  sys.exit(0)
+  print(f"[cloudflared-up] JSON parse failed for stale-CNAME enumeration "
+        f"(page {page}): {e}; body excerpt: {data[:200]!r}", file=sys.stderr)
+  sys.exit(1)
+if not d.get("success"):
+  for err in (d.get("errors") or []):
+    print(f"[cloudflared-up] Cloudflare API error listing CNAMEs (page {page}): "
+          f"code={err.get('code')} message={err.get('message')}", file=sys.stderr)
+  sys.exit(1)
+print((d.get("result_info") or {}).get("total_pages", 1))
 for r in (d.get('result') or []):
   if r.get('content') == target and r.get('name') not in current:
     print(r.get('id', ''), r.get('name', ''))
 PYEOF
-)"
+)" || { _prune_ok=0; break; }
+  _total_pages="$(printf '%s\n' "$page_out" | sed -n '1p')"
+  _rest="$(printf '%s\n' "$page_out" | sed -n '2,$p')"
+  # `if` blocks rather than `[[ ... ]] && cmd` / `(( ... )) && cmd`:
+  # under `set -e` a trailing test that evaluates false makes the whole
+  # line return non-zero and aborts the script. Here that would mean a
+  # zone with nothing stale (the common case!) killing the run right
+  # after the CNAMEs were written.
+  if [[ -n "$_rest" ]]; then
+    stale_pairs="${stale_pairs}${_rest}"$'\n'
+  fi
+  [[ "$_total_pages" =~ ^[0-9]+$ ]] || _total_pages=1
+  if (( _page >= _total_pages )); then break; fi
+  _page=$(( _page + 1 ))
+done
+if (( _prune_ok == 0 )); then
+  log_warn "could not enumerate the zone's CNAMEs — stale records from a previous provision may still point at this tunnel" \
+    "diagnose:check the Cloudflare errors above; the token needs Zone.DNS:Edit (which implies read) on zone $CF_ZONE_ID" \
+    "fix:review CNAMEs at https://dash.cloudflare.com and delete any pointing at ${TARGET_CONTENT} that you no longer serve"
+elif (( _hit_cap == 1 )); then
+  log_warn "hit the ${CF_DNS_PAGE_LIMIT}-page cap while enumerating CNAMEs; records beyond the first $(( CF_DNS_PAGE_LIMIT * CF_DNS_PAGE_SIZE )) were not checked for staleness"
+fi
 while IFS=' ' read -r rid rname; do
-  [[ -z "$rid" ]] && continue
+  if [[ -z "$rid" ]]; then continue; fi
   r="$(cf_api DELETE "/zones/$CF_ZONE_ID/dns_records/$rid")"
   if cf_check_success "$r" "delete stale CNAME $rname"; then
     log_info "deleted stale CNAME" host="$rname"
@@ -766,7 +985,7 @@ except Exception as e:
     print(f'[cloudflared-up] JSON parse failed for connector-token response: {e}; body excerpt: {sys.argv[1][:200]!r}', file=sys.stderr)
     sys.exit(1)
 print(d.get('result', '') if d.get('success') else '')
-" "$token_resp")"
+" "$token_resp" || true)"
 [[ -n "$TUNNEL_TOKEN" ]] || die "could not fetch connector token; raw response: $token_resp"
 
 # Atomic update of shared.env: filter out any prior TUNNEL_TOKEN line,
@@ -854,6 +1073,37 @@ else
   log_warn "cloudflared didn't report a registered connection within 12s — public requests may fail" \
     "diagnose:sudo docker logs vibe-cloudflared --tail 30" \
     "fix:check that outbound TCP 7844 is allowed from this host (any firewall rules?)"
+fi
+
+# --- 9b. Fail the run if any CNAME didn't land -----------------------
+# Everything above can succeed — tunnel object created, ingress pushed,
+# connector registered with the edge, Caddy reloaded — while a hostname
+# resolves to nothing because its CNAME write was rejected. Exiting 0
+# there made the wizard paint "✓ Tunnel is up" over a tunnel nobody
+# could reach, and the wizard's own Test-connection button agreed,
+# because it only inspects connector registration. Fail loudly instead:
+# the operator can re-run this script once the token scope is fixed
+# (it is idempotent and will reuse the existing tunnel).
+if (( ${#CNAME_FAILED_HOSTS[@]} > 0 )); then
+  die "the tunnel is running but ${#CNAME_FAILED_HOSTS[@]} DNS record(s) could NOT be written: ${CNAME_FAILED_HOSTS[*]}
+
+  Those hostnames will not resolve publicly, so requests fail before
+  they ever reach the tunnel. Everything else (tunnel object, ingress
+  config, connector, Caddy) is up.
+
+  Common cause: the API token carries Account.Cloudflare-Tunnel:Edit
+  but its Zone.DNS:Edit scope covers a different zone than
+  CLOUDFLARE_ZONE_ID=${CF_ZONE_ID}.
+
+  Diagnose:
+    curl -sS -H \"Authorization: Bearer <token>\" \\
+      '${CF_API}/zones/${CF_ZONE_ID}' | python3 -m json.tool
+  Fix:
+    Re-create the token at https://dash.cloudflare.com/profile/api-tokens
+    with Zone.DNS:Edit on ${DOMAIN}, paste it via Configuration →
+    Network → Cloudflare Tunnel → Rotate token, then re-run this script.
+  Roll back:
+    sudo bash $APPLIANCE_DIR/infra/cloudflared-down.sh"
 fi
 
 log_ok "Cloudflare Tunnel is up" tunnel_id="$TUNNEL_ID" tunnel_name="$CF_TUNNEL_NAME" host="$TUNNEL_FQDN"

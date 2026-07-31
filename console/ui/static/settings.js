@@ -14,7 +14,7 @@
 // operators can confirm in DevTools (F12 → Console) that the file
 // they're running is the version they expect, vs. a stale cached
 // copy. Compare against the server's /api/v1/version response.
-const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
+const SETTINGS_JS_VERSION = '2026-07-30-tunnel-scope-and-rootserved-urls';
 
 (function () {
   // eslint-disable-next-line no-console
@@ -32,6 +32,62 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
     if (!err) return 'unknown error';
     if (err.name === 'AbortError') return 'Request timed out';
     return err.message || String(err);
+  }
+
+  // fetchWithTimeout — wraps fetch with an AbortController + ms
+  // deadline so a hung server can't deadlock the caller. Without this,
+  // a single hanging fetch means the Cloudflare wizard sits on LOADING
+  // forever and the network-mode switch never resolves — no way to
+  // surface the issue, no way to retry short of a full page reload.
+  // AbortController is supported in every browser we target.
+  //
+  // Lives at IIFE scope, NOT inside renderCloudflareTunnelSection.
+  // It was nested there previously, which put it out of scope for the
+  // two callers that need it most: doModeSwitch (the "switch to Public
+  // domain" button) and renderEmergencyExitDomain (the break-glass
+  // drop-to-LAN button). Both threw ReferenceError on every click, and
+  // switching INTO domain mode is the prerequisite for the tunnel
+  // wizard — so the wizard told operators to press a button that could
+  // not work. Keep this at shared scope.
+  function fetchWithTimeout(url, opts, timeoutMs) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    const merged = Object.assign({}, opts || {}, { signal: ctrl.signal });
+    return fetch(url, merged).finally(() => clearTimeout(timer));
+  }
+
+  // zoneCoversDomain — does this Cloudflare zone hold `domain`? True for
+  // an exact match and for a subdomain of the zone (domain
+  // "vibe.firm.com" lives in zone "firm.com"). Mirrors the check
+  // infra/cloudflared-up.sh runs server-side before any DNS write.
+  function zoneCoversDomain(zoneName, domain) {
+    if (!zoneName || !domain) return false;
+    return domain === zoneName || domain.endsWith('.' + zoneName);
+  }
+
+  // findZoneForDomain — the most specific accessible zone holding
+  // `domain`, or null. Longest zone name wins, so a domain under both
+  // "firm.com" and a delegated "eu.firm.com" binds to the latter.
+  //
+  // Returning null is meaningful and must NOT be papered over with a
+  // fallback to the first zone in the account: that silently bound the
+  // appliance to an unrelated domain, and every DNS write then targeted
+  // someone else's zone.
+  function findZoneForDomain(zones, domain) {
+    const hits = (zones || []).filter(z => zoneCoversDomain(z.name, domain));
+    if (!hits.length) return null;
+    return hits.sort((a, b) => b.name.length - a.name.length)[0];
+  }
+
+  // defaultTunnelName — domain-derived so two appliances under one
+  // Cloudflare account can't both land on the same tunnel. Sharing a
+  // tunnel name means the second appliance's provision overwrites the
+  // first's ingress and its teardown deletes the first's tunnel.
+  // cloudflared-up.sh refuses that collision server-side; this just
+  // stops it from happening in the first place.
+  function defaultTunnelName(domain) {
+    const slug = (domain || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    return slug ? 'vibe-appliance-' + slug : 'vibe-appliance';
   }
 
   function escapeHtml(s) {
@@ -1663,6 +1719,15 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
               slug:            a.slug,
               displayName:     a.displayName,
               subdomain:       a.subdomain,
+              // rootServedOnly apps are NOT path-mounted: Caddy gives
+              // them their own <subdomain>.<domain> vhost even in
+              // single-host mode, because a path mount would serve the
+              // SPA shell and 404 every asset. Carry both fields so the
+              // reachable-list prints the hostname Caddy actually
+              // answers instead of a /<prefix>/ URL that lands on the
+              // console's catch-all.
+              rootServedOnly:  a.rootServedOnly === true,
+              effectiveSubdomain: a.effectiveSubdomain || a.subdomain,
               // Non-primary subdomains from the manifest — e.g.
               // vibe-connect's `client` entry pointing at port 8080.
               // The provision script (infra/cloudflared-up.sh) already
@@ -1706,7 +1771,15 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
           // dashboard URL like one.dash.cloudflare.com//networks/tunnels.
           if (data.account_id)  wiz.accountId  = data.account_id;
           if (data.zone_id)     wiz.zoneId     = data.zone_id;
-          if (data.tunnel_name) wiz.tunnelName = data.tunnel_name;
+          // Keep the bound name when one exists — renaming an existing
+          // tunnel here would orphan it. Only a first-time setup gets
+          // the domain-derived default, which keeps two appliances in
+          // one Cloudflare account off the same tunnel.
+          if (data.tunnel_name) {
+            wiz.tunnelName = data.tunnel_name;
+          } else if (wiz.domain) {
+            wiz.tunnelName = defaultTunnelName(wiz.domain);
+          }
 
           // Bootstrap state transitions from default IDLE:
           //   - UP:     container running + token + mode=domain.
@@ -1897,9 +1970,14 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
             if (!data.ok) { wiz.error = data.error || ('HTTP ' + r.status); paint(); return; }
             wiz.accounts = data.accounts || [];
             wiz.zones    = data.zones    || [];
-            const match = wiz.zones.find(z => z.name === wiz.domain);
-            wiz.zoneId    = match ? match.id          : ((wiz.zones[0]    || {}).id || '');
-            wiz.accountId = match ? match.account_id  : ((wiz.accounts[0] || {}).id || '');
+            // No fallback to zones[0]. When nothing holds the configured
+            // domain we leave the selection EMPTY and the READY screen
+            // blocks Provision — see paintReady. Silently selecting an
+            // unrelated zone pointed every DNS write at a different
+            // domain in the same account.
+            const match = findZoneForDomain(wiz.zones, wiz.domain);
+            wiz.zoneId    = match ? match.id         : '';
+            wiz.accountId = match ? match.account_id : '';
             wiz.screen = 'READY';
             paint();
           } catch (err) {
@@ -2016,6 +2094,13 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
       grid.appendChild(accSel);
 
       grid.appendChild(el('label', { style: 'font-weight:600;font-size:0.9em;margin-top:0.3rem;' }, ['Zone (your domain)']));
+      // Placeholder first so an unmatched domain shows "— select —"
+      // rather than silently displaying whichever zone sorts first.
+      const zoneOpts = [el('option', { value: '' }, ['— select the zone for ' + (wiz.domain || 'your domain') + ' —'])]
+        .concat(wiz.zones.map(z => el('option', { value: z.id }, [
+          z.name + '  (' + z.id.slice(0, 8) + '…)' +
+          (zoneCoversDomain(z.name, wiz.domain) ? '' : '  — does not hold ' + (wiz.domain || '')),
+        ])));
       const zoneSel = el('select', {
         style: 'padding:0.45rem 0.65rem;border:1px solid var(--border);border-radius:4px;background:var(--surface);',
         onchange: (e) => {
@@ -2029,8 +2114,9 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
             const a = section.querySelector('select');  // first select = account
             if (a) a.value = z.account_id;
           }
+          paint();   // re-evaluate the mismatch warning + Provision gate
         },
-      }, wiz.zones.map(z => el('option', { value: z.id }, [z.name + '  (' + z.id.slice(0, 8) + '…)'])));
+      }, zoneOpts);
       zoneSel.value = wiz.zoneId;
       grid.appendChild(zoneSel);
 
@@ -2072,11 +2158,49 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
         ', and starts the cloudflared container. Idempotent — safe to re-run.',
       ]));
 
+      // Zone gate. Provisioning against a zone that doesn't hold the
+      // domain writes DNS records into an unrelated domain in the same
+      // Cloudflare account, so block it here and explain why. The same
+      // rule is enforced server-side in cloudflared-up.sh — this is the
+      // friendly half, not the load-bearing one.
+      const selectedZone = wiz.zones.find(z => z.id === wiz.zoneId) || null;
+      const zoneOk = !!selectedZone && zoneCoversDomain(selectedZone.name, wiz.domain);
+      if (!zoneOk) {
+        section.appendChild(el('div', {
+          style: 'margin-top:0.8rem;padding:0.7rem 0.9rem;background:rgba(220,38,38,0.06);border:1px solid var(--bad);border-radius:4px;',
+        }, [
+          el('p', { style: 'margin:0;font-weight:600;color:var(--bad);' }, [
+            selectedZone
+              ? '⚠ That zone does not hold ' + (wiz.domain || 'your domain')
+              : '⚠ No accessible zone holds ' + (wiz.domain || 'your domain'),
+          ]),
+          el('p', { class: 'help', style: 'margin:0.3rem 0 0;' }, selectedZone
+            ? [
+                'Zone ', el('span', { class: 'mono' }, [selectedZone.name]),
+                ' is a different domain. Provisioning would create DNS records for ',
+                el('span', { class: 'mono' }, [wiz.domain || '(unset)']),
+                ' inside it. Pick the zone named exactly ',
+                el('span', { class: 'mono' }, [wiz.domain || 'your domain']), '.',
+              ]
+            : [
+                'Your API token can see ', String(wiz.zones.length), ' zone(s), none of which hold ',
+                el('span', { class: 'mono' }, [wiz.domain || '(unset)']), '. Usually one of: ',
+                'the domain\'s nameservers aren\'t pointed at Cloudflare yet, the domain hasn\'t been added ',
+                'at dash.cloudflare.com, or the token is scoped to a different zone. ',
+                'The tunnel cannot route a domain Cloudflare doesn\'t host, so this must be fixed first.',
+              ]),
+        ]));
+      }
+
       const cta = el('div', { class: 'cta-row', style: 'gap:0.5rem;margin-top:0.5rem;' });
       const provisionBtn = el('button', {
         type: 'button', class: 'btn',
         onclick: () => provision(),
       }, ['Provision tunnel']);
+      if (!zoneOk) {
+        provisionBtn.disabled = true;
+        provisionBtn.title = 'Select the Cloudflare zone that holds ' + (wiz.domain || 'your domain');
+      }
       cta.appendChild(provisionBtn);
       cta.appendChild(el('button', {
         type: 'button', class: 'btn btn--ghost',
@@ -2107,11 +2231,23 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
       const dom  = wiz.domain || '<your-domain>';
       const wrap = el('ul', { style: 'margin:0.3rem 0 0;padding-left:1.4rem;max-width:36rem;' });
       for (const a of wiz.enabledApps) {
-        // Primary: the single-host path-prefix mount on the tunnel hostname.
+        // Primary URL. Most apps path-mount under the single tunnel
+        // hostname; rootServedOnly apps get their own hostname instead
+        // (see lib/render-caddyfile.sh::render_root_served_vhosts).
+        // Printing the /<prefix>/ form for those sent operators to the
+        // console landing page and looked like the app was broken.
         const li = el('li', { style: 'padding:0.15rem 0;' });
         li.appendChild(el('span', { style: 'font-weight:600;' }, [a.displayName]));
         li.appendChild(document.createTextNode(' — '));
-        li.appendChild(el('span', { class: 'mono' }, ['https://' + host + '/' + pathPrefix(a.slug) + '/']));
+        const primaryUrl = a.rootServedOnly
+          ? 'https://' + (a.effectiveSubdomain || a.subdomain) + '.' + dom + '/'
+          : 'https://' + host + '/' + pathPrefix(a.slug) + '/';
+        li.appendChild(el('span', { class: 'mono' }, [primaryUrl]));
+        if (a.rootServedOnly) {
+          li.appendChild(el('span', {
+            class: 'help', style: 'color:var(--text-muted);',
+          }, [' (own hostname — this app cannot be served under a path)']));
+        }
         wrap.appendChild(li);
 
         // Extra subdomains: one item per manifest.subdomains[] entry
@@ -2312,6 +2448,40 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
         ', portainer.', wiz.domain || '<your-domain>',
         ', backup.', wiz.domain || '<your-domain>',
       ]));
+
+      // Drift warning. Enabling an app that needs its OWN hostname
+      // (rootServedOnly, or one declaring extra subdomains) re-renders
+      // Caddy but does not touch the tunnel — lib/enable-app.sh logs a
+      // hint, which nobody reads. Until a re-provision creates the CNAME
+      // + ingress rule, that hostname simply doesn't resolve, while this
+      // screen cheerfully says "Tunnel is up". Surface it here, where
+      // the Re-provision button already is.
+      //
+      // published_slugs mirrors CLOUDFLARE_TUNNEL_PUBLISH, rewritten on
+      // every provision, so "enabled but not published" == "enabled
+      // since the last provision". Path-mounted apps are deliberately
+      // NOT flagged: they ride the existing tunnel FQDN and work
+      // immediately.
+      const staleHostApps = wiz.enabledApps.filter(a =>
+        !(wiz.publishedSlugs || []).includes(a.slug) &&
+        (a.rootServedOnly || (a.extraSubdomains || []).length > 0));
+      if (staleHostApps.length) {
+        section.appendChild(el('div', {
+          style: 'margin-top:0.8rem;padding:0.7rem 0.9rem;background:rgba(217,119,6,0.08);border:1px solid var(--warn);border-radius:4px;',
+        }, [
+          el('p', { style: 'margin:0;font-weight:600;color:var(--warn);' }, [
+            '⚠ Re-provision needed — ' + staleHostApps.length +
+            ' app' + (staleHostApps.length === 1 ? '' : 's') + ' need' +
+            (staleHostApps.length === 1 ? 's' : '') + ' a hostname this tunnel does not route yet',
+          ]),
+          el('p', { class: 'help', style: 'margin:0.3rem 0 0;' }, [
+            staleHostApps.map(a => a.displayName).join(', '),
+            ' were enabled after the tunnel was last provisioned. They are live on the LAN, ',
+            'but their public hostnames have no DNS record until you click ',
+            el('strong', null, ['Re-provision']), ' below.',
+          ]),
+        ]));
+      }
 
       // Reachable-apps list — read-only, mirrors the Apps tab. Changes
       // happen there, not here. The Re-provision button below is for
@@ -2683,9 +2853,15 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
         el('span', { class: 'mono' }, ['https://' + pausedHost + '/']),
       ]));
       if (wiz.enabledApps.length) {
-        const prefixes = wiz.enabledApps.map(a => '/' + pathPrefix(a.slug) + '/').join(', ');
+        // rootServedOnly apps resume at their own hostname, not a path
+        // under the tunnel FQDN — list them that way so the paused
+        // screen agrees with the UP screen.
+        const pausedDom = wiz.domain || '<your-domain>';
+        const targets = wiz.enabledApps.map(a => a.rootServedOnly
+          ? (a.effectiveSubdomain || a.subdomain) + '.' + pausedDom
+          : '/' + pathPrefix(a.slug) + '/').join(', ');
         section.appendChild(el('p', { class: 'help', style: 'margin-top:0.2rem;color:var(--text-muted);' }, [
-          'Enabled apps reachable at: ', prefixes,
+          'Enabled apps reachable at: ', targets,
         ]));
       }
 
@@ -2831,18 +3007,6 @@ const SETTINGS_JS_VERSION = '2026-05-14-shorten-app-paths';
       } catch { return { domain: '', mode: null, tunnel_subdomain: 'vibe' }; }
     }
 
-    // fetchWithTimeout — wraps fetch with an AbortController + ms
-    // deadline so a hung server can't deadlock the wizard's bootstrap.
-    // Without this, a single fetch hanging means the wizard sits on
-    // LOADING forever (no way to surface the issue, no way to retry
-    // without a full page reload). AbortController is supported in
-    // every browser we target.
-    function fetchWithTimeout(url, opts, timeoutMs) {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-      const merged = Object.assign({}, opts || {}, { signal: ctrl.signal });
-      return fetch(url, merged).finally(() => clearTimeout(timer));
-    }
   }
 
   // Tailscale section — full management surface for the host's

@@ -8,12 +8,17 @@
 #
 # Sequence:
 #   1. stop + remove the cloudflared container
-#   2. delete the CNAMEs the up-script created (apex, www, infra, every
-#      enabled app's subdomain). Only deletes records whose content
-#      matches <tunnel-id>.cfargotunnel.com — never touches CNAMEs that
-#      point elsewhere, so an operator who hand-added CNAMEs for other
+#   2. delete the CNAMEs the up-script created (the tunnel subdomain,
+#      plus each rootServedOnly / per-app / extra subdomain the ingress
+#      covered — NOT apex or www, which the up-script never creates).
+#      Only deletes records whose content matches
+#      <tunnel-id>.cfargotunnel.com — never touches CNAMEs that point
+#      elsewhere, so an operator who hand-added CNAMEs for other
 #      services keeps them.
-#   3. delete the tunnel object via the Cloudflare API
+#   3. delete the tunnel object via the Cloudflare API — but ONLY if
+#      step 2 fully succeeded. A CNAME that outlives its tunnel answers
+#      every request with Cloudflare error 1016 forever, so a partial
+#      DNS cleanup aborts here rather than stranding records.
 #   4. strip TUNNEL_TOKEN from /opt/vibe/env/shared.env
 #
 # Reads the same env values from /opt/vibe/env/appliance.env that
@@ -21,7 +26,11 @@
 # flipped to 'false' via Settings, this script still runs (operator may
 # have disabled the toggle and now wants the residual state cleaned up).
 
-set -uo pipefail
+# See the matching note in cloudflared-up.sh: `-e` is the backstop for
+# unanticipated failures only. Every Cloudflare call and python helper
+# below is explicitly guarded so its handled failure path still reaches
+# the operator with a recovery hint instead of a silent abort.
+set -euo pipefail
 
 _self="$(readlink -f "${BASH_SOURCE[0]}")"
 APPLIANCE_DIR="${APPLIANCE_DIR:-$(dirname "$(dirname "$_self")")}"
@@ -62,10 +71,14 @@ CF_TUNNEL_NAME="${CF_TUNNEL_NAME:-vibe-appliance}"
 CF_API="https://api.cloudflare.com/client/v4"
 cf_api() {
   local method="$1" path="$2"
+  # `|| true` so a transport failure yields an empty body for the
+  # caller's own success check, rather than aborting under `set -e`
+  # with no diagnosis — teardown must always reach step 5/6 so the
+  # local state gets cleaned up even when Cloudflare is unreachable.
   curl -sS -X "$method" \
     -H "Authorization: Bearer $CF_TUNNEL_API_TOKEN" \
     -H "Content-Type: application/json" \
-    "$CF_API$path"
+    "$CF_API$path" || true
 }
 
 # --- 1. Stop the container ---------------------------------------------
@@ -110,35 +123,104 @@ if [[ -n "$TUNNEL_ID" ]]; then
   # Cloudflare's API supports filter-by-content via &content=... but the
   # safer approach is to fetch and filter client-side: we never delete a
   # record whose content doesn't EXACTLY match this tunnel's hostname.
-  records="$(cf_api GET "/zones/$CF_ZONE_ID/dns_records?type=CNAME&per_page=200")"
-  record_ids="$(python3 - "$records" "$TARGET_CONTENT" <<'PYEOF'
+  # Paginate. Cloudflare clamps per_page on this listing, so the old
+  # single `per_page=200` request saw at most one page — and the parser
+  # swallowed every error, including an outright API rejection, as
+  # "no matching records". Both failure modes are silent AND dangerous
+  # here: step 4 then deletes the tunnel object, leaving CNAMEs that
+  # point at a tunnel id which no longer exists. Cloudflare answers
+  # those hostnames with error 1016 indefinitely, and teardown reported
+  # success. Walk pages explicitly and treat an unreadable page as a
+  # hard failure.
+  CF_DNS_PAGE_SIZE=50
+  CF_DNS_PAGE_LIMIT=10
+  record_ids=""
+  _enum_ok=1
+  _hit_cap=0
+  _page=1
+  while :; do
+    if (( _page > CF_DNS_PAGE_LIMIT )); then _hit_cap=1; break; fi
+    records="$(cf_api GET "/zones/$CF_ZONE_ID/dns_records?type=CNAME&per_page=${CF_DNS_PAGE_SIZE}&page=${_page}")"
+    # Line 1 = total_pages, remaining lines = matching record ids.
+    page_out="$(python3 - "$records" "$TARGET_CONTENT" "$_page" <<'PYEOF'
 import json, sys
-records, target = sys.argv[1], sys.argv[2]
+records, target, page = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
   d = json.loads(records)
-  for r in (d.get("result") or []):
-    if r.get("content") == target:
-      print(r.get("id", ""))
-except Exception:
-  pass
+except Exception as e:
+  print(f"[cloudflared-down] JSON parse failed listing CNAMEs (page {page}): {e}; "
+        f"body excerpt: {records[:200]!r}", file=sys.stderr)
+  sys.exit(1)
+if not d.get("success"):
+  for err in (d.get("errors") or []):
+    print(f"[cloudflared-down] Cloudflare API error listing CNAMEs (page {page}): "
+          f"code={err.get('code')} message={err.get('message')}", file=sys.stderr)
+  sys.exit(1)
+print((d.get("result_info") or {}).get("total_pages", 1))
+for r in (d.get("result") or []):
+  if r.get("content") == target:
+    print(r.get("id", ""))
 PYEOF
-)"
+)" || { _enum_ok=0; break; }
+    _total_pages="$(printf '%s\n' "$page_out" | sed -n '1p')"
+    _rest="$(printf '%s\n' "$page_out" | sed -n '2,$p')"
+    if [[ -n "$_rest" ]]; then record_ids="${record_ids}${_rest}"$'\n'; fi
+    [[ "$_total_pages" =~ ^[0-9]+$ ]] || _total_pages=1
+    if (( _page >= _total_pages )); then break; fi
+    _page=$(( _page + 1 ))
+  done
+
   # Iterate the IDs and delete each one. Whitespace-separated read so
   # an empty result is a no-op (the for loop runs zero times).
+  DNS_DELETE_FAILURES=0
   for record_id in $record_ids; do
-    [[ -z "$record_id" ]] && continue
+    if [[ -z "$record_id" ]]; then continue; fi
     r="$(cf_api DELETE "/zones/$CF_ZONE_ID/dns_records/$record_id")"
     ok="$(python3 -c "
 import json, sys
-d = json.loads(sys.argv[1])
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    print('0'); sys.exit(0)
 print('1' if d.get('success') else '0')
 " "$r" 2>/dev/null || true)"
     if [[ "$ok" == "1" ]]; then
       log_info "deleted CNAME" id="$record_id"
     else
-      log_warn "DELETE failed for record $record_id; see $VIBE_LOG_FILE"
+      log_error "DELETE failed for record $record_id; see $VIBE_LOG_FILE"
+      DNS_DELETE_FAILURES=$(( DNS_DELETE_FAILURES + 1 ))
     fi
   done
+
+  # Do NOT delete the tunnel object if we couldn't confirm the CNAMEs
+  # are gone. A CNAME outliving its tunnel is the one failure mode that
+  # is actively worse than not tearing down at all: the hostname stays
+  # in DNS answering every request with Cloudflare error 1016, and the
+  # operator has no local state left pointing at what to clean up.
+  # Leaving the tunnel in place keeps those records valid and makes the
+  # whole teardown re-runnable once the token/API problem is fixed.
+  if (( _enum_ok == 0 )); then
+    die "could not enumerate this zone's CNAMEs, so the records pointing at ${TARGET_CONTENT} cannot be verified as removed. The tunnel object was left in place ON PURPOSE — deleting it now would strand those records answering error 1016.
+
+  Common cause: the API token lost Zone.DNS:Edit on zone ${CF_ZONE_ID}.
+
+  Diagnose:
+    sudo grep '^CLOUDFLARE_' $VIBE_ENV_APPLIANCE
+  Fix:
+    Restore a token with Zone.DNS:Edit, then re-run this script (idempotent).
+  Manual alternative:
+    Delete CNAMEs pointing at ${TARGET_CONTENT} at https://dash.cloudflare.com,
+    then delete the tunnel under Zero Trust -> Networks -> Tunnels."
+  fi
+  if (( DNS_DELETE_FAILURES > 0 )); then
+    die "${DNS_DELETE_FAILURES} CNAME record(s) pointing at ${TARGET_CONTENT} could not be deleted. The tunnel object was left in place ON PURPOSE — see the note above about error 1016.
+
+  Fix: resolve the Cloudflare errors above, then re-run this script."
+  fi
+  if (( _hit_cap == 1 )); then
+    log_warn "hit the ${CF_DNS_PAGE_LIMIT}-page cap while listing CNAMEs; records beyond the first $(( CF_DNS_PAGE_LIMIT * CF_DNS_PAGE_SIZE )) were not examined" \
+      "fix:check https://dash.cloudflare.com for leftover CNAMEs pointing at ${TARGET_CONTENT}"
+  fi
 fi
 
 # --- 4. Delete the tunnel object --------------------------------------
@@ -191,7 +273,12 @@ fi
 log_step "clearing CLOUDFLARE_TUNNEL_ENABLED in appliance.env"
 # shellcheck source=/dev/null
 . "$APPLIANCE_DIR/lib/secrets.sh"
-secrets_set_kv_appliance CLOUDFLARE_TUNNEL_ENABLED "false"
+# Guarded: a failure here must not abort before the Caddy re-render
+# below, or Caddy keeps serving tunnel-mode config (tls internal +
+# auto_https off) against a tunnel that no longer exists.
+secrets_set_kv_appliance CLOUDFLARE_TUNNEL_ENABLED "false" \
+  || log_warn "could not set CLOUDFLARE_TUNNEL_ENABLED=false in $VIBE_ENV_APPLIANCE — the Network wizard may still show tunnel-mode state" \
+       "fix:edit $VIBE_ENV_APPLIANCE as root and set CLOUDFLARE_TUNNEL_ENABLED=false"
 
 log_step "re-rendering Caddyfile + reloading Caddy"
 # shellcheck source=/dev/null

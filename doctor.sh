@@ -523,7 +523,14 @@ try:
 except Exception:
     sys.exit(0)
 subs = m.get("subdomains") or []
-if m.get("userFacing") is False and not subs:
+# `userFacing: false` blocks EVERY secondary subdomain, unconditionally.
+# render_extra_subdomain_vhosts emits no vhost for such an app, and
+# cloudflared-up.sh creates no CNAME, so checking DNS + cert for those
+# hostnames would report two hard failures per app for hosts that are
+# not supposed to exist. The gate here previously read
+# `userFacing is False and not subs`, which only skipped an app that
+# declared no subdomains at all.
+if m.get("userFacing") is False:
     sys.exit(0)
 primary = m.get("subdomain", "")
 for s in subs:
