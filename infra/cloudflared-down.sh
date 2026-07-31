@@ -92,7 +92,7 @@ log_step "stopping cloudflared container (if running)"
 # is down — that alone may be all the operator wanted (e.g. they're
 # rotating the API token and want to start clean).
 if [[ -z "$CF_TUNNEL_API_TOKEN" || -z "$CF_ACCOUNT_ID" || -z "$CF_ZONE_ID" ]]; then
-  log_warn "Cloudflare API credentials not in $VIBE_ENV_APPLIANCE — container is stopped, but DNS records and the tunnel object remain at Cloudflare. Re-add the creds via Settings → Network and re-run this script to clean up the rest."
+  log_warn "Cloudflare API credentials not in $VIBE_ENV_APPLIANCE — container is stopped, but DNS records and the tunnel object remain at Cloudflare. Re-add the creds under Configuration → Network → Cloudflare Tunnel, then click Tear down again to clean up the rest."
   exit 0
 fi
 
@@ -207,7 +207,9 @@ print('1' if d.get('success') else '0')
   Diagnose:
     sudo grep '^CLOUDFLARE_' $VIBE_ENV_APPLIANCE
   Fix:
-    Restore a token with Zone.DNS:Edit, then re-run this script (idempotent).
+    Restore a working token via Configuration → Network → Cloudflare
+    Tunnel → Rotate token, then click Tear down again (idempotent).
+    SSH equivalent: sudo bash $APPLIANCE_DIR/infra/cloudflared-down.sh
   Manual alternative:
     Delete CNAMEs pointing at ${TARGET_CONTENT} at https://dash.cloudflare.com,
     then delete the tunnel under Zero Trust -> Networks -> Tunnels."
@@ -215,7 +217,9 @@ print('1' if d.get('success') else '0')
   if (( DNS_DELETE_FAILURES > 0 )); then
     die "${DNS_DELETE_FAILURES} CNAME record(s) pointing at ${TARGET_CONTENT} could not be deleted. The tunnel object was left in place ON PURPOSE — see the note above about error 1016.
 
-  Fix: resolve the Cloudflare errors above, then re-run this script."
+  Fix: resolve the Cloudflare errors above (usually a token that lost
+  Zone.DNS:Edit — rotate it under Configuration → Network → Cloudflare
+  Tunnel), then click Tear down again. It is idempotent."
   fi
   if (( _hit_cap == 1 )); then
     log_warn "hit the ${CF_DNS_PAGE_LIMIT}-page cap while listing CNAMEs; records beyond the first $(( CF_DNS_PAGE_LIMIT * CF_DNS_PAGE_SIZE )) were not examined" \
