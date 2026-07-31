@@ -1841,3 +1841,134 @@ Append to this list as phases complete. Format:
   env-template block. On pre-PR#5 images the seed exits 254 (missing
   script, verified), enable-app warns without failing, `seeded` stays
   unset, and the next enable after the image update runs it automatically.
+
+- 2026-07-30 — Cloudflare Tunnel: provisioning repair + single-zone
+  containment. By Claude (Fable 5) on Windows dev host.
+
+  Opened as "trouble with tunnel provisioning", which turned out to be
+  literal: the tunnel could not be provisioned from the console at all.
+  Three passes — the wizard and provisioning path, then the surfaces left
+  unreviewed (teardown, doctor, mode switching), then a blast-radius audit
+  asking whether any Cloudflare operation could touch a domain other than
+  the configured one.
+
+  **The blocker.** `fetchWithTimeout` was defined *inside*
+  `renderCloudflareTunnelSection`, so the two callers in sibling scopes —
+  `doModeSwitch` (the "switch to Public domain" radio) and
+  `renderEmergencyExitDomain` (break-glass drop to LAN) — threw
+  `ReferenceError` on every click. Domain mode is the prerequisite for the
+  tunnel, so the wizard rendered a red callout telling operators to press a
+  button that could not work. Everything *inside* the wizard worked, which
+  is why it looked healthy right up to the point of following its own
+  instructions. Moved to shared IIFE scope.
+
+  **Reported success over broken state.** Three paths returned exit 0 (or
+  warned) while leaving the appliance unreachable:
+  1. A rejected CNAME write was `log_warn` only; the script still exited 0
+     and the wizard painted "Tunnel is up" over a tunnel nothing could
+     resolve. Test-connection agreed, because it only inspects connector
+     registration. Now fatal, with the token-scope diagnosis. The
+     failed-PUT branch had no `else` at all — a dead tunnel id silently
+     survived.
+  2. Stale-CNAME pruning issued one `per_page=200` request with no
+     pagination and never checked `success`, so a clamp and an outright API
+     rejection both looked identical to "nothing stale".
+  3. Teardown deleted the tunnel object even when CNAME cleanup failed,
+     stranding records answering Cloudflare error 1016 forever with no local
+     state left pointing at them. It now refuses to delete the tunnel unless
+     every record is confirmed gone — a partial teardown is worse than none.
+
+  **Blast radius.** Every mutating DNS call was already pinned to
+  `/zones/$CF_ZONE_ID/...` and deletion filtered on exact tunnel-content
+  match, so the zone could not be crossed by accident. Two ways to be bound
+  to the *wrong* zone remained, both now closed:
+  - The wizard fell back to `zones[0]` when no zone matched the configured
+    domain — silently binding the appliance to an unrelated domain in the
+    same account. Plausible for the target audience: nameservers not moved
+    yet, NS pre-check warns, operator clicks "Continue anyway". Fallback
+    removed; Provision is gated on a zone that actually holds the domain.
+  - Tunnel lookup is by name and Cloudflare permits duplicates, so two
+    appliances in one account both left at the default name would share a
+    tunnel: one provision overwrites the other's ingress, one teardown
+    deletes it. `cloudflared-up.sh` now reads the existing tunnel's ingress
+    and refuses to adopt one serving another domain; the default name is
+    domain-derived (`vibe-appliance-firm-com`) so it cannot collide.
+
+  Both new suffix checks are anchored on a dot boundary — `evilfirm.com`
+  must not read as living in zone `firm.com`.
+
+  Deviations from the plan:
+  1. **`set -euo pipefail` in both cloudflared scripts** (CLAUDE.md
+     convention; they shipped with `-uo`). Adding `-e` naively would have
+     replaced ~10 friendly `die` messages with silent aborts — and an
+     unhandled abort between "tunnel created" and "CNAMEs written" strands
+     account-side state. So every Cloudflare call and python helper is
+     explicitly guarded (`|| true` / `|| die` / `if`), with `-e` as the
+     backstop for the *unanticipated* failure only. Three
+     `[[ ... ]] && cmd` line-enders became `if` blocks: under `-e` a
+     trailing test evaluating false kills the script, which for the prune
+     loop meant "zone has nothing stale" — the common case — aborting the
+     run right after the CNAMEs were written.
+  2. **The `userFacing:false` gate for secondary subdomains had four
+     independent implementations** (Caddy renderer, tunnel ingress,
+     `server.js`, `doctor.sh`) and three had drifted from the renderer.
+     Aligned to the renderer's stricter rule — never publish a hostname the
+     proxy will not answer. doctor's stale copy was producing two hard
+     failures per app for hosts deliberately not served, taking `doctor` to
+     exit 1 on a healthy install. Three of the four are now under test.
+  3. **`rootServedOnly` was mishandled in two places.** The wizard printed
+     `https://<tunnel>/<prefix>/` for every app, but the renderer emits no
+     path handler for these (a path mount serves the SPA shell and 404s
+     every asset) — so `vibe-1099` and `vibe-ai-router` were advertised at a
+     URL answering with the console landing page. And `enable-app`'s
+     "tunnel ingress is stale" warning skipped exactly these apps: its gate
+     counted only *non-primary* subdomains and bailed early on
+     `userFacing:false`, missing both. Enabling either while the tunnel was
+     up produced a live vhost, no CNAME, and no warning anywhere.
+  4. **Leaving domain mode stranded a running connector.**
+     `lib/exit-domain-mode.sh` has always stopped cloudflared; the
+     radio-button path (`/api/v1/admin/network-mode/switch`) did not, so the
+     connector kept 502ing every public request while the wizard hid its own
+     screen. The two exits from domain mode now behave identically.
+  5. **`_secrets_set_kv_in` staged to a fixed `<path>.tmp`** — two writers
+     racing on one env file lose an update. Now unique-named, and
+     `os.replace` rather than `os.rename` (matching `exit-domain-mode.sh`).
+     Found by the teardown harness at runtime, not by reading.
+  6. **Not recorded as a phase.** This is defect repair against Phase 8.5
+     substrate, not new phase work, so it lands in the dated log only.
+
+  Tested on Windows (git-bash), NOT on a fresh host:
+  - 8 test files green. +11 tests: routing 6 to 9 (the `userFacing:false`
+    gate across Caddy/ingress/doctor), plus a new `zone-binding` suite
+    (zone matcher, dot-boundary, domain-derived naming, tunnel ownership).
+    Every new guard was verified to FAIL against the pre-fix behaviour by
+    reverting it and re-running — a test that has never failed proves
+    nothing.
+  - Two stubbed end-to-end harnesses drive the real scripts against faked
+    `curl`/`docker`, because `bash -n` cannot catch a `set -e` abort.
+    Provisioning: happy path, unclaimed-tunnel adopt, rejected CNAME,
+    wrong zone, foreign tunnel. Teardown: clean, unreadable CNAME list,
+    rejected delete. The harness counts every mutating API call — the two
+    containment guards abort with **zero** mutations of any kind (no tunnel
+    POST, no DNS write, no token persisted), and pruning across a 2-page
+    listing removed a stale record the old single-request code could not
+    see while leaving an unrelated CNAME in the same zone untouched.
+  - Harness note: needed a `python3` shim stripping CR, since native
+    Windows python emits CRLF and the CR lands mid-string-literal in the
+    next generated snippet. Host artifact, not a script defect — but it is
+    why these harnesses are not committed as tests.
+
+  **Owed before this is trusted in production** — fresh DigitalOcean
+  `s-1vcpu-2gb` Ubuntu 24.04 droplet with a real Cloudflare token and a
+  real domain. Specifically:
+  1. The `set -euo pipefail` conversion. The harnesses cover the happy path
+     and several failure paths, not every branch.
+  2. The new zone pre-flight depends on `GET /zones/{id}` being readable by
+     a `Zone.DNS:Edit`-scoped token. It is written to fail OPEN if not (same
+     reasoning as the `GET /accounts/{id}` trap documented in
+     cloudflared-up.sh), so the worst case is a skipped check — but which
+     path a real token takes is unverified.
+  3. End-to-end: provision, enable a `rootServedOnly` app, confirm the
+     re-provision banner appears and the app resolves only after clicking
+     it, switch to LAN and confirm the connector stops, switch back, then
+     tear down and confirm the zone has no leftover CNAMEs.
