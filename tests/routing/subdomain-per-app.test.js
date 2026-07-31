@@ -220,6 +220,56 @@ test('ingress subdomain-per-app: one rule per app subdomain + console + extras, 
   assert.ok(!hosts.includes('ocr.firm.com'), 'userFacing:false excluded from ingress');
 });
 
+// An app whose product name has drifted from its slug declares an
+// explicit `pathPrefix` rather than forcing a slug rename (the slug keys
+// state.json, the env filename, container names and the per-app Postgres
+// database — renaming it is a data migration, not a rename). FIVE places
+// derive this prefix: render-caddyfile.sh, server.js::appPathPrefix,
+// settings.js, enable-app.sh's VITE_BASE_PATH, and cloudflared-up.sh's
+// printed summary. If Caddy routes /time/ while the SPA is built for
+// /payroll/, the app serves a shell that 404s every one of its assets —
+// a blank page with a 200, which is about the worst failure shape there
+// is. These tests pin the two that are mechanically checkable here.
+test('an explicit pathPrefix overrides the slug-derived URL path', () => {
+  const fx = mkFixtures();
+  const mpath = path.join(fx.manifests, 'vibe-tb.json');
+  const m = JSON.parse(fs.readFileSync(mpath, 'utf8'));
+  m.pathPrefix = 'time';
+  fs.writeFileSync(mpath, JSON.stringify(m));
+
+  const caddy = renderCaddy(fx, 'single-host');
+  assert.match(caddy, /handle \/time\/\*/, 'Caddy must mount the app at the declared prefix');
+  assert.match(caddy, /uri strip_prefix \/time/, 'and strip that prefix before the upstream');
+  assert.doesNotMatch(caddy, /handle \/tb\/\*/,
+    'the slug-derived prefix must NOT also be mounted — two routes for one app');
+});
+
+test('omitting pathPrefix keeps the slug-derived default', () => {
+  // The override is additive: every existing manifest must be unaffected.
+  const caddy = renderCaddy(mkFixtures(), 'single-host');
+  assert.match(caddy, /handle \/tb\/\*/, 'vibe-tb still serves at /tb/');
+  assert.match(caddy, /handle \/mybooks\/\*/);
+  assert.doesNotMatch(caddy, /handle \/vibe-tb\/\*/, 'the vibe- prefix is still stripped');
+});
+
+test('server and Caddy resolve pathPrefix the same way', () => {
+  // appPathPrefix is the console's copy of the rule. Pull it out of
+  // server.js and check it agrees with what the renderer emitted above,
+  // rather than trusting two hand-written implementations to match.
+  const src = fs.readFileSync(path.join(REPO, 'console', 'server.js'), 'utf8');
+  const start = src.indexOf('function appPathPrefix(');
+  assert.ok(start !== -1, 'appPathPrefix not found in server.js');
+  const body = src.slice(start, src.indexOf('\n}', start) + 2);
+  // eslint-disable-next-line no-new-func
+  const appPathPrefix = new Function(`${body}; return appPathPrefix;`)();
+
+  assert.equal(appPathPrefix({ slug: 'vibe-payroll', pathPrefix: 'time' }), 'time');
+  assert.equal(appPathPrefix({ slug: 'vibe-tb' }), 'tb');
+  assert.equal(appPathPrefix({ slug: 'vibe-tb', pathPrefix: '' }), 'tb', 'empty override ignored');
+  assert.equal(appPathPrefix({ slug: 'vibe-tb', pathPrefix: '   ' }), 'tb', 'blank override ignored');
+  assert.equal(appPathPrefix({ slug: 'thirdparty' }), 'thirdparty', 'non-vibe slug passes through');
+});
+
 // Regression: the tunnel must never publish a hostname Caddy won't
 // serve. `userFacing: false` blocks an app's SECONDARY subdomains
 // outright in lib/render-caddyfile.sh (render_extra_subdomain_vhosts),

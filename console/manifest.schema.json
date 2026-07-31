@@ -67,6 +67,14 @@
       "description": "DNS label prepended to the appliance domain. May start with a digit (RFC 1123) so apps like vibe-1099 can use `1099` as their subdomain."
     },
 
+    "pathPrefix": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "minLength": 1,
+      "maxLength": 40,
+      "description": "Optional URL path segment, e.g. `time` serves the app at https://<host>/time/. Defaults to the slug with a leading `vibe-` stripped (vibe-tb -> /tb/). Set this when the product name and the slug diverge: the slug is the INTERNAL identifier (state.json keys, /opt/vibe/env/<slug>.env, container names, the per-app Postgres database) so renaming it is a data migration, whereas the URL is presentation and should be free to change. Must be unique across enabled apps — two sharing a prefix would collide in Caddy."
+    },
+
     "subdomains": {
       "type": "array",
       "description": "Phase 8.5 v1.2 — opt-in multi-subdomain manifest. When present, this list controls EMERGENCY-ACCESS wiring only (HAProxy emits one frontend per item with emergencyPort). The PRIMARY Caddy vhost still uses the top-level `subdomain` field — per-subdomain Caddy routing is a future enhancement gated on backend container splits in the upstream Vibe-* repos. Vibe-Connect's staff/client split is the canonical use case. Manifests should declare BOTH the legacy `subdomain` field (for Caddy) AND `subdomains[]` (for HAProxy multi-port emergency access); declaring `subdomains` alone is allowed but means no Caddy vhost. The `emergencyPort` values across items must be unique per manifest (HAProxy refuses to bind the same port twice).",

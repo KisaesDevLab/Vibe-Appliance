@@ -808,15 +808,29 @@ def _matcher_id(slug, name):
     return f"{slug.replace('-', '_')}_{name}"
 
 
-def _path_prefix(slug):
+def _path_prefix(slug, manifest=None):
     """
-    URL path prefix for an app: the slug with a leading `vibe-` stripped.
-    Keeps the slug as the internal identifier (container names, env
-    filenames, state.json keys, matcher IDs) while shortening the
-    user-visible URL — `/vibe-tb/` becomes `/tb/`, `/vibe-tax-research/`
-    becomes `/tax-research/`. Slugs that don't start with `vibe-` pass
-    through unchanged so third-party manifests stay routable.
+    URL path prefix for an app.
+
+    Precedence: the manifest's explicit `pathPrefix`, else the slug with
+    a leading `vibe-` stripped. Keeps the slug as the internal identifier
+    (container names, env filenames, state.json keys, the per-app
+    Postgres database, matcher IDs) while the URL stays presentation —
+    `/vibe-tb/` becomes `/tb/`, and an app whose product name has drifted
+    from its slug can declare `pathPrefix` instead of forcing a slug
+    rename, which would be a data migration rather than a rename.
+    Slugs that don't start with `vibe-` pass through unchanged so
+    third-party manifests stay routable.
+
+    Every consumer resolves this the same way — console/server.js's
+    appPathPrefix(), lib/enable-app.sh's _render_app_env, and
+    infra/cloudflared-up.sh's printed summary — or the Caddy route and
+    the URL the operator is told to visit drift apart.
     """
+    if manifest:
+        explicit = (manifest.get("pathPrefix") or "").strip()
+        if explicit:
+            return explicit
     return slug[len("vibe-"):] if slug.startswith("vibe-") else slug
 
 
@@ -839,7 +853,7 @@ def render_path_handler(slug, manifest):
     routing = manifest.get("routing", {})
     matchers = routing.get("matchers", []) or []
     default_upstream = routing["default_upstream"]
-    prefix = _path_prefix(slug)
+    prefix = _path_prefix(slug, manifest)
 
     lines = []
     lines.append(f"\t# {slug}")

@@ -1126,16 +1126,20 @@ try:
 except Exception:
   state_apps = {}
 # URL path prefix mirrors lib/render-caddyfile.sh's _path_prefix():
-# slug with the redundant leading `vibe-` stripped (so vibe-tb → tb).
+# the manifest's explicit `pathPrefix` if it declares one, else the slug
+# with the redundant leading `vibe-` stripped (so vibe-tb → tb). This is
+# the URL the operator is told to bookmark, so it has to be the one
+# Caddy actually routes.
 for it in items:
   slug = it['slug']
-  prefix = slug[len('vibe-'):] if slug.startswith('vibe-') else slug
   man_path = os.path.join(manifests_dir, f"{slug}.json")
   try:
     with open(man_path) as f:
       manifest = json.load(f)
   except (FileNotFoundError, ValueError):
     manifest = {}
+  prefix = (manifest.get('pathPrefix') or '').strip() or (
+    slug[len('vibe-'):] if slug.startswith('vibe-') else slug)
   if routing_mode == "subdomain-per-app" or manifest.get("rootServedOnly") is True:
     # Each app at its own subdomain root. Effective subdomain =
     # operator override (state) → manifest. rootServedOnly apps land

@@ -944,11 +944,27 @@ _render_app_env() {
   routing_mode="${routing_mode//[[:space:]]/}"
   [[ "$routing_mode" == "subdomain-per-app" ]] || routing_mode="single-host"
 
-  # URL path prefix — slug with redundant `vibe-` stripped. Must match
+  # URL path prefix — the manifest's explicit `pathPrefix` if it declares
+  # one, else the slug with the redundant `vibe-` stripped. Must match
   # the prefix lib/render-caddyfile.sh's _path_prefix() produces for
   # Caddy's `handle /<prefix>/*` blocks, otherwise the SPA's base-path
   # diverges from Caddy's routing and every asset request 404s.
-  local path_prefix="${slug#vibe-}"
+  local path_prefix
+  path_prefix="$(python3 - "$manifest" "$slug" <<'PYEOF' 2>/dev/null || true
+import json, sys
+manifest_path, slug = sys.argv[1], sys.argv[2]
+try:
+    m = json.load(open(manifest_path))
+except Exception:
+    m = {}
+explicit = (m.get("pathPrefix") or "").strip()
+print(explicit or (slug[len("vibe-"):] if slug.startswith("vibe-") else slug))
+PYEOF
+)"
+  # Fall back to the shell derivation if python couldn't read the
+  # manifest — a missing prefix here would render VITE_BASE_PATH as `//`
+  # and break every asset URL, which is worse than ignoring an override.
+  [[ -n "$path_prefix" ]] || path_prefix="${slug#vibe-}"
 
   # The "client portal" subdomain name from the manifest — empty unless
   # the app declares a second subdomain meant for client (not staff)

@@ -96,17 +96,29 @@ const SETTINGS_JS_VERSION = '2026-07-30-tunnel-scope-and-rootserved-urls';
     }[c]));
   }
 
-  // pathPrefix(slug) — URL path prefix for an app: the slug with a
+  // pathPrefix(app) — URL path prefix for an app: the server-resolved
+  // `pathPrefix` from the /api/v1/apps payload, else the slug with a
   // leading `vibe-` stripped. Mirrors lib/render-caddyfile.sh's
   // _path_prefix() and console/server.js's appPathPrefix(). The
   // wizard panels build URLs against `wiz.tunnelSubdomain` /
   // `wiz.domain` rather than current state.config.mode, so they
   // can't reuse the server-computed `url` field on the apps payload
   // — they need this client-side helper to stay in sync.
-  function pathPrefix(slug) {
-    return slug && slug.startsWith('vibe-')
-      ? slug.slice('vibe-'.length)
-      : (slug || '');
+  //
+  // Takes the app OBJECT, not a bare slug: an app whose product name
+  // has drifted from its slug (vibe-payroll serving /time/) declares an
+  // explicit pathPrefix, and deriving from the slug alone would print a
+  // URL that 404s. Accepts a bare string too so any older call site
+  // degrades to the slug rule rather than throwing.
+  function pathPrefix(app) {
+    if (typeof app === 'string') {
+      return app.startsWith('vibe-') ? app.slice('vibe-'.length) : app;
+    }
+    if (!app) return '';
+    const explicit = typeof app.pathPrefix === 'string' ? app.pathPrefix.trim() : '';
+    if (explicit) return explicit;
+    const slug = app.slug || '';
+    return slug.startsWith('vibe-') ? slug.slice('vibe-'.length) : slug;
   }
 
   function el(tag, attrs, children) {
@@ -2431,7 +2443,7 @@ const SETTINGS_JS_VERSION = '2026-07-30-tunnel-scope-and-rootserved-urls';
         li.appendChild(document.createTextNode(' — '));
         const primaryUrl = a.rootServedOnly
           ? 'https://' + (a.effectiveSubdomain || a.subdomain) + '.' + dom + '/'
-          : 'https://' + host + '/' + pathPrefix(a.slug) + '/';
+          : 'https://' + host + '/' + pathPrefix(a) + '/';
         li.appendChild(el('span', { class: 'mono' }, [primaryUrl]));
         if (a.rootServedOnly) {
           li.appendChild(el('span', {
@@ -3049,7 +3061,7 @@ const SETTINGS_JS_VERSION = '2026-07-30-tunnel-scope-and-rootserved-urls';
         const pausedDom = wiz.domain || '<your-domain>';
         const targets = wiz.enabledApps.map(a => a.rootServedOnly
           ? (a.effectiveSubdomain || a.subdomain) + '.' + pausedDom
-          : '/' + pathPrefix(a.slug) + '/').join(', ');
+          : '/' + pathPrefix(a) + '/').join(', ');
         section.appendChild(el('p', { class: 'help', style: 'margin-top:0.2rem;color:var(--text-muted);' }, [
           'Enabled apps reachable at: ', targets,
         ]));

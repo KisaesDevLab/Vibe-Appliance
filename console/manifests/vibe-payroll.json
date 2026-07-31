@@ -11,7 +11,8 @@
     "defaultTag": "latest"
   },
 
-  "subdomain":     "payroll",
+  "subdomain":     "time",
+  "pathPrefix":    "time",
   "emergencyPort": 5192,
   "ports":         { "server": 4000, "client": 8080 },
 

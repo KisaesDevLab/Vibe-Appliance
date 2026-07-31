@@ -1658,6 +1658,12 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
         // operators vibe-1099 lived at https://vibe.example.com/1099/,
         // which Caddy answers with the console landing page.
         rootServedOnly: m.rootServedOnly === true,
+        // Server-resolved URL path segment. The wizard builds its own
+        // URLs (it targets a hypothetical domain-mode host, not the
+        // current one) so it can't reuse `url` — without this it would
+        // derive the prefix from the slug and print /payroll/ for an app
+        // Caddy serves at /time/.
+        pathPrefix: appPathPrefix(m),
         effectiveSubdomain: appEffectiveSubdomain(m),
         // Manifest-declared extra subdomains beyond the primary. Used
         // by the Cloudflare-Tunnel wizard to surface client-portal
@@ -5740,6 +5746,13 @@ function appEmergencyPort(manifest) {
 // filename) — only the visible URL is shortened. Third-party manifests
 // that don't start with `vibe-` pass through unchanged.
 function appPathPrefix(manifest) {
+  // Explicit manifest override wins; else the slug minus a leading
+  // `vibe-`. Mirrors lib/render-caddyfile.sh::_path_prefix and
+  // lib/enable-app.sh — the URL Caddy routes, the URL baked into the
+  // app's VITE_BASE_PATH, and the URL shown in the admin all have to
+  // agree or the app loads a shell that 404s its own assets.
+  const explicit = typeof manifest.pathPrefix === 'string' ? manifest.pathPrefix.trim() : '';
+  if (explicit) return explicit;
   const slug = manifest.slug || '';
   return slug.startsWith('vibe-') ? slug.slice('vibe-'.length) : slug;
 }
