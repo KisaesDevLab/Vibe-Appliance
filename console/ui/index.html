@@ -58,26 +58,59 @@
         </div>`;
     }
 
-    function renderTiles(apps, customCards, tools) {
-      const appTiles = apps.map((a) => renderCard({
-        title: a.displayName,
-        description: a.description,
-        actions: renderActions(a),
+    function renderTiles(apps, customCards, tools, cardOrder) {
+      // Tiles carry their card key so the operator's cross-source order
+      // (state.landingOrder, resolved server-side and sent as
+      // `cardOrder`) can interleave the three sources. Before this they
+      // were concatenated in a fixed group sequence — apps, tools, then
+      // custom — so a firm could not put their intake card first.
+      const appTiles = apps.map((a) => ({
+        key: 'app:' + a.slug,
+        html: renderCard({
+          title: a.displayName,
+          description: a.description,
+          actions: renderActions(a),
+        }),
       }));
       // Mini-apps (JSX tools) uploaded by the firm's admin — rendered
       // in-appliance at /tools/<id>. Same _blank/noopener treatment as
       // app links so an open staff-console tab is never navigated away.
-      const toolTiles = tools.map((t) => renderCard({
-        title: t.title,
-        description: t.description,
-        actions: `<a class="btn" href="${escapeHtml(t.url)}" target="_blank" rel="noopener noreferrer">Open</a>`,
+      const toolTiles = tools.map((t) => ({
+        key: 'tool:' + t.id,
+        html: renderCard({
+          title: t.title,
+          description: t.description,
+          actions: `<a class="btn" href="${escapeHtml(t.url)}" target="_blank" rel="noopener noreferrer">Open</a>`,
+        }),
       }));
-      const customTiles = customCards.map((c) => renderCard({
-        title: c.title,
-        description: c.description,
-        actions: `<a class="btn" href="${escapeHtml(c.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(c.buttonLabel || 'Open')}</a>`,
+      const customTiles = customCards.map((c) => ({
+        key: 'custom:' + c.id,
+        html: renderCard({
+          title: c.title,
+          description: c.description,
+          actions: `<a class="btn" href="${escapeHtml(c.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(c.buttonLabel || 'Open')}</a>`,
+        }),
       }));
-      return `<div class="client-grid">${[...appTiles, ...toolTiles, ...customTiles].join('')}</div>`;
+
+      // Rank by the server's resolved order; anything unranked keeps
+      // its position at the end. An older server that doesn't send
+      // cardOrder leaves every rank Infinity, so the sort is a no-op
+      // and the original apps-tools-custom sequence survives.
+      const tiles = [...appTiles, ...toolTiles, ...customTiles];
+      const rank = new Map();
+      (Array.isArray(cardOrder) ? cardOrder : []).forEach((k, i) => {
+        if (!rank.has(k)) rank.set(k, i);
+      });
+      const ranked = tiles
+        .map((t, idx) => ({ t, idx }))
+        .sort((a, b) => {
+          const ar = rank.has(a.t.key) ? rank.get(a.t.key) : Number.POSITIVE_INFINITY;
+          const br = rank.has(b.t.key) ? rank.get(b.t.key) : Number.POSITIVE_INFINITY;
+          if (ar !== br) return ar - br;
+          return a.idx - b.idx;
+        })
+        .map(({ t }) => t.html);
+      return `<div class="client-grid">${ranked.join('')}</div>`;
     }
 
     function renderCard({ title, description, actions }) {
@@ -131,8 +164,9 @@
         const apps = Array.isArray(data.apps) ? data.apps : [];
         const customCards = Array.isArray(data.customCards) ? data.customCards : [];
         const tools = Array.isArray(data.tools) ? data.tools : [];
+        const cardOrder = Array.isArray(data.cardOrder) ? data.cardOrder : [];
         section.innerHTML = (apps.length || customCards.length || tools.length)
-          ? renderTiles(apps, customCards, tools)
+          ? renderTiles(apps, customCards, tools, cardOrder)
           : renderEmpty();
       } catch (err) {
         section.innerHTML = renderError(err.message || String(err));

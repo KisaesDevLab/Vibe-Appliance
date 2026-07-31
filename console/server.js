@@ -22,6 +22,10 @@ const http        = require('http');
 const { spawn, execFileSync } = require('child_process');
 const Docker      = require('dockerode');
 const Database    = require('better-sqlite3');
+// Landing-page card ordering. Required at the top (not beside its
+// endpoints like cf-helpers) because the PUBLIC landing payload above
+// those endpoints uses it too, and a const require is not hoisted.
+const landingOrderLib = require('./lib/landing-order');
 
 // ----- config -----------------------------------------------------------
 
@@ -1148,7 +1152,127 @@ app.get('/api/v1/public/apps', async (_req, res) => {
     log('warn', 'jsx-tools: public list query failed', { err: err.message });
   }
 
-  res.json({ apps: items, customCards, tools, firmName, showStaffSignin });
+  // Unified card order across all three sources. The landing page
+  // renders apps + tools + custom cards into one flat grid, so the
+  // operator's ordering has to span them; previously each source was
+  // sorted independently and then concatenated in a fixed group
+  // sequence, which made "put the intake card first" impossible.
+  //
+  // We send the resolved key order rather than pre-merging the arrays:
+  // the three payload arrays keep their existing shape (nothing
+  // downstream breaks), the sort stays server-authoritative, and the
+  // page just orders tiles it already knows how to build.
+  const defaultKeys = [
+    ...items.map((a) => landingOrderLib.cardKey('app', a.slug)),
+    ...tools.map((t) => landingOrderLib.cardKey('tool', t.id)),
+    ...customCards.map((c) => landingOrderLib.cardKey('custom', c.id)),
+  ];
+  const cardOrder = landingOrderLib.resolveLandingOrder(
+    defaultKeys,
+    Array.isArray(state.landingOrder) ? state.landingOrder : [],
+  );
+
+  res.json({ apps: items, customCards, tools, cardOrder, firmName, showStaffSignin });
+});
+
+// --- Landing card order ------------------------------------------------
+//
+// Read/write the operator's cross-source card ordering. GET returns
+// every card that currently exists, already in resolved order and
+// labelled, so the admin UI can render a sortable list without having
+// to re-derive the merge itself (and drift from the server's rules).
+app.get('/api/v1/admin/landing-order', requireAdmin, (_req, res) => {
+  const state = readState();
+  const stateApps = state.apps || {};
+
+  // Apps: must match the PUBLIC payload's three-gate filter exactly —
+  // userFacing !== false, enabled === true, visibleToCustomers === true
+  // (opt-in, default false). Listing an app here that the customer
+  // landing doesn't render would let the operator carefully position a
+  // card nobody can see.
+  const appCards = Object.values(MANIFESTS)
+    .filter((m) => {
+      const s = stateApps[m.slug] || {};
+      if (m.userFacing === false) return false;
+      return s.enabled === true && s.visibleToCustomers === true;
+    })
+    .map((m) => ({
+      key:   landingOrderLib.cardKey('app', m.slug),
+      type:  'app',
+      label: m.displayName || m.slug,
+      description: m.description || '',
+      // Manifest default, kept only to sort by below.
+      _order: Number.isInteger(m.landingOrder) ? m.landingOrder : Number.POSITIVE_INFINITY,
+    }))
+    .sort((a, b) => (a._order !== b._order)
+      ? a._order - b._order
+      : a.label.localeCompare(b.label))
+    .map(({ _order, ...card }) => card);
+
+  let toolCards = [];
+  try {
+    toolCards = db.prepare(
+      "SELECT id, title, description FROM custom_tools WHERE visible = 1 AND source IS NOT NULL AND source != '' ORDER BY created_ts, id"
+    ).all().map((t) => ({
+      key: landingOrderLib.cardKey('tool', t.id),
+      type: 'tool',
+      label: t.title,
+      description: t.description || '',
+    }));
+  } catch (err) {
+    log('warn', 'landing-order: tool query failed', { err: err.message });
+  }
+
+  const customCardList = sanitizeCustomCardsForPublic(state.customCards).map((c) => ({
+    key: landingOrderLib.cardKey('custom', c.id),
+    type: 'custom',
+    label: c.title,
+    description: c.description || '',
+  }));
+
+  const byKey = new Map();
+  for (const c of [...appCards, ...toolCards, ...customCardList]) byKey.set(c.key, c);
+  const resolved = landingOrderLib.resolveLandingOrder(
+    [...byKey.keys()],
+    Array.isArray(state.landingOrder) ? state.landingOrder : [],
+  );
+
+  res.json({
+    ok: true,
+    // True when the operator has never saved an order — lets the UI say
+    // "currently using the default order" instead of implying they chose it.
+    customized: Array.isArray(state.landingOrder) && state.landingOrder.length > 0,
+    cards: resolved.map((k) => byKey.get(k)).filter(Boolean),
+  });
+});
+
+app.put('/api/v1/admin/landing-order', requireAdmin, testRateLimit, (req, res) => {
+  const body = req.body || {};
+  const v = landingOrderLib.validateLandingOrder(body.order);
+  if (!v.ok) return res.status(400).json({ ok: false, error: v.error });
+  try {
+    applyStatePatch({ landingOrder: v.order });
+  } catch (err) {
+    log('error', 'landing-order write failed', { err: err.message });
+    return res.status(500).json({ ok: false, error: 'state.json write failed: ' + err.message });
+  }
+  log('info', 'landing order updated', { count: v.order.length });
+  res.json({ ok: true, order: v.order });
+});
+
+// Reset to the system default (manifest landingOrder for apps, creation
+// order for tools, list order for custom cards). Clearing the array is
+// the reset — resolveLandingOrder falls back to defaults for anything
+// unlisted, so an empty list means "all defaults".
+app.delete('/api/v1/admin/landing-order', requireAdmin, testRateLimit, (_req, res) => {
+  try {
+    applyStatePatch({ landingOrder: [] });
+  } catch (err) {
+    log('error', 'landing-order reset failed', { err: err.message });
+    return res.status(500).json({ ok: false, error: 'state.json write failed: ' + err.message });
+  }
+  log('info', 'landing order reset to default');
+  res.json({ ok: true });
 });
 
 // --- Custom cards (operator-curated landing tiles) ---------------------

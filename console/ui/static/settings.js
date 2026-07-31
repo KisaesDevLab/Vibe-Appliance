@@ -3800,6 +3800,192 @@ const SETTINGS_JS_VERSION = '2026-07-30-tunnel-scope-and-rootserved-urls';
 
     await renderCustomCardsSection(panelEl);
     await renderToolsSection(panelEl);
+    await renderCardOrderSection(panelEl);
+  }
+
+  // ---- Card order ------------------------------------------------------
+  //
+  // The landing page paints apps, mini-apps and custom cards into ONE
+  // flat grid, but each source used to be sorted independently and then
+  // concatenated in a fixed group sequence — so "put our document-upload
+  // card first" was impossible without editing a manifest, which is the
+  // wrong place: manifests ship from each app's own repo and an app
+  // update would silently revert the layout. The order now lives in
+  // state.json and spans all three sources.
+  //
+  // Reordering is ↑/↓ buttons rather than drag-and-drop. Drag looks
+  // nicer in a demo, but this list is operated by CPAs who may be on a
+  // tablet or using a keyboard, and a drag that half-works is worse than
+  // a button that always does. Buttons are also trivially undoable,
+  // which matters more than elegance here.
+  async function renderCardOrderSection(parent) {
+    parent.appendChild(el('h3', {
+      style: 'margin:2rem 0 0.4rem;font-size:1rem;color:#6b4423;',
+    }, ['Card order']));
+    const help = el('p', { class: 'help' }, [
+      'The order these cards appear on your public landing page. ',
+      'Covers every card type together — apps, mini-apps, and custom cards — ',
+      'so you can put whatever matters most to your clients at the top.',
+    ]);
+    parent.appendChild(help);
+
+    const statusLine = el('p', { class: 'help', style: 'margin:0.3rem 0;' }, ['Loading…']);
+    parent.appendChild(statusLine);
+    const listWrap = el('div', { class: 'settings-form', style: 'max-width:44rem;' });
+    parent.appendChild(listWrap);
+    const ctaRow = el('div', { class: 'cta-row', style: 'gap:0.5rem;margin-top:0.6rem;' });
+    parent.appendChild(ctaRow);
+
+    let cards = [];        // [{key,type,label,description}] in current order
+    let dirty = false;
+
+    const TYPE_LABEL = { app: 'App', tool: 'Mini-app', custom: 'Custom card' };
+
+    function setStatus(text, color) {
+      statusLine.textContent = text;
+      statusLine.style.color = color || '';
+    }
+
+    function move(idx, delta) {
+      const to = idx + delta;
+      if (to < 0 || to >= cards.length) return;
+      const [item] = cards.splice(idx, 1);
+      cards.splice(to, 0, item);
+      dirty = true;
+      paintList();
+      // Keep focus on the button the operator just used so repeated
+      // presses keep working — re-rendering the list otherwise drops
+      // focus to <body> and a keyboard user has to re-tab every step.
+      const sel = `[data-card-idx="${to}"] [data-move="${delta < 0 ? 'up' : 'down'}"]`;
+      const next = listWrap.querySelector(sel);
+      if (next && !next.disabled) next.focus();
+      refreshCta();
+    }
+
+    function paintList() {
+      listWrap.innerHTML = '';
+      if (!cards.length) {
+        listWrap.appendChild(el('p', { class: 'help' }, [
+          'No cards are on the landing page yet. Enable an app for customers above, ',
+          'or add a custom card, and it will show up here.',
+        ]));
+        return;
+      }
+      cards.forEach((c, i) => {
+        const row = el('div', {
+          'data-card-idx': String(i),
+          style: 'display:flex;align-items:center;gap:0.6rem;padding:0.5rem 0.6rem;' +
+                 'border:1px solid var(--border);border-radius:4px;margin-bottom:0.35rem;' +
+                 'background:var(--surface);',
+        });
+        row.appendChild(el('span', {
+          style: 'min-width:1.6rem;text-align:right;color:var(--text-muted);font-variant-numeric:tabular-nums;',
+        }, [String(i + 1)]));
+
+        const meta = el('div', { style: 'flex:1;min-width:0;' });
+        meta.appendChild(el('div', { style: 'font-weight:600;' }, [c.label || c.key]));
+        meta.appendChild(el('div', {
+          class: 'help', style: 'margin:0;color:var(--text-muted);',
+        }, [TYPE_LABEL[c.type] || c.type]));
+        row.appendChild(meta);
+
+        const up = el('button', {
+          type: 'button', class: 'btn btn--ghost', 'data-move': 'up',
+          title: 'Move up', 'aria-label': 'Move ' + (c.label || 'card') + ' up',
+          onclick: () => move(i, -1),
+        }, ['↑']);
+        const down = el('button', {
+          type: 'button', class: 'btn btn--ghost', 'data-move': 'down',
+          title: 'Move down', 'aria-label': 'Move ' + (c.label || 'card') + ' down',
+          onclick: () => move(i, +1),
+        }, ['↓']);
+        up.disabled = (i === 0);
+        down.disabled = (i === cards.length - 1);
+        row.appendChild(up);
+        row.appendChild(down);
+        listWrap.appendChild(row);
+      });
+    }
+
+    const saveBtn = el('button', {
+      type: 'button', class: 'btn',
+      onclick: () => save(),
+    }, ['Save order']);
+    const resetBtn = el('button', {
+      type: 'button', class: 'btn btn--ghost',
+      onclick: () => reset(),
+    }, ['Reset to default']);
+    ctaRow.appendChild(saveBtn);
+    ctaRow.appendChild(resetBtn);
+
+    function refreshCta() { saveBtn.disabled = !dirty; }
+
+    async function load(msg) {
+      try {
+        const r = await fetchWithTimeout('/api/v1/admin/landing-order',
+          { credentials: 'same-origin' }, 10000);
+        const data = await r.json();
+        if (!r.ok || !data.ok) throw new Error(data.error || ('HTTP ' + r.status));
+        cards = Array.isArray(data.cards) ? data.cards : [];
+        dirty = false;
+        paintList();
+        refreshCta();
+        setStatus(msg || (data.customized
+          ? 'Using your saved order.'
+          : 'Using the default order. Move a card to customise it.'),
+          msg ? 'var(--good)' : '');
+      } catch (err) {
+        setStatus('Could not load the card list: ' + _friendlyError(err), 'var(--bad)');
+      }
+    }
+
+    async function save() {
+      saveBtn.disabled = true;
+      setStatus('Saving…');
+      try {
+        const r = await fetchWithTimeout('/api/v1/admin/landing-order', {
+          method: 'PUT', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ order: cards.map((c) => c.key) }),
+        }, 15000);
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || !data.ok) {
+          setStatus('✗ ' + (data.error || 'Save failed (HTTP ' + r.status + ').'), 'var(--bad)');
+          saveBtn.disabled = false;
+          return;
+        }
+        // Re-load rather than trusting local state: the server may have
+        // dropped keys for cards removed by someone else meanwhile, and
+        // the operator should see what actually got saved.
+        await load('✓ Saved. Your landing page uses this order now.');
+      } catch (err) {
+        setStatus('✗ ' + _friendlyError(err) + ' — order not saved.', 'var(--bad)');
+        saveBtn.disabled = false;
+      }
+    }
+
+    async function reset() {
+      if (!window.confirm(
+        'Reset the card order back to the default?\n\n' +
+        'Cards return to the order the system picks (apps first, in their ' +
+        'built-in order, then mini-apps, then custom cards). Your cards ' +
+        'themselves are not changed.'
+      )) return;
+      try {
+        const r = await fetchWithTimeout('/api/v1/admin/landing-order',
+          { method: 'DELETE', credentials: 'same-origin' }, 15000);
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || !data.ok) {
+          setStatus('✗ ' + (data.error || 'Reset failed.'), 'var(--bad)');
+          return;
+        }
+        await load('✓ Reset to the default order.');
+      } catch (err) {
+        setStatus('✗ ' + _friendlyError(err) + ' — not reset.', 'var(--bad)');
+      }
+    }
+
+    await load();
   }
 
   // Operator-curated tiles on /. State lives in /opt/vibe/state.json
