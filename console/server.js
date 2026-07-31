@@ -1523,6 +1523,18 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
         displayName: m.displayName,
         description: m.description,
         subdomain: m.subdomain,
+        // rootServedOnly + the RESOLVED primary subdomain. The
+        // Cloudflare-Tunnel wizard needs both to print a URL that
+        // matches what Caddy actually serves: lib/render-caddyfile.sh
+        // (render_domain_app_vhost) deliberately emits NO path handler
+        // for a rootServedOnly app — a path mount would serve the SPA
+        // shell and 404 every asset — and gives it its own
+        // <subdomain>.<domain> vhost instead. Without these fields the
+        // wizard fell back to the generic /<prefix>/ form and told
+        // operators vibe-1099 lived at https://vibe.example.com/1099/,
+        // which Caddy answers with the console landing page.
+        rootServedOnly: m.rootServedOnly === true,
+        effectiveSubdomain: appEffectiveSubdomain(m),
         // Manifest-declared extra subdomains beyond the primary. Used
         // by the Cloudflare-Tunnel wizard to surface client-portal
         // hosts (e.g. client.<domain> for vibe-connect) in the
@@ -1532,11 +1544,20 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
         // but the wizard previously listed only the single-host
         // path-prefix URL, so operators couldn't see the public
         // client URL to share with clients. Per-entry `internal: true`
-        // and app-level `userFacing: false` (when no subdomains[]
-        // declared) both block public routing — mirror the renderer's
-        // gates exactly so the wizard's URL list matches what's
-        // actually reachable.
-        extraSubdomains: (m.userFacing === false && !(m.subdomains || []).length)
+        // and app-level `userFacing: false` both block public routing —
+        // mirror the renderer's gates exactly so the wizard's URL list
+        // matches what's actually reachable.
+        //
+        // The `userFacing: false` gate here is unconditional, matching
+        // lib/render-caddyfile.sh::render_extra_subdomain_vhosts, which
+        // skips ALL secondary vhosts for such an app. The previous
+        // `&& !(m.subdomains || []).length` qualifier meant an app with
+        // userFacing:false AND a non-primary subdomain would be listed
+        // (and, in the matching cloudflared-up.sh gate, given a public
+        // CNAME) while Caddy served no vhost for that hostname — a TLS
+        // handshake failure at the Cloudflare edge. Never advertise or
+        // publish a hostname the reverse proxy won't answer.
+        extraSubdomains: m.userFacing === false
           ? []
           : ((m.subdomains || [])
               .filter((sd) => sd && sd.name && sd.name !== m.subdomain && sd.internal !== true)
@@ -3329,6 +3350,50 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, async
       }
     }
 
+    // Leaving domain mode strands a running tunnel. The connector keeps
+    // its edge connections and the CNAMEs still resolve, but Caddy no
+    // longer has a :443 listener (LAN) or is bound to 127.0.0.1
+    // (tailscale), so the ingress target is gone and every public
+    // request 502s — indefinitely, with the wizard showing nothing
+    // wrong because it downgrades its own screen on a mode change.
+    // lib/exit-domain-mode.sh has always stopped the connector for
+    // exactly this reason; the radio-button path must match it or the
+    // two ways out of domain mode leave the appliance in different
+    // states. Also clear CLOUDFLARE_TUNNEL_ENABLED so the next
+    // render_caddyfile stops emitting tunnel-mode flags (tls internal +
+    // auto_https off), which are wrong once nothing is tunnelling.
+    //
+    // Deliberately a STOP, not a teardown: Cloudflare-side state
+    // (tunnel object, CNAMEs, TUNNEL_TOKEN) is preserved so switching
+    // back to domain mode is a re-provision, not a re-setup.
+    const tunnelStop = { attempted: false, stopped: false, error: null };
+    if (prevMode === 'domain' && mode !== 'domain') {
+      tunnelStop.attempted = true;
+      try {
+        const found = await _inspectCloudflared();
+        if (found.error) {
+          // No container is the normal case when no tunnel was ever set
+          // up — not worth surfacing as a problem.
+          tunnelStop.error = found.error.daemonDown ? 'docker daemon unreachable' : null;
+        } else if (found.info.State && (found.info.State.Running || found.info.State.Paused)) {
+          await found.container.stop({ t: 5 });
+          tunnelStop.stopped = true;
+          log('info', 'cloudflared stopped: leaving domain mode', { from: prevMode, to: mode });
+          _auditTunnelStateChange('running', 'stopped', 'disabled', {
+            source: 'network-mode-switch', to_mode: mode,
+          });
+        }
+      } catch (err) {
+        tunnelStop.error = err.message;
+        log('warn', 'could not stop cloudflared while leaving domain mode', { err: err.message });
+      }
+      try {
+        setApplianceEnv('CLOUDFLARE_TUNNEL_ENABLED', 'false');
+      } catch (err) {
+        log('warn', 'could not clear CLOUDFLARE_TUNNEL_ENABLED on mode switch', { err: err.message });
+      }
+    }
+
     const warnings = [];
     if (mode === 'domain') {
       warnings.push(`Apps live at https://${newTunnelSub}.${domain}/<app>/ (e.g. /tb, /mybooks). The bare apex (https://${domain}) redirects to that host.`);
@@ -3337,6 +3402,11 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, async
     }
     if (prevMode === 'domain' && mode !== 'domain') {
       warnings.push('Public domain access has stopped. Apps that need a public URL (Connect\'s client portal) won\'t work for external clients.');
+      if (tunnelStop.stopped) {
+        warnings.push('The Cloudflare Tunnel connector was stopped (it would have 502\'d every public request in this mode). The tunnel object and CNAMEs are preserved — switch back to Public domain and click Re-provision to resume.');
+      } else if (tunnelStop.error) {
+        warnings.push(`Could not stop the Cloudflare Tunnel connector (${tunnelStop.error}). If it is still running it will 502 every public request. SSH path: sudo docker stop vibe-cloudflared.`);
+      }
     }
     if (rerender.failed.length > 0) {
       warnings.push(`${rerender.failed.length} app(s) failed to re-render their env after the mode switch — see rerender.failed in this response. Retry by clicking Disable → Enable on the Apps tab.`);

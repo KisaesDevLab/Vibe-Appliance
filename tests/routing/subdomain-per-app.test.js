@@ -25,7 +25,11 @@ const REPO = path.resolve(__dirname, '..', '..');
 // Pull the embedded `<<'PYEOF' … PYEOF` block that contains `marker`.
 function extractPyeof(scriptPath, marker) {
   const src = fs.readFileSync(scriptPath, 'utf8');
-  const re = /<<'PYEOF'\n([\s\S]*?)\nPYEOF/g;
+  // `[^\n]*` after the heredoc token: the shell line may carry trailing
+  // operators (e.g. `<<'PYEOF' || true`, which guards the substitution
+  // under `set -e`). Anchoring straight to \n made this extractor fail
+  // with a confusing "no PYEOF block" the moment such a guard was added.
+  const re = /<<'PYEOF'[^\n]*\n([\s\S]*?)\nPYEOF/g;
   let m;
   while ((m = re.exec(src)) !== null) {
     if (m[1].includes(marker)) return m[1];
@@ -214,6 +218,92 @@ test('ingress subdomain-per-app: one rule per app subdomain + console + extras, 
     'airouter.firm.com',// rootServedOnly app
   ]));
   assert.ok(!hosts.includes('ocr.firm.com'), 'userFacing:false excluded from ingress');
+});
+
+// Regression: the tunnel must never publish a hostname Caddy won't
+// serve. `userFacing: false` blocks an app's SECONDARY subdomains
+// outright in lib/render-caddyfile.sh (render_extra_subdomain_vhosts),
+// but the ingress builder's gate used to read
+// `userFacing is False AND not subdomains` — so an app with
+// userFacing:false PLUS a non-primary subdomain got a proxied CNAME and
+// an ingress rule pointing at a vhost that was never emitted. The edge
+// then fails the TLS handshake, which reads to an operator as a dead
+// tunnel rather than a manifest problem. Both gates are now
+// unconditional on userFacing.
+//
+// Uses its own manifest rather than extending mkFixtures() so the two
+// deepEqual host-set assertions above keep stating exactly what the
+// normal app mix produces.
+function withHeadlessExtras(fx) {
+  fs.writeFileSync(path.join(fx.manifests, 'vibe-headless.json'), JSON.stringify({
+    schemaVersion: 1, slug: 'vibe-headless', displayName: 'Headless', description: 'd',
+    image: { server: 'x', defaultTag: 'latest' }, subdomain: 'headless',
+    ports: { server: 9100 }, userFacing: false,
+    subdomains: [{ name: 'headless', audience: 'staff' },
+                 { name: 'hooks', audience: 'partner' }],
+    routing: { default_upstream: 'vibe-headless:9100', matchers: [] },
+    env: { required: [] }, health: '/h',
+  }));
+  const st = JSON.parse(fs.readFileSync(fx.stateFile, 'utf8'));
+  st.apps['vibe-headless'] = { enabled: true, status: 'running' };
+  fs.writeFileSync(fx.stateFile, JSON.stringify(st));
+  return fx;
+}
+
+test('userFacing:false blocks secondary subdomains in BOTH Caddy and tunnel ingress', () => {
+  for (const mode of ['single-host', 'subdomain-per-app']) {
+    const fx = withHeadlessExtras(mkFixtures());
+    const caddy = renderCaddy(fx, mode);
+    const hosts = buildIngressHosts(fx, mode);
+
+    assert.doesNotMatch(caddy, /hooks\.firm\.com \{/,
+      `${mode}: Caddy emits no vhost for a userFacing:false app's extra subdomain`);
+    assert.ok(!hosts.includes('hooks.firm.com'),
+      `${mode}: tunnel must not create a CNAME for a hostname Caddy won't serve`);
+  }
+});
+
+// doctor.sh carries its OWN copy of the extra-subdomain gate, to decide
+// which public hostnames to DNS/cert-check. That makes four independent
+// implementations of one rule (render-caddyfile.sh, cloudflared-up.sh,
+// server.js's extraSubdomains, and this) — which is precisely how they
+// drifted. doctor's copy going stale is not cosmetic: it hard-FAILs two
+// checks per app for hostnames that are deliberately not served, and
+// takes `doctor` to exit 1 on a healthy install.
+function doctorExtraSubdomains(fx, manifestName) {
+  const py = extractPyeof(path.join(REPO, 'doctor.sh'), 'subs = m.get("subdomains") or []');
+  const pyFile = path.join(fx.dir, 'doctor-extras.py');
+  fs.writeFileSync(pyFile, py + '\n');
+  const out = execFileSync('python3', [pyFile, path.join(fx.manifests, manifestName)],
+    { encoding: 'utf8' });
+  return out.split('\n').map(s => s.trim()).filter(Boolean);
+}
+
+test('doctor.sh extra-subdomain gate agrees with Caddy and the tunnel', () => {
+  const fx = withHeadlessExtras(mkFixtures());
+  // userFacing:false -> no public extras, so doctor must not probe them.
+  assert.deepEqual(doctorExtraSubdomains(fx, 'vibe-headless.json'), [],
+    'doctor must not DNS/cert-check extras of a userFacing:false app');
+  // The ordinary case still yields the client portal, in both modes.
+  assert.deepEqual(doctorExtraSubdomains(fx, 'vibe-connect.json'), ['client'],
+    'doctor still checks a normal app\'s non-primary subdomain');
+  // And it must match what the tunnel actually publishes.
+  const hosts = buildIngressHosts(fx, 'single-host');
+  assert.ok(hosts.includes('client.firm.com'));
+  assert.ok(!hosts.includes('hooks.firm.com'));
+});
+
+test('userFacing:false still exposes its PRIMARY surface where Caddy serves one', () => {
+  // The primary gate is deliberately looser than the secondary one:
+  // userFacing:false alone no longer hides an app's own admin surface
+  // (it previously 404'd Vibe-Shield's admin UI). Caddy and the tunnel
+  // must agree on that too — in subdomain-per-app mode the app owns
+  // headless.firm.com, so both sides emit it.
+  const fx = withHeadlessExtras(mkFixtures());
+  const caddy = renderCaddy(fx, 'subdomain-per-app');
+  const hosts = buildIngressHosts(fx, 'subdomain-per-app');
+  assert.match(caddy, /headless\.firm\.com \{/, 'Caddy serves the primary subdomain');
+  assert.ok(hosts.includes('headless.firm.com'), 'tunnel routes the primary subdomain');
 });
 
 test('ingress single-host: only the tunnel subdomain + non-primary extras', () => {

@@ -326,9 +326,10 @@ enable_app() {
   log_ok "$slug is up"
 }
 
-# Emit a recovery hint when an app with extra subdomains is enabled
-# but the tunnel hasn't been re-provisioned yet. No-op when the tunnel
-# isn't active or the manifest declares no extra subdomain. Pure
+# Emit a recovery hint when an app that needs its own public hostname
+# is enabled but the tunnel hasn't been re-provisioned yet. No-op when
+# the tunnel isn't active, or when the app is simply path-mounted under
+# the existing tunnel FQDN (nothing new for the tunnel to learn). Pure
 # diagnostic: never fails enable, just logs.
 _warn_if_tunnel_ingress_stale() {
   local slug="$1" manifest="$2"
@@ -343,42 +344,81 @@ _warn_if_tunnel_ingress_stale() {
   tunnel_enabled="${tunnel_enabled#\'}"; tunnel_enabled="${tunnel_enabled%\'}"
   [[ "$tunnel_enabled" == "true" ]] || return 0
 
-  # Count manifest subdomains[] entries that aren't the primary.
-  # Zero non-primary subdomains → nothing for the tunnel to learn,
-  # the single-host /<slug>/ path already covers this app.
-  local extra_count
-  extra_count="$(python3 - "$manifest" <<'PYEOF' 2>/dev/null
+  # The routing mode decides whether this app needs a hostname of its
+  # own, so read it the same way render-caddyfile.sh and cloudflared-up.sh
+  # do. Anything but the explicit opt-in means single-host.
+  local routing_mode
+  routing_mode="$(grep -m1 '^DOMAIN_ROUTING_MODE=' "$appliance_env" 2>/dev/null | cut -d= -f2- || true)"
+  routing_mode="${routing_mode#\"}"; routing_mode="${routing_mode%\"}"
+  routing_mode="${routing_mode#\'}"; routing_mode="${routing_mode%\'}"
+  [[ "$routing_mode" == "subdomain-per-app" ]] || routing_mode="single-host"
+
+  # List every hostname the TUNNEL would have to learn for this app,
+  # mirroring infra/cloudflared-up.sh's ingress builder exactly. Empty
+  # list → the app is path-mounted under the existing tunnel FQDN and
+  # the tunnel already routes it; nothing to warn about.
+  #
+  # This used to count only non-primary subdomains[] entries and bailed
+  # early on `userFacing: false`, which missed precisely the apps that
+  # need their own hostname most — the rootServedOnly ones. Caddy gives
+  # those a <subdomain>.<domain> vhost even in single-host mode (a path
+  # mount would serve the SPA shell and 404 every asset), so enabling
+  # e.g. vibe-1099 (rootServedOnly, no subdomains[]) or vibe-ai-router
+  # (rootServedOnly, userFacing:false) while the tunnel was up produced
+  # a live vhost with no CNAME and no ingress rule, no warning anywhere,
+  # and an app that simply didn't resolve from outside the LAN.
+  local pending_hosts
+  pending_hosts="$(python3 - "$manifest" "$routing_mode" "$VIBE_STATE_FILE" "$slug" <<'PYEOF' 2>/dev/null || true
 import json, sys
+manifest_path, routing_mode, state_path, slug = sys.argv[1:5]
 try:
-  m = json.load(open(sys.argv[1]))
+  m = json.load(open(manifest_path))
 except Exception:
-  print(0); sys.exit(0)
-if m.get("userFacing") is False:
-  print(0); sys.exit(0)
+  sys.exit(0)
+try:
+  entry = ((json.load(open(state_path)).get("apps") or {}).get(slug)) or {}
+except Exception:
+  entry = {}
+
+subs    = m.get("subdomains") or []
 primary = m.get("subdomain", "")
-subs = m.get("subdomains") or []
-extras = [s for s in subs if s.get("name") and s.get("name") != primary]
-print(len(extras))
+hosts   = []
+
+# (1) Primary hostname — needed when each app owns a subdomain, and for
+# rootServedOnly apps in EITHER mode.
+if routing_mode == "subdomain-per-app" or m.get("rootServedOnly") is True:
+  primary_internal = any(
+    s.get("name") == primary and s.get("internal") is True for s in subs
+  )
+  fully_internal = m.get("userFacing") is False and not subs
+  if not primary_internal and not fully_internal:
+    # Operator override (VIBE_APP_SUBDOMAIN → state.apps.<slug>.subdomain)
+    # wins, same precedence as _effective_subdomain().
+    sub = (entry.get("subdomain") or "").strip() or primary
+    if sub:
+      hosts.append(sub)
+
+# (2) Secondary subdomains — blocked wholesale by userFacing:false, and
+# per-entry by internal:true. Matches render_extra_subdomain_vhosts.
+if m.get("userFacing") is not False:
+  for s in subs:
+    name = s.get("name")
+    if not name or name == primary or s.get("internal") is True:
+      continue
+    hosts.append(name)
+
+seen = set()
+print(",".join(h for h in hosts if not (h in seen or seen.add(h))))
 PYEOF
 )"
-  [[ "${extra_count:-0}" -gt 0 ]] || return 0
+  [[ -n "$pending_hosts" ]] || return 0
 
-  # Surface the extra-subdomain names so the operator knows exactly
-  # which public hostname(s) won't resolve until they re-provision.
-  local extra_names
-  extra_names="$(python3 - "$manifest" <<'PYEOF' 2>/dev/null
-import json, sys
-m = json.load(open(sys.argv[1]))
-primary = m.get("subdomain", "")
-print(",".join(s["name"] for s in (m.get("subdomains") or [])
-               if s.get("name") and s.get("name") != primary))
-PYEOF
-)"
-
-  log_warn "$slug declares extra subdomain(s) and the Cloudflare Tunnel is active, but the tunnel's ingress + CNAMEs are NOT refreshed automatically by enable-app. Public requests to those subdomains will 404 at the Cloudflare edge until you re-run cloudflared-up.sh." \
+  log_warn "$slug needs public hostname(s) the Cloudflare Tunnel does not know about yet. enable-app re-rendered Caddy (so the vhost is live on the LAN) but does NOT refresh the tunnel's ingress or CNAMEs. Requests from the public internet will fail to resolve until you re-provision." \
     slug="$slug" \
-    extra_subdomains="$extra_names" \
-    "fix:sudo bash ${APPLIANCE_DIR}/infra/cloudflared-up.sh"
+    pending_hosts="$pending_hosts" \
+    routing_mode="$routing_mode" \
+    "diagnose:dig +short ${pending_hosts%%,*}.<your-domain>   # NXDOMAIN until re-provisioned" \
+    "fix:click Re-provision in Configuration → Network → Cloudflare Tunnel, or run: sudo bash ${APPLIANCE_DIR}/infra/cloudflared-up.sh"
 }
 
 # Pre-flight enable validator. Returns 0 if every check passes; non-
