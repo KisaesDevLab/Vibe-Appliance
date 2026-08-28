@@ -37,7 +37,9 @@ Vibe-Appliance/
 │   ├── vibe-calculators.yml
 │   ├── vibe-tx-converter.yml
 │   ├── vibe-1099.yml
-│   └── vibe-ai-router.yml       # two services from one image (ROUTER_ROLE)
+│   ├── vibe-1040.yml            # api + worker + python sidecar + migrate one-shot
+│   ├── vibe-ai-router.yml       # two services from one image (ROUTER_ROLE)
+│   └── vibe-printer.yml         # single container; own SQLite, no shared PG/Redis
 ├── caddy/
 │   ├── Caddyfile.tmpl           # rendered by bootstrap from CONFIG_MODE
 │   └── snippets/

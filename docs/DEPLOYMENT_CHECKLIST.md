@@ -102,7 +102,7 @@ For each app you want (`vibe-tb`, `vibe-mybooks`, …) in **/admin → Apps**:
   (e.g. `vibe.firm.example/tb/`). One cert, one tunnel CNAME.
 - **subdomain-per-app:** apps at `https://<subdomain>.<domain>/` (root),
   one CNAME + tunnel ingress rule per app; per-app subdomain editable in
-  Settings → Network. Root-base-only SPAs (`vibe-1099`, `vibe-ai-router`)
+  Settings → Network. Root-base-only SPAs (`vibe-1099`, `vibe-1040`, `vibe-ai-router`, `vibe-printer`)
   no longer force this mode: their manifests declare `rootServedOnly`,
   which gives them a root-served vhost at their own subdomain in BOTH
   routing modes (see docs/addenda/emergency-access.md).
@@ -146,7 +146,9 @@ GHCR and update-ready (audited 2026-07-24):
 | vibe-calculators | vibe-calculators-server | vibe-calculators-client | — | ✅ |
 | vibe-tx-converter | vibe-tx-converter | — | — | ✅ |
 | vibe-1099 | vibe1099-app | vibe1099-web | render | ✅ (2026-07-28; use ≥ v0.1.1 — see Known blockers) |
+| vibe-1040 | vibe-1040 | — | sidecar | ✅ (v0.0.1, 2026-08-26) |
 | vibe-ai-router | vibe-ai-router | — | — | ✅ |
+| vibe-printer | vibe-printer | — | — | ✅ (v0.1.0) |
 
 (`vibe-glm-ocr` and `vibe-shield` were removed from the appliance — 2026-07-24.)
 
@@ -190,6 +192,41 @@ alone being healthy is not enough.
   and NO login exists — update the app once that release ships and
   re-enable; the seed retries automatically. Its demo `pnpm seed` injects
   demo data + `admin@demo.firm` — do NOT run it in production.
+- **`vibe-1040` will not enable until `vibe-ai-router` is enabled and
+  healthy.** Not a soft dependency: this app holds no provider credentials
+  of its own, and its config schema requires a non-empty `VIBE_AI_TOKEN`,
+  which the appliance can only mint by talking to a running router console.
+  Without it the api, the worker AND the migration one-shot all exit at
+  import time. The manifest declares `requiredApps`, so enable-app refuses
+  up front and names the app to turn on — but if you are scripting an
+  unattended install, order the enables: router first, wait healthy, then
+  1040.
+- **`vibe-1040` ships with `ROUTER_REQUIRE_US_REGION=false`, and that is a
+  real compliance decision, not a default.** Upstream ships it `true`: the
+  app asks the router whether its task classes are US-pinned and refuses to
+  start if they are not. vibe-ai-router v0.0.2 has no region concept to
+  answer with, so `true` means the app never boots on this appliance. With
+  the assertion off, what keeps taxpayer page images out of non-US
+  inference is which providers you have enabled in the router console —
+  the scrubber cannot help here, because a rasterized W-2 is a picture of a
+  W-2. The alternative available today is to leave 1040's three task classes
+  at `local_only` in the router console (that is what registration creates
+  them as) so they never leave the appliance. Read the header of
+  `env-templates/per-app/vibe-1040.env.tmpl` before processing live client
+  data either way.
+- **`vibe-printer` cannot discover printers by broadcast.** It sits on
+  `vibe_net` like every other app, so outbound printing works (TCP :9100,
+  IPP, ZPL, Star) but the Printers tab's discovery scan sees the Docker
+  bridge, not the office LAN. Add network printers by IP. USB printers need
+  the `devices:` mapping in `apps/vibe-printer.yml` uncommented, which is a
+  bare-metal-only, copy-paste change — it is commented out because a
+  device mapping for a path that does not exist stops the container from
+  starting at all.
+- **Do not start `vibe-printer`'s own Cloudflare Tunnel** from its Remote
+  Access tab. The appliance's Caddy + tunnel own ingress; a second tunnel
+  publishes the print gateway on a hostname the appliance does not know
+  about, cannot re-render, and cannot tear down when you leave domain mode.
+  There is no upstream env var to hide that tab.
 - **Per-app subdomain routing (PR #3) is unmerged** — merge it before relying
   on `subdomain-per-app`.
 - **`vibe-tax-research` container rename (this branch):** containers/services

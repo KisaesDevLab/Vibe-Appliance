@@ -321,6 +321,7 @@ services:
       - "5174:5174"   # vibe-calculators
       - "5175:5175"   # vibe-tx-converter
       - "5176:5176"   # vibe-1099
+      - "5177:5177"   # vibe-1040
       - "5181:5181"   # vibe-connect (main)
       - "5182:5182"   # vibe-connect (public)
       - "5191:5191"   # vibe-tax-research
@@ -334,6 +335,11 @@ services:
       # The /v1 gateway is never published; apps reach it at
       # vibe-ai-router:8220 on vibe_net.
       - "5193:5193"   # vibe-ai-router (admin console)
+      # vibe-printer. Same "primary, not fallback" story as the router
+      # console above, and more so: this app is rootServedOnly, and the
+      # printers it drives are on the office LAN, so the LAN address is
+      # the natural one to use even when domain mode is perfectly healthy.
+      - "5194:5194"   # vibe-printer
       # Phase 8.5 v1.2 — fallback ports for infra services. Same UFW
       # gating, same rate-limit + custom 503 — Duplicati / Portainer
       # become reachable when Caddy / DNS / certs are broken.

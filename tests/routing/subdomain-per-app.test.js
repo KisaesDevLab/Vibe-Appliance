@@ -368,3 +368,73 @@ test('ingress single-host: only the tunnel subdomain + non-primary extras', () =
   ]));
   assert.ok(!hosts.includes('tb.firm.com'), 'no per-app primary rule in single-host');
 });
+
+// --- routing.root_redirect --------------------------------------------
+
+test('root_redirect 308s the bare / on a root-served vhost, in both modes', () => {
+  // An app that serves nothing at `/` (Vibe Print: SPA at /admin, API at
+  // /v1) would otherwise 404 at every URL the appliance advertises for
+  // it — appPublicUrl hands out the hostname root for a rootServedOnly
+  // app, and the emergency frontend is root-served by construction.
+  const fx = mkFixtures();
+  const mpath = path.join(fx.manifests, 'vibe-router.json');
+  const m = JSON.parse(fs.readFileSync(mpath, 'utf8'));
+  m.routing.root_redirect = '/admin/';
+  fs.writeFileSync(mpath, JSON.stringify(m));
+
+  for (const mode of ['single-host', 'subdomain-per-app']) {
+    const caddy = renderCaddy(fx, mode);
+    const vhost = caddy.split('airouter.firm.com {')[1].split('\n}\n')[0];
+    assert.match(vhost, /handle \/ \{[\s\S]*?redir \/admin\/ 308/,
+      `${mode}: bare / redirects to the app's real entry point`);
+    // Exact-path `handle /` only. If this ever became `handle /*` the
+    // app would be unreachable: every request would redirect to /admin/,
+    // including the ones already under it.
+    assert.doesNotMatch(vhost, /handle \/\* \{/,
+      `${mode}: the redirect must not swallow every path`);
+    // It has to win over the catch-all proxy, which matches / as well.
+    assert.ok(vhost.indexOf('handle / {') < vhost.indexOf('reverse_proxy'),
+      `${mode}: redirect handler precedes the default reverse_proxy`);
+  }
+});
+
+test('an app without root_redirect gets no redirect handler', () => {
+  const fx = mkFixtures();
+  const caddy = renderCaddy(fx, 'subdomain-per-app');
+  const vhost = caddy.split('tb.firm.com {')[1].split('\n}\n')[0];
+  assert.doesNotMatch(vhost, /redir /, 'no root_redirect declared, none emitted');
+});
+
+// --- emergency proxy: root_redirect + the new ports -------------------
+
+test('render-haproxy emits the root redirect on the emergency frontend', () => {
+  // Same reasoning as the Caddy case: the emergency port has no path to
+  // mount under, so `/` is all an operator can type. Extracted from the
+  // real renderer so the two stay in step.
+  const fx = mkFixtures();
+  const mpath = path.join(fx.manifests, 'vibe-router.json');
+  const m = JSON.parse(fs.readFileSync(mpath, 'utf8'));
+  m.routing.root_redirect = '/admin/';
+  fs.writeFileSync(mpath, JSON.stringify(m));
+
+  const py = extractPyeof(path.join(REPO, 'lib', 'render-haproxy.sh'), 'frontend fe_');
+  const pyFile = path.join(fx.dir, 'haproxy.py');
+  fs.writeFileSync(pyFile, py + '\n');
+  const out = path.join(fx.dir, 'haproxy.cfg');
+  execFileSync('python3', [pyFile, fx.manifests, fx.stateFile, out]);
+  const cfg = fs.readFileSync(out, 'utf8');
+
+  const fe = cfg.split('frontend fe_vibe_router_airouter')[1].split('\nfrontend ')[0];
+  assert.match(fe, /http-request redirect location \/admin\/ code 308 if \{ path \/ \}/,
+    'bare / redirects to the app entry point');
+  // After the rate-limit deny, before the backend hand-off.
+  assert.ok(fe.indexOf('deny_status 429') < fe.indexOf('http-request redirect'),
+    'rate limit is evaluated before the redirect');
+  assert.ok(fe.indexOf('http-request redirect') < fe.indexOf('default_backend'),
+    'redirect is evaluated before the backend hand-off');
+
+  // An app with no root_redirect must not grow one.
+  const other = cfg.split('frontend fe_vibe_connect')[1] || '';
+  assert.doesNotMatch(other.split('\nfrontend ')[0], /http-request redirect/,
+    'no root_redirect declared, none emitted');
+});

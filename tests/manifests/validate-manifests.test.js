@@ -296,6 +296,121 @@ test('a manifest declaring a seed block declares a runnable command array', () =
   }
 });
 
+test('requiredApps name manifests that exist and are not self-referential', () => {
+  // lib/enable-app.sh's pre-flight resolves each entry to
+  // console/manifests/<slug>.json and refuses the enable if it is absent.
+  // A typo here would block the app from ever being enabled, with an
+  // error message that reads like a packaging bug because it is one.
+  const slugs = new Set(manifests.map((m) => m.data.slug));
+  for (const { file, data } of manifests) {
+    const req = data.requiredApps;
+    if (req === undefined) continue;
+    assert.ok(Array.isArray(req) && req.length > 0,
+      `${file}: requiredApps must be a non-empty array`);
+    for (const dep of req) {
+      assert.notStrictEqual(dep, data.slug, `${file}: requiredApps lists itself`);
+      assert.ok(slugs.has(dep),
+        `${file}: requiredApps names "${dep}", which has no manifest`);
+    }
+  }
+});
+
+test('requiredApps has no cycles', () => {
+  // Two apps each requiring the other can never both be enabled: whichever
+  // you try first fails pre-flight on the other being disabled.
+  const graph = new Map(manifests.map((m) => [m.data.slug, m.data.requiredApps || []]));
+  const state = new Map();
+  const walk = (slug, trail) => {
+    if (state.get(slug) === 'done') return;
+    assert.ok(state.get(slug) !== 'open',
+      `requiredApps cycle: ${[...trail, slug].join(' -> ')}`);
+    state.set(slug, 'open');
+    for (const dep of graph.get(slug) || []) walk(dep, [...trail, slug]);
+    state.set(slug, 'done');
+  };
+  for (const slug of graph.keys()) walk(slug, []);
+});
+
+test('dataOwner is uid:gid and every overlay service pins the same user', () => {
+  // dataOwner and the overlay's `user:` keys are two halves of one
+  // decision — enable-app chowns the host directory to dataOwner, and the
+  // containers have to run as that same pair or they hit EACCES on first
+  // write. Nothing else keeps them in step, so this does.
+  const root = path.join(__dirname, '..', '..');
+  for (const { file, data } of manifests) {
+    const owner = data.dataOwner;
+    if (owner === undefined) continue;
+    assert.match(owner, /^\d+:\d+$/, `${file}: dataOwner "${owner}" is not <uid>:<gid>`);
+    const overlay = fs.readFileSync(path.join(root, 'apps', `${data.slug}.yml`), 'utf8');
+    const services = [...overlay.matchAll(/^ {2}([a-z0-9][a-z0-9_.-]*):\s*$/gm)].map((m) => m[1]);
+    assert.ok(services.length > 0, `${file}: could not read services from the overlay`);
+    const pinned = [...overlay.matchAll(/^ {4}user:\s*"?([0-9]+:[0-9]+)"?\s*$/gm)].map((m) => m[1]);
+    assert.strictEqual(pinned.length, services.length,
+      `${file}: declares dataOwner but only ${pinned.length} of ${services.length} overlay services pin a user`);
+    for (const u of pinned) {
+      assert.strictEqual(u, owner,
+        `${file}: overlay pins user ${u} but dataOwner is ${owner}`);
+    }
+  }
+});
+
+test('root_redirect is an absolute path and only on a root-served app', () => {
+  // The renderers emit it on the per-app vhost and the emergency frontend
+  // only. Declaring it on a path-mounted app would silently do nothing,
+  // which is worse than being told.
+  for (const { file, data } of manifests) {
+    const redirect = (data.routing || {}).root_redirect;
+    if (redirect === undefined) continue;
+    assert.match(redirect, /^\/.+$/,
+      `${file}: root_redirect "${redirect}" must be an absolute path with a target`);
+    assert.strictEqual(data.rootServedOnly, true,
+      `${file}: root_redirect only takes effect on a rootServedOnly app`);
+  }
+});
+
+test('generated: env entries name a shape the renderer can produce', () => {
+  // _render_app_env fills @NAME@ for these; an unknown shape leaves the
+  // marker unfilled, which pre-flight then reports as an unsubstituted
+  // marker. Catching it here names the manifest instead.
+  const SHAPES = new Set(['hex32', 'hex16', 'base64-32bytes']);
+  const renderer = fs.readFileSync(
+    path.join(__dirname, '..', '..', 'lib', 'enable-app.sh'), 'utf8');
+  for (const { file, data } of manifests) {
+    const env = data.env || {};
+    for (const section of ['required', 'optional']) {
+      for (const e of env[section] || []) {
+        if (typeof e.from !== 'string' || !e.from.startsWith('generated:')) continue;
+        const shape = e.from.slice('generated:'.length);
+        assert.ok(SHAPES.has(shape),
+          `${file}: ${e.name} declares generated:${shape}, which the renderer cannot produce`);
+        // And the shape has to still be in the renderer's case statement.
+        assert.ok(renderer.includes(`${shape})`),
+          `lib/enable-app.sh no longer handles generated:${shape} (used by ${file})`);
+      }
+    }
+  }
+});
+
+test('a generated: secret is referenced by its env template as @NAME@', () => {
+  // The manifest entry is what makes the renderer generate the value; the
+  // template marker is what puts it in the file. Declaring one without the
+  // other produces a silently missing secret rather than an error.
+  const root = path.join(__dirname, '..', '..');
+  for (const { file, data } of manifests) {
+    const tmplPath = path.join(root, 'env-templates', 'per-app', `${data.slug}.env.tmpl`);
+    if (!fs.existsSync(tmplPath)) continue;
+    const tmpl = fs.readFileSync(tmplPath, 'utf8');
+    const env = data.env || {};
+    for (const section of ['required', 'optional']) {
+      for (const e of env[section] || []) {
+        if (typeof e.from !== 'string' || !e.from.startsWith('generated:')) continue;
+        assert.ok(tmpl.includes(`@${e.name}@`),
+          `${file}: ${e.name} is generated but env-templates/per-app/${data.slug}.env.tmpl never references @${e.name}@`);
+      }
+    }
+  }
+});
+
 // --- helpers ------------------------------------------------------------
 
 // Walk the schema and return [dotted-path-with-[] for arrays, maxLength]

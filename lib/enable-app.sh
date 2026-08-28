@@ -561,6 +561,74 @@ PYEOF
     fi
   fi
 
+  # 7b. Hard app dependencies (manifest.requiredApps). Unlike
+  # optionalDepends, these are enforced: the app treats the dependency as
+  # fatal, so letting the enable proceed only converts a clear refusal
+  # into a container that boots, throws, and restarts forever while the
+  # operator reads Docker logs looking for the cause.
+  #
+  # vibe-1040 is the case. Its env schema requires a non-empty
+  # VIBE_AI_TOKEN, which _render_app_env can only mint by talking to a
+  # RUNNING vibe-ai-router console. With the router down, the token
+  # renders empty, the config parse throws at import time, and every
+  # container in the set - api, worker, and the migration one-shot -
+  # exits immediately. Checking here costs one state read plus one HTTP
+  # probe and produces a sentence naming the app to turn on first.
+  #
+  # Both halves matter: `enabled` alone is a stale claim after a crash,
+  # and a health probe alone can't distinguish "never installed" from
+  # "installed and briefly restarting". They are reported separately.
+  local required_apps
+  required_apps="$(_manifest_field "$manifest" '" ".join(data.get("requiredApps") or [])')"
+  if [[ -n "$required_apps" ]]; then
+    local dep dep_manifest dep_enabled dep_upstream dep_health
+    for dep in $required_apps; do
+      dep_manifest="${APPLIANCE_DIR}/console/manifests/${dep}.json"
+      if [[ ! -f "$dep_manifest" ]]; then
+        log_error "preflight FAIL: $slug requires app '$dep', which has no manifest in this appliance"
+        log_error "         This is a packaging bug, not something you can fix on the host."
+        log_error "         Diagnose: ls ${APPLIANCE_DIR}/console/manifests/"
+        ((errors++)) || true
+        continue
+      fi
+      dep_enabled="$(python3 -c "
+import json
+try:
+    s = json.load(open('${VIBE_STATE_FILE}'))
+    print(s.get('apps', {}).get('${dep}', {}).get('enabled', False))
+except Exception:
+    print(False)
+" 2>/dev/null)"
+      if [[ "$dep_enabled" != "True" ]]; then
+        log_error "preflight FAIL: $slug requires $dep, which is not enabled"
+        log_error "         $slug will not start without it: the appliance mints its"
+        log_error "         AI-router app token during enable, and the app refuses to"
+        log_error "         boot (and its migrations refuse to run) without one."
+        log_error "         Fix:  enable $dep from the admin Apps tab, wait for it to"
+        log_error "               report healthy, then enable $slug."
+        log_error "         Or:   sudo bash ${APPLIANCE_DIR}/lib/enable-app.sh $dep"
+        ((errors++)) || true
+        continue
+      fi
+      # Enabled per state.json - now confirm it actually answers. Probe
+      # the same way _wait_for_app_health does (through the console
+      # container, which is always up and on vibe_net) so we don't add a
+      # dependency on the host having curl.
+      dep_upstream="$(_manifest_field "$dep_manifest" 'next((m["upstream"] for m in (data["routing"].get("matchers") or []) if m.get("name") == "api"), data["routing"]["default_upstream"])')"
+      dep_health="$(_manifest_field "$dep_manifest" 'data["health"]')"
+      if [[ -n "$dep_upstream" && -n "$dep_health" ]]; then
+        if ! docker exec vibe-console curl -fsS -o /dev/null --max-time 5 "http://${dep_upstream}${dep_health}" >/dev/null 2>&1; then
+          log_error "preflight FAIL: $slug requires $dep, which is enabled but not answering ${dep_upstream}${dep_health}"
+          log_error "         Enabling $slug now would mint no token and fail the same way."
+          log_error "         Diagnose: sudo docker logs --tail 40 ${dep_upstream%:*}"
+          log_error "         Fix:      wait for $dep to finish starting, or Disable then"
+          log_error "                   Enable it from the admin Apps tab, then retry."
+          ((errors++)) || true
+        fi
+      fi
+    done
+  fi
+
   # 8. Env render dry-run — does the template have any @MARKER@s the
   # renderer doesn't fill? This is the bug class that historically
   # bit Vibe-Payroll (SECRETS_ENCRYPTION_KEY), Vibe-MyBooks
@@ -795,6 +863,34 @@ for x in json.loads(sys.argv[1]):
 _seed_app_data_dirs() {
   local slug="$1" manifest="$2"
   local data_dir="${VIBE_DIR}/data/apps/${slug}"
+
+  # manifest.dataOwner short-circuits the image-derived uid. Declared by
+  # an app whose containers do NOT all run as the same user but DO share
+  # one bind-mounted data directory: reading the SERVER image's USER
+  # would leave every other container in the set locked out of the
+  # directory it also has to write. vibe-1040 is the case - a Node api and
+  # a Python sidecar, different base images, different baked-in uids, both
+  # reading and writing the encrypted blob store. Its overlay pins every
+  # service to this same uid:gid with a compose `user:` key, so the pin
+  # and this chown are two halves of one decision and must agree.
+  local declared_owner
+  declared_owner="$(_manifest_field "$manifest" 'data.get("dataOwner","")')"
+  if [[ -n "$declared_owner" ]]; then
+    if [[ ! "$declared_owner" =~ ^[0-9]+:[0-9]+$ ]]; then
+      log_warn "manifest dataOwner '$declared_owner' is not <uid>:<gid>; falling back to the image's USER" slug="$slug"
+      declared_owner=""
+    else
+      mkdir -p "$data_dir"
+      local sub_declared
+      while IFS= read -r sub_declared; do
+        [[ -n "$sub_declared" ]] && mkdir -p "$sub_declared"
+      done < <(_collect_bind_mount_sources "$slug")
+      log_step "ensuring $data_dir is owned by $declared_owner (manifest dataOwner)"
+      chown -R "$declared_owner" "$data_dir" || { log_warn "chown failed on $data_dir" uid_gid="$declared_owner"; return 1; }
+      return 0
+    fi
+  fi
+
   local server_image
   server_image="$(_manifest_field "$manifest" 'data["image"]["server"]')"
   if [[ -z "$server_image" ]]; then
@@ -1223,6 +1319,63 @@ PYEOF
     fi
   fi
 
+  # Manifest-declared generated secrets. Any env entry whose `from` is
+  # `generated:<shape>` gets a @NAME@ marker filled here — generated once
+  # on first enable, then PRESERVED verbatim from the existing env file on
+  # every re-render. This is the generic form of the hand-written
+  # MASTER_KEY / ROUTER_ADMIN_PASSWORD / VIBE1099_ADMIN_PASSWORD blocks
+  # above: adding the tenth app should not mean adding a tenth bespoke
+  # `local foo=""; _extract_env_value ...` stanza to this function.
+  #
+  # Preservation is the whole point and is not optional. Several of these
+  # are key material that derives at-rest encryption (Vibe-1040's
+  # TIN_HASH_SALT salts the client join key; STORAGE_ENCRYPTION_KEY
+  # unwraps every stored page image) — regenerating one on a routine
+  # re-enable would silently orphan every record already written under it.
+  # The existing file is therefore always read first, and a value found
+  # there wins over a fresh one.
+  #
+  # The hand-written blocks above still run and still win for the markers
+  # they own; this pass only fills names the manifest declares.
+  local generated_json="{}"
+  local generated_pairs
+  generated_pairs="$(_manifest_field "$manifest" 'chr(10).join(e["name"] + " " + e["from"].split(":", 1)[1] for section in ("required", "optional") for e in (data.get("env", {}).get(section) or []) if isinstance(e.get("from"), str) and e["from"].startswith("generated:"))' 2>/dev/null || true)"
+  if [[ -n "$generated_pairs" ]]; then
+    local -a generated_kv=()
+    local g_name g_shape g_value
+    while read -r g_name g_shape; do
+      # Trim any trailing control character - python3 on a CRLF host
+      # emits a CR per line, and a shape that silently failed to match
+      # would leave the marker unfilled with only a warning to show for it.
+      g_name="${g_name%%[![:print:]]*}"; g_shape="${g_shape%%[![:print:]]*}"
+      [[ -n "$g_name" ]] || continue
+      g_value=""
+      [[ -f "$out" ]] && g_value="$(_extract_env_value "$out" "$g_name")"
+      if [[ -z "$g_value" ]]; then
+        case "$g_shape" in
+          hex32)          g_value="$(openssl rand -hex 32)" ;;
+          hex16)          g_value="$(openssl rand -hex 16)" ;;
+          base64-32bytes) g_value="$(openssl rand -base64 32 | tr -d '[:space:]')" ;;
+          *)
+            # Unknown shape: leave the marker unfilled rather than invent
+            # a value. Pre-flight's "unsubstituted markers" check turns
+            # this into a named FAIL before anything boots.
+            log_warn "manifest declares generated:$g_shape for $g_name, which the renderer does not know how to produce" slug="$slug"
+            continue
+            ;;
+        esac
+      fi
+      generated_kv+=("$g_name" "$g_value")
+    done <<< "$generated_pairs"
+    if [[ ${#generated_kv[@]} -gt 0 ]]; then
+      generated_json="$(python3 -c '
+import json, sys
+a = sys.argv[1:]
+print(json.dumps(dict(zip(a[0::2], a[1::2]))))
+' "${generated_kv[@]}")"
+    fi
+  fi
+
   # DB and redis target details from manifest.
   local db_name db_user
   db_name="$(_manifest_field "$manifest" 'data.get("database",{}).get("name","")')"
@@ -1260,15 +1413,15 @@ PYEOF
       "$vs_kek" "$gateway_admin_key" \
       "$staff_app_url" "$client_portal_url" \
       "$master_key" "$router_admin_password" "$vibe1099_admin_password" \
-      "$vibe_ai_mode" "$vibe_ai_token" <<'PYEOF'
-import base64, sys
+      "$vibe_ai_mode" "$vibe_ai_token" "$generated_json" <<'PYEOF'
+import base64, json, sys
 src, dst, allowed_origin, database_url, redis_url, \
     encryption_key, jwt_secret, db_name, db_user, db_pass, \
     vite_base_path, session_secure, intake_key, \
     vs_kek, gateway_admin_key, \
     staff_app_url, client_portal_url, \
     master_key, router_admin_password, vibe1099_admin_password, \
-    vibe_ai_mode, vibe_ai_token = sys.argv[1:23]
+    vibe_ai_mode, vibe_ai_token, generated_json = sys.argv[1:24]
 # Some upstream apps want the appliance's 32-byte AES key as base64 (32
 # raw bytes -> 44-char base64 with padding) rather than the hex form
 # we ship in shared.env. Derive it once here so per-app templates can
@@ -1306,6 +1459,12 @@ body = body.replace("@VIBE_AI_MODE@",        vibe_ai_mode)
 body = body.replace("@VIBE_AI_TOKEN@",       vibe_ai_token)
 body = body.replace("@STAFF_APP_URL@",      staff_app_url)
 body = body.replace("@CLIENT_PORTAL_URL@",  client_portal_url)
+# Manifest-declared generated secrets (env[].from = "generated:<shape>").
+# Applied last so a hand-written marker above always wins for a name both
+# describe - the bespoke blocks carry per-app caveats the generic pass
+# cannot know about.
+for _name, _value in (json.loads(generated_json) or {}).items():
+    body = body.replace("@%s@" % _name, _value)
 with open(dst, "w") as f:
     f.write(body)
 PYEOF

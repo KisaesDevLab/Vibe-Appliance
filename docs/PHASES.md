@@ -1972,3 +1972,173 @@ Append to this list as phases complete. Format:
      re-provision banner appears and the app resolves only after clicking
      it, switch to LAN and confirm the connector stops, switch back, then
      tear down and confirm the zone has no leftover CNAMEs.
+
+- Vibe-1040 and Vibe-Printer added as the tenth and eleventh appliance apps,
+  2026-08-28 by Claude (Opus 5), on the Windows dev host. Not a numbered
+  phase — app integrations on top of Phase 8.5. **NOT YET RUN ON A FRESH
+  HOST**; see "Owed before this is trusted" below.
+
+  **Vibe-1040** (`ghcr.io/kisaesdevlab/vibe-1040` v0.0.1 + a `-sidecar`
+  extra). Reads a client's 1040 source documents and emits a worksheet of
+  totals keyed to Form 1040 and schedule line numbers. Four services from
+  two images: a Fastify api on `:8240` that also serves its own React review
+  UI at root, a BullMQ worker, a Python PyMuPDF rasterizer that speaks no
+  HTTP at all (it takes work off the shared Redis and hands pages back
+  through a shared blob directory), and a migration one-shot. Subdomain
+  `1040`, emergency port `:5177`, Redis db 8, `rootServedOnly`.
+
+  **Vibe-Printer** (`ghcr.io/kisaesdevlab/vibe-printer` v0.1.0). LAN print
+  routing gateway — a caller POSTs a payload and a printer id, it renders
+  and routes to thermal, label, or office printers. One container, and the
+  first appliance app that shares NOTHING with the core stack: its own
+  SQLite under `/data`, no Postgres role, no Redis index, empty `depends`.
+  Subdomain `print`, emergency port `:5194`, `userFacing: false` +
+  `subdomains[]` (the vibe-ai-router pattern: off the customer landing page,
+  still gets a staff vhost in domain mode), `rootServedOnly`.
+
+  Deviations from the plan, and the appliance changes they forced:
+
+  1. **`routing.root_redirect` (new manifest field).** Vibe Print serves
+     NOTHING at `/` — the API is at `/v1`, the admin SPA is mounted at
+     `/admin`. Every URL the appliance advertises for a `rootServedOnly` app
+     is a hostname root (`appPublicUrl`), and an emergency port has no path
+     to mount under, so both surfaces would have handed the operator a 404
+     with no hint that a different path existed. Caddy's per-app vhost and
+     HAProxy's frontend now emit an exact-path 308 on `/` when the manifest
+     declares one — exact-path, ahead of the app's own handlers, and in
+     HAProxy after the rate-limit deny so a flood can't be amplified into
+     redirects. Path-mounted apps are untouched. The durable fix is upstream
+     (serve something at `/`); this is a shim, like `rootServedOnly` itself.
+  2. **`requiredApps` (new manifest field).** `optionalDepends` was
+     explicitly informational, and Vibe-1040's dependency on the router is
+     not: it holds no provider credentials at all, its config schema demands
+     a non-empty `VIBE_AI_TOKEN`, and the appliance can only mint one from a
+     RUNNING router console. With the router down, the api, the worker AND
+     the migration one-shot all throw at config-parse time — three crash
+     loops, no message naming the cause. Pre-flight now reads
+     `state.apps.<dep>.enabled` and then probes the dep's health endpoint,
+     reporting the two separately (an `enabled` flag is a stale claim after
+     a crash; a failed probe alone can't distinguish "never installed" from
+     "restarting"). Enforced, unlike `optionalDepends`; use only where the
+     app itself treats the dependency as fatal.
+  3. **`dataOwner` (new manifest field).** `_seed_app_data_dirs` chowns
+     `/opt/vibe/data/apps/<slug>/` to the uid it reads from the SERVER
+     image's `USER`. That assumes one uid per app, and Vibe-1040 breaks it:
+     a Node api/worker from `node:24-alpine` and a Python sidecar from
+     `python:3.12-slim` have different baked-in uids and BOTH read and write
+     the encrypted blob store. Chowning to either one locks the other out.
+     The overlay pins all four services to `10001:10001` with a compose
+     `user:` key and the manifest declares the same pair; a test asserts the
+     two never drift apart, because they are two halves of one decision and
+     nothing else keeps them in step.
+  4. **`generated:<shape>` became load-bearing instead of documentation.**
+     Vibe-1040 needs three independent 32-byte base64 secrets
+     (`TIN_HASH_SALT`, `SESSION_SECRET`, `STORAGE_ENCRYPTION_KEY`) plus a
+     first-login password; Vibe-Printer needs one shared bearer secret. The
+     renderer's existing pattern was a hand-written
+     `local x=""; _extract_env_value ...` stanza per secret — five more
+     would have been five more, and rule 3 says adding an app is a one-file
+     change. `_render_app_env` now fills `@NAME@` for any env entry whose
+     `from` is `generated:{hex32,hex16,base64-32bytes}`, generate-once and
+     then **preserve verbatim** from the existing file. The existing
+     hand-written blocks (`MASTER_KEY`, `ROUTER_ADMIN_PASSWORD`,
+     `VIBE1099_ADMIN_PASSWORD`) are untouched and still win for the names
+     they own. Preservation is the contract, not an optimisation:
+     `TIN_HASH_SALT` salts the client join key and `STORAGE_ENCRYPTION_KEY`
+     unwraps every stored page image, so regenerating one on a routine
+     re-enable would silently orphan every record written under it.
+  5. **Vibe-1040 owns its migrations through a one-shot, not
+     `MIGRATIONS_AUTO`.** Every other app self-migrates on first boot
+     because enable-app has no rollback net and a wrong migration command
+     would brick every first enable. Vibe-1040 has no such switch — its
+     server never migrates — so the overlay adds a `vibe-1040-migrate`
+     one-shot that the other three services wait on via
+     `service_completed_successfully`. A failure is then a container named
+     for what it was doing, plus compose's "dependency failed to start",
+     rather than a healthy api over an empty schema. The manifest still
+     declares `migrations.command` for update.sh's explicit path.
+
+  Judgement calls worth flagging rather than burying:
+
+  - **`ROUTER_REQUIRE_US_REGION=false` for Vibe-1040 is a compliance
+    decision the appliance is making on the operator's behalf, and it is
+    documented as one** (env template header, manifest `doc`, and a Known
+    Blockers entry). Upstream ships it `true`: the app asks the router
+    whether its task classes are US-pinned and fails closed if not.
+    vibe-ai-router v0.0.2 has no region concept to answer with, so `true`
+    means the app never boots here. With it off, the control that remains is
+    which providers are enabled in the router console — the scrubber cannot
+    help, because a rasterized W-2 is a picture of a W-2. The alternative
+    available today is to leave 1040's task classes at `local_only` (what
+    registration creates them as), which keeps every page image on the
+    appliance. The real fix is region support in the router; until then this
+    is stated, not hidden.
+  - **Vibe-Printer cannot discover printers by broadcast** from `vibe_net`.
+    Outbound printing works (TCP :9100, IPP, ZPL, Star); the discovery scan
+    sees the Docker bridge. Add printers by IP. Host networking would fix
+    discovery and simultaneously publish an unauthenticated-except-for-one-
+    secret :8080 on the host, so it is not offered. USB is a commented
+    `devices:` mapping — uncommenting it on a droplet stops the container
+    from starting at all, so it stays a copy-paste, bare-metal-only change.
+  - **Vibe-Printer's own Cloudflare Tunnel must stay off.** The image
+    bundles cloudflared and its Remote Access tab can start one. There is no
+    upstream env var to hide that tab, so the control is documentation in
+    three places. A second tunnel would publish the gateway on a hostname
+    the appliance cannot re-render or tear down.
+
+  Tested on Windows (git-bash), NOT on a fresh host:
+
+  - 106 tests green (was 97). +9: six manifest guards (requiredApps resolve
+    + acyclic, dataOwner ↔ overlay `user:` agreement, root_redirect only on
+    root-served apps, generated shapes the renderer actually handles,
+    generated secrets actually referenced by their template) and three
+    renderer guards driving the REAL embedded Python out of
+    render-caddyfile.sh and render-haproxy.sh.
+  - Every new guard was verified to FAIL against the pre-fix behaviour by
+    reverting it and re-running — a dataOwner/`user:` mismatch, a
+    root_redirect on a path-mounted app, a requiredApps typo, and both
+    renderers with the redirect branch disabled. A test that has never
+    failed proves nothing.
+  - The generated-secret block was extracted from `_render_app_env` and run
+    standalone against both new manifests: fresh generation produces three
+    keys that base64-decode to exactly 32 bytes (matching Vibe-1040's own
+    zod validator) plus a 64-char hex password, and a second run against an
+    existing env file preserves the prior values rather than regenerating
+    them. That harness caught two real defects — a shape match that failed
+    on a CRLF host, and `tr -d` leaving a stray CR inside a base64 value.
+  - Caddy and HAProxy renders were eyeballed end to end for both apps in
+    both routing modes: `print.<domain>` and `1040.<domain>` get root-served
+    vhosts in single-host mode too, neither is path-mounted, `/metrics` 404s
+    ahead of the app on the printer, and the emergency frontend on `:5194`
+    carries the redirect between the rate-limit deny and the backend.
+
+  **Owed before this is trusted in production** — fresh DigitalOcean
+  `s-1vcpu-2gb` Ubuntu 24.04 droplet:
+
+  1. **The shared-uid decision for Vibe-1040 is unverified against the real
+     images.** `user: "10001:10001"` overrides what both upstream Dockerfiles
+     set. Node and the Python sidecar should both be fine (neither needs a
+     passwd entry and neither writes outside `/data/blobs` and `/tmp`), but
+     "should" is not "did". Enable the app, upload a bundle, and confirm the
+     sidecar writes rasters the api can read back.
+  2. **The migration one-shot under `--force-recreate`.** Verify it re-runs
+     and no-ops on a converged schema, that a deliberate failure surfaces as
+     a named container plus compose's dependency error, and that
+     `disable-app` cleans up the exited container.
+  3. **`requiredApps` pre-flight against a real router.** Enable Vibe-1040
+     with the router disabled (expect a clean refusal naming it), with the
+     router enabled but still starting (expect the health-probe branch), and
+     then for real — and confirm the minted token survives a re-enable
+     rather than orphaning a row.
+  4. **First login for both.** Vibe-1040's seed must produce the email the
+     First-login card prints (upstream's own default is
+     `admin@example.test`, which is why `SEED_ADMIN_EMAIL` is one of the few
+     Settings-surfaced keys kept IN the template), and MFA enrolment must
+     complete. Vibe-Printer's card shows no username by design — confirm the
+     secret pastes straight into the admin UI.
+  5. **The root redirect end to end**, not just in the rendered config:
+     `https://print.<domain>/` and `http://<ip>:5194/` should both land on
+     `/admin/`, and `/v1` must still answer directly.
+  6. **GHCR pull for Vibe-1040.** Its repo was private at v0.0.1; the images
+     inherit repository visibility, so a droplet may need a token with
+     `read:packages` before the console's badge turns green.

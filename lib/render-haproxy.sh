@@ -265,6 +265,12 @@ for slug in all_app_slugs:
             "note":       c["note"],
             "health":     "/api/v1/ping",
             "kind":       "app",
+            # manifest.routing.root_redirect - an app that serves nothing
+            # at `/`. The emergency frontend is root-served by definition
+            # (there is no path to mount under on a bare port), so without
+            # this the fallback URL printed in CREDENTIALS.txt and the
+            # Emergency Access panel lands on the app's own 404.
+            "root_redirect": (m.get("routing", {}) or {}).get("root_redirect") or "",
         })
 
 # Phase 8.5 v1.2 — fallback ports for infra services. Same pattern as
@@ -390,6 +396,13 @@ else:
         lines.append(f"  stick-table type ip size 1m expire 60s store http_req_rate(10s)")
         lines.append(f"  http-request track-sc0 src")
         lines.append(f"  http-request deny deny_status 429 if {{ sc_http_req_rate(0) gt 300 }}")
+        # Exact-path match on `/` only: everything else still reaches the
+        # backend. Emitted after the rate-limit deny so a flood can't be
+        # cheaply amplified into redirects.
+        if fe.get("root_redirect"):
+            lines.append(
+                f"  http-request redirect location {fe['root_redirect']} code 308 "
+                "if { path / }")
         lines.append(f"  default_backend be_{fe['name']}")
         lines.append(f"backend be_{fe['name']}")
         lines.append(f"  option httpchk GET /")

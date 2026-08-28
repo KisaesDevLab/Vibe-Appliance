@@ -215,6 +215,21 @@ def render_vhost(slug, manifest, domain, subdomain, tls_internal=False):
     lines.append("    }")
     lines.append("")
 
+    # Root redirect, for an app that serves nothing at `/`. Emitted
+    # before the deny/matcher/default handlers because `handle` is
+    # first-match-wins and this one is an exact-path match on `/`
+    # only — every other path still falls through to the app.
+    #
+    # Only root-served surfaces get this. A path-mounted app's prefix
+    # handler already lands the operator inside the app, and the bare
+    # `/` of a single-host appliance belongs to the console.
+    redirect = (manifest.get("routing", {}) or {}).get("root_redirect")
+    if redirect:
+        lines.append("    handle / {")
+        lines.append(f"        redir {redirect} 308")
+        lines.append("    }")
+        lines.append("")
+
     # Denied paths first — `handle` blocks are first-match-wins.
     deny = deny_path_lines(manifest, "    ")
     if deny:

@@ -1,0 +1,74 @@
+# apps/vibe-printer.yml — Vibe Print overlay.
+#
+# One service from one GHCR image: FastAPI on 8080, with the React admin
+# SPA mounted at /admin and the print API at /v1. container_name is
+# basename(image) per the appliance convention
+# (console/server.js::_appCanonicalContainer, update.sh::_tag_rollback).
+#
+# NO SHARED POSTGRES, NO SHARED REDIS. This app keeps everything in its
+# own SQLite file under /data, so unlike every other app in the appliance
+# it declares no database and no redis index and depends on neither. All
+# of its state — jobs, printers, templates, the hash-chained audit log —
+# lives in the one bind mount below. Back that up and you have backed up
+# the app.
+#
+# NETWORK REACH. It sits on vibe_net like everything else, which is what
+# lets other Vibe apps call it by container DNS at http://vibe-printer:8080
+# and lets it reach LAN printers outbound through the host's NAT — the
+# TCP :9100 / IPP / Zebra backends work from here. What does NOT work
+# from a bridge network is broadcast/mDNS PRINTER DISCOVERY: the Printers
+# tab's discovery scan sees the Docker bridge, not the office LAN. Add
+# network printers by IP instead, which is the more reliable practice
+# anyway. Putting this container on the host network to fix discovery
+# would also put its :8080 on the host, unauthenticated by anything but
+# the shared secret, and is not something the appliance will do for you.
+#
+# THE IN-APP TUNNEL IS NOT FOR THIS DEPLOYMENT. The image bundles
+# cloudflared and its Remote Access tab can start a tunnel of its own.
+# On the appliance, ingress belongs to the shared Caddy plus the
+# appliance's own Cloudflare Tunnel — starting a second one publishes
+# this gateway on a hostname the appliance does not know about and
+# cannot take down. There is no env var upstream to disable that tab;
+# the instruction not to use it lives in the env template and the
+# first-login note.
+#
+# USB PRINTERS are commented out below on purpose. A device mapping for
+# a path that does not exist stops the container from starting at all,
+# which on a droplet (no USB bus) would mean the app never comes up.
+# Uncomment on bare metal only — that is a surgical, copy-paste change,
+# per the appliance's click-to-execute/copy-paste split.
+
+name: vibe
+
+services:
+  vibe-printer:
+    image: ghcr.io/kisaesdevlab/vibe-printer:${APP_TAG:-latest}
+    container_name: vibe-printer
+    restart: unless-stopped
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-printer.env
+    volumes:
+      # SQLite database, uploaded assets, backup snapshots. The whole
+      # app's state; nothing here is derived or disposable.
+      - /opt/vibe/data/apps/vibe-printer/data:/data
+    networks:
+      - vibe_net
+    # A job that is mid-send to a printer must not be cut off — the app
+    # marks such a job `uncertain` rather than reprinting a financial
+    # receipt, and 30s is what upstream's own compose allows it to drain.
+    stop_grace_period: 30s
+    # devices:
+    #   - "/dev/bus/usb:/dev/bus/usb"     # USB printers, bare metal only
+    healthcheck:
+      # /readyz answers 200 only when the SQLite handle and the delivery
+      # worker are both up — the same endpoint manifest.health uses.
+      # curl is present in the image (the Dockerfile installs it for
+      # cloudflared) but python3 is the base, so probe with python3 and
+      # depend on nothing extra.
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/readyz',timeout=4).status==200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 30s

@@ -1,0 +1,151 @@
+# apps/vibe-1040.yml — Vibe 1040 overlay.
+#
+# Four services from two GHCR images:
+#   vibe-1040-migrate → one-shot `node dist/db/migrate.js up`. See the
+#                       MIGRATIONS note below; this app has no
+#                       migrate-on-boot switch, so somebody has to run
+#                       them and enable-app deliberately doesn't.
+#   vibe-1040         → the api tier (8240). It also serves the React
+#                       review UI from its own root, which is why the
+#                       manifest marks the app rootServedOnly and there
+#                       is no separate web image. Its container_name is
+#                       basename(image) per the appliance convention
+#                       (console/server.js::_appCanonicalContainer,
+#                       update.sh::_tag_rollback), and it is the
+#                       routing-derived service `enable-app` brings up.
+#   vibe-1040-worker  → same image, the BullMQ pipeline worker.
+#   vibe-1040-sidecar → Python PyMuPDF/Pillow rasterizer. Speaks no
+#                       HTTP at all: it takes work off the shared Redis
+#                       and hands pages back through the blob store, so
+#                       it is never exposed to Caddy or the tunnel and
+#                       has no health check the appliance can probe.
+#
+# Shared Postgres + Redis (never per-app). No host port publish — only
+# Caddy fronts the api on vibe_net.
+#
+# MIGRATIONS. Every other app in the appliance self-migrates on first
+# boot (`MIGRATIONS_AUTO=true` in its env file), because enable-app has
+# no rollback safety net and a wrong migration command would brick every
+# first enable. Vibe 1040 has no such switch — its server.ts never
+# migrates — so the work is done by an explicit one-shot instead, and
+# `depends_on: service_completed_successfully` makes every other service
+# in the set wait for it. That keeps the failure legible (a container
+# named vibe-1040-migrate exits non-zero, and compose reports "dependency
+# failed to start") rather than a healthy api over an empty schema.
+# The one-shot re-runs on every enable; the runner is idempotent, so a
+# converged database is a no-op.
+#
+# SHARED UID. The api/worker come from node:24-alpine and the sidecar
+# from python:3.12-slim, with different baked-in users, and all three
+# read and write the same encrypted blob store. Pinning every service to
+# 10001:10001 (the uid the sidecar image already creates) is what makes
+# that sharing work; manifest `dataOwner` tells lib/enable-app.sh to
+# chown the host side to the same pair instead of reading the api
+# image's USER. Change one and you must change the other.
+
+name: vibe
+
+services:
+  vibe-1040-migrate:
+    image: ghcr.io/kisaesdevlab/vibe-1040:${APP_TAG:-latest}
+    container_name: vibe-1040-migrate
+    user: "10001:10001"
+    restart: "no"
+    init: true
+    command: ["node", "dist/db/migrate.js", "up"]
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-1040.env
+    networks:
+      - vibe_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  vibe-1040-sidecar:
+    image: ghcr.io/kisaesdevlab/vibe-1040-sidecar:${APP_TAG:-latest}
+    container_name: vibe-1040-sidecar
+    user: "10001:10001"
+    restart: unless-stopped
+    init: true
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-1040.env
+    volumes:
+      # Encrypted blob store — source documents written by the api, page
+      # rasters written back here by this container. Both sides are
+      # AES-256-GCM under STORAGE_ENCRYPTION_KEY; the directory is not a
+      # cache and must not be treated as disposable.
+      - /opt/vibe/data/apps/vibe-1040/blobs:/data/blobs
+    networks:
+      - vibe_net
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  vibe-1040-worker:
+    image: ghcr.io/kisaesdevlab/vibe-1040:${APP_TAG:-latest}
+    container_name: vibe-1040-worker
+    user: "10001:10001"
+    restart: unless-stopped
+    init: true
+    command: ["node", "dist/queue/worker.js"]
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-1040.env
+    volumes:
+      - /opt/vibe/data/apps/vibe-1040/blobs:/data/blobs
+    networks:
+      - vibe_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vibe-1040-migrate:
+        condition: service_completed_successfully
+      vibe-1040-sidecar:
+        condition: service_started
+
+  vibe-1040:
+    image: ghcr.io/kisaesdevlab/vibe-1040:${APP_TAG:-latest}
+    container_name: vibe-1040
+    user: "10001:10001"
+    restart: unless-stopped
+    init: true
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-1040.env
+    volumes:
+      - /opt/vibe/data/apps/vibe-1040/blobs:/data/blobs
+    networks:
+      - vibe_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vibe-1040-migrate:
+        condition: service_completed_successfully
+      # Pulls the worker (and through it the sidecar) into the `up` set.
+      # enable-app derives the services to start from manifest routing,
+      # which names only this container — without this edge, `compose up
+      # vibe-1040` would leave the background pipeline stopped and every
+      # uploaded bundle would sit in the queue forever.
+      vibe-1040-worker:
+        condition: service_started
+    healthcheck:
+      # Liveness on the api's own port. The appliance's readiness gate is
+      # manifest.health = /health, probed through Caddy; this just needs
+      # the process listening. Note the api only listens AFTER it has
+      # tried to register its task classes with the router and cleared
+      # the region assertion, so a long start_period is not padding.
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8240/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 45s

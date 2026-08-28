@@ -83,14 +83,16 @@ Reserved range: `:5171–:5199`. Within that, app categories get blocks with gap
 | Vibe-Calculators | default | `:5174` | Finance |
 | Vibe-Transactions-Converter | default | `:5175` | Finance |
 | Vibe-1099 | default | `:5176` | Finance — 1099 prep / IRIS e-filing |
-| *(reserved)* | | `:5177–:5180` | Future finance apps |
+| Vibe-1040 | default | `:5177` | Finance — 1040 source-document worksheets. **Primary** access path in LAN/Tailscale mode (`rootServedOnly`), a fallback in domain mode |
+| *(reserved)* | | `:5178–:5180` | Future finance apps |
 | Vibe-Connect | staff | `:5181` | Messaging |
 | Vibe-Connect | client portal | `:5182` | Messaging — staff emergency only, client features won't work |
 | *(reserved)* | | `:5183–:5190` | Future messaging apps |
 | Vibe-Tax-Research-Chat | default | `:5191` | AI/research |
 | Vibe-Payroll-Time | default | `:5192` | AI/operations |
 | Vibe-AI-Router | staff admin console | `:5193` | AI/operations — **primary** access path in LAN/Tailscale mode (see below), a fallback in domain mode |
-| *(reserved)* | | `:5194–:5196` | Future AI/operations apps |
+| Vibe-Printer | staff | `:5194` | AI/operations — LAN print gateway. **Primary** access path in LAN/Tailscale mode (`rootServedOnly`), and arguably the right one everywhere: the printers it drives are on that same LAN. `/` 308-redirects to `/admin/` (`routing.root_redirect`) because the app serves nothing at its root |
+| *(reserved)* | | `:5195–:5196` | Future AI/operations apps |
 | Portainer | (admin tool) | `:5197` | v1.2 — infra fallback; UI for container ops when Caddy/DNS/cert is broken |
 | Duplicati | (admin tool) | `:5198` | v1.2 — infra fallback; UI for backup config when Caddy/DNS/cert is broken |
 | Cockpit | (admin tool) | native `:9090` | Already binds the host port directly (separate UFW allow); not behind HAProxy |

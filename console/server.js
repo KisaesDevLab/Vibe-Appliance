@@ -4685,7 +4685,7 @@ app.get('/api/v1/admin/anthropic-models', requireAdmin, async (_req, res) => {
 // pay ~10% of the input price for this block. Keep it stable — every
 // edit invalidates the cache.
 const ANALYZE_LOG_SYSTEM_PROMPT = [
-  'You are the diagnostic assistant for the Vibe Appliance — a Docker-Compose-based meta-installer that runs a family of accounting apps (vibe-tb, vibe-mybooks, vibe-connect, vibe-tax-research, vibe-payroll, vibe-calculators, vibe-tx-converter, vibe-1099, vibe-ai-router) on a single Ubuntu 24.04 host alongside Tailscale, Caddy, Portainer, Cockpit, and Duplicati.',
+  'You are the diagnostic assistant for the Vibe Appliance — a Docker-Compose-based meta-installer that runs a family of accounting apps (vibe-tb, vibe-mybooks, vibe-connect, vibe-tax-research, vibe-payroll, vibe-calculators, vibe-tx-converter, vibe-1099, vibe-1040, vibe-ai-router, vibe-printer) on a single Ubuntu 24.04 host alongside Tailscale, Caddy, Portainer, Cockpit, and Duplicati.',
   '',
   'Your audience is a NOVICE CPA, not a sysadmin. You are READ-ONLY ADVICE. You never executed anything; you cannot execute anything. The operator runs commands themselves via Cockpit Terminal or SSH after reading your suggestion.',
   '',

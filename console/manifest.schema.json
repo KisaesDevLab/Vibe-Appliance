@@ -184,6 +184,12 @@
           "type": "string",
           "pattern": "^[a-z0-9.-]+:[0-9]+$"
         },
+        "root_redirect": {
+          "type": "string",
+          "pattern": "^/.+$",
+          "maxLength": 200,
+          "description": "Path to 308-redirect the bare `/` to, for an app that serves nothing at its own root. Emitted only on ROOT-SERVED surfaces — the per-app Caddy vhost (subdomain-per-app mode, and rootServedOnly apps in single-host mode) and the app's emergency-proxy frontend — because those are the only places the appliance sends an operator to a bare `/`. Path-mounted apps are unaffected: their prefix handler already lands inside the app. Vibe-Printer is the motivating case: its API is at /v1 and its admin SPA is mounted at /admin, so `/` is a bare 404 and every URL the console advertises for it would be broken. Prefer fixing the app to serve something useful at its root; this exists so an app that cannot is still openable."
+        },
         "deny_paths": {
           "type": "array",
           "minItems": 1,
@@ -219,6 +225,12 @@
       "uniqueItems": true,
       "description": "Other Vibe app slugs this app benefits from when enabled (e.g. vibe-tx-converter calls vibe-glm-ocr for OCR if available). Informational only — the appliance does NOT enforce these at enable time; an app whose optional dep is disabled will see its dependent features fail at runtime with whatever upstream error path the app itself produces. Consider wiring a preflight WARN in a future iteration."
     },
+    "requiredApps": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]+$" },
+      "uniqueItems": true,
+      "description": "Other Vibe app slugs that MUST already be enabled and healthy before this app can be enabled. Unlike optionalDepends this IS enforced: lib/enable-app.sh's pre-flight refuses the enable and names the missing app, rather than letting the operator discover it as a container that boots and immediately exits. Use only for a hard runtime dependency the app itself treats as fatal — Vibe-1040 is the case this exists for: its env schema requires a VIBE_AI_TOKEN, which only exists once vibe-ai-router is up to mint one, so without the router even the migration step fails."
+    },
 
     "env": {
       "type": "object",
@@ -253,6 +265,12 @@
         "db": { "type": "integer", "minimum": 0, "maximum": 15 }
       },
       "description": "Logical Redis DB index (0-15). Each app gets its own to prevent key collisions on the shared Redis instance."
+    },
+
+    "dataOwner": {
+      "type": "string",
+      "pattern": "^[0-9]+:[0-9]+$",
+      "description": "Explicit uid:gid that /opt/vibe/data/apps/<slug>/ must be owned by, overriding the uid lib/enable-app.sh would otherwise read from the server image's USER directive. Needed when an app's containers do NOT all run as the same user but DO share one bind-mounted data directory — Vibe-1040 is the case: its Node api/worker and its Python sidecar come from different base images with different baked-in uids, and both read and write the encrypted blob store. The overlay pins every one of those services to this same uid:gid with a compose `user:` key; declaring it here is what keeps the host-side chown in agreement with that pin. Omit whenever the image-derived uid is correct, which is every other app."
     },
 
     "requiredExtensions": {

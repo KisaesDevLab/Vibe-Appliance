@@ -33,6 +33,8 @@ document is the human-readable companion.
   "routing":    { ... },                    // required, how Caddy splits traffic
   "depends":    ["postgres", "redis"],      // optional, hard deps the appliance must run
   "optionalDepends": ["vibe-glm-ocr"],      // optional, soft deps; appliance does not block
+  "requiredApps": ["vibe-ai-router"],       // optional, HARD app deps; pre-flight refuses without them
+  "dataOwner":  "10001:10001",              // optional, uid:gid for /opt/vibe/data/apps/<slug>/
 
   "env":        { ... },                    // required envelope, see below
   "database":   { ... },                    // optional; omit for stateless apps
@@ -58,6 +60,47 @@ is `paradedb/paradedb:0.23.2-pg16`, which provides `vector` and
 `pg_search`. If you override that image, the override must ship every
 `requiredExtensions` value used by every enabled app.
 ```
+
+### `requiredApps`
+
+Optional array of app slugs that must already be **enabled and
+answering their health endpoint** before this app can be enabled.
+
+`optionalDepends` is a note to the reader; this is a gate.
+`enable-app.sh`'s pre-flight reads `state.apps.<slug>.enabled` for each
+entry and then probes that app's health endpoint, and refuses the enable
+naming the app to turn on first. Reserve it for a dependency the app
+itself treats as fatal.
+
+Vibe-1040 is the case it exists for. It holds no provider credentials at
+all, so its config schema requires a non-empty `VIBE_AI_TOKEN`, and the
+appliance can only mint one by calling a running `vibe-ai-router`
+console. With the router down, the api, the worker, and the migration
+one-shot all throw at import time — three crash loops and nothing that
+says why. The pre-flight turns that into one sentence.
+
+Both halves of the check matter and are reported separately: `enabled`
+alone is a stale claim after a crash, and a health probe alone cannot
+tell "never installed" from "installed and briefly restarting".
+
+### `dataOwner`
+
+Optional `"<uid>:<gid>"` that overrides the ownership
+`enable-app.sh` would otherwise derive from the server image's `USER`
+directive when it chowns `/opt/vibe/data/apps/<slug>/`.
+
+Needed only when an app's containers do **not** all run as the same user
+but **do** share one bind-mounted data directory. Vibe-1040 is the case:
+a Node api and worker from `node:24-alpine`, a Python rasterizer from
+`python:3.12-slim`, different baked-in uids, and all three reading and
+writing the same encrypted blob store. Reading the api image's `USER`
+would lock the sidecar out of a directory it has to write.
+
+Declaring it is half a decision: the app's overlay must also pin every
+one of those services to the same uid with a compose `user:` key. Change
+one without the other and the chown and the containers disagree, which
+surfaces as `EACCES` on first write. Omit the field whenever the
+image-derived uid is right, which is every other app.
 
 ---
 
@@ -131,6 +174,36 @@ reverse_proxy <upstream> {
 
 Apps with a single tier use just `default_upstream` and omit `matchers`.
 
+### `routing.root_redirect`
+
+```jsonc
+"routing": {
+  "default_upstream": "vibe-printer:8080",
+  "root_redirect":    "/admin/"
+}
+```
+
+A path to 308-redirect the bare `/` to, for an app that serves nothing
+at its own root. Emitted only on **root-served surfaces** — the per-app
+Caddy vhost (subdomain-per-app mode, and `rootServedOnly` apps in
+single-host mode) and the app's emergency-proxy frontend. Path-mounted
+apps are unaffected: their prefix handler already lands inside the app.
+
+Vibe-Print is the motivating case: its API is at `/v1` and its admin SPA
+is mounted at `/admin`, so `/` is a bare 404 — and `/` is exactly what
+the console advertises for a `rootServedOnly` app and all an operator can
+type at an emergency port. Without this every URL the appliance printed
+for it would be broken.
+
+Both renderers emit an **exact-path** match on `/` only, placed ahead of
+the app's own handlers (Caddy `handle` blocks and HAProxy `http-request`
+rules are both first-match-wins) so it beats the catch-all proxy, and in
+HAProxy after the rate-limit deny so a flood cannot be amplified into
+redirects.
+
+Prefer fixing the app to serve something useful at its root; this exists
+so an app that cannot is still openable.
+
 ---
 
 ## `env`
@@ -158,6 +231,8 @@ Apps with a single tier use just `default_upstream` and omit `matchers`.
 | `shared:<KEY>`                | Pull the value from `/opt/vibe/env/shared.env`           |
 | `appliance:<KEY>`             | Pull the value from `/opt/vibe/env/appliance.env` (Tier 1 inline-editable settings; see `ui` below) |
 | `generated:hex32`             | Generate a fresh 64-char hex value once, then preserve   |
+| `generated:hex16`             | Same, 32-char hex                                        |
+| `generated:base64-32bytes`    | Generate 32 random bytes as base64 once, then preserve   |
 | `subdomain-url`               | `https://<slug-subdomain>.<domain>` (or LAN equivalent)  |
 | `database-url`                | `postgresql://<user>:<pass>@postgres:5432/<dbname>`      |
 | `redis-url`                   | `redis://:<password>@redis:6379/<db_index>`              |
@@ -165,6 +240,27 @@ Apps with a single tier use just `default_upstream` and omit `matchers`.
 
 Optional entries are exposed in the admin "Env files" panel so the
 operator knows what they can set, without surfacing them as required.
+
+**`generated:*` is the one `from` value the renderer actually acts on.**
+Everything else in the table above is descriptive metadata: `_render_app_env`
+does literal `@MARKER@` substitution against the env template, so a
+`shared:JWT_SECRET` entry documents where `@JWT_SECRET@` comes from but
+does not cause anything. A `generated:<shape>` entry does: the renderer
+fills `@<NAME>@` with a value it creates on first enable and then
+**preserves verbatim** by reading it back out of the existing env file on
+every later render.
+
+That preservation is the point, not an optimisation. These are the values
+that key material derives from — Vibe-1040's `TIN_HASH_SALT` salts the
+client join key and its `STORAGE_ENCRYPTION_KEY` unwraps every stored page
+image — and regenerating one during a routine re-enable would silently
+orphan every record already written under it. If you add a shape, add it
+to the `case` in `_render_app_env` and keep the same read-first contract.
+
+A few older markers (`MASTER_KEY`, `ROUTER_ADMIN_PASSWORD`,
+`VIBE1099_ADMIN_PASSWORD`) are still filled by hand-written blocks in the
+renderer that predate this. They keep working and they win for the names
+they own; new apps should use `generated:` and add no code.
 
 ---
 

@@ -1,0 +1,221 @@
+{
+  "schemaVersion": 1,
+  "slug": "vibe-1040",
+  "displayName": "Vibe 1040",
+  "description": "Reads a client's 1040 source documents and emits a worksheet of totals keyed to Form 1040 and schedule line numbers.",
+  "logo": "vibe-1040.svg",
+  "_doc": "In-tree manifest for KisaesDevLab/Vibe-1040 (github.com/KisaesDevLab/Vibe-1040), current release v0.0.1. THREE containers plus a migration one-shot, from two GHCR images: `vibe-1040` runs the Fastify api (8240, and the React review UI it serves at its own root), the BullMQ worker, and the migration one-shot; `vibe-1040-sidecar` is the Python PyMuPDF rasterization worker, which talks to nothing over HTTP - it takes work off the shared Redis and shares the encrypted blob store on disk. THE ROUTER IS A HARD DEPENDENCY: the app's env schema requires a non-empty VIBE_AI_TOKEN, so with vibe-ai-router down even the migration step throws at config-parse time. That is what requiredApps encodes. See also the ROUTER_REQUIRE_US_REGION note in env-templates/per-app/vibe-1040.env.tmpl - the appliance ships it OFF because the router has no region concept yet, and the app fails closed when it is on. MIGRATIONS: This app has no MIGRATIONS_AUTO knob and its server never migrates on boot, so the appliance owns migrations outright - update.sh runs this command with its pre-update dump and health-check rollback behind it. Enable-time migration comes from the overlay's vibe-1040-migrate one-shot instead, which every other service in the set waits on via service_completed_successfully. FIRST LOGIN: Verified against src/db/seed.ts in the upstream repo: it reads SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD from the environment, is a no-op when the user already exists, and deliberately does NOT pre-enrol MFA.",
+  "image": {
+    "server": "ghcr.io/kisaesdevlab/vibe-1040",
+    "defaultTag": "latest",
+    "extras": [
+      {
+        "name": "sidecar",
+        "image": "ghcr.io/kisaesdevlab/vibe-1040-sidecar"
+      }
+    ]
+  },
+  "subdomain": "1040",
+  "emergencyPort": 5177,
+  "ports": {
+    "server": 8240
+  },
+  "rootServedOnly": true,
+  "routing": {
+    "default_upstream": "vibe-1040:8240"
+  },
+  "depends": [
+    "postgres",
+    "redis"
+  ],
+  "requiredApps": [
+    "vibe-ai-router"
+  ],
+  "dataOwner": "10001:10001",
+  "env": {
+    "required": [
+      {
+        "name": "DATABASE_URL",
+        "from": "database-url"
+      },
+      {
+        "name": "REDIS_URL",
+        "from": "redis-url"
+      },
+      {
+        "name": "VIBE_AI_ROUTER_URL",
+        "from": "static:http://vibe-ai-router:8220",
+        "doc": "The router's /v1 gateway on vibe_net. Never route this through Caddy - it is a server-to-server call inside the appliance and the gateway has no public vhost."
+      },
+      {
+        "name": "VIBE_AI_TOKEN",
+        "secret": true,
+        "doc": "App token minted against the vibe-ai-router admin API during enable, then preserved across re-renders (minting again would orphan the old row). This app has no direct-provider fallback: it holds no provider credentials at all, so an empty token means it does not boot."
+      },
+      {
+        "name": "TIN_HASH_SALT",
+        "from": "generated:base64-32bytes",
+        "secret": true,
+        "doc": "32 raw bytes, base64. Salts the taxpayer-identification hash that forms the client join key. NOT ROTATABLE IN PLACE - changing it orphans every taxpayer record already stored. Generated once on first enable and preserved on every re-render; it lives in /opt/vibe/env, which is inside the appliance's sealed backup set."
+      },
+      {
+        "name": "SESSION_SECRET",
+        "from": "generated:base64-32bytes",
+        "secret": true,
+        "doc": "32 raw bytes, base64. Signs staff session cookies. Per-app rather than the appliance-wide JWT_SECRET because this app's zod schema requires exactly 32 decoded bytes and rotating it should sign out this app only."
+      },
+      {
+        "name": "STORAGE_ENCRYPTION_KEY",
+        "from": "generated:base64-32bytes",
+        "secret": true,
+        "doc": "32 raw bytes, base64. AES-256-GCM at rest for the local blob driver - source documents and rasterized page images both. Losing it loses every stored page. Generated once and preserved, same contract as TIN_HASH_SALT."
+      },
+      {
+        "name": "SEED_ADMIN_PASSWORD",
+        "from": "generated:hex32",
+        "secret": true,
+        "doc": "First-login password for the staff admin the appliance's seed step creates. Surfaced in the console's First-login card and in /opt/vibe/CREDENTIALS.txt. Generated once and preserved so a re-enable never invalidates the password the operator wrote down."
+      },
+      {
+        "name": "ROUTER_REQUIRE_US_REGION",
+        "from": "static:false",
+        "doc": "Compliance guardrail. When true the app asserts at startup that the router reports US-region pinning for its three task classes and REFUSES TO START otherwise. As of vibe-ai-router v0.0.2 there is no region concept to report, so leaving it true means the app never boots. The appliance ships it false and says so in the env template; see that file for what you are accepting."
+      },
+      {
+        "name": "STORAGE_LOCAL_PATH",
+        "from": "static:/data/blobs",
+        "doc": "Blob root inside every container of this app. Bind-mounted from /opt/vibe/data/apps/vibe-1040/blobs, shared by the api, the worker, and the Python sidecar - which is why this app declares dataOwner."
+      }
+    ],
+    "optional": [
+      {
+        "name": "VIBE_APP_SUBDOMAIN",
+        "doc": "Operator override for this app's subdomain label. Empty = the manifest default. Consumed by the appliance routing (Caddy vhost + Cloudflare Tunnel CNAME/ingress). This app is rootServedOnly, so it gets its own hostname in domain mode under BOTH routing modes. Single DNS label - lowercase letters, digits, dashes, no dots.",
+        "ui": {
+          "tier": 1,
+          "category": "Network",
+          "label": "Subdomain",
+          "helpText": "The <subdomain> in <subdomain>.<your-domain> for this app. Leave blank to use the built-in default. Lowercase letters, digits, and dashes; no dots. Saving re-renders routing and re-provisions the Cloudflare Tunnel; the app briefly restarts.",
+          "input": "text",
+          "appliance": "per-app",
+          "validate": "regex:^([a-z0-9][a-z0-9-]*)?$",
+          "postSaveJob": "routing-reconcile"
+        }
+      },
+      {
+        "name": "SEED_ADMIN_EMAIL",
+        "value": "admin@appliance.local",
+        "doc": "Login for the staff admin created by the seed step. Set this BEFORE first enable if you want a real address - the seed runs exactly once (state.apps.vibe-1040.seeded gates it), so changing it later creates nothing and the original login stays. Add further staff from inside the app under Admin -> Users.",
+        "ui": {
+          "tier": 1,
+          "category": "Application",
+          "label": "First staff admin email",
+          "helpText": "The email you sign in with the first time. Set it before you enable the app - afterwards the account already exists and this field does nothing.",
+          "input": "text",
+          "appliance": "per-app",
+          "validate": "email"
+        }
+      },
+      {
+        "name": "RECONCILE_TOLERANCE_CENTS",
+        "value": "100",
+        "doc": "Per-document rounding tolerance, in cents, for the arithmetic gate that decides whether a worksheet may be produced. Widening it hides real disagreements between a form's stated subtotal and the sum of its parts.",
+        "ui": {
+          "tier": 1,
+          "category": "Application",
+          "label": "Reconciliation tolerance (cents)",
+          "helpText": "How far a document's arithmetic may be off before the bundle is held for review. Default 100 (one dollar). Do not widen this to make a stubborn document pass.",
+          "input": "number",
+          "appliance": "per-app",
+          "validate": "number-range:0:10000"
+        }
+      },
+      {
+        "name": "EXTRACT_PASSES",
+        "value": "2",
+        "doc": "How many independent extraction passes run per document. Multi-pass agreement is the only confidence signal available, so 1 means no confidence signal at all. Each pass costs another inference call.",
+        "ui": {
+          "tier": 1,
+          "category": "AI",
+          "label": "Extraction passes",
+          "helpText": "Independent reads of each document, compared against each other. 2 is the default; 1 disables the agreement check entirely; 3 costs more and catches a little more.",
+          "input": "number",
+          "appliance": "per-app",
+          "validate": "number-range:1:5"
+        }
+      },
+      {
+        "name": "RETENTION_RASTER_DAYS",
+        "value": "90",
+        "doc": "Days a rasterized page image is kept. Page images are derived PII and the app refuses to start if this exceeds RETENTION_DOCUMENT_DAYS.",
+        "ui": {
+          "tier": 1,
+          "category": "Compliance",
+          "label": "Page-image retention (days)",
+          "helpText": "How long rendered page images live before the retention job purges them. Must not exceed the source-document retention below - the app refuses to start if it does.",
+          "input": "number",
+          "appliance": "per-app",
+          "validate": "number-range:1:3650"
+        }
+      },
+      {
+        "name": "RETENTION_DOCUMENT_DAYS",
+        "value": "2555",
+        "doc": "Days a source document is kept. Default 2555 (seven years).",
+        "ui": {
+          "tier": 1,
+          "category": "Compliance",
+          "label": "Source-document retention (days)",
+          "helpText": "How long uploaded client documents live before the retention job purges them. Default 2555 (seven years).",
+          "input": "number",
+          "appliance": "per-app",
+          "validate": "number-range:1:36500"
+        }
+      },
+      {
+        "name": "TZ",
+        "from": "appliance:TZ",
+        "doc": "IANA time-zone name (e.g. America/Chicago). Inherits the appliance-wide TZ unless overridden.",
+        "ui": {
+          "tier": 1,
+          "category": "Time & Logging",
+          "label": "Time zone (override)",
+          "helpText": "Inherited from appliance. Override only if this firm operates in a different zone than the host.",
+          "input": "time-zone",
+          "appliance": "both",
+          "validate": "iana-timezone"
+        }
+      }
+    ]
+  },
+  "database": {
+    "name": "vibe_1040_db",
+    "user": "vibe1040"
+  },
+  "redis": {
+    "db": 8
+  },
+  "firstLogin": {
+    "type": "default-credentials-passive",
+    "username": "admin@appliance.local",
+    "passwordEnvKey": "SEED_ADMIN_PASSWORD",
+    "url": "/",
+    "note": "The username is whatever SEED_ADMIN_EMAIL was at enable time. MFA IS MANDATORY and cannot be turned off: the session is unusable until you complete second-factor enrolment on this first sign-in, and an authenticator app (TOTP) is the only factor that needs no further configuration - emailed and texted codes require SMTP or SMS to be set up first. Change the password after signing in; the appliance's seed runs once and will not reset it again, not even on disable/re-enable. This app is served at the ROOT of its own subdomain in both routing modes (its bundle cannot be path-mounted; see rootServedOnly), so in LAN/Tailscale mode use http://<server-ip>:5177/ instead."
+  },
+  "migrations": {
+    "command": [
+      "node",
+      "dist/db/migrate.js",
+      "up"
+    ]
+  },
+  "seed": {
+    "command": [
+      "node",
+      "dist/db/seed.js"
+    ],
+    "description": "Creates the first staff admin from SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD. No demo data, no pre-enrolled MFA secret."
+  },
+  "health": "/health",
+  "health_timeout_s": 180
+}
