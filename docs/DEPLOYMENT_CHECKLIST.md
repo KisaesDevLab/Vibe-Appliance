@@ -227,6 +227,13 @@ alone being healthy is not enough.
   publishes the print gateway on a hostname the appliance does not know
   about, cannot re-render, and cannot tear down when you leave domain mode.
   There is no upstream env var to hide that tab.
+- **Vibe Sentinel on the same host: `:443` collides.** This appliance's Caddy
+  binds `0.0.0.0:443`; Sentinel's Vaultwarden binds `<mesh-ip>:443` in
+  `mesh_only` mode, and a wildcard bind wins over a specific one. Run
+  Vaultwarden in `tunnel` mode, or give Sentinel its own host. Two Cloudflare
+  Tunnels on one zone are fine - the stale-CNAME pruning only deletes records
+  pointing at this appliance's own tunnel id. Full detail in
+  [`docs/addenda/sentinel-federation.md`](addenda/sentinel-federation.md).
 - **Per-app subdomain routing (PR #3) is unmerged** — merge it before relying
   on `subdomain-per-app`.
 - **`vibe-tax-research` container rename (this branch):** containers/services

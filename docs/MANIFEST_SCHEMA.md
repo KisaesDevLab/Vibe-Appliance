@@ -276,6 +276,15 @@ Surfaced in the console catalog so an operator sees the terms before installing.
 check, and gating a security and compliance tool behind a network call is the
 wrong trade.
 
+### Coexisting on one host
+
+`docs/addenda/sentinel-federation.md` records what actually collides when both
+appliances share a box, and what does not: `:443` is a real conflict (this
+appliance's Caddy binds `0.0.0.0:443`, Sentinel's Vaultwarden binds
+`<mesh-ip>:443` in mesh_only mode), while two Cloudflare Tunnels on one zone are
+safe because the stale-CNAME pruning in `infra/cloudflared-up.sh` filters on
+records pointing at **its own** tunnel id.
+
 ### Where the contract lives
 
 `console/manifest.schema.json` in this repo is the single source of truth.
