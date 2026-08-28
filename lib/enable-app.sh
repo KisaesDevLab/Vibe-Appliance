@@ -40,7 +40,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   APPLIANCE_DIR="${APPLIANCE_DIR:-$(cd "${_self_dir}/.." && pwd)}"
   export APPLIANCE_DIR
   # shellcheck source=/dev/null
-  for _f in log.sh state.sh secrets.sh db-bootstrap.sh render-caddyfile.sh render-haproxy.sh; do
+  for _f in log.sh compose-files.sh state.sh secrets.sh db-bootstrap.sh render-caddyfile.sh render-haproxy.sh; do
     . "${_self_dir}/${_f}"
   done
   log_init
@@ -131,7 +131,7 @@ enable_app() {
   export APP_TAG="$default_tag"
   # shellcheck disable=SC2086
   if ! ( cd "$APPLIANCE_DIR" && \
-         docker compose -f docker-compose.yml -f "apps/${slug}.yml" pull --include-deps $services ) >>"$VIBE_LOG_FILE" 2>&1; then
+         compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" pull --include-deps $services ) >>"$VIBE_LOG_FILE" 2>&1; then
     _state_app_set "$slug" status failed error "image pull failed"
     die "Image pull failed for $slug. See $VIBE_LOG_FILE; common cause is a registry rate limit."
   fi
@@ -192,7 +192,7 @@ enable_app() {
   # shellcheck disable=SC2086
   {
     ( cd "$APPLIANCE_DIR" && \
-        docker compose -f docker-compose.yml -f "apps/${slug}.yml" up -d --force-recreate $services ) \
+        compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" up -d --force-recreate $services ) \
       2>&1 | tee -a "$VIBE_LOG_FILE" >&2
   } || {
     _state_app_set "$slug" status failed error "compose up failed"
@@ -204,7 +204,7 @@ enable_app() {
       printf '========================================\n'
     } >&2
     # shellcheck disable=SC2086
-    ( cd "$APPLIANCE_DIR" && docker compose -f docker-compose.yml -f "apps/${slug}.yml" logs --tail=50 --no-color $log_services ) \
+    ( cd "$APPLIANCE_DIR" && compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" logs --tail=50 --no-color $log_services ) \
       2>&1 | tee -a "$VIBE_LOG_FILE" >&2 || true
     printf '========================================\n\n' >&2
     die "Could not bring up $slug. See compose output and container logs above."
@@ -227,7 +227,7 @@ enable_app() {
       printf '========================================\n'
     } >&2
     # shellcheck disable=SC2086
-    ( cd "$APPLIANCE_DIR" && docker compose -f docker-compose.yml -f "apps/${slug}.yml" logs --tail=50 --no-color $log_services ) \
+    ( cd "$APPLIANCE_DIR" && compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" logs --tail=50 --no-color $log_services ) \
       2>&1 | tee -a "$VIBE_LOG_FILE" >&2 || true
     printf '========================================\n\n' >&2
     local _health_timeout
@@ -250,7 +250,7 @@ enable_app() {
       printf '========================================\n'
     } >&2
     # shellcheck disable=SC2086
-    ( cd "$APPLIANCE_DIR" && docker compose -f docker-compose.yml -f "apps/${slug}.yml" logs --tail=50 --no-color $log_services ) \
+    ( cd "$APPLIANCE_DIR" && compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" logs --tail=50 --no-color $log_services ) \
       2>&1 | tee -a "$VIBE_LOG_FILE" >&2 || true
     printf '========================================\n\n' >&2
     die "App $slug came up but one of its declared health targets never answered. See container logs above."
@@ -693,8 +693,14 @@ _overlay_services() {
   local overlay="${APPLIANCE_DIR}/apps/${slug}.yml"
   [[ -f "$overlay" ]] || return 0
   local all_svc core_svc
-  all_svc="$(docker compose -f "$core_compose" -f "$overlay" config --services 2>/dev/null | sort -u)"
-  core_svc="$(docker compose -f "$core_compose" config --services 2>/dev/null | sort -u)"
+  # App services = (core + overlay + overrides) minus (core + core override).
+  # Both sides must agree on the core file list or the subtraction leaks a
+  # core service into the app's list and `disable` stops shared Postgres.
+  local -a _all_f _core_f
+  compose_files "$slug"; _all_f=( "${COMPOSE_FILES[@]}" )
+  compose_files;         _core_f=( "${COMPOSE_FILES[@]}" )
+  all_svc="$(docker compose "${_all_f[@]}" config --services 2>/dev/null | sort -u)"
+  core_svc="$(docker compose "${_core_f[@]}" config --services 2>/dev/null | sort -u)"
   [[ -n "$all_svc" && -n "$core_svc" ]] || return 0
   comm -23 <(printf '%s\n' "$all_svc") <(printf '%s\n' "$core_svc") | tr '\n' ' '
 }

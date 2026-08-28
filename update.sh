@@ -44,6 +44,7 @@ VIBE_ENV_SHARED="${VIBE_ENV_SHARED:-${VIBE_ENV_DIR}/shared.env}"
 
 # shellcheck source=/dev/null
 . "${APPLIANCE_DIR}/lib/log.sh"
+. "${APPLIANCE_DIR}/lib/compose-files.sh"
 log_init
 
 # ---- helpers -----------------------------------------------------------
@@ -406,7 +407,7 @@ cmd_update() {
   # Step 4: stop app containers (data volumes preserved).
   log_step "stopping containers for $slug" services="$services"
   if ! ( cd "$APPLIANCE_DIR" && \
-         docker compose -f docker-compose.yml -f "apps/${slug}.yml" stop $services ) >>"$VIBE_LOG_FILE" 2>&1; then
+         compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" stop $services ) >>"$VIBE_LOG_FILE" 2>&1; then
     log_warn "compose stop reported errors — continuing"
   fi
 
@@ -424,7 +425,7 @@ cmd_update() {
   log_step "bringing up $slug with new image"
   export APP_TAG="$default_tag"
   if ! ( cd "$APPLIANCE_DIR" && \
-         docker compose -f docker-compose.yml -f "apps/${slug}.yml" up -d $services ) >>"$VIBE_LOG_FILE" 2>&1; then
+         compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" up -d $services ) >>"$VIBE_LOG_FILE" 2>&1; then
     log_error "compose up failed; rolling back"
     _do_rollback "$slug" "$manifest" "$backup_path" "compose up failed"
     die "Update failed bringing up new images. Rolled back."
@@ -528,12 +529,12 @@ cmd_rollback() {
   services="$(_app_services "$manifest")"
 
   ( cd "$APPLIANCE_DIR" && \
-    docker compose -f docker-compose.yml -f "apps/${slug}.yml" stop $services ) \
+    compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" stop $services ) \
     >>"$VIBE_LOG_FILE" 2>&1 || true
 
   export APP_TAG="vibe-rollback-${slug}"
   if ! ( cd "$APPLIANCE_DIR" && \
-         docker compose -f docker-compose.yml -f "apps/${slug}.yml" up -d $services ) >>"$VIBE_LOG_FILE" 2>&1; then
+         compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" up -d $services ) >>"$VIBE_LOG_FILE" 2>&1; then
     _state_app_set "$slug" status failed update_error "rollback up failed"
     die "Rollback bring-up failed for $slug. Manual recovery: see /opt/vibe/data/apps/${slug}/pre-update-backups/."
   fi
@@ -558,7 +559,7 @@ _do_pull() {
   local services
   services="$(_app_services "$manifest")"
   ( cd "$APPLIANCE_DIR" && \
-    docker compose -f docker-compose.yml -f "apps/${slug}.yml" pull $services ) >>"$VIBE_LOG_FILE" 2>&1
+    compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" pull $services ) >>"$VIBE_LOG_FILE" 2>&1
 }
 
 _tag_rollback() {
@@ -755,7 +756,7 @@ _do_rollback() {
   services="$(_app_services "$manifest")"
   export APP_TAG="vibe-rollback-${slug}"
   ( cd "$APPLIANCE_DIR" && \
-    docker compose -f docker-compose.yml -f "apps/${slug}.yml" up -d $services ) \
+    compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" up -d $services ) \
     >>"$VIBE_LOG_FILE" 2>&1 || \
     log_warn "rollback bring-up failed too — both versions broken, manual recovery needed"
 

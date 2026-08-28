@@ -14,6 +14,14 @@ Thumbs.db
 .env.local
 *.local
 
+# Host-specific compose overrides. This is the supported way to customise
+# a single appliance: keep the tracked files pristine so `git pull` and the
+# console's self-update button keep working. See docs/LOCAL_OVERRIDES.md.
+docker-compose.override.yml
+docker-compose.override.yaml
+apps/*.override.yml
+apps/*.override.yaml
+
 # Per-host runtime artifacts that should never be committed
 # (these live under /opt/vibe on the host; if a developer ever drops a
 # symlink or copy into the repo, ignore it)

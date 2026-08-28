@@ -24,7 +24,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   APPLIANCE_DIR="${APPLIANCE_DIR:-$(cd "${_self_dir}/.." && pwd)}"
   export APPLIANCE_DIR
   # shellcheck source=/dev/null
-  for _f in log.sh state.sh render-caddyfile.sh render-haproxy.sh; do
+  for _f in log.sh compose-files.sh state.sh render-caddyfile.sh render-haproxy.sh; do
     . "${_self_dir}/${_f}"
   done
   log_init
@@ -90,14 +90,14 @@ disable_app() {
   log_step "stopping containers for $slug" services="$services"
   # shellcheck disable=SC2086
   if ! ( cd "$APPLIANCE_DIR" && \
-         docker compose -f docker-compose.yml -f "apps/${slug}.yml" stop $services ) >>"$VIBE_LOG_FILE" 2>&1; then
+         compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" stop $services ) >>"$VIBE_LOG_FILE" 2>&1; then
     _state_app_set "$slug" status failed error "compose stop failed"
     die "Could not stop containers for $slug. Inspect 'docker compose ... ps' and re-run."
   fi
 
   # shellcheck disable=SC2086
   if ! ( cd "$APPLIANCE_DIR" && \
-         docker compose -f docker-compose.yml -f "apps/${slug}.yml" rm -f $services ) >>"$VIBE_LOG_FILE" 2>&1; then
+         compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" rm -f $services ) >>"$VIBE_LOG_FILE" 2>&1; then
     log_warn "compose rm reported errors; containers may already be gone"
   fi
 
@@ -120,8 +120,14 @@ _overlay_services() {
   local core_compose="${APPLIANCE_DIR}/docker-compose.yml"
   local overlay="${APPLIANCE_DIR}/apps/${slug}.yml"
   local all_svc core_svc
-  all_svc="$(docker compose -f "$core_compose" -f "$overlay" config --services 2>/dev/null | sort -u)"
-  core_svc="$(docker compose -f "$core_compose" config --services 2>/dev/null | sort -u)"
+  # App services = (core + overlay + overrides) minus (core + core override).
+  # Both sides must agree on the core file list or the subtraction leaks a
+  # core service into the app's list and `disable` stops shared Postgres.
+  local -a _all_f _core_f
+  compose_files "$slug"; _all_f=( "${COMPOSE_FILES[@]}" )
+  compose_files;         _core_f=( "${COMPOSE_FILES[@]}" )
+  all_svc="$(docker compose "${_all_f[@]}" config --services 2>/dev/null | sort -u)"
+  core_svc="$(docker compose "${_core_f[@]}" config --services 2>/dev/null | sort -u)"
   comm -23 <(printf '%s\n' "$all_svc") <(printf '%s\n' "$core_svc") | tr '\n' ' '
 }
 

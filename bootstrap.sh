@@ -1074,7 +1074,7 @@ main() {
 
   # Source library files. These live alongside this script.
   local lib="${APPLIANCE_DIR}/lib"
-  for f in log.sh state.sh preflight.sh secrets.sh render-caddyfile.sh \
+  for f in log.sh compose-files.sh state.sh preflight.sh secrets.sh render-caddyfile.sh \
            render-haproxy.sh ufw-rules.sh \
            db-bootstrap.sh enable-app.sh disable-app.sh; do
     if [[ ! -f "${lib}/${f}" ]]; then
