@@ -154,7 +154,41 @@ The nine slugs, for when the console starts reading them:
 | `sentinel-scan` | 80 | 9392 | — | — |
 | `sentinel-ai` | 90 | — *(no container)* | — | — |
 
-## 6. What is not built yet
+## 6. Verification status
+
+**Verified on real Ubuntu 24.04** (a container, not the dev host's git-bash —
+which is where every portability artifact this session has been hiding):
+
+- every script in both repos parses under bash 5.2
+- `scripts/check-manifests.py` passes on Linux python 3.12
+- `lib/state.sh` round-trips a config write with **real** `fcntl` and
+  `os.replace` — the fix works where it matters, not only on Windows
+- Sentinel's manifest-driven ports preflight runs against real `ss`
+- the real seven-module `docker compose config` merge succeeds, and the merged
+  stack publishes **exactly** the ports the manifests declare
+  (443, 1514, 1515, 3001, 8080, 8085, 8632, 9200, 55000) — no more, no fewer
+- `sentinel-backup` mounts `print-data` read-only, so the print gateway's SQLite
+  is covered now that it is no longer a Postgres database
+
+**Phase D precondition met.** `tests/federation/phase-d-precondition.sh` stages
+all eleven Vibe manifests plus all nine real Sentinel manifests, marks every one
+enabled, and confirms the three renderers emit nothing for the Sentinel units in
+either routing mode while still serving every Vibe app and binding
+5171/5177/5194/5197. Re-run it before copying the manifests in.
+
+**Still needs a real droplet**, and nothing below has been done:
+
+- `bootstrap.sh` end to end on a fresh `s-1vcpu-2gb`, including enabling an app
+  with the `runtime` guards in place
+- the retargeted print module actually pulling and starting
+  `ghcr.io/kisaesdevlab/vibe-printer`, and its `/readyz` gate
+- Sentinel's `install.sh` end to end — needs its own box at 4 cores / 8 GB
+- ufw, nftables, systemd and the Cloudflare API paths
+- the `:443` conflict being caught with both stacks genuinely running
+
+---
+
+## 7. What is not built yet
 
 - **Phase D** — console federation: the collapsed *Security & Compliance* group,
   Enable/Disable routed by `runtime` via a new `lib/sentinel-module.sh`, and the
