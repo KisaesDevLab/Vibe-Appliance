@@ -829,6 +829,59 @@ Diagnose: tail -50 /opt/vibe/logs/bootstrap.log | grep -i claude-code"
 # is reachable and the settings_audit table is writeable. The
 # "Tier 1 settings populated" checks (e.g. EMAIL_PROVIDER not 'none' when
 # Connect is enabled) land in the next session alongside the UI.
+# Session-cookie policy. The point of this check is drift: consent is a
+# one-time act, firewall state is not. `ufw reset`, a distro upgrade
+# rewriting after.rules, or a well-meant rule cleanup all remove the
+# restriction that justified dropping the Secure flag, while the recorded
+# opt-in lives on. enable-app re-verifies at render time, so the cookie
+# self-heals on the next enable — but nothing forces an enable, so without
+# this check an appliance can sit for months believing it is protected.
+check_cookie_policy() {
+  _check_begin "Session cookie policy"
+
+  # shellcheck source=/dev/null
+  if ! . "${APPLIANCE_DIR}/lib/lan-only-cookies.sh" 2>/dev/null; then
+    _check_warn "cannot load lib/lan-only-cookies.sh; policy not evaluated"
+    return
+  fi
+
+  if ! lan_only_cookies_consented; then
+    _check_pass "Secure flag set on session cookies (no operator opt-out recorded)"
+    return
+  fi
+
+  local who when
+  who="$(state_get_config_kv lan_only_cookies_actor 2>/dev/null)"
+  when="$(state_get_config_kv lan_only_cookies_at 2>/dev/null)"
+
+  # In-container: `ufw status` and /etc/ufw/after.rules aren't reachable, so
+  # verification would fail closed and read as drift when nothing is wrong.
+  # Report the opt-in and defer the verdict to a host-side run.
+  if _in_container; then
+    _check_warn "cookies opted out of the Secure flag by ${who:-unknown} at ${when:-unknown}; firewall not verifiable from in here" \
+      "Diagnose on the host: sudo vibe cookies --status"
+    return
+  fi
+
+  if lan_only_cookies_verify; then
+    _check_pass "Secure flag intentionally dropped by ${who:-unknown} at ${when:-unknown}; emergency ports still verified LAN/tailnet-only"
+    return
+  fi
+
+  # Opted in, but the compensating control is gone. This is the case the
+  # check exists for, and it is a FAIL: right now there is a live opt-out
+  # of a security control with nothing standing behind it.
+  local why
+  why="$(lan_only_cookies_verify --explain | sed 's/^/           /')"
+  _check_fail "cookies are opted out of the Secure flag but the firewall no longer backs it up
+${why}
+Diagnose: sudo vibe cookies --status
+Fix:      sudo bash ${APPLIANCE_DIR}/lib/ufw-rules.sh    (restore the restriction)
+Or:       sudo vibe cookies --secure                     (revoke the opt-out)
+Then:     sudo vibe disable <slug> && sudo vibe enable <slug>   (re-render env)
+Note:     apps already running keep the weakened cookie until re-enabled."
+}
+
 check_settings_audit_db() {
   _check_begin "Settings audit DB"
   local db="${VIBE_DIR}/data/console/console.sqlite"
@@ -947,6 +1000,7 @@ check_cockpit_reachability      # Workstream A
 check_emergency_proxy           # Workstream D
 check_ufw_rules                 # Workstream D
 check_settings_audit_db         # Workstream C
+check_cookie_policy             # security-gate drift
 check_claude_code               # Workstream B
 
 # Mode-specific checks. We read state.config to know which mode this

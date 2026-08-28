@@ -90,6 +90,9 @@ CONFIG_CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
 # --with-claude-code. The optional API key is persisted to appliance.env
 # (Workstream C) by phase_secrets.
 CONFIG_CLAUDE_CODE="false"
+# Tri-state on purpose: "" means "leave whatever the operator already chose".
+# A bare re-run of bootstrap must never silently revoke or grant this.
+CONFIG_LAN_ONLY_COOKIES=""
 CONFIG_ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
 
 # ----------------------------------------------------------------------
@@ -153,6 +156,19 @@ FLAGS
                                   and by per-app AI features that opt into the
                                   shared key via manifest ui blocks. Reads
                                   ANTHROPIC_API_KEY from the environment too.
+  --lan-only-cookies              Allow session cookies to drop the `Secure`
+                                  flag so the plain-HTTP emergency ports
+                                  (5171-5198) are usable for sign-in, not just
+                                  liveness checks. Typing this flag IS the
+                                  agreement to the trade-off. It only takes
+                                  effect while those ports are verifiably
+                                  firewalled to RFC1918 + Tailscale CGNAT; if
+                                  that check fails, bootstrap refuses and says
+                                  why. Re-verified on every app enable and by
+                                  doctor.sh, so it cannot outlive the
+                                  restriction that justifies it.
+  --secure-cookies                Revoke the above and restore `Secure`
+                                  cookies everywhere.
   -h | --help                     Show this help.
 
 DOCS
@@ -180,6 +196,8 @@ parse_flags() {
       --force)           CONFIG_FORCE="true"; shift ;;
       --no-cockpit)      CONFIG_COCKPIT="false"; shift ;;
       --with-claude-code) CONFIG_CLAUDE_CODE="true"; shift ;;
+      --lan-only-cookies) CONFIG_LAN_ONLY_COOKIES="true"; shift ;;
+      --secure-cookies)   CONFIG_LAN_ONLY_COOKIES="false"; shift ;;
       --anthropic-api-key)        CONFIG_ANTHROPIC_API_KEY="${2:?--anthropic-api-key requires a value}"; shift 2 ;;
       --anthropic-api-key=*)      CONFIG_ANTHROPIC_API_KEY="${1#*=}"; shift ;;
       -h|--help)         usage; exit 0 ;;
@@ -585,6 +603,40 @@ HELP
 
   state_set_phase secrets ok
   log_ok "shared.env populated at $VIBE_ENV_SHARED"
+}
+
+# --- Cookie policy (--lan-only-cookies / --secure-cookies) ------------
+#
+# Grants or revokes the operator's opt-in to non-Secure session cookies.
+# Granting is refused unless the compensating control — emergency ports
+# firewalled to RFC1918 + Tailscale CGNAT — is verifiably in place, so the
+# flag cannot be used to wave away a check it does not actually satisfy.
+#
+# Revoking is never refused. Turning a weakening OFF must work from any
+# state, including one where verification itself is broken.
+_apply_cookie_policy() {
+  local want="$1"
+
+  if [[ "$want" != "true" ]]; then
+    lan_only_cookies_record false "cli:--secure-cookies"
+    log_ok "session cookies restored to Secure everywhere (--secure-cookies)"
+    return 0
+  fi
+
+  local reasons
+  if ! reasons="$(lan_only_cookies_verify --explain)"; then
+    log_error "refusing --lan-only-cookies: the emergency ports are not verifiably restricted"
+    local r
+    while IFS= read -r r; do [[ -n "$r" ]] && log_error "  - $r"; done <<<"$reasons"
+    log_error "  fix: sudo bash ${APPLIANCE_DIR}/lib/ufw-rules.sh, then re-run with --lan-only-cookies"
+    log_error "  why: without that firewall the plain-HTTP surface is public, and dropping the Secure flag would expose session cookies to the internet"
+    die "--lan-only-cookies pre-flight failed. Nothing was changed."
+  fi
+
+  lan_only_cookies_record true "cli:--lan-only-cookies"
+  log_warn "session cookies will render WITHOUT the Secure flag (operator opt-in via --lan-only-cookies)" \
+           scope="apps using @SESSION_SECURE@" verified="ufw + DOCKER-USER restrict ${_LOC_EMERGENCY_RANGE} to RFC1918/CGNAT"
+  log_info "revoke at any time with: sudo vibe cookies --secure"
 }
 
 # --- Phase 5 — pull registry images and build local images -----------
@@ -1074,7 +1126,7 @@ main() {
 
   # Source library files. These live alongside this script.
   local lib="${APPLIANCE_DIR}/lib"
-  for f in log.sh compose-files.sh state.sh preflight.sh secrets.sh render-caddyfile.sh \
+  for f in log.sh compose-files.sh state.sh lan-only-cookies.sh preflight.sh secrets.sh render-caddyfile.sh \
            render-haproxy.sh ufw-rules.sh \
            db-bootstrap.sh enable-app.sh disable-app.sh; do
     if [[ ! -f "${lib}/${f}" ]]; then
@@ -1088,6 +1140,13 @@ main() {
   # failures land in the JSONL log.
   log_init
   state_init
+
+  # Cookie policy, if the operator passed a flag this run. Deliberately
+  # after state_init (consent is recorded in state.json) and before
+  # phase_apps re-renders every enabled app's env file.
+  if [[ -n "$CONFIG_LAN_ONLY_COOKIES" ]]; then
+    _apply_cookie_policy "$CONFIG_LAN_ONLY_COOKIES"
+  fi
 
   # Reconcile abandoned 'enabling' state from a prior interrupted run.
   # If the operator hit Ctrl-C during phase_apps mid-enable, the state

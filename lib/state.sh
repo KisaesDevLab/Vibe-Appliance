@@ -134,6 +134,23 @@ os.rename(tmp, path)
 PYEOF
 }
 
+# state_get_config_kv <key>
+#   Prints state.config[key], or nothing when unset. Non-fatal on a missing
+#   or malformed state file: callers treat "no answer" as "not configured",
+#   which for security gates must mean off.
+state_get_config_kv() {
+  local key="$1"
+  python3 - "$VIBE_STATE_FILE" "$key" <<'PYEOF' 2>/dev/null || true
+import json, sys
+path, key = sys.argv[1:3]
+try:
+    with open(path) as f:
+        print(json.load(f).get("config", {}).get(key, "") or "")
+except Exception:
+    print("")
+PYEOF
+}
+
 # state_set_config_kv <key> <value>
 #   Sets state.config[key] = value (string). Pass "" to clear.
 state_set_config_kv() {

@@ -209,6 +209,7 @@ const SETTINGS_JS_VERSION = '2026-07-30-tunnel-scope-and-rootserved-urls';
     section.appendChild(row);
     host.appendChild(section);
     renderSelfUpdateRow(section);
+    renderCookiePolicyRow(section);
   }
 
   // ---- Appliance self-update -------------------------------------------
@@ -226,6 +227,127 @@ const SETTINGS_JS_VERSION = '2026-07-30-tunnel-scope-and-rootserved-urls';
   //   - fetch failures during polling are expected and rendered as
   //     "restarting", not as errors. Treating them as errors was the
   //     obvious first cut and it reports failure every single time.
+  // ---- Session cookie policy -------------------------------------------
+  //
+  // Lets an operator trade the `Secure` flag on session cookies for working
+  // sign-in on the plain-HTTP emergency ports. The panel is built to make
+  // that trade legible rather than easy:
+  //
+  //   - the current state always shows WHY, not just on/off. "Opted in but
+  //     the firewall no longer backs it up" is a different situation from
+  //     "off", and it is the one that needs attention;
+  //   - turning it ON requires ticking an acknowledgement first. The server
+  //     enforces this too — the checkbox is the explanation, not the gate;
+  //   - turning it OFF is one click with no ceremony. Never make the secure
+  //     direction harder than the insecure one.
+  //
+  // The host decides. This panel only asks, and renders the refusal verbatim
+  // when the answer is no, because the reasons ARE the useful part.
+  function renderCookiePolicyRow(section) {
+    const row = el('div', { class: 'maintenance__row', style: 'margin-top:1.2rem;' });
+    row.appendChild(el('strong', null, ['Sign-in on the emergency ports']));
+    row.appendChild(el('p', { class: 'help' }, [
+      'The emergency ports (5171-5198) are plain HTTP, so browsers refuse to send ',
+      'back session cookies marked ', el('code', null, ['Secure']), '. That makes those ',
+      'ports usable for checking an app is alive, but not for logging in — exactly when ',
+      'you need them most, if TLS or DNS has broken. Turning this on drops the ',
+      el('code', null, ['Secure']), ' flag so sign-in works there. ',
+      el('strong', null, ['Only safe while those ports stay firewalled to your LAN and tailnet']),
+      ' — which the appliance verifies before allowing it, and re-checks every time doctor runs.',
+    ]));
+
+    const statusLine = el('p', { class: 'help', style: 'margin:0.4rem 0 0;' }, ['Checking…']);
+    const reasons    = el('pre', { class: 'maintenance__output', hidden: '', style: 'margin-top:0.4rem;' });
+    const ack = el('input', { type: 'checkbox', id: 'cookie-ack' });
+    const ackLabel = el('label', { for: 'cookie-ack', class: 'help', style: 'display:block;margin-top:0.5rem;' }, [
+      ack,
+      ' I understand session cookies will lose the ', el('code', null, ['Secure']),
+      ' flag, and that this is only acceptable while the emergency ports are restricted to my LAN and tailnet.',
+    ]);
+    const btnOn  = el('button', { type: 'button', class: 'btn btn--ghost' }, ['Allow sign-in on emergency ports']);
+    const btnOff = el('button', { type: 'button', class: 'btn btn--ghost' }, ['Restore Secure cookies']);
+
+    const ctaRow = el('div', { class: 'cta-row', style: 'gap:0.5rem;align-items:center;margin-top:0.4rem;' });
+    ctaRow.appendChild(btnOn); ctaRow.appendChild(btnOff);
+    row.appendChild(statusLine); row.appendChild(reasons);
+    row.appendChild(ackLabel); row.appendChild(ctaRow);
+    section.appendChild(row);
+
+    function showReasons(list) {
+      if (!list || !list.length) { reasons.hidden = true; reasons.textContent = ''; return; }
+      reasons.hidden = false;
+      reasons.textContent = list.map(r => '- ' + r).join('\n');
+    }
+
+    async function refresh() {
+      statusLine.textContent = 'Checking…';
+      let d;
+      try {
+        const r = await fetchWithTimeout('/api/v1/admin/cookie-policy', { credentials: 'same-origin' }, 15000);
+        d = await r.json();
+        if (!r.ok || !d.ok) throw new Error(d && d.error ? d.error : 'could not read policy');
+      } catch (e) {
+        statusLine.textContent = 'Could not read the current setting: ' + e.message;
+        showReasons(['Check from a terminal: sudo vibe cookies --status']);
+        return;
+      }
+
+      if (d.effective) {
+        statusLine.textContent = 'ON — cookies drop the Secure flag; sign-in works on the emergency ports.';
+        showReasons(null);
+      } else if (d.consented && !d.verified) {
+        // The drift case, and the reason this panel reports reasons at all.
+        statusLine.textContent =
+          'NEEDS ATTENTION — this was turned on, but the firewall no longer restricts the ' +
+          'emergency ports, so the appliance has fallen back to Secure cookies. Sign-in ' +
+          'there will not work until the firewall is repaired, or you turn this off.';
+        showReasons(d.reasons);
+      } else {
+        statusLine.textContent = 'OFF — cookies keep the Secure flag (recommended).';
+        showReasons(null);
+      }
+      btnOn.disabled = !!d.effective;
+      btnOff.disabled = !d.consented;
+      ack.checked = false;
+    }
+
+    async function set(enabled) {
+      btnOn.disabled = true; btnOff.disabled = true;
+      statusLine.textContent = enabled ? 'Checking the firewall…' : 'Restoring Secure cookies…';
+      try {
+        const r = await fetchWithTimeout('/api/v1/admin/cookie-policy', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled, acknowledged: enabled ? ack.checked : undefined }),
+        }, 30000);
+        const d = await r.json();
+        if (!r.ok || !d.ok) {
+          statusLine.textContent = enabled
+            ? 'Refused — the emergency ports are not restricted, so this would expose session cookies to the internet.'
+            : 'Could not change the setting.';
+          showReasons(String(d && d.error ? d.error : 'unknown error').split('\n').filter(Boolean));
+          return;
+        }
+        showReasons(d.note ? [d.note] : null);
+      } catch (e) {
+        statusLine.textContent = 'Request failed: ' + e.message;
+      } finally {
+        await refresh();
+      }
+    }
+
+    btnOn.addEventListener('click', () => {
+      if (!ack.checked) {
+        statusLine.textContent = 'Tick the acknowledgement first — this weakens a security setting.';
+        return;
+      }
+      set(true);
+    });
+    btnOff.addEventListener('click', () => set(false));
+    refresh();
+  }
+
   function renderSelfUpdateRow(section) {
     const row = el('div', { class: 'maintenance__row', style: 'margin-top:1.2rem;' });
     row.appendChild(el('strong', null, ['Update the appliance']));

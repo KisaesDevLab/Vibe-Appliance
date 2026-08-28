@@ -1854,6 +1854,92 @@ app.post('/api/v1/admin/prune-images', requireAdmin, testRateLimit, async (_req,
 const SELF_UPDATE_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'self-update.sh');
 const SELF_UPDATE_STATUS = path.join(LOGS_DIR, 'self-update.status.json');
 
+// --- Session cookie policy -------------------------------------------
+//
+// Grants or revokes the operator's opt-in to session cookies without the
+// `Secure` flag, so the plain-HTTP emergency ports are usable for sign-in.
+//
+// Everything here runs THROUGH `vibe cookies` on the host rather than
+// re-implementing the gate in JS. Two reasons, and both matter:
+//
+//   1. The console runs unprivileged in a container. It cannot read
+//      `ufw status` or /etc/ufw/after.rules, so a check written here would
+//      fail closed every time and the toggle would never work — or, worse,
+//      someone would "fix" that by trusting a cached value.
+//   2. One implementation of a security gate. A second copy in JS is a
+//      second thing to keep in sync, and the copy that drifts is the one
+//      that says yes when it should say no.
+//
+// So the browser can ASK for the change; the host decides. A refusal from
+// the host is passed through verbatim, reasons and all.
+const COOKIE_POLICY_CMD = 'vibe cookies';
+
+function parseCookieStatus(stdout) {
+  const out = { consented: null, verified: null, effective: null, reasons: [] };
+  for (const line of String(stdout || '').split('\n')) {
+    const t = line.trim();
+    if (t.startsWith('opt-in:')) out.consented = /RECORDED/.test(t);
+    else if (t.startsWith('firewall:')) out.verified = /VERIFIED/.test(t) && !/NOT VERIFIED/.test(t);
+    else if (t.startsWith('effective:')) out.effective = /WITHOUT Secure/.test(t);
+    else if (t.startsWith('- ')) out.reasons.push(t.slice(2).trim());
+  }
+  return out;
+}
+
+app.get('/api/v1/admin/cookie-policy', requireAdmin, async (_req, res) => {
+  const r = await runOnHost(`${COOKIE_POLICY_CMD} --status`);
+  if (r.code !== 0) {
+    return res.status(500).json({
+      ok: false,
+      error: 'Could not read the cookie policy from the host: ' +
+             (trim(r.stderr, 300) || `exit ${r.code}`) +
+             '. SSH path: sudo vibe cookies --status',
+    });
+  }
+  res.json({ ok: true, ...parseCookieStatus(r.stdout), raw: trim(r.stdout, 2000) });
+});
+
+app.post('/api/v1/admin/cookie-policy', requireAdmin, testRateLimit, async (req, res) => {
+  const enabled = req.body && req.body.enabled === true;
+
+  // Turning the weakening ON requires an explicit acknowledgement in the
+  // same request. Not a nicety: this is the one control whose entire
+  // justification is that a human understood the trade. A toggle that can
+  // be flipped by a stray click, or by a script POSTing {enabled:true},
+  // is not consent. Turning it OFF needs no ceremony — making things more
+  // secure should never be gated.
+  if (enabled && !(req.body && req.body.acknowledged === true)) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Refusing without acknowledgement. Session cookies would lose the Secure flag, ' +
+             'which is only safe while the emergency ports stay firewalled to your LAN and tailnet. ' +
+             'Re-send with acknowledged:true, or use: sudo vibe cookies --lan-only',
+    });
+  }
+
+  const who = (req.session && req.session.user) || 'console';
+  const flag = enabled ? '--lan-only' : '--secure';
+  const r = await runOnHost(`${COOKIE_POLICY_CMD} ${flag}`);
+
+  if (r.code !== 0) {
+    // The host refused — almost always because the firewall no longer
+    // restricts the emergency ports. Its stderr already names each failed
+    // condition, so pass it through instead of flattening it to "failed".
+    const detail = trim(r.stderr || r.stdout, 800) || `exit ${r.code}`;
+    log('warn', 'cookie policy change refused by host', { enabled, who, detail: trim(detail, 300) });
+    return res.status(409).json({ ok: false, error: detail, refused: true });
+  }
+
+  log('warn', 'cookie policy changed', { enabled, who });
+  res.json({
+    ok: true,
+    enabled,
+    note: enabled
+      ? 'Recorded. Apps keep their current cookies until re-enabled: sudo vibe disable <slug> && sudo vibe enable <slug>'
+      : 'Revoked. Apps keep their current cookies until re-enabled: sudo vibe disable <slug> && sudo vibe enable <slug>',
+  });
+});
+
 app.post('/api/v1/admin/self-update', requireAdmin, testRateLimit, async (_req, res) => {
   // Refuse while a tunnel provision is in flight. Both re-render the
   // Caddyfile and bounce containers; interleaving them is how you get a

@@ -1207,10 +1207,23 @@ PYEOF
   # inside the WireGuard tunnel. Domain mode keeps `true` — there the
   # app has a real HTTPS vhost and the plain-HTTP port is a status-check
   # fallback, as its emergencyNote documents.
+  #
+  # Domain mode normally keeps Secure=true. An operator can opt out via
+  # `vibe cookies --lan-only` (or the console toggle) when they need the
+  # plain-HTTP emergency ports to be usable for sign-in — but only while
+  # lib/lan-only-cookies.sh can verify those ports are still firewalled to
+  # RFC1918 + Tailscale CGNAT. Verification runs HERE, on every render, not
+  # once at opt-in time: if the firewall rules are later reset or lost, the
+  # next enable silently restores Secure cookies rather than leaving a
+  # weakening in place whose justification has evaporated.
   if [[ "$mode" == "lan" ]]; then
     session_secure="false"
   elif [[ "$mode" == "tailscale" && "$root_served" == "true" ]]; then
     session_secure="false"
+  elif declare -F lan_only_cookies_active >/dev/null 2>&1 && lan_only_cookies_active; then
+    session_secure="false"
+    log_warn "session cookies rendered WITHOUT the Secure flag for $slug (operator opt-in; emergency ports verified LAN/tailnet-only)" \
+             slug="$slug" gate="lan_only_cookies"
   else
     session_secure="true"
   fi

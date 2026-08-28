@@ -35,6 +35,14 @@ COMMANDS
                                  ssh host 'sudo vibe credentials' > local.txt
   logs   [name]                Tail /opt/vibe/logs/<name>.log
                                (defaults to bootstrap.log).
+  cookies [--status]           Show whether session cookies carry the
+                               Secure flag, and why.
+  cookies --lan-only           Allow cookies to drop Secure so the
+                               plain-HTTP emergency ports are usable for
+                               sign-in. Refused unless those ports are
+                               verifiably firewalled to RFC1918 +
+                               Tailscale CGNAT.
+  cookies --secure             Revoke the above; restore Secure cookies.
   bootstrap [args…]            Re-run the full bootstrap.
   uninstall [--remove-data | --full]
                                Tear down the appliance. Default keeps data;
@@ -96,6 +104,72 @@ case "$cmd" in
       exit 1
     fi
     exec tail -f -n 200 "$file"
+    ;;
+  cookies)
+    # Session-cookie policy. Reading status is safe for anyone; changing it
+    # writes state.json and is root-only, same as every other mutating
+    # subcommand here.
+    # shellcheck source=/dev/null
+    . "${APPLIANCE_DIR}/lib/log.sh"
+    # shellcheck source=/dev/null
+    . "${APPLIANCE_DIR}/lib/state.sh"
+    # shellcheck source=/dev/null
+    . "${APPLIANCE_DIR}/lib/lan-only-cookies.sh"
+    case "${1:---status}" in
+      --status|status|"")
+        if lan_only_cookies_consented; then
+          echo "opt-in:    RECORDED ($(state_get_config_kv lan_only_cookies_actor) at $(state_get_config_kv lan_only_cookies_at))"
+        else
+          echo "opt-in:    not recorded — cookies keep the Secure flag"
+        fi
+        if lan_only_cookies_verify; then
+          echo "firewall:  VERIFIED — emergency ports restricted to RFC1918 + Tailscale CGNAT"
+        else
+          echo "firewall:  NOT VERIFIED"
+          # `verify --explain` exits non-zero by design, and `set -o pipefail`
+          # propagates that through the pipe. Without `|| true` the shell's
+          # `set -e` kills a purely informational command mid-report.
+          lan_only_cookies_verify --explain | sed 's/^/           - /' || true
+        fi
+        if lan_only_cookies_active; then
+          echo "effective: cookies render WITHOUT Secure (sign-in works on the emergency ports)"
+        else
+          echo "effective: cookies render WITH Secure"
+          if lan_only_cookies_consented; then
+            echo "           (opt-in is recorded but unverified, so it is NOT being applied)"
+          fi
+        fi
+        # `vibe cookies --status` reports; it does not pass judgement. Exiting
+        # non-zero here would make callers — the console's runOnHost among them
+        # — read a healthy appliance as a failed command.
+        exit 0
+        ;;
+      --lan-only)
+        [[ $EUID -eq 0 ]] || { echo "vibe cookies --lan-only must run as root (sudo)" >&2; exit 1; }
+        if ! reasons="$(lan_only_cookies_verify --explain)"; then
+          echo "Refusing: the emergency ports are not verifiably restricted." >&2
+          sed 's/^/  - /' <<<"$reasons" >&2
+          echo "  fix: sudo bash ${APPLIANCE_DIR}/lib/ufw-rules.sh, then retry." >&2
+          echo "  why: without that firewall the plain-HTTP surface is public, and dropping" >&2
+          echo "       the Secure flag would expose session cookies to the internet." >&2
+          exit 1
+        fi
+        lan_only_cookies_record true "cli:vibe cookies --lan-only"
+        echo "Recorded. Session cookies will render without the Secure flag."
+        echo "Applies on the next enable: sudo vibe disable <slug> && sudo vibe enable <slug>"
+        echo "Revoke with: sudo vibe cookies --secure"
+        ;;
+      --secure)
+        [[ $EUID -eq 0 ]] || { echo "vibe cookies --secure must run as root (sudo)" >&2; exit 1; }
+        lan_only_cookies_record false "cli:vibe cookies --secure"
+        echo "Revoked. Session cookies will render with the Secure flag."
+        echo "Applies on the next enable: sudo vibe disable <slug> && sudo vibe enable <slug>"
+        ;;
+      *)
+        echo "usage: vibe cookies [--status | --lan-only | --secure]" >&2
+        exit 2
+        ;;
+    esac
     ;;
   bootstrap)
     exec sudo "${APPLIANCE_DIR}/bootstrap.sh" "$@"
