@@ -170,11 +170,22 @@ which is where every portability artifact this session has been hiding):
 - `sentinel-backup` mounts `print-data` read-only, so the print gateway's SQLite
   is covered now that it is no longer a Postgres database
 
-**Phase D precondition met.** `tests/federation/phase-d-precondition.sh` stages
-all eleven Vibe manifests plus all nine real Sentinel manifests, marks every one
-enabled, and confirms the three renderers emit nothing for the Sentinel units in
-either routing mode while still serving every Vibe app and binding
-5171/5177/5194/5197. Re-run it before copying the manifests in.
+**Phase D precondition met, and the guards are proven — the two are not the
+same claim.** `tests/federation/phase-d-precondition.sh` renders against a
+synthetic probe that declares everything a renderer acts on (subdomain,
+`subdomains[]`, a routing upstream, an emergencyPort, `rootServedOnly`), so only
+the `runtime` guard can suppress it. Deleting each guard in turn makes the
+script fail for that renderer specifically — Caddy leaks the probe's upstream
+and hostnames, the tunnel leaks both hostnames in both modes, HAProxy leaks
+`fe_sentinel_probe` and its binds. It also asserts the nine real manifests leak
+nothing, which is the weaker claim Phase D actually depends on.
+
+The first version of that script asserted only the second half, and was
+worthless: the real manifests declare no `subdomain` and no
+`routing.default_upstream`, so pre-existing guards already excluded them, and
+with every `runtime` guard deleted five of the six renderer × mode cells still
+reported OK. It proved the manifests were inert, not that the guards work.
+Re-run it before copying the manifests in.
 
 **Still needs a real droplet**, and nothing below has been done:
 

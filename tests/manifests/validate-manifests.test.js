@@ -573,6 +573,32 @@ test('every manifest validates against the published JSON Schema', () => {
     'the top-level required list must not demand appliance-only fields');
 });
 
+test("preflight's fallback port list matches what compose publishes", () => {
+  // lib/preflight.sh keeps a hardcoded copy of the emergency-proxy publish
+  // list, used only when docker-compose.yml cannot be parsed - which is
+  // exactly the moment nobody is in a position to notice the copy is short.
+  // It had drifted by two: 5176 (vibe-1099) and 5177 (vibe-1040) were never
+  // added, so the fallback under-reported and the check it feeds passed on
+  // ports that were in fact published.
+  const root = path.join(__dirname, '..', '..');
+  const compose = fs.readFileSync(path.join(root, 'docker-compose.yml'), 'utf8');
+  const block = compose.split(/^  emergency-proxy:\s*$/m)[1] || '';
+  const stop = block.search(/^  [a-zA-Z0-9_.-]+:\s*$/m);
+  const published = [...(stop >= 0 ? block.slice(0, stop) : block)
+    .matchAll(/^\s*-\s*"(?:\d{1,3}(?:\.\d{1,3}){3}:)?(\d+):\d+"/gm)]
+    .map((m) => Number(m[1])).sort((a, b) => a - b);
+
+  const preflight = fs.readFileSync(path.join(root, 'lib', 'preflight.sh'), 'utf8');
+  const hit = preflight.match(/ports="((?:\d+ ?)+)"/);
+  assert.ok(hit, 'lib/preflight.sh no longer carries a fallback port list');
+  const fallback = hit[1].trim().split(/\s+/).map(Number).sort((a, b) => a - b);
+
+  assert.deepEqual(fallback, published,
+    'lib/preflight.sh fallback list and docker-compose.yml publishes disagree: ' +
+    `only in compose [${published.filter((p) => !fallback.includes(p))}], ` +
+    `only in fallback [${fallback.filter((p) => !published.includes(p))}]`);
+});
+
 // --- helpers ------------------------------------------------------------
 
 // Walk the schema and return [dotted-path-with-[] for arrays, maxLength]

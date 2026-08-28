@@ -363,11 +363,15 @@ preflight_emergency_ports() {
   local ports p
   ports="$(_emergency_ports_from_compose)"
   if [[ -z "$ports" ]]; then
-    # Fall back to the documented canonical range endpoints rather than
-    # skipping the check entirely if the compose file can't be parsed.
+    # Fall back to a copy of docker-compose.yml's publish list rather than
+    # skipping the check entirely if that file can't be parsed. It is a copy,
+    # so it drifts: it was missing 5176 (vibe-1099) and 5177 (vibe-1040), which
+    # meant the one code path that runs when compose is unreadable silently
+    # under-reported. tests/manifests/validate-manifests.test.js now asserts
+    # this list matches the compose publishes exactly.
     log_check_warn "Emergency-access ports" \
       "Could not read the emergency-proxy port list from docker-compose.yml; falling back to the known set. If bootstrap later fails with 'port is already allocated', that's the cause."
-    ports="5171 5172 5174 5175 5181 5182 5191 5192 5193 5194 5197 5198 5199"
+    ports="5171 5172 5174 5175 5176 5177 5181 5182 5191 5192 5193 5194 5197 5198 5199"
   fi
   for p in $ports; do
     if ! preflight_port "$p" vibe-emergency-proxy; then
