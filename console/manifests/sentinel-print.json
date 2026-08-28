@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "slug": "sentinel-print",
+  "displayName": "Vibe Print Gateway",
+  "description": "Print routing and controlled egress: the only thing on the network allowed to talk to a printer.",
+  "runtime": "sentinel",
+  "_doc": "Runs ghcr.io/kisaesdevlab/vibe-printer - the SAME image the Vibe Appliance installs, so a firm running both runs one packaging of one product. It is an API print gateway, not a print server: it dials OUT to devices on tcp/9100 and tcp/631 and publishes no IPP queues. Held release and the scanner inbox do not exist upstream yet, so Decision 26 and SENT-PR-009 are NOT enforced by this module today.",
+  "bootOrder": 70,
+  "requiredApps": [
+    "sentinel-core"
+  ],
+  "hostPorts": [
+    {
+      "port": 8632,
+      "proto": "tcp",
+      "bind": "mesh",
+      "label": "Vibe Print gateway + admin UI"
+    }
+  ],
+  "resources": {
+    "cores": 0.5,
+    "ramMb": 512
+  },
+  "disableRequires": "compensating-control",
+  "ingress": {
+    "via": "mesh",
+    "origin": "http",
+    "hostname": "print"
+  },
+  "preUninstallExport": {
+    "command": [
+      "bash",
+      "uninstall.sh",
+      "--export-dir",
+      "/var/lib/vibe-sentinel/exports"
+    ],
+    "description": "pg_dump of every database, a tarball per volume, host state, config and an EXPORT-MANIFEST.json. Runs BEFORE anything is removed; skipping takes a typed confirmation."
+  },
+  "license": {
+    "name": "PolyForm Internal Use 1.0.0",
+    "note": "Free with any licensed Vibe product for a firm's own use. The MSP/multi-tenant tier - monitoring OTHER firms - is the only paid one. Third-party components keep their own licenses.",
+    "url": "https://polyformproject.org/licenses/internal-use/1.0.0/"
+  },
+  "health": {
+    "script": "healthcheck.sh",
+    "doc": "Run from the module's directory in the installer checkout; exit 0 means healthy. Several modules have no HTTP surface to probe, and pulse's probe must assert the pinned build is the one running rather than merely that something answered."
+  }
+}

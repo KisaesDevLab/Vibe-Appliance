@@ -421,6 +421,12 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
             .catch(() => null),
         ]);
         renderStatus(status);
+        // Feeds the resource gate on foreign-runtime cards. Stays null on a
+        // host where MemAvailable is unreadable, and the gate is then simply
+        // not applied - better than disabling a button on a guess.
+        _hostCapacity = (status.host && typeof status.host.mem_available_mb === 'number')
+          ? { cores: status.host.cpus || 0, memAvailableMb: status.host.mem_available_mb }
+          : null;
         renderApps(apps.apps || []);
         renderInfra((infra && infra.infra) || []);
         renderFirstLogin((firstLogin && firstLogin.first_login) || []);
@@ -765,12 +771,89 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
         summary.textContent = '0 apps known';
         return;
       }
-      summary.textContent = apps.length + ' app(s) registered, ' +
-        apps.filter(a => a.enabled && a.status === 'running').length + ' running';
 
-      list.innerHTML = apps.map(a => {
+      // Units another orchestrator installs get their own collapsed group.
+      // Nine Sentinel modules would otherwise nearly double this page and bury
+      // the eight Vibe apps a firm came for - and most firm hosts cannot run
+      // them anyway, so a flat list would show nine rows that can never enable.
+      const own = apps.filter(a => (a.runtime || 'appliance') === 'appliance');
+      const foreign = apps.filter(a => (a.runtime || 'appliance') !== 'appliance')
+                          .sort((x, y) => (x.bootOrder ?? 999) - (y.bootOrder ?? 999));
+
+      summary.textContent = own.length + ' app(s) registered, ' +
+        own.filter(a => a.enabled && a.status === 'running').length + ' running' +
+        (foreign.length ? ' · ' + foreign.length + ' Sentinel module(s)' : '');
+
+      list.innerHTML = own.map(renderAppCard).join('') +
+        (foreign.length ? renderForeignGroup(foreign) : '');
+
+      list.querySelectorAll('button[data-action]').forEach(btn => {
+        btn.addEventListener('click', () => toggle(btn));
+      });
+    }
+
+    // Free capacity on THIS host, reported by /api/v1/status. Null until the
+    // first refresh lands, in which case the resource line is simply omitted
+    // rather than guessed at.
+    let _hostCapacity = null;
+
+    function renderForeignGroup(items) {
+      const running = items.filter(a => a.enabled && a.status === 'running').length;
+      const lic = items.find(a => a.license && a.license.name);
+      return `
+        <details class="app-card" id="sentinel-group"${_sentinelGroupOpen ? ' open' : ''}>
+          <summary class="app-card__title" style="cursor:pointer">
+            Security &amp; Compliance (Vibe Sentinel)
+            <span class="badge ${running ? 'badge--good' : ''}">${running} of ${items.length} running</span>
+          </summary>
+          <p class="muted app-card__desc" style="margin-top:0.6rem">
+            Installed and upgraded by <span class="mono">vibe-sentinel-installer</span>, not by this
+            appliance: its modules run in their own compose project with their own database and their
+            own ingress. This console lists them, reports what they need, and starts and stops them.
+            ${lic ? escapeHtml(lic.license && lic.license.name || (lic.license || {}).name || '') : ''}
+          </p>
+          ${lic && lic.license ? '<p class="muted app-card__desc"><strong>Licence:</strong> ' +
+             escapeHtml(lic.license.name) + (lic.license.note ? ' — ' + escapeHtml(lic.license.note) : '') +
+             '</p>' : ''}
+          <div style="margin-top:0.8rem">${items.map(renderAppCard).join('')}</div>
+        </details>`;
+    }
+
+    // Preserved across the 15s refresh so an open group does not snap shut
+    // while an operator is reading it.
+    let _sentinelGroupOpen = false;
+    document.addEventListener('toggle', (e) => {
+      if (e.target && e.target.id === 'sentinel-group') _sentinelGroupOpen = e.target.open;
+    }, true);
+
+    function renderAppCard(a) {
+        const foreign = (a.runtime || 'appliance') !== 'appliance';
         const notPublished = a.image_published === false;
-        const enableDisabled = !a.enabled && notPublished;
+        // A foreign runtime's images are not all on GHCR (Wazuh, Falco and
+        // CrowdSec are not ours), and checkGhcrPublished correctly returns
+        // null for those - so the publish badge must not gate its button.
+        let enableDisabled = !a.enabled && !foreign && notPublished;
+        let enableTitle = enableDisabled ? 'Image not published to GHCR yet' : '';
+
+        // Resource floor, checked as FREE capacity. The honest answer for most
+        // firm hosts is a second box, and saying so before the click beats a
+        // failed install.
+        let resourceHint = '';
+        if (foreign && a.resources && _hostCapacity) {
+          const needC = a.resources.cores || 0, needM = a.resources.ramMb || 0;
+          const haveC = _hostCapacity.cores || 0, haveM = _hostCapacity.memAvailableMb || 0;
+          if (haveC < needC || haveM < needM) {
+            enableDisabled = !a.enabled;
+            enableTitle = 'This host is too small for this module';
+            resourceHint =
+              '<div class="error-banner">This host has ' + haveC + ' cores and ' +
+              haveM + ' MB free; <strong>' + escapeHtml(a.displayName) + '</strong> needs ' +
+              needC + ' cores and ' + needM + ' MB <em>free</em>. That is the usual case, not a ' +
+              'misconfiguration \u2014 install Sentinel on its own host and point it at the same ' +
+              'firm domain. This console will keep listing the module and link to it once it answers.' +
+              '</div>';
+          }
+        }
 
         // Build the "image source" hint surfaced when a build is missing.
         let imageHint = '';
@@ -793,14 +876,24 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
             <div class="app-card__badges">
               ${appBadge(a.status)}
               ${a.update_available ? '<span class="badge badge--warn">update available</span>' : ''}
-              ${notPublished ? '<span class="badge badge--bad">image not published</span>' : ''}
+              ${!foreign && notPublished ? '<span class="badge badge--bad">image not published</span>' : ''}
+              ${foreign ? '<span class="badge">' + escapeHtml(a.runtime) + '</span>' : ''}
+              ${a.disableRequires === 'compensating-control' ? '<span class="badge badge--warn" title="Turning this off needs a recorded compensating control">Security Six</span>' : ''}
+              ${a.harnessGate ? '<span class="badge" title="Upgrades are gated on a detection-harness run in the owning installer">harness-gated</span>' : ''}
             </div>
           </header>
           <p class="muted app-card__desc">${escapeHtml(a.description)}</p>
           <dl class="kv app-card__kv">
             <dt>slug</dt><dd>${escapeHtml(a.slug)}</dd>
-            <dt>subdomain</dt><dd>${escapeHtml(a.subdomain)}</dd>
-            <dt>build</dt><dd>${
+            ${a.subdomain ? '<dt>subdomain</dt><dd>' + escapeHtml(a.subdomain) + '</dd>' : ''}
+            ${foreign && a.resources ? '<dt>needs</dt><dd>' + (a.resources.cores || 0) +
+               ' cores · ' + (a.resources.ramMb || 0) + ' MB free' +
+               (a.resources.diskFormula ? ' <span class="muted">· disk: ' +
+                 escapeHtml(a.resources.diskFormula) + '</span>' : '') + '</dd>' : ''}
+            ${foreign && a.hostPrereqs && a.hostPrereqs.length
+               ? '<dt>host needs</dt><dd class="mono">' +
+                 a.hostPrereqs.map(escapeHtml).join('<br>') + '</dd>' : ''}
+            ${foreign ? '' : `<dt>build</dt><dd>${
               // The build row replaces the prior "tag" row (which only
               // ever showed `latest` — useless for verifying an update
               // actually took). Priority order:
@@ -841,10 +934,15 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
                 if (a.image_digest_short) return '<span class="mono">' + escapeHtml(a.image_digest_short) + '</span>';
                 return '<span class="muted mono">' + escapeHtml(a.image_tag || a.defaultTag || '—') + '</span>';
               })()
-            }${a.image_created ? ' <span class="muted">· built ' + escapeHtml(new Date(a.image_created).toLocaleString()) + '</span>' : ''}</dd>
-            <dt>url</dt><dd>${a.enabled && a.status === 'running' && a.url.startsWith('http')
+            }${a.image_created ? ' <span class="muted">· built ' + escapeHtml(new Date(a.image_created).toLocaleString()) + '</span>' : ''}</dd>`}
+            ${foreign
+              ? (a.ingress && a.ingress.hostname
+                  ? '<dt>served at</dt><dd class="mono">' + escapeHtml(a.ingress.hostname) +
+                    '.&lt;your-domain&gt;</dd><dd class="muted">published by Sentinel\'s own ingress, not by this appliance</dd>'
+                  : '<dt>served at</dt><dd class="muted">no public surface \u2014 reached over the private network</dd>')
+              : `<dt>url</dt><dd>${a.enabled && a.status === 'running' && a.url.startsWith('http')
                               ? '<a href="' + escapeHtml(a.url) + '">' + escapeHtml(a.url) + '</a>'
-                              : '<span class="muted">' + escapeHtml(a.url) + '</span>'}</dd>
+                              : '<span class="muted">' + escapeHtml(a.url) + '</span>'}</dd>`}
             ${a.lanFallbackUrl ? `
             <dt>backup</dt><dd><a href="${escapeHtml(a.lanFallbackUrl)}">${escapeHtml(a.lanFallbackUrl)}</a>
               <span class="muted">(LAN / Tailscale only)</span></dd>` : ''}
@@ -856,18 +954,24 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
               <span class="muted">(via Tailscale Serve)</span></dd>` : ''}
           </dl>
           ${imageHint}
+          ${resourceHint}
           ${a.error ? '<div class="error-banner">' + escapeHtml(a.error) + '</div>' : ''}
           ${a.update_error ? '<div class="error-banner">last update error: ' + escapeHtml(a.update_error) + '</div>' : ''}
           <div class="app-card__actions">
-            ${a.enabled && a.update_available
+            ${!foreign && a.enabled && a.update_available
               ? '<button class="btn"             data-action="update"   data-slug="' + escapeHtml(a.slug) + '" title="Pull the newer tag from GHCR, recreate, and roll back automatically on health failure">Update</button>'
               : ''}
             ${a.enabled
-              ? '<button class="btn btn--ghost" data-action="disable" data-slug="' + escapeHtml(a.slug) + '">Disable</button>'
+              ? '<button class="btn btn--ghost" data-action="disable" data-slug="' + escapeHtml(a.slug) + '"' +
+                  (a.disableRequires === 'compensating-control'
+                    ? ' data-requires-control="1"' : '') + '>Disable</button>'
               : '<button class="btn"             data-action="enable"  data-slug="' + escapeHtml(a.slug) + '"' +
-                  (enableDisabled ? ' disabled title="Image not published to GHCR yet"' : '') + '>Enable</button>'}
-            ${a.enabled && a.update_history && a.update_history.length
+                  (enableDisabled ? ' disabled title="' + escapeHtml(enableTitle) + '"' : '') + '>Enable</button>'}
+            ${!foreign && a.enabled && a.update_history && a.update_history.length
               ? '<button class="btn btn--ghost" data-action="rollback" data-slug="' + escapeHtml(a.slug) + '">Roll back</button>'
+              : ''}
+            ${foreign && a.enabled
+              ? '<span class="muted" style="align-self:center">Updates run through the Sentinel installer\'s own harness-gated upgrade.</span>'
               : ''}
           </div>
           ${a.update_history && a.update_history.length ? `
@@ -887,11 +991,6 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
           <pre class="app-card__output" hidden></pre>
         </article>
       `;
-      }).join('');
-
-      list.querySelectorAll('button[data-action]').forEach(btn => {
-        btn.addEventListener('click', () => toggle(btn));
-      });
     }
 
     async function toggle(btn) {
@@ -918,8 +1017,28 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
         null;
       if (!apiPath) return;
 
+      // Turning off a Security Six module leaves a hole something else must
+      // fill, and the firm's compliance scorecard still needs an answer for
+      // it. The server refuses without one too; asking here means the operator
+      // types it once instead of reading a failed job.
+      let body;
+      if (action === 'disable' && btn.dataset.requiresControl === '1') {
+        const reason = window.prompt(
+          'Turning this off leaves a gap in the firm\'s Security Six.\n\n' +
+          'What does the firm use instead? (e.g. "firm uses Tailscale", ' +
+          '"firm uses 1Password Business")');
+        if (!reason || !reason.trim()) { btn.disabled = false; await refresh(); return; }
+        const approver = window.prompt('Who approved this? (name and role, e.g. "Jane Smith, QI")');
+        if (!approver || !approver.trim()) { btn.disabled = false; await refresh(); return; }
+        body = JSON.stringify({ reason: reason.trim(), approver: approver.trim() });
+      }
+
       try {
-        const r = await fetch(apiPath, { method: 'POST', credentials: 'same-origin' });
+        const r = await fetch(apiPath, {
+          method: 'POST',
+          credentials: 'same-origin',
+          ...(body ? { headers: { 'Content-Type': 'application/json' }, body } : {}),
+        });
         const data = await r.json();
         if (!r.ok) {
           out.hidden = false;

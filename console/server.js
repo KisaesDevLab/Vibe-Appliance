@@ -40,6 +40,16 @@ const SQLITE_PATH    = path.join(SQLITE_DIR, 'console.sqlite');
 const MANIFESTS_DIR  = path.join(__dirname, 'manifests');
 const ENABLE_SCRIPT  = path.join(APPLIANCE_DIR, 'lib', 'enable-app.sh');
 const DISABLE_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'disable-app.sh');
+// Lifecycle for units another orchestrator owns. Same argv shape as the two
+// above (`bash <script> <slug>`) so runToggle needs no second code path; the
+// action and the compensating-control fields travel in the environment.
+const SENTINEL_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'sentinel-module.sh');
+
+// Which orchestrator installs a unit. Absent means this appliance, which is
+// what every manifest written before the field existed means.
+function appRuntime(manifest) {
+  return (manifest && manifest.runtime) || 'appliance';
+}
 const CUSTOMER_VISIBILITY_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'set-customer-visibility.sh');
 const DOCTOR_SCRIPT  = path.join(APPLIANCE_DIR, 'doctor.sh');
 const UPDATE_SCRIPT  = path.join(APPLIANCE_DIR, 'update.sh');
@@ -1612,6 +1622,10 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
     Object.values(MANIFESTS).map(async (m) => {
       const s = stateApps[m.slug] || {};
       if (!s.enabled) return;
+      // A foreign runtime's containers live in another compose project with
+      // names this appliance does not know. _appCanonicalContainer derives one
+      // from image.server, which such a manifest may not even have.
+      if (appRuntime(m) !== 'appliance') return;
       const containerName = _appCanonicalContainer(m);
       imageInfoBySlug[m.slug] = await _inspectAppImage(containerName);
     }),
@@ -1658,6 +1672,29 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
         // operators vibe-1099 lived at https://vibe.example.com/1099/,
         // which Caddy answers with the console landing page.
         rootServedOnly: m.rootServedOnly === true,
+        // --- federation ---------------------------------------------------
+        // `appliance` for every Vibe app. The admin UI groups anything else
+        // into its own collapsed section and routes its buttons elsewhere.
+        runtime: appRuntime(m),
+        // Floor checked as FREE capacity before Enable is offered. Sentinel's
+        // core wants 4 cores / 8 GB against a 1vcpu/2GB reference droplet, so
+        // for most firms the honest answer is a second host - and saying so up
+        // front beats a failed install.
+        resources: m.resources || null,
+        hostPrereqs: m.hostPrereqs || null,
+        // Surfaced so an operator sees the terms before installing. Never
+        // enforced: gating a compliance tool behind an entitlement check is
+        // the wrong trade.
+        license: m.license || null,
+        // Where its own installer publishes it, so we can link without having
+        // learned Cloudflare Access, gRPC origins or DNS-01 wildcards.
+        ingress: m.ingress || null,
+        // Non-null when turning it off needs a recorded compensating control.
+        disableRequires: m.disableRequires || null,
+        // Non-null when its upgrade is gated on a harness run. Surfaced only;
+        // the gate lives in the owning installer, where there is no --force.
+        harnessGate: m.harnessGate || null,
+        bootOrder: typeof m.bootOrder === 'number' ? m.bootOrder : null,
         // Server-resolved URL path segment. The wizard builds its own
         // URLs (it targets a hypothetical domain-mode host, not the
         // current one) so it can't reuse `url` — without this it would
@@ -1789,10 +1826,42 @@ app.get('/api/v1/admin/customer-visibility', requireAdmin, (_req, res) => {
 // bandwidth and trigger registry rate-limits. Same 10-req/min/IP
 // budget as the test endpoints, keyed separately by req.path.
 app.post('/api/v1/enable/:slug', requireAdmin, testRateLimit, async (req, res) => {
+  const m = MANIFESTS[req.params.slug];
+  if (m && appRuntime(m) !== 'appliance') {
+    return runToggle(req, res, SENTINEL_SCRIPT, 'enable',
+                     { VIBE_SENTINEL_ACTION: 'enable' });
+  }
   await runToggle(req, res, ENABLE_SCRIPT, 'enable');
 });
 
 app.post('/api/v1/disable/:slug', requireAdmin, testRateLimit, async (req, res) => {
+  const m = MANIFESTS[req.params.slug];
+  if (m && appRuntime(m) !== 'appliance') {
+    // Disabling a Security Six module leaves a hole something else must fill,
+    // and the compliance scorecard still needs an answer for it. Collect what
+    // the firm uses instead BEFORE spawning anything - the script refuses
+    // without it too, but refusing here gives the UI a 400 it can render as a
+    // form rather than a failed job.
+    const body = req.body || {};
+    const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
+    const approver = typeof body.approver === 'string' ? body.approver.trim() : '';
+    if (m.disableRequires === 'compensating-control' && (!reason || !approver)) {
+      return res.status(400).json({
+        error: 'compensating-control-required',
+        detail: `${m.displayName} provides one of the Security Six. Record what the ` +
+                'firm uses instead, and who approved it, before turning it off.',
+        fields: ['reason', 'approver'],
+      });
+    }
+    if (reason.length > 500 || approver.length > 200) {
+      return res.status(400).json({ error: 'reason or approver too long' });
+    }
+    return runToggle(req, res, SENTINEL_SCRIPT, 'disable', {
+      VIBE_SENTINEL_ACTION: 'disable',
+      VIBE_SENTINEL_REASON: reason,
+      VIBE_SENTINEL_APPROVER: approver,
+    });
+  }
   await runToggle(req, res, DISABLE_SCRIPT, 'disable');
 });
 
@@ -4164,7 +4233,14 @@ function buildSettingsRegistry() {
     // settings" instead.
     const env = m.env || {};
     if (!m.env) {
-      log('warn', 'manifest has no env block; no settings registered', { slug: m.slug });
+      // A unit another orchestrator installs has no env block here BY DESIGN:
+      // this appliance never renders its environment, so there is nothing to
+      // surface on the Settings page. Warning about all nine on every boot
+      // would train operators to ignore the warning that matters - a Vibe app
+      // whose manifest really is malformed.
+      if (appRuntime(m) === 'appliance') {
+        log('warn', 'manifest has no env block; no settings registered', { slug: m.slug });
+      }
     }
     const entries = [...(env.required || []), ...(env.optional || [])];
     for (const e of entries) {
@@ -5743,7 +5819,7 @@ async function runShell(res, args, action, extra = {}) {
   });
 }
 
-async function runToggle(req, res, script, action) {
+async function runToggle(req, res, script, action, extraEnv) {
   const slug = req.params.slug;
   if (!SLUG_RE.test(slug)) {
     return res.status(400).json({ error: 'invalid slug' });
@@ -5761,6 +5837,11 @@ async function runToggle(req, res, script, action) {
       ...process.env,
       APPLIANCE_DIR,
       VIBE_DIR,
+      // Values a foreign-runtime script needs, passed as environment rather
+      // than argv so every lifecycle script keeps the same `bash <script>
+      // <slug>` shape. They are NEVER interpolated into a shell command -
+      // spawn takes an argv array and the script reads them as variables.
+      ...(extraEnv || {}),
       // Inherit DOCKER_HOST etc. from compose; the socket is mounted.
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -6171,6 +6252,20 @@ app.use((_req, res) => {
   res.status(404).type('text/plain').send('Not found\n');
 });
 
+// MemAvailable in MB, or null where /proc is not present (a non-Linux dev
+// host). Null rather than a guess: the UI omits the resource gate entirely
+// when it does not know, which is the right failure direction - it must not
+// disable an Enable button on a number it invented.
+function _memAvailableMb() {
+  try {
+    const meminfo = fs.readFileSync('/proc/meminfo', 'utf8');
+    const m = meminfo.match(/^MemAvailable:\s+(\d+) kB$/m);
+    return m ? Math.floor(Number(m[1]) / 1024) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function collectStatus() {
   const dockerInfo = await docker.info();
 
@@ -6218,6 +6313,12 @@ async function collectStatus() {
     host: {
       cpus:     dockerInfo.NCPU,
       mem_total_bytes: dockerInfo.MemTotal,
+      // FREE memory, which is the number that decides whether a heavy module
+      // can be enabled. MemTotal on a 2 GB droplet already running eight Vibe
+      // apps says nothing useful; MemAvailable is what is actually left for a
+      // new workload. Read from /proc rather than os.freemem(), which excludes
+      // reclaimable page cache and therefore under-reports badly.
+      mem_available_mb: _memAvailableMb(),
     },
     disk,
     containers: containerList,

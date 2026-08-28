@@ -357,6 +357,19 @@ cmd_update() {
   local manifest="$(_manifest_path "$slug")"
 
   [[ -f "$manifest" ]] || die "manifest not found: $manifest"
+  # Units another orchestrator installs are not ours to update. A Sentinel
+  # module's images live in versions/manifest.json on that side, and five
+  # families are gated on a detection-harness run with deliberately no
+  # --force - a gate this script has no equivalent for and must not step
+  # around. Say who owns the upgrade instead of failing on a missing
+  # image.server three steps in.
+  local _runtime
+  _runtime="$(_manifest_field "$manifest" 'data.get("runtime","appliance")')"
+  if [[ -n "$_runtime" && "$_runtime" != "appliance" ]]; then
+    die "$slug is a '${_runtime}' unit; this appliance does not update it." "Its own installer owns the upgrade, including the harness gate on Uptime Kuma, Vaultwarden, NetBird, Authentik and Wazuh:
+    sudo bash /opt/vibe-sentinel-installer/upgrade/upgrade.sh <version> --dry-run"
+  fi
+
   log_set_phase "update"
   log_step "starting update" slug="$slug"
 
@@ -518,6 +531,19 @@ cmd_rollback() {
   local slug="$1"
   local manifest="$(_manifest_path "$slug")"
   [[ -f "$manifest" ]] || die "manifest not found: $manifest"
+  # Units another orchestrator installs are not ours to update. A Sentinel
+  # module's images live in versions/manifest.json on that side, and five
+  # families are gated on a detection-harness run with deliberately no
+  # --force - a gate this script has no equivalent for and must not step
+  # around. Say who owns the upgrade instead of failing on a missing
+  # image.server three steps in.
+  local _runtime
+  _runtime="$(_manifest_field "$manifest" 'data.get("runtime","appliance")')"
+  if [[ -n "$_runtime" && "$_runtime" != "appliance" ]]; then
+    die "$slug is a '${_runtime}' unit; this appliance does not update it." "Its own installer owns the upgrade, including the harness gate on Uptime Kuma, Vaultwarden, NetBird, Authentik and Wazuh:
+    sudo bash /opt/vibe-sentinel-installer/upgrade/upgrade.sh <version> --dry-run"
+  fi
+
 
   log_set_phase "update-rollback"
   log_step "rolling back $slug to vibe-rollback-${slug}"

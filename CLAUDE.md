@@ -14,7 +14,7 @@ These govern every change. If a change violates one, push back on the change.
 
 1. **Recoverability over polish.** Every script is idempotent. Every error message has a recovery hint. Every phase health-checks before continuing. Pre-flight is ruthless. The happy path is the easy half.
 2. **Additive, never replacing.** Each Vibe app's standalone install (its own `scripts/install.sh`, its own compose) keeps working unchanged. The appliance composes the same GHCR images. Standalone and appliance are two harnesses around one set of images. **Do not vendor app code into this repo.**
-3. **Manifest-driven, not hardcoded.** Per-app data lives in each app's `.appliance/manifest.json`. The console reads manifests; it does not contain `if (slug === "vibe-tb")` branches. Adding the seventh app must be a one-file change, not a console-code change.
+3. **Manifest-driven, not hardcoded.** Per-app data lives in each app's `.appliance/manifest.json`. The console reads manifests; it does not contain `if (slug === "vibe-tb")` branches. Adding the seventh app must be a one-file change, not a console-code change. This extends past this repo: `console/manifest.schema.json` is also the contract `vibe-sentinel-installer` vendors and CI-checks, so a unit another orchestrator installs (`runtime: "sentinel"`) appears in the same catalog. Changing that schema changes a contract two repos depend on — see `docs/addenda/sentinel-federation.md`.
 4. **Click-to-execute for routine, copy-paste for surgical.** Toggle, start, stop, and update apps via console buttons. Editing env files, rotating secrets, and force-recreating volumes are copy-paste only — never executed from the browser.
 5. **State is reversible.** Every install action has an explicit reverse. Re-running bootstrap from any partial-failure state recovers cleanly without manual intervention.
 
@@ -25,7 +25,7 @@ See `docs/PLAN.md` §1 for the canonical file tree. Key anchors:
 - `bootstrap.sh` — single entry point. Phased; each phase idempotent.
 - `doctor.sh` — diagnostic runner. Called by bootstrap, by console, and standalone.
 - `update.sh` — update orchestrator. Pre-update DB backup; rollback on health-check failure.
-- `lib/` — sourced helpers (`log.sh`, `state.sh`, `preflight.sh`, `secrets.sh`, `render-caddyfile.sh`, `enable-app.sh`, `disable-app.sh`, `db-bootstrap.sh`).
+- `lib/` — sourced helpers (`log.sh`, `state.sh`, `preflight.sh`, `secrets.sh`, `render-caddyfile.sh`, `enable-app.sh`, `disable-app.sh`, `db-bootstrap.sh`, `sentinel-module.sh`).
 - `docker-compose.yml` — core only (Caddy, Postgres, Redis, Console).
 - `apps/<slug>.yml` — per-app compose overlays. Use GHCR images. Do not duplicate per-app Postgres/Redis services — point them at the shared instances.
 - `caddy/Caddyfile.tmpl` + `caddy/snippets/{domain,lan,tailscale}.conf` — templated; rendered by bootstrap.

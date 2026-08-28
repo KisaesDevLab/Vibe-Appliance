@@ -57,3 +57,30 @@ the script fails for that renderer specifically:
 | `lib/render-caddyfile.sh` | FAIL — probe upstream and both probe hostnames rendered |
 | `infra/cloudflared-up.sh` | FAIL — both probe hostnames in the ingress, both modes |
 | `lib/render-haproxy.sh` | FAIL — `fe_sentinel_probe`, `bind *:5195`, `bind *:5196` |
+
+## api-shape.sh
+
+Boots the **real console** against the real manifests and asserts what
+`/api/v1/apps` actually returns for a Sentinel module — Phase D's read path end
+to end, rather than by reading the source. It checks that all nine modules and
+all eleven Vibe apps appear, that `runtime`, `resources`, `hostPrereqs`,
+`license`, `harnessGate`, `bootOrder` and `disableRequires` are surfaced, that a
+foreign unit gets no bogus container-inspect result, that a Vibe app is
+unchanged, that `/api/v1/admin/status` reports free memory for the resource
+gate, and that the console no longer logs nine env-block warnings per boot.
+
+It needs its dependencies built for Linux, so it installs them in the
+container rather than using the repo's `node_modules`:
+
+```bash
+docker run --rm -v "$PWD:/w/appliance:ro"   -v "$PWD/tests/federation/api-shape.sh:/tmp/t.orig.sh:ro"   -v /var/run/docker.sock:/var/run/docker.sock   node:20-bookworm bash -c '
+    apt-get update -qq && apt-get install -y -qq python3 curl
+    mkdir -p /app && cp -r /w/appliance/. /app/ && rm -rf /app/console/node_modules
+    cd /app/console && npm install --omit=dev --no-audit --no-fund
+    sed "s#APP=/w/appliance#APP=/app#" /tmp/t.orig.sh > /tmp/t.sh && bash /tmp/t.sh'
+```
+
+**Verified 2026-08-28:** all 16 assertions pass. The first version of this
+script used `cond and ok(...) or bad(...)`, which is wrong — `ok()` returns
+`None`, so the `or` branch ran every time and every assertion printed both an
+OK and a FAIL. It is an `if/else` now.

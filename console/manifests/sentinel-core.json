@@ -1,0 +1,87 @@
+{
+  "schemaVersion": 1,
+  "slug": "sentinel-core",
+  "displayName": "Sentinel Core",
+  "description": "Detection and compliance control plane: Sentinel API/web/worker, Wazuh, Authentik, ntfy.",
+  "runtime": "sentinel",
+  "_doc": "Required; every other module depends on it. vm.max_map_count is not advisory - OpenSearch will not start below it.",
+  "bootOrder": 10,
+  "ownsInfra": [
+    "postgres",
+    "redis",
+    "ingress",
+    "identity",
+    "backup"
+  ],
+  "hostPorts": [
+    {
+      "port": 1514,
+      "proto": "tcp",
+      "bind": "mesh",
+      "label": "Wazuh agent events"
+    },
+    {
+      "port": 1515,
+      "proto": "tcp",
+      "bind": "mesh",
+      "label": "Wazuh agent enrollment"
+    },
+    {
+      "port": 55000,
+      "proto": "tcp",
+      "bind": "loopback",
+      "label": "Wazuh API"
+    },
+    {
+      "port": 9200,
+      "proto": "tcp",
+      "bind": "loopback",
+      "label": "OpenSearch"
+    },
+    {
+      "port": 8085,
+      "proto": "tcp",
+      "bind": "mesh",
+      "label": "ntfy push notifications"
+    }
+  ],
+  "hostPrereqs": [
+    "sysctl:vm.max_map_count>=262144",
+    "pkg:auditd",
+    "timesync"
+  ],
+  "resources": {
+    "cores": 4,
+    "ramMb": 8192,
+    "diskFormula": "agent count x retention window, +30% headroom; refuses below the computed floor"
+  },
+  "harnessGate": {
+    "family": "wazuh",
+    "gated": true,
+    "doc": "upgrade/upgrade.sh refuses to move this image unless versions/manifest.json marks the target harness_passed. There is no --force: a break in this family does not look like an outage."
+  },
+  "ingress": {
+    "via": "tunnel",
+    "access": "protect",
+    "origin": "http",
+    "hostname": "sentinel"
+  },
+  "preUninstallExport": {
+    "command": [
+      "bash",
+      "uninstall.sh",
+      "--export-dir",
+      "/var/lib/vibe-sentinel/exports"
+    ],
+    "description": "pg_dump of every database, a tarball per volume, host state, config and an EXPORT-MANIFEST.json. Runs BEFORE anything is removed; skipping takes a typed confirmation."
+  },
+  "license": {
+    "name": "PolyForm Internal Use 1.0.0",
+    "note": "Free with any licensed Vibe product for a firm's own use. The MSP/multi-tenant tier - monitoring OTHER firms - is the only paid one. Third-party components keep their own licenses.",
+    "url": "https://polyformproject.org/licenses/internal-use/1.0.0/"
+  },
+  "health": {
+    "script": "healthcheck.sh",
+    "doc": "Run from the module's directory in the installer checkout; exit 0 means healthy. Several modules have no HTTP surface to probe, and pulse's probe must assert the pinned build is the one running rather than merely that something answered."
+  }
+}

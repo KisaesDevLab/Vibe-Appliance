@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "slug": "sentinel-ai",
+  "displayName": "Sentinel AI Routing",
+  "description": "Model routing config for the Sentinel worker's summaries. Ships no container.",
+  "runtime": "sentinel",
+  "_doc": "Config only: it writes /etc/vibe-sentinel/ai/router-client.json and starts nothing. Local vibellm by default; cloud Anthropic is opt-in, metadata-only, and every call is written to the disclosure log. When the Vibe Appliance's vibe-ai-router is on the same host, setup.sh says so - two routers for one firm means two sets of provider keys, two cost ledgers and two disclosure logs.",
+  "bootOrder": 90,
+  "requiredApps": [
+    "sentinel-core"
+  ],
+  "resources": {
+    "cores": 0,
+    "ramMb": 0
+  },
+  "ingress": {
+    "via": "none"
+  },
+  "preUninstallExport": {
+    "command": [
+      "bash",
+      "uninstall.sh",
+      "--export-dir",
+      "/var/lib/vibe-sentinel/exports"
+    ],
+    "description": "pg_dump of every database, a tarball per volume, host state, config and an EXPORT-MANIFEST.json. Runs BEFORE anything is removed; skipping takes a typed confirmation."
+  },
+  "license": {
+    "name": "PolyForm Internal Use 1.0.0",
+    "note": "Free with any licensed Vibe product for a firm's own use. The MSP/multi-tenant tier - monitoring OTHER firms - is the only paid one. Third-party components keep their own licenses.",
+    "url": "https://polyformproject.org/licenses/internal-use/1.0.0/"
+  }
+}

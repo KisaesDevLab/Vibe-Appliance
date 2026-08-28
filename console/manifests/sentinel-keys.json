@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "slug": "sentinel-keys",
+  "displayName": "Vaultwarden Password Manager",
+  "description": "The firm password manager - Security Six. Runs on the shared Sentinel Postgres, separate database.",
+  "runtime": "sentinel",
+  "_doc": "THE :443 CONFLICT. On a host that also runs the Vibe Appliance, its Caddy binds 0.0.0.0:443 and wins over this specific bind. Use tunnel mode there - which is what most firms should pick anyway, since Bitwarden clients cannot complete an interactive Cloudflare Access login. Access protects /admin only. Vaultwarden migrates its schema one-way over the firm's entire vault, which is why it is harness-gated.",
+  "bootOrder": 50,
+  "requiredApps": [
+    "sentinel-core"
+  ],
+  "hostPorts": [
+    {
+      "port": 443,
+      "proto": "tcp",
+      "bind": "mesh",
+      "label": "Vaultwarden - the published endpoint in mesh_only mode"
+    }
+  ],
+  "resources": {
+    "cores": 0.5,
+    "ramMb": 512
+  },
+  "harnessGate": {
+    "family": "vaultwarden",
+    "gated": true,
+    "doc": "upgrade/upgrade.sh refuses to move this image unless versions/manifest.json marks the target harness_passed. There is no --force: a break in this family does not look like an outage."
+  },
+  "disableRequires": "compensating-control",
+  "ingress": {
+    "via": "tunnel",
+    "access": "bypass",
+    "origin": "http",
+    "hostname": "vault"
+  },
+  "preUninstallExport": {
+    "command": [
+      "bash",
+      "uninstall.sh",
+      "--export-dir",
+      "/var/lib/vibe-sentinel/exports"
+    ],
+    "description": "pg_dump of every database, a tarball per volume, host state, config and an EXPORT-MANIFEST.json. Runs BEFORE anything is removed; skipping takes a typed confirmation."
+  },
+  "license": {
+    "name": "PolyForm Internal Use 1.0.0",
+    "note": "Free with any licensed Vibe product for a firm's own use. The MSP/multi-tenant tier - monitoring OTHER firms - is the only paid one. Third-party components keep their own licenses.",
+    "url": "https://polyformproject.org/licenses/internal-use/1.0.0/"
+  },
+  "health": {
+    "script": "healthcheck.sh",
+    "doc": "Run from the module's directory in the installer checkout; exit 0 means healthy. Several modules have no HTTP surface to probe, and pulse's probe must assert the pinned build is the one running rather than merely that something answered."
+  }
+}

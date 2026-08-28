@@ -640,3 +640,80 @@ function resolve(data, pathExpr) {
   }
   return frontier;
 }
+
+// --- federation: the console must route lifecycle by runtime --------------
+
+test('the console routes enable/disable by runtime, not by slug', () => {
+  // The whole federation rests on this: a `runtime: "sentinel"` unit must
+  // reach lib/sentinel-module.sh, and everything else lib/enable-app.sh. A
+  // slug-based branch would be exactly the `if (slug === "vibe-tb")` the
+  // manifest contract exists to prevent, and would silently break the day a
+  // tenth Sentinel module appears.
+  const src = fs.readFileSync(
+    path.join(__dirname, '..', '..', 'console', 'server.js'), 'utf8');
+
+  assert.match(src, /const SENTINEL_SCRIPT\s*=/,
+    'console/server.js declares no SENTINEL_SCRIPT');
+  assert.match(src, /function appRuntime\(/,
+    'console/server.js has no appRuntime helper');
+
+  // Slice each handler and assert on its body. Building a regex from a
+  // template literal here needs double-escaping that is easy to get wrong and
+  // fails as an opaque "Invalid regular expression" rather than a useful
+  // message — indexOf says the same thing and cannot be mis-escaped.
+  for (const route of ['enable', 'disable']) {
+    const start = src.indexOf(`app.post('/api/v1/${route}/:slug'`);
+    assert.ok(start >= 0, `no /api/v1/${route}/:slug handler found`);
+    const body = src.slice(start, start + 2000);
+    assert.ok(body.includes("appRuntime(m) !== 'appliance'"),
+      `/api/v1/${route} does not branch on runtime`);
+    assert.ok(body.includes('SENTINEL_SCRIPT'),
+      `/api/v1/${route} does not route a foreign runtime to SENTINEL_SCRIPT`);
+    const branchAt = body.indexOf("appRuntime(m) !== 'appliance'");
+    const sentinelAt = body.indexOf('SENTINEL_SCRIPT');
+    assert.ok(sentinelAt > branchAt,
+      `/api/v1/${route} reaches SENTINEL_SCRIPT outside the runtime branch`);
+  }
+
+  // No slug-literal branch anywhere near the toggles.
+  assert.doesNotMatch(src, /slug\s*===\s*['"]sentinel-/,
+    'found a slug-literal branch for a Sentinel module; use runtime instead');
+});
+
+test('every foreign-runtime manifest carries what the console renders', () => {
+  // The card shows a resource floor, a licence and where the unit is served.
+  // A manifest missing them renders blank rows and, worse, skips the resource
+  // gate entirely - the operator gets an Enable button on a host that cannot
+  // run the module.
+  for (const { file, data } of manifests) {
+    if (runtimeOf(data) === 'appliance') continue;
+    assert.ok(data.resources && typeof data.resources.ramMb === 'number',
+      `${file}: no resources.ramMb, so the console cannot gate Enable on host size`);
+    assert.ok(data.license && data.license.name,
+      `${file}: no license.name, so the catalog cannot state the terms`);
+    assert.ok(data.ingress && data.ingress.via,
+      `${file}: no ingress.via, so the card cannot say where it is served`);
+    assert.ok(data.preUninstallExport && Array.isArray(data.preUninstallExport.command),
+      `${file}: no preUninstallExport, so uninstall would remove this appliance ` +
+      'without exporting compliance artifacts that must outlive the tool');
+  }
+});
+
+test('a Security Six module is disable-gated and a non-Six one is not', () => {
+  // Guards the pairing the compensating-control flow depends on: the four
+  // Security Six modules carry disableRequires, and core does not - core is
+  // refused outright by modules/module.sh because turning it off is a teardown.
+  const six = ['sentinel-mesh', 'sentinel-keys', 'sentinel-pulse', 'sentinel-print'];
+  const bySlug = new Map(manifests.map((m) => [m.data.slug, m.data]));
+  for (const slug of six) {
+    const m = bySlug.get(slug);
+    if (!m) continue;   // not yet copied in
+    assert.strictEqual(m.disableRequires, 'compensating-control',
+      `${slug} is one of the Security Six and must require a compensating control`);
+  }
+  const core = bySlug.get('sentinel-core');
+  if (core) {
+    assert.strictEqual(core.disableRequires, undefined,
+      'sentinel-core must not be disable-gated; it is refused outright instead');
+  }
+});

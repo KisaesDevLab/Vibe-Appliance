@@ -198,6 +198,79 @@ remove_network() {
   fi
 }
 
+# ---- foreign-runtime data ----------------------------------------------
+
+# Units another orchestrator installs keep their data outside /opt/vibe, so
+# `remove_data` never touches it. That is correct - but it also means an
+# operator who wipes this appliance can be left believing Sentinel went with
+# it. Worse, some of what Sentinel holds must OUTLIVE the tool: incident
+# records, reports, attestations and evidence are the firm's compliance
+# artifacts, retained indefinitely, and several of them have to survive by
+# years.
+#
+# So: run each foreign manifest's declared preUninstallExport, and say plainly
+# what this script cannot reach. It exports; it does not remove. Removing
+# Sentinel is Sentinel's own uninstall.sh, which exports first and takes a
+# typed confirmation to skip.
+export_foreign_runtimes() {
+  local manifests="${APPLIANCE_DIR}/console/manifests"
+  [[ -d "$manifests" ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  local rows
+  rows="$(python3 - "$manifests" <<'PYEOF' 2>/dev/null || true
+import json, os, sys
+d = sys.argv[1]
+seen = set()
+for f in sorted(os.listdir(d)):
+    if not f.endswith(".json") or f.startswith("_"):
+        continue
+    try:
+        m = json.load(open(os.path.join(d, f), encoding="utf-8"))
+    except Exception:
+        continue
+    if (m.get("runtime") or "appliance") == "appliance":
+        continue
+    exp = m.get("preUninstallExport") or {}
+    cmd = exp.get("command")
+    if not cmd:
+        continue
+    key = " ".join(cmd)
+    if key in seen:
+        continue
+    seen.add(key)
+    print("%s	%s	%s" % (m.get("runtime"), key, exp.get("description", "")))
+PYEOF
+)"
+  [[ -n "$rows" ]] || return 0
+
+  local runtime cmd desc
+  while IFS=$'	' read -r runtime cmd desc; do
+    [[ -n "$cmd" ]] || continue
+    step "exporting ${runtime} data before this appliance is removed"
+    note "  $desc"
+    local dir="/opt/vibe-${runtime}-installer"
+    if [[ ! -d "$dir" ]]; then
+      warn "${runtime} installer not found at $dir - nothing exported from here."
+      note  "  If ${runtime} IS installed on this host, export it yourself BEFORE removing anything:"
+      note  "    sudo bash <its installer>/uninstall.sh"
+      continue
+    fi
+    if ( cd "$dir" && eval "$cmd" ); then
+      ok "${runtime} data exported"
+    else
+      warn "${runtime} export reported errors - check its output above."
+      note  "  Do NOT continue a destructive uninstall until you have a copy of the"
+      note  "  firm's compliance artifacts; several must outlive the tool by years."
+    fi
+  done <<< "$rows"
+
+  note ""
+  note "This script does not remove ${runtime:-that} stack: it lives in its own compose"
+  note "project with its own volumes. Remove it with its own uninstaller when you"
+  note "are ready, which exports again before it deletes anything."
+}
+
 # ---- step 2: data + env -----------------------------------------------
 
 remove_data() {
@@ -324,6 +397,7 @@ case "$LEVEL" in
     stop_containers
     remove_images
     remove_network
+    export_foreign_runtimes
     remove_data
     ok "done. Re-run /opt/vibe/appliance/bootstrap.sh for a fresh install."
     ;;
@@ -335,6 +409,7 @@ case "$LEVEL" in
     stop_containers
     remove_images
     remove_network
+    export_foreign_runtimes
     remove_data
     remove_cli_symlink
     remove_cockpit

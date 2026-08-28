@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "slug": "sentinel-mesh",
+  "displayName": "NetBird Private Network",
+  "description": "The firm's private network - Security Six #6. Management, signal and dashboard.",
+  "runtime": "sentinel",
+  "_doc": "The gRPC surfaces need an h2c origin (http2Origin); without it NetBird does not work at all. The relay is the ONE possible inbound port on the whole appliance and stays off until a failed NAT test plus QI consent, recorded in the risk assessment. Bringing this module up rebinds every mesh-only listener from loopback to the real mesh IP.",
+  "bootOrder": 40,
+  "requiredApps": [
+    "sentinel-core"
+  ],
+  "hostPorts": [
+    {
+      "port": 3478,
+      "proto": "udp",
+      "bind": "any",
+      "label": "NetBird relay - opt-in only, off by default",
+      "optional": true
+    }
+  ],
+  "resources": {
+    "cores": 1,
+    "ramMb": 1024
+  },
+  "harnessGate": {
+    "family": "netbird",
+    "gated": true,
+    "doc": "upgrade/upgrade.sh refuses to move this image unless versions/manifest.json marks the target harness_passed. There is no --force: a break in this family does not look like an outage."
+  },
+  "disableRequires": "compensating-control",
+  "ingress": {
+    "via": "tunnel",
+    "access": "bypass",
+    "origin": "http2",
+    "hostname": "nb"
+  },
+  "preUninstallExport": {
+    "command": [
+      "bash",
+      "uninstall.sh",
+      "--export-dir",
+      "/var/lib/vibe-sentinel/exports"
+    ],
+    "description": "pg_dump of every database, a tarball per volume, host state, config and an EXPORT-MANIFEST.json. Runs BEFORE anything is removed; skipping takes a typed confirmation."
+  },
+  "license": {
+    "name": "PolyForm Internal Use 1.0.0",
+    "note": "Free with any licensed Vibe product for a firm's own use. The MSP/multi-tenant tier - monitoring OTHER firms - is the only paid one. Third-party components keep their own licenses.",
+    "url": "https://polyformproject.org/licenses/internal-use/1.0.0/"
+  },
+  "health": {
+    "script": "healthcheck.sh",
+    "doc": "Run from the module's directory in the installer checkout; exit 0 means healthy. Several modules have no HTTP surface to probe, and pulse's probe must assert the pinned build is the one running rather than merely that something answered."
+  }
+}

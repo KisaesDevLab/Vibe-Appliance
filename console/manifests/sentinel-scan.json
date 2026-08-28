@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "slug": "sentinel-scan",
+  "displayName": "Greenbone Vulnerability Scanning",
+  "description": "Network and device vulnerability scanning. Off by default; Wazuh already covers installed packages.",
+  "runtime": "sentinel",
+  "_doc": "Off by default and worth leaving off unless the firm has network gear or printers to scan. Needs two env keys added by hand before it will build - see modules/scan/env.schema.",
+  "bootOrder": 80,
+  "requiredApps": [
+    "sentinel-core"
+  ],
+  "hostPorts": [
+    {
+      "port": 9392,
+      "proto": "tcp",
+      "bind": "loopback",
+      "label": "Greenbone dashboard"
+    }
+  ],
+  "resources": {
+    "cores": 2,
+    "ramMb": 4096
+  },
+  "ingress": {
+    "via": "loopback",
+    "origin": "http"
+  },
+  "preUninstallExport": {
+    "command": [
+      "bash",
+      "uninstall.sh",
+      "--export-dir",
+      "/var/lib/vibe-sentinel/exports"
+    ],
+    "description": "pg_dump of every database, a tarball per volume, host state, config and an EXPORT-MANIFEST.json. Runs BEFORE anything is removed; skipping takes a typed confirmation."
+  },
+  "license": {
+    "name": "PolyForm Internal Use 1.0.0",
+    "note": "Free with any licensed Vibe product for a firm's own use. The MSP/multi-tenant tier - monitoring OTHER firms - is the only paid one. Third-party components keep their own licenses.",
+    "url": "https://polyformproject.org/licenses/internal-use/1.0.0/"
+  },
+  "health": {
+    "script": "healthcheck.sh",
+    "doc": "Run from the module's directory in the installer checkout; exit 0 means healthy. Several modules have no HTTP surface to probe, and pulse's probe must assert the pinned build is the one running rather than merely that something answered."
+  }
+}

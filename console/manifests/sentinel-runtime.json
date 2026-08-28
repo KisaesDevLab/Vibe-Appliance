@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "slug": "sentinel-runtime",
+  "displayName": "Falco Runtime Detection",
+  "description": "Container runtime behaviour detection over modern eBPF, with falcosidekick forwarding.",
+  "runtime": "sentinel",
+  "_doc": "No host ports and no web surface: it forwards to the Sentinel API over the internal network. A kernel without BTF forces the privileged fallback, which preflight records as a risk item rather than failing.",
+  "bootOrder": 30,
+  "requiredApps": [
+    "sentinel-core"
+  ],
+  "hostPrereqs": [
+    "kernel:>=5.8+btf"
+  ],
+  "resources": {
+    "cores": 0.5,
+    "ramMb": 512
+  },
+  "ingress": {
+    "via": "none"
+  },
+  "preUninstallExport": {
+    "command": [
+      "bash",
+      "uninstall.sh",
+      "--export-dir",
+      "/var/lib/vibe-sentinel/exports"
+    ],
+    "description": "pg_dump of every database, a tarball per volume, host state, config and an EXPORT-MANIFEST.json. Runs BEFORE anything is removed; skipping takes a typed confirmation."
+  },
+  "license": {
+    "name": "PolyForm Internal Use 1.0.0",
+    "note": "Free with any licensed Vibe product for a firm's own use. The MSP/multi-tenant tier - monitoring OTHER firms - is the only paid one. Third-party components keep their own licenses.",
+    "url": "https://polyformproject.org/licenses/internal-use/1.0.0/"
+  },
+  "health": {
+    "script": "healthcheck.sh",
+    "doc": "Run from the module's directory in the installer checkout; exit 0 means healthy. Several modules have no HTTP surface to probe, and pulse's probe must assert the pinned build is the one running rather than merely that something answered."
+  }
+}

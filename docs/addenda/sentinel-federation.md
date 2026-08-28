@@ -1,6 +1,7 @@
 # Vibe Appliance — Sentinel Federation Addendum
 
-**Status:** Phases A, B and C landed 2026-08-28. Phases D and E are planned, not built.
+**Status:** Phases A–E landed 2026-08-28. The build is complete; what remains is
+host testing, listed in §6.
 
 Vibe Sentinel is a security-monitoring and FTC Safeguards compliance appliance
 with its own installer (`KisaesDevLab/vibe-sentinel-installer`). A firm should
@@ -199,16 +200,64 @@ Re-run it before copying the manifests in.
 
 ---
 
-## 7. What is not built yet
+## 7. Phases D and E: the console drives it
 
-- **Phase D** — console federation: the collapsed *Security & Compliance* group,
-  Enable/Disable routed by `runtime` via a new `lib/sentinel-module.sh`, and the
-  copy-paste second-host flow.
-- **Phase E** — the compliance gates: compensating-control capture on disable,
-  `preUninstallExport` before teardown, and `hostPrereqs` in pre-flight.
+All nine manifests now live in `console/manifests/`, so the skips in §1 are
+live rather than hypothetical.
 
-Until Phase D lands, nothing in `console/manifests/` carries
-`runtime: "sentinel"` — the skips in §1 are inert here, and are covered by
-tests rather than by any live manifest. Copying the nine manifests in is the
-first step of Phase D, not something to do early: the console has no way to
-enable them yet, so they would render as buttons that cannot work.
+**The catalog.** `/api/v1/apps` surfaces `runtime`, `resources`, `hostPrereqs`,
+`license`, `ingress`, `disableRequires`, `harnessGate` and `bootOrder`. The
+admin page renders anything non-`appliance` into a collapsed *Security &
+Compliance (Vibe Sentinel)* group ordered by `bootOrder` — nine modules would
+otherwise nearly double the page and bury the apps a firm came for. A foreign
+unit's card drops the rows that only make sense for a container this appliance
+runs (build identity, the URL Caddy serves) and gains the ones that decide
+whether it can run here at all.
+
+**The resource gate.** `/api/v1/admin/status` now reports `mem_available_mb`
+from `/proc/meminfo` — free memory, not `MemTotal`, because a 2 GB droplet
+already running eight Vibe apps has nothing useful to say via the latter. When
+a module's floor exceeds what is free, the Enable button is disabled and the
+card explains that a second host is the normal answer, not a misconfiguration.
+Where `/proc` is unreadable the capacity is `null` and the gate is simply not
+applied: it must never disable a button on a number it invented.
+
+**Lifecycle.** `lib/sentinel-module.sh` is the delegate, spawned by `runToggle`
+with the same `bash <script> <slug>` shape as `enable-app.sh`; the action and
+the compensating-control fields travel in the environment, never in a composed
+shell string. It clones `/opt/vibe-sentinel-installer` at a pinned ref on first
+use — nothing is downloaded onto a firm's host until an operator asks — and
+delegates to `modules/module.sh enable|disable|health` on that side. Pre-flight
+runs `resources` and `hostPrereqs` first; when the host is too small it prints
+the exact second-host command, including the module set this catalog would have
+used, and installs nothing.
+
+**Update and rollback refuse.** `update.sh` names the owning installer instead
+of failing three steps in on a missing `image.server`. Five families are gated
+on a harness run with deliberately no `--force`, and this appliance has no
+equivalent gate — so it must not be the thing that moves them.
+
+**Phase E, the compliance gates.**
+
+- *Compensating control.* Disabling one of the Security Six is refused without
+  a reason and an approver — in the UI, in the API (a 400 the form can render),
+  in `lib/sentinel-module.sh`, and again in `modules/module.sh`, which is what
+  actually writes it to `config.json`. Four layers because a firm may
+  legitimately use Tailscale instead of NetBird, but the scorecard still needs
+  an answer.
+- *`core` cannot be disabled.* Turning it off is a teardown, so it is refused
+  outright and pointed at `uninstall.sh`, which exports first.
+- *`preUninstallExport`.* This appliance's `uninstall.sh` runs each foreign
+  manifest's declared export before `--remove-data` or `--full` deletes
+  anything, and says plainly what it cannot reach. Sentinel's data lives
+  outside `/opt/vibe`, so nothing here would otherwise touch it — and some of
+  what it holds must outlive the tool by years.
+- *`hostPrereqs`.* Checked before enable: `vm.max_map_count`, kernel version
+  and BTF, `auditd`, time sync. Each failure carries the command that fixes it.
+  OpenSearch simply will not start below the map-count floor, and finding that
+  out from a crash loop is the experience this exists to prevent.
+
+**`doctor.sh`** runs the module's own `healthcheck.sh` rather than reporting it
+as unprobeable — that script is what the owning installer would run, and it
+asserts things a curl cannot, such as Uptime Kuma's pinned build actually being
+the one running.

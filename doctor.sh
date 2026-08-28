@@ -448,16 +448,35 @@ check_app_health() {
     _check_warn "manifest missing; skipping"
     return
   fi
-  # Units another orchestrator installs are not ours to probe. A Sentinel
-  # module runs in a different compose project on a different network, so the
-  # curl below would fail to resolve the upstream and report a healthy module
-  # as down. Its own installer ships a healthcheck.sh per module; wiring that
-  # in is Phase D of the federation work.
+  # Units another orchestrator installs are not ours to probe with curl: a
+  # Sentinel module runs in a different compose project on a different
+  # network, so the probe below would fail to resolve the upstream and report
+  # a healthy module as down. What we CAN do is run the health script its own
+  # manifest declares, which is the check that installer would run itself.
   local runtime
   runtime="$(_manifest_field "$manifest" 'data.get("runtime","appliance")')"
   if [[ -n "$runtime" && "$runtime" != "appliance" ]]; then
-    _check_warn "managed by the $runtime installer - not probed from here" "Diagnose: run that installer's own health check for this module
+    local hscript
+    hscript="$(_manifest_field "$manifest" '(data.get("health") or {}).get("script","") if isinstance(data.get("health"), dict) else ""')"
+    if [[ -z "$hscript" ]]; then
+      _check_warn "managed by the $runtime installer; it declares no health script" "Diagnose: run that installer's own health check for this module
 Fix:      see the Security & Compliance section of the admin Apps tab"
+      return
+    fi
+    local mid="${slug#sentinel-}"
+    local hpath="/etc/vibe-sentinel/modules/${mid}/${hscript}"
+    [[ -f "$hpath" ]] || hpath="${SENTINEL_INSTALLER_DIR:-/opt/vibe-sentinel-installer}/modules/${mid}/${hscript}"
+    if [[ ! -f "$hpath" ]]; then
+      _check_warn "managed by the $runtime installer, which is not installed on this host" "Diagnose: ls /etc/vibe-sentinel/
+Fix:      install it from the Security & Compliance section of the admin Apps tab, or leave the module disabled"
+      return
+    fi
+    if bash "$hpath" >>"$VIBE_LOG_FILE" 2>&1; then
+      _check_pass "$runtime health script reports healthy ($hscript)"
+    else
+      _check_fail "$runtime health script reports a problem ($hscript)" "Diagnose: sudo bash $hpath
+Fix:      that installer owns this module; its output names the failing service"
+    fi
     return
   fi
 

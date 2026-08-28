@@ -40,6 +40,9 @@ Vibe-Appliance/
 │   ├── vibe-1040.yml            # api + worker + python sidecar + migrate one-shot
 │   ├── vibe-ai-router.yml       # two services from one image (ROUTER_ROLE)
 │   └── vibe-printer.yml         # single container; own SQLite, no shared PG/Redis
+├── lib/
+│   └── sentinel-module.sh       # lifecycle for runtime:"sentinel" units;
+│                                # delegates to vibe-sentinel-installer
 ├── caddy/
 │   ├── Caddyfile.tmpl           # rendered by bootstrap from CONFIG_MODE
 │   └── snippets/
