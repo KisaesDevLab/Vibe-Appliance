@@ -36,6 +36,19 @@ document is the human-readable companion.
   "requiredApps": ["vibe-ai-router"],       // optional, HARD app deps; pre-flight refuses without them
   "dataOwner":  "10001:10001",              // optional, uid:gid for /opt/vibe/data/apps/<slug>/
 
+  // --- federation: units another orchestrator installs -------------------
+  "runtime":    "appliance",                // "appliance" (default) | "sentinel"
+  "hostPorts":  [ ... ],                    // ports published on the HOST
+  "ownsInfra":  ["postgres", "redis"],      // brings its own, not the shared instance
+  "bootOrder":  30,                         // ascending start order within a runtime
+  "resources":  { "cores": 4, "ramMb": 8192 },
+  "hostPrereqs": ["sysctl:vm.max_map_count>=262144"],
+  "ingress":    { "via": "tunnel", "access": "protect" },
+  "harnessGate": { "family": "wazuh" },     // upgrade gated on a harness run
+  "disableRequires": "compensating-control",
+  "preUninstallExport": { "command": [...] },
+  "license":    { "name": "PolyForm Internal Use 1.0.0" },
+
   "env":        { ... },                    // required envelope, see below
   "database":   { ... },                    // optional; omit for stateless apps
   "requiredExtensions": ["vector"],         // optional; PG extensions the app's migrations need
@@ -101,6 +114,175 @@ one of those services to the same uid with a compose `user:` key. Change
 one without the other and the chown and the containers disagree, which
 surfaces as `EACCES` on first write. Omit the field whenever the
 image-derived uid is right, which is every other app.
+
+---
+
+## Federation: `runtime` and the fields that follow it
+
+The appliance is not the only thing that installs software on a firm's host.
+Vibe Sentinel ships its own installer, its own compose project, its own
+Postgres and Redis, and its own ingress — and a firm should still see **one**
+catalog. `runtime` is how one manifest schema describes both.
+
+```jsonc
+"runtime": "appliance"   // default; installed by lib/enable-app.sh
+"runtime": "sentinel"    // installed by vibe-sentinel-installer
+```
+
+**`appliance` is the default, and an absent `runtime` means exactly that.** The
+schema's conditional-required branch keys on `runtime === "appliance"`, and an
+absent property satisfies a `properties` subschema — so every manifest written
+before this field existed matches that branch and validates precisely as it did
+before. Nothing about the existing apps changed.
+
+### What the appliance does with a foreign runtime: nothing
+
+This is the load-bearing part. A unit with `runtime != "appliance"` is **read**
+by the console so it can appear in the catalog, and **skipped** everywhere else:
+
+| Component | Behaviour |
+|---|---|
+| `lib/render-caddyfile.sh` | `list_enabled_apps()` drops it — no vhost, no path handler, in either routing mode |
+| `lib/render-haproxy.sh` | no emergency frontend, enabled or not |
+| `infra/cloudflared-up.sh` | no ingress rule and no CNAME; naming one in `CLOUDFLARE_TUNNEL_PUBLISH` is refused with a reason |
+| `lib/enable-app.sh` / `lib/disable-app.sh` | refuse outright, naming the installer that owns it |
+| `doctor.sh` | reports it as managed elsewhere; does not probe it or check its DNS and certificates |
+
+Each of those is a failure that would otherwise be quiet and confusing. A Caddy
+vhost would point this appliance's edge at a container that is not on
+`vibe_net`. A CNAME would claim a hostname Sentinel's own provisioner also
+writes, and the two would overwrite each other on every re-run. `doctor` would
+compare a Sentinel hostname against this host's IP and report every module down.
+
+### `hostPorts`
+
+Ports published on the **host**. Appliance apps never set this — only Caddy and
+the emergency proxy publish, which is the appliance's own standing rule. It
+exists because a Sentinel module cannot avoid it: Wazuh agents dial 1514/1515,
+printers speak IPP on 631, an MFP scanning to a share needs 445. None of those
+can be reverse-proxied.
+
+```jsonc
+"hostPorts": [
+  { "port": 1514, "proto": "tcp", "bind": "mesh",     "label": "Wazuh agent events" },
+  { "port": 9200, "proto": "tcp", "bind": "loopback", "label": "OpenSearch" },
+  { "port": 30000, "portEnd": 30009, "bind": "mesh",  "label": "FTPS passive" },
+  { "port": 3478, "proto": "udp", "bind": "any", "optional": true, "label": "NetBird relay" }
+]
+```
+
+`bind` is `mesh` | `loopback` | `lan` | `any`. Conflict detection treats `any`
+as colliding with everything on that port and two different specific binds as
+compatible. `optional: true` marks a publish that only happens behind an opt-in.
+
+Declaring them is what lets **either** installer catch a conflict before a
+container fails to bind. The motivating case is live today: the appliance's
+Caddy binds `0.0.0.0:443` and Sentinel's Vaultwarden binds `<mesh-ip>:443` in
+`mesh_only` mode, and Sentinel's `preflight/ports.sh` does not check 443 at all.
+
+Two constraints are enforced by tests: host ports are globally unique across
+every manifest, and none may fall inside `5171–5198`, which belongs to the
+emergency proxy — the thing that is supposed to still work when nothing else
+does.
+
+### `ownsInfra`
+
+Infrastructure this unit brings its **own** copy of rather than sharing the
+appliance's. Values: `postgres`, `redis`, `ingress`, `identity`, `backup`.
+Anything listed is skipped by DB bootstrap and by the shared-URL env renderers.
+
+Sentinel's `core` owns all five. Its Postgres carries the `authentik` and
+`vaultwarden` schemas, and Vaultwarden migrates one-way over the firm's entire
+credential set — so pointing it at a shared instance is not a decision to make
+casually, and this field is how a manifest states the rule does not apply.
+
+### `bootOrder`
+
+Ascending start order **within one runtime**, for a stack whose units come up in
+sequence with a health gate between each. `requiredApps` already expresses the
+hard edges; this expresses ordering within a tier that has no dependency edge to
+hang it on — Wazuh's indexer, manager and dashboard refuse mixed versions and
+must move in that order.
+
+A test asserts `bootOrder` never contradicts `requiredApps`. Appliance apps omit
+it: they are independent by design and any subset is a valid stack.
+
+### `resources` and `hostPrereqs`
+
+```jsonc
+"resources":   { "cores": 4, "ramMb": 8192, "diskFormula": "agents x retention x 1.3" },
+"hostPrereqs": ["sysctl:vm.max_map_count>=262144", "kernel:>=5.8+btf", "pkg:auditd", "timesync"]
+```
+
+`resources` is a floor checked as **free** capacity, not installed capacity. The
+console runs it before the Enable button is live: the appliance's reference host
+is a 1vcpu/2GB droplet and Sentinel's core alone wants 4 cores and 8 GB, so on
+most firm hosts the honest answer is a second host — and saying so up front
+beats a failed install.
+
+`hostPrereqs` entries are real failures that are otherwise discovered late and
+cryptically: OpenSearch simply will not start below the `vm.max_map_count`
+floor, and Falco's modern eBPF probe needs a kernel with BTF or it silently
+falls back to privileged mode.
+
+### `ingress`
+
+**Describes** where a unit is published, for a runtime that owns its own ingress.
+The appliance never renders from it.
+
+```jsonc
+"ingress": { "via": "tunnel", "access": "protect", "origin": "http2", "hostname": "nb" }
+```
+
+`origin: "http2"` means an h2c origin (`http2Origin` in the tunnel config), which
+NetBird's gRPC requires and without which it does not work at all.
+`access: "bypass"` is for machine-facing endpoints that cannot complete an
+interactive Cloudflare Access login — NetBird's agent traffic, and the Bitwarden
+clients that talk to Vaultwarden.
+
+This field is what lets the console link to a Sentinel module correctly **without**
+the appliance having to learn Access policies, gRPC origins, WAF rate limits and
+ACME DNS-01 wildcards, all of which Sentinel's ingress already implements.
+
+### `harnessGate`, `disableRequires`, `preUninstallExport`
+
+The three lifecycle gates a compliance product cannot ship without.
+
+`harnessGate` marks a unit whose upgrade is gated on a detection/integration
+harness having been run against the target version. The console **surfaces** the
+state; the gate itself stays in `vibe-sentinel-installer`'s `upgrade.sh`, where
+it was designed and tested and where there is deliberately no `--force`. Five
+families are gated because a break in them does not look like an outage: Uptime
+Kuma's socket.io API is unversioned, Vaultwarden migrates one-way over the whole
+vault, NetBird is every agent's only path home, Authentik is the IdP, and Wazuh
+*is* the detection engine — a broken decoder set reads as "quiet".
+
+`disableRequires: "compensating-control"` means turning the unit off leaves a
+hole something else must fill, and the console must collect what that something
+is before proceeding. Set on Sentinel's Security Six modules: a firm may
+legitimately use Tailscale instead of NetBird or 1Password instead of
+Vaultwarden, but the compliance scorecard still needs an answer, so "off"
+without a recorded reason is refused rather than silently accepted.
+
+`preUninstallExport` runs before teardown. Incident records, reports,
+attestations and evidence are the firm's compliance artifacts, retained
+indefinitely, and several of them have to outlive the tool that produced them by
+years.
+
+### `license`
+
+Surfaced in the console catalog so an operator sees the terms before installing.
+**Never enforced** — the appliance does not gate installs on an entitlement
+check, and gating a security and compliance tool behind a network call is the
+wrong trade.
+
+### Where the contract lives
+
+`console/manifest.schema.json` in this repo is the single source of truth.
+`vibe-sentinel-installer` vendors a pinned copy at `.schema/manifest.schema.json`
+and fails CI on drift. Changing the schema is changing a contract two repos
+depend on; the test suite here asserts the conditional-required branch keeps its
+shape for exactly that reason.
 
 ---
 
@@ -367,6 +549,21 @@ A path on the app that returns 200 **only** when the app is fully
 ready: dependencies up, DB migrated, caches warm. Critical for the
 toggle flow — the appliance polls this with a 60-second timeout before
 declaring an enable successful.
+
+A foreign runtime may declare a **script** instead:
+
+```jsonc
+"health": { "script": "healthcheck.sh" }
+```
+
+The path is relative to the unit's own directory in its installer's checkout,
+and exit 0 means healthy. Sentinel modules use this because several of them have
+no HTTP surface to probe at all, and because a probe of Uptime Kuma has to
+assert the pinned build is the one running — not merely that something answered.
+
+An appliance app must use the path form: nothing on the appliance path runs a
+script from another installer's checkout, and both `doctor.sh` and
+`lib/enable-app.sh` read this field as a string. A test enforces the split.
 
 ---
 

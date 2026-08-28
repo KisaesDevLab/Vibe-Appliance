@@ -177,6 +177,13 @@ for slug in all_app_slugs:
     # candidates list below and emit no frontend. Truly headless
     # server-to-server services like vibe-glm-ocr have no port to
     # declare and stay out automatically.
+    # Another orchestrator's unit gets no emergency frontend here. A Sentinel
+    # module publishes its own host ports (manifest hostPorts) on the mesh or
+    # loopback and is reached there; binding a second listener for it in this
+    # proxy would either collide with that publish or proxy to a container
+    # that is not on vibe_net.
+    if m.get("runtime", "appliance") != "appliance":
+        continue
     upstream = m.get("routing", {}).get("default_upstream")
     if not upstream:
         continue

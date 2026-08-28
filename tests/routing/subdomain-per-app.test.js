@@ -438,3 +438,90 @@ test('render-haproxy emits the root redirect on the emergency frontend', () => {
   assert.doesNotMatch(other.split('\nfrontend ')[0], /http-request redirect/,
     'no root_redirect declared, none emitted');
 });
+
+// --- runtime federation: another orchestrator's units are not ours --------
+
+// A Sentinel module: no image, no ports, no routing, health by script, its own
+// ingress. Added to the fixture set and marked enabled, exactly as it would be
+// after the console federates it into state.json.
+function addSentinelModule(fx) {
+  fs.writeFileSync(path.join(fx.manifests, 'sentinel-core.json'), JSON.stringify({
+    schemaVersion: 1, slug: 'sentinel-core', displayName: 'Sentinel Core',
+    description: 'Detection and compliance control plane.',
+    runtime: 'sentinel',
+    subdomain: 'sentinel',
+    emergencyPort: 5195,
+    rootServedOnly: true,
+    subdomains: [{ name: 'wazuh', audience: 'staff', emergencyPort: 5196 }],
+    routing: { default_upstream: 'sentinel-web:8080' },
+    health: { script: 'healthcheck.sh' },
+    ingress: { via: 'tunnel', access: 'protect', origin: 'http' },
+  }));
+  const state = JSON.parse(fs.readFileSync(fx.stateFile, 'utf8'));
+  state.apps['sentinel-core'] = { enabled: true, status: 'running' };
+  fs.writeFileSync(fx.stateFile, JSON.stringify(state));
+  return fx;
+}
+
+test('Caddy renders nothing for a runtime it does not own, in both modes', () => {
+  // The manifest deliberately carries everything that WOULD produce output —
+  // a subdomain, a routing upstream, rootServedOnly, a secondary subdomain.
+  // Only `runtime` should stop it. Without the gate the appliance points its
+  // edge at a container that isn't on vibe_net.
+  const fx = addSentinelModule(mkFixtures());
+  for (const mode of ['single-host', 'subdomain-per-app']) {
+    const caddy = renderCaddy(fx, mode);
+    assert.doesNotMatch(caddy, /sentinel\.firm\.com/, `${mode}: no primary vhost`);
+    assert.doesNotMatch(caddy, /wazuh\.firm\.com/,    `${mode}: no secondary vhost`);
+    assert.doesNotMatch(caddy, /sentinel-web:8080/,   `${mode}: no upstream anywhere`);
+    assert.doesNotMatch(caddy, /handle \/sentinel-core\//, `${mode}: no path mount`);
+    // The appliance's own apps must be untouched by the gate.
+    assert.match(caddy, /vibe\.firm\.com \{/, `${mode}: console vhost still rendered`);
+  }
+});
+
+test('the tunnel gets no ingress rule for a runtime it does not own', () => {
+  // A CNAME written here would point at THIS tunnel while Sentinel's own
+  // provisioner points the same name at its own — the two would overwrite
+  // each other on every re-run.
+  const fx = addSentinelModule(mkFixtures());
+  for (const mode of ['single-host', 'subdomain-per-app']) {
+    const hosts = buildIngressHosts(fx, mode);
+    assert.ok(!hosts.includes('sentinel.firm.com'), `${mode}: no primary ingress rule`);
+    assert.ok(!hosts.includes('wazuh.firm.com'),    `${mode}: no secondary ingress rule`);
+    assert.ok(hosts.includes('vibe.firm.com'), `${mode}: console rule still present`);
+  }
+});
+
+test('the emergency proxy gets no frontend for a runtime it does not own', () => {
+  // It declares an emergencyPort in range, so only `runtime` stops it. A
+  // frontend here would bind a port Sentinel publishes itself, or proxy to a
+  // container on another network.
+  const fx = addSentinelModule(mkFixtures());
+  const py = extractPyeof(path.join(REPO, 'lib', 'render-haproxy.sh'), 'frontend fe_');
+  const pyFile = path.join(fx.dir, 'haproxy-runtime.py');
+  fs.writeFileSync(pyFile, py + '\n');
+  const out = path.join(fx.dir, 'haproxy-runtime.cfg');
+  execFileSync('python3', [pyFile, fx.manifests, fx.stateFile, out]);
+  const cfg = fs.readFileSync(out, 'utf8');
+  assert.doesNotMatch(cfg, /fe_sentinel_core/, 'no frontend for the foreign unit');
+  assert.doesNotMatch(cfg, /bind \*:5196/,     'its declared port is not bound');
+  assert.match(cfg, /frontend fe_duplicati/,   'infra frontends still emitted');
+});
+
+test('a foreign unit is skipped whether or not it is currently enabled', () => {
+  // render-haproxy emits a frontend for every manifest, enabled or not, so
+  // that a disabled app answers with the friendly 503 rather than a TCP
+  // reset. That "regardless of state" path must respect the runtime gate too.
+  const fx = addSentinelModule(mkFixtures());
+  const state = JSON.parse(fs.readFileSync(fx.stateFile, 'utf8'));
+  state.apps['sentinel-core'].enabled = false;
+  fs.writeFileSync(fx.stateFile, JSON.stringify(state));
+
+  const py = extractPyeof(path.join(REPO, 'lib', 'render-haproxy.sh'), 'frontend fe_');
+  const pyFile = path.join(fx.dir, 'haproxy-disabled.py');
+  fs.writeFileSync(pyFile, py + '\n');
+  const out = path.join(fx.dir, 'haproxy-disabled.cfg');
+  execFileSync('python3', [pyFile, fx.manifests, fx.stateFile, out]);
+  assert.doesNotMatch(fs.readFileSync(out, 'utf8'), /fe_sentinel_core/);
+});

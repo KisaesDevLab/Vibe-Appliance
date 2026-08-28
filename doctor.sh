@@ -448,6 +448,19 @@ check_app_health() {
     _check_warn "manifest missing; skipping"
     return
   fi
+  # Units another orchestrator installs are not ours to probe. A Sentinel
+  # module runs in a different compose project on a different network, so the
+  # curl below would fail to resolve the upstream and report a healthy module
+  # as down. Its own installer ships a healthcheck.sh per module; wiring that
+  # in is Phase D of the federation work.
+  local runtime
+  runtime="$(_manifest_field "$manifest" 'data.get("runtime","appliance")')"
+  if [[ -n "$runtime" && "$runtime" != "appliance" ]]; then
+    _check_warn "managed by the $runtime installer - not probed from here" "Diagnose: run that installer's own health check for this module
+Fix:      see the Security & Compliance section of the admin Apps tab"
+    return
+  fi
+
   local upstream health
   upstream="$(_manifest_field "$manifest" 'data["routing"]["matchers"][0]["upstream"] if data["routing"].get("matchers") else data["routing"]["default_upstream"]')"
   health="$(_manifest_field "$manifest" 'data["health"]')"
@@ -1061,6 +1074,16 @@ if [[ "$mode" == "domain" && -n "$domain" ]]; then
   while IFS= read -r slug; do
     [[ -z "$slug" ]] && continue
     manifest="${APPLIANCE_DIR}/console/manifests/${slug}.json"
+
+    # Hostnames another orchestrator provisions are not ours to verify. A
+    # Sentinel module's CNAME points at ITS tunnel, not at this host, so
+    # check_dns_host would compare against the wrong address and fail every
+    # one of them. Its own preflight/dns.sh owns those records.
+    _runtime="appliance"
+    [[ -f "$manifest" ]] && _runtime="$(_manifest_field "$manifest" 'data.get("runtime","appliance")')"
+    if [[ "$_runtime" != "appliance" ]]; then
+      continue
+    fi
 
     # rootServedOnly apps get a per-app hostname in single-host mode too
     # (render_root_served_vhosts) — check theirs in both modes, or the

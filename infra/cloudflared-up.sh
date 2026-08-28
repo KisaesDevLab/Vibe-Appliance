@@ -609,6 +609,7 @@ apps = (state.get("apps") or {})
 
 # slug → label (for the printed summary)
 slug_to_label = {}
+foreign_slugs = {}
 for f in sorted(os.listdir(manifests_dir)):
   if not f.endswith(".json") or f.startswith("_"):
     continue
@@ -617,12 +618,27 @@ for f in sorted(os.listdir(manifests_dir)):
   except Exception:
     continue
   slug = m.get("slug")
-  if slug:
-    slug_to_label[slug] = m.get("name") or slug
+  if not slug:
+    continue
+  # Skip units another orchestrator publishes. Without this an operator who
+  # names a Sentinel module in CLOUDFLARE_TUNNEL_PUBLISH gets a cheerful
+  # "publishing N apps" and no rule, because the ingress builder below drops
+  # it again. Being told the slug is not ours to publish is the useful answer.
+  if m.get("runtime", "appliance") != "appliance":
+    foreign_slugs[slug] = m.get("runtime")
+    continue
+  slug_to_label[slug] = m.get("name") or slug
 
 requested = [s.strip() for s in publish_csv.split(",") if s.strip()]
 ok = []
 for slug in requested:
+  if slug in foreign_slugs:
+    print(f"[cloudflared-up] WARN: slug '{slug}' is a {foreign_slugs[slug]} unit - "
+          f"its ingress belongs to that installer, not to this tunnel. Remove it "
+          f"from CLOUDFLARE_TUNNEL_PUBLISH; reach it at the hostname that "
+          f"installer provisions.",
+          file=sys.stderr)
+    continue
   if slug not in slug_to_label:
     print(f"[cloudflared-up] WARN: slug '{slug}' has no manifest under {manifests_dir} — skipping",
           file=sys.stderr)
@@ -709,6 +725,15 @@ for slug, entry in (state.get("apps") or {}).items():
     with open(man_path) as f:
       manifest = json.load(f)
   except (FileNotFoundError, ValueError):
+    continue
+  # Another orchestrator owns this unit's ingress. Sentinel runs its own
+  # cloudflared with its own Access policies, gRPC (http2Origin) origins and
+  # ACME DNS-01 wildcard; adding its hostnames to THIS tunnel would create a
+  # second route to the same name, and the CNAME would point at this tunnel
+  # rather than Sentinel's - so Sentinel's own provisioner would then fight
+  # this one over the record on every re-run. Mirrors the skip in
+  # lib/render-caddyfile.sh::list_enabled_apps.
+  if manifest.get("runtime", "appliance") != "appliance":
     continue
   subdomains = manifest.get("subdomains") or []
   primary = manifest.get("subdomain", "")

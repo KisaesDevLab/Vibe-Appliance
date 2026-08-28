@@ -37,6 +37,11 @@ const manifests = files.map((f) => ({
   data: JSON.parse(fs.readFileSync(path.join(MANIFESTS_DIR, f), 'utf8')),
 }));
 
+// Which orchestrator installs a unit. Absent means the appliance, which is
+// what every manifest written before the field existed means.
+const runtimeOf = (m) => m.runtime || 'appliance';
+const applianceManifests = () => manifests.filter(({ data }) => runtimeOf(data) === 'appliance');
+
 test('there is at least one app manifest to check', () => {
   assert.ok(manifests.length > 0, 'no manifests found in ' + MANIFESTS_DIR);
 });
@@ -47,7 +52,11 @@ test('every manifest carries the fields enable-app.sh pre-flight requires', () =
   // has already told the operator the app is installable.
   const required = ['schemaVersion', 'slug', 'displayName', 'description',
                     'image', 'subdomain', 'ports', 'routing', 'env', 'health'];
-  for (const { file, data } of manifests) {
+  // Only for units this appliance installs. A Sentinel module has no
+  // subdomain (Falco and CrowdSec have no web surface), may ship no image at
+  // all, and routes through its own ingress — lib/enable-app.sh refuses it
+  // outright rather than pre-flighting it, so this list does not apply.
+  for (const { file, data } of applianceManifests()) {
     for (const key of required) {
       assert.ok(key in data, `${file}: missing required field "${key}"`);
     }
@@ -67,9 +76,12 @@ test('filename matches slug, and slug matches the console SLUG_RE', () => {
   }
 });
 
-test('every manifest has a matching compose overlay and env template', () => {
+test('every appliance manifest has a matching compose overlay and env template', () => {
+  // A foreign-runtime unit has neither: its compose and env live in its own
+  // installer's checkout, not in this repo. Requiring them here would force
+  // empty placeholder files whose only purpose was to satisfy a test.
   const root = path.join(__dirname, '..', '..');
-  for (const { file, data } of manifests) {
+  for (const { file, data } of applianceManifests()) {
     const overlay = path.join(root, 'apps', `${data.slug}.yml`);
     const tmpl    = path.join(root, 'env-templates', 'per-app', `${data.slug}.env.tmpl`);
     assert.ok(fs.existsSync(overlay), `${file}: missing overlay ${overlay}`);
@@ -167,7 +179,14 @@ test('public subdomains are unique and do not collide with infra hosts', () => {
     owner.set(name, slug);
   };
 
-  for (const { data } of manifests) {
+  for (const { file, data } of manifests) {
+    // A unit with no web surface at all declares no subdomain - Falco and
+    // CrowdSec are agents, not sites. Only the appliance's own apps are
+    // required to have one; every name that IS declared is still checked for
+    // collisions across BOTH runtimes, because they share one firm domain and
+    // two installers provisioning the same hostname is the real hazard.
+    if (data.subdomain === undefined && runtimeOf(data) !== 'appliance') continue;
+    assert.ok(data.subdomain, `${file}: an appliance app must declare a subdomain`);
     claim(data.subdomain, data.slug, 'primary');
     for (const sd of data.subdomains || []) {
       if (sd && sd.name) claim(sd.name, data.slug, 'subdomains[]');
@@ -195,7 +214,7 @@ test('routing upstreams are <service>:<port> and resolvable to services', () => 
   // regex over these; anything that does not match yields an empty list
   // and the enable dies with "could not derive service names".
   const UPSTREAM_RE = /^[a-z0-9.-]+:\d+$/;
-  for (const { file, data } of manifests) {
+  for (const { file, data } of applianceManifests()) {
     const routing = data.routing || {};
     assert.ok(routing.default_upstream, `${file}: routing.default_upstream is required`);
     assert.match(routing.default_upstream, UPSTREAM_RE,
@@ -215,7 +234,7 @@ test('a rootServedOnly app declares a subdomain and an emergency port', () => {
   // a per-app hostname in domain mode, and the emergency port everywhere
   // else. A manifest missing either one describes an app the operator
   // simply cannot open in one of the appliance's modes.
-  for (const { file, data } of manifests) {
+  for (const { file, data } of applianceManifests()) {
     if (data.rootServedOnly !== true) continue;
     assert.ok(data.subdomain, `${file}: rootServedOnly needs a subdomain to be served at`);
     const ports = [data.emergencyPort, ...(data.subdomains || []).map((s) => s && s.emergencyPort)];
@@ -409,6 +428,149 @@ test('a generated: secret is referenced by its env template as @NAME@', () => {
       }
     }
   }
+});
+
+test('hostPorts are well-formed and globally unique across every manifest', () => {
+  // This is the cross-appliance conflict check, and the reason the field is
+  // declared at all. Two units claiming one host port produce a container
+  // that will not bind \u2014 which is how the appliance's Caddy on 0.0.0.0:443
+  // and Vaultwarden's mesh :443 currently collide with nothing to catch it.
+  // `any` binds every interface, so it conflicts with a specific-IP bind on
+  // the same port; two different specific binds do not.
+  const claims = [];
+  for (const { file, data } of manifests) {
+    const ports = data.hostPorts;
+    if (ports === undefined) continue;
+    for (const p of ports) {
+      const end = p.portEnd === undefined ? p.port : p.portEnd;
+      assert.ok(end >= p.port,
+        `${file}: hostPorts range ${p.port}-${p.portEnd} ends before it starts`);
+      claims.push({ file, slug: data.slug, proto: p.proto || 'tcp', bind: p.bind,
+                    lo: p.port, hi: end, label: p.label || '' });
+    }
+  }
+  for (let i = 0; i < claims.length; i++) {
+    for (let j = i + 1; j < claims.length; j++) {
+      const a = claims[i], b = claims[j];
+      if (a.slug === b.slug) continue;
+      if (a.proto !== b.proto) continue;
+      if (a.hi < b.lo || b.hi < a.lo) continue;          // ranges do not touch
+      if (a.bind !== b.bind && a.bind !== 'any' && b.bind !== 'any') continue;
+      assert.fail(`host port overlap on ${a.proto} ${a.lo}-${a.hi} (${a.bind}) ` +
+                  `between ${a.slug} and ${b.slug}`);
+    }
+  }
+});
+
+test('a hostPort never lands in the emergency proxy\'s reserved range', () => {
+  // 5171-5198 belongs to lib/render-haproxy.sh, which publishes them from
+  // docker-compose.yml unconditionally. A unit binding one of them directly
+  // would race the emergency proxy for the port \u2014 and the emergency proxy
+  // is the thing that is supposed to still work when everything else does not.
+  for (const { file, data } of manifests) {
+    for (const p of data.hostPorts || []) {
+      const end = p.portEnd === undefined ? p.port : p.portEnd;
+      assert.ok(end < 5171 || p.port > 5198,
+        `${file}: hostPort ${p.port}-${end} overlaps the emergency range 5171-5198`);
+    }
+  }
+});
+
+test('fields no appliance code reads are only set on a foreign runtime', () => {
+  // Setting one of these on an appliance app is silently inert: nothing in
+  // enable-app.sh, the renderers or update.sh looks at them. Failing here is
+  // the difference between "this does nothing" and finding out months later
+  // that a declared resource floor or upgrade gate was never enforced.
+  const FOREIGN_ONLY = ['hostPorts', 'ownsInfra', 'bootOrder', 'harnessGate',
+                        'preUninstallExport', 'disableRequires'];
+  for (const { file, data } of manifests) {
+    if (runtimeOf(data) !== 'appliance') continue;
+    for (const key of FOREIGN_ONLY) {
+      assert.ok(!(key in data),
+        `${file}: declares "${key}", which no appliance code path reads. ` +
+        `Wire it up first, or set runtime to the orchestrator that honours it.`);
+    }
+  }
+});
+
+test('emergencyPort and rootServedOnly stay appliance-only', () => {
+  // Both are answered by appliance machinery \u2014 the HAProxy frontends and the
+  // Caddy root-served vhosts. render-haproxy.sh now skips foreign runtimes
+  // entirely, so an emergencyPort on one would be a promise nothing keeps.
+  for (const { file, data } of manifests) {
+    if (runtimeOf(data) === 'appliance') continue;
+    assert.ok(data.emergencyPort === undefined,
+      `${file}: emergencyPort is served by this appliance's proxy, which skips ` +
+      `runtime "${runtimeOf(data)}". Publish the port via hostPorts instead.`);
+    for (const sd of data.subdomains || []) {
+      assert.ok(!sd || sd.emergencyPort === undefined,
+        `${file}: subdomains[].emergencyPort on a foreign runtime is never bound`);
+    }
+  }
+});
+
+test('health shape matches what its runtime can probe', () => {
+  // The appliance probes an HTTP path through Caddy; it has no way to run a
+  // script that lives in another installer's checkout. doctor.sh and
+  // enable-app.sh both read this field as a string on the appliance path.
+  for (const { file, data } of manifests) {
+    const h = data.health;
+    if (h === undefined) {
+      assert.notStrictEqual(runtimeOf(data), 'appliance',
+        `${file}: an appliance app must declare health`);
+      continue;
+    }
+    if (runtimeOf(data) === 'appliance') {
+      assert.strictEqual(typeof h, 'string',
+        `${file}: appliance apps declare health as a path; nothing here runs a script`);
+      assert.match(h, /^\//, `${file}: health path must be absolute`);
+    } else if (typeof h === 'object') {
+      assert.ok(h.script, `${file}: health object must name a script`);
+    }
+  }
+});
+
+test('bootOrder does not contradict requiredApps', () => {
+  // requiredApps is the hard edge; bootOrder is the ordering within a tier.
+  // A unit that starts before something it requires is a boot loop nobody
+  // will read as an ordering bug.
+  const order = new Map();
+  for (const { data } of manifests) {
+    if (data.bootOrder !== undefined) order.set(data.slug, data.bootOrder);
+  }
+  for (const { file, data } of manifests) {
+    if (data.bootOrder === undefined) continue;
+    for (const dep of data.requiredApps || []) {
+      if (!order.has(dep)) continue;
+      assert.ok(order.get(dep) < data.bootOrder,
+        `${file}: bootOrder ${data.bootOrder} starts before its requiredApp ` +
+        `${dep} (bootOrder ${order.get(dep)})`);
+    }
+  }
+});
+
+test('every manifest validates against the published JSON Schema', () => {
+  // The other guards in this file cover the constraints that bite at runtime.
+  // This one is the backstop for everything else the schema declares \u2014 and
+  // it is the same file vibe-sentinel-installer vendors and CI-checks, so a
+  // change here is a change to a contract two repos depend on.
+  const schemaPath = path.join(__dirname, '..', '..', 'console', 'manifest.schema.json');
+  const raw = JSON.parse(fs.readFileSync(schemaPath, 'utf8'));
+  // Dependency-free: assert the conditional-required branch is present and
+  // shaped the way both installers rely on, rather than pulling in ajv.
+  assert.ok(Array.isArray(raw.allOf) && raw.allOf.length > 0,
+    'schema must carry the runtime-conditional required branch');
+  const branch = raw.allOf.find((b) => b.if && b.if.properties && b.if.properties.runtime);
+  assert.ok(branch, 'no runtime-conditional branch found in schema.allOf');
+  assert.strictEqual(branch.if.properties.runtime.const, 'appliance',
+    'the conditional must key on runtime === "appliance" so an ABSENT runtime ' +
+    'still matches and legacy manifests keep their full required set');
+  for (const key of ['image', 'subdomain', 'ports', 'routing', 'env', 'health']) {
+    assert.ok(branch.then.required.includes(key),
+      `appliance manifests must still require "${key}"`);
+  }
+  assert.ok(!raw.required.includes('image'),
+    'the top-level required list must not demand appliance-only fields');
 });
 
 // --- helpers ------------------------------------------------------------

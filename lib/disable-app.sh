@@ -38,8 +38,26 @@ disable_app() {
 
   local manifest="${APPLIANCE_DIR}/console/manifests/${slug}.json"
   local overlay="${APPLIANCE_DIR}/apps/${slug}.yml"
-  [[ -f "$overlay" ]]  || die "compose overlay not found: $overlay"
   [[ -f "$manifest" ]] || die "manifest not found: $manifest"
+  # Refuse a unit this appliance does not install. A Sentinel module lives in
+  # a different compose project on a different network with its own Postgres,
+  # Redis and ingress; running it through this path would render an env file
+  # from a template that does not exist and then `compose up` a service name
+  # that is not in our project. Say which installer owns it instead.
+  local _runtime
+  _runtime="$(python3 -c "
+import json
+print((json.load(open('${manifest}')).get('runtime') or 'appliance'))
+" 2>/dev/null || echo appliance)"
+  if [[ "$_runtime" != "appliance" ]]; then
+    log_error "$slug is a '${_runtime}' unit - this appliance does not install it"
+    log_error "         Its installer owns its lifecycle, images, ingress and upgrade gate."
+    log_error "         Fix: use the Security & Compliance section of the admin Apps tab,"
+    log_error "              or run the ${_runtime} installer directly on this host."
+    die "refusing to disable a ${_runtime} unit from the appliance path"
+  fi
+
+  [[ -f "$overlay" ]]  || die "compose overlay not found: $overlay"
 
   # Compute service names BEFORE flipping enabled=false so the
   # extraction is unambiguous. We need EVERY service the overlay

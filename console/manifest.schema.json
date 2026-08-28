@@ -8,13 +8,14 @@
     "schemaVersion",
     "slug",
     "displayName",
-    "description",
-    "image",
-    "subdomain",
-    "ports",
-    "routing",
-    "env",
-    "health"
+    "description"
+  ],
+  "allOf": [
+    {
+      "_doc": "Everything the appliance itself installs must still carry the full field set. `runtime` defaults to \"appliance\", and an ABSENT property satisfies a `properties` subschema, so every manifest written before this field existed matches this branch and validates exactly as it did before. A Sentinel module opts out by declaring runtime:\"sentinel\" - it has no subdomain (Falco and CrowdSec have no web surface), may have no image at all (the `ai` module ships no container), and publishes through its own ingress.",
+      "if":   { "properties": { "runtime": { "const": "appliance" } } },
+      "then": { "required": ["image", "subdomain", "ports", "routing", "env", "health"] }
+    }
   ],
   "additionalProperties": false,
   "properties": {
@@ -28,6 +29,11 @@
       "pattern": "^[a-z][a-z0-9-]+$",
       "minLength": 3,
       "maxLength": 40
+    },
+    "runtime": {
+      "enum": ["appliance", "sentinel"],
+      "default": "appliance",
+      "description": "Which orchestrator installs and owns this unit. `appliance` (the default, and what every manifest written before this field existed means) is installed by lib/enable-app.sh into the `vibe` compose project on vibe_net. `sentinel` is installed by vibe-sentinel-installer into its own `vibe-sentinel` compose project, with its own Postgres, Redis and ingress; the appliance reads the manifest so the console can present one catalog, but renders NOTHING for it - no Caddy vhost, no path handler, no emergency frontend, no tunnel ingress. See docs/MANIFEST_SCHEMA.md#runtime."
     },
     "displayName": { "type": "string", "minLength": 1, "maxLength": 80 },
     "description": { "type": "string", "minLength": 1, "maxLength": 200 },
@@ -175,6 +181,29 @@
       }
     },
 
+    "hostPorts": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "description": "Ports this unit publishes on the HOST. Appliance apps never set this - only Caddy and the emergency proxy publish, which is the appliance's own anti-pattern rule. It exists because a Sentinel module cannot avoid it: Wazuh agents dial 1514/1515, printers speak IPP on 631, and an MFP scanning to a share needs 445 - none of those can be reverse-proxied. Declaring them here is what lets EITHER installer detect a conflict on a shared host before a container fails to bind, which is how the appliance's Caddy on 0.0.0.0:443 and Vaultwarden on <mesh-ip>:443 currently collide with nothing to catch it.",
+      "items": {
+        "type": "object",
+        "required": ["port", "bind"],
+        "additionalProperties": false,
+        "properties": {
+          "port":     { "type": "integer", "minimum": 1, "maximum": 65535 },
+          "portEnd":  { "type": "integer", "minimum": 1, "maximum": 65535,
+                        "description": "Inclusive end of a contiguous range (FTPS passive ports are the case). Omit for a single port." },
+          "proto":    { "enum": ["tcp", "udp"], "default": "tcp" },
+          "bind":     { "enum": ["mesh", "loopback", "lan", "any"],
+                        "description": "Which interface the publish is scoped to. `mesh` = the private-network IP only, `loopback` = 127.0.0.1 only, `lan` = an RFC1918 address, `any` = 0.0.0.0. Conflict detection treats `any` as colliding with everything on that port." },
+          "label":    { "type": "string", "maxLength": 80 },
+          "optional": { "type": "boolean", "default": false,
+                        "description": "True when the publish only happens behind an opt-in (NetBird's relay on 3478/udp). Conflict checks report it, but its absence is not a failure." }
+        }
+      }
+    },
+
     "routing": {
       "type": "object",
       "required": ["default_upstream"],
@@ -219,6 +248,12 @@
       "items": { "type": "string", "enum": ["postgres", "redis"] },
       "uniqueItems": true
     },
+    "ownsInfra": {
+      "type": "array",
+      "items": { "enum": ["postgres", "redis", "ingress", "identity", "backup"] },
+      "uniqueItems": true,
+      "description": "Infrastructure this unit brings its OWN copy of, rather than using the appliance's shared instance. The appliance's standing rule is that nothing duplicates Postgres or Redis; this field is how a unit states that the rule does not apply to it and why. Sentinel's `core` owns all five: its Postgres carries the authentik and vaultwarden schemas (Vaultwarden migrates one-way over the firm's entire credential set, so sharing an instance is not a decision to make casually), and it runs its own cloudflared, Authentik and restic. Anything listed here is skipped by db-bootstrap and by the shared-URL env renderers."
+    },
     "optionalDepends": {
       "type": "array",
       "items": { "type": "string", "minLength": 1 },
@@ -230,6 +265,13 @@
       "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]+$" },
       "uniqueItems": true,
       "description": "Other Vibe app slugs that MUST already be enabled and healthy before this app can be enabled. Unlike optionalDepends this IS enforced: lib/enable-app.sh's pre-flight refuses the enable and names the missing app, rather than letting the operator discover it as a container that boots and immediately exits. Use only for a hard runtime dependency the app itself treats as fatal — Vibe-1040 is the case this exists for: its env schema requires a VIBE_AI_TOKEN, which only exists once vibe-ai-router is up to mint one, so without the router even the migration step fails."
+    },
+
+    "bootOrder": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 999,
+      "description": "Ascending start order within one runtime, for a stack whose units must come up in sequence with a health gate between each. `requiredApps` already expresses the hard edges (everything depends on Sentinel's `core`); this expresses the ordering WITHIN a tier that has no dependency edge to hang it on - Wazuh's indexer, manager and dashboard refuse mixed states and must move in that order. Appliance apps omit it: they are independent by design and any subset is a valid stack."
     },
 
     "env": {
@@ -299,9 +341,20 @@
     },
 
     "health": {
-      "type": "string",
-      "pattern": "^/.*$",
-      "minLength": 1
+      "description": "How readiness is decided. A PATH (the appliance convention) is probed over HTTP and must return 200 only when the unit is fully ready - DB migrated, dependencies up. A SCRIPT is run instead, exit 0 meaning healthy; Sentinel modules use this because several of them have no HTTP surface to probe at all, and because a probe of Uptime Kuma has to assert the pinned build is the one running, not merely that something answered.",
+      "oneOf": [
+        { "type": "string", "pattern": "^/.*$", "minLength": 1 },
+        {
+          "type": "object",
+          "required": ["script"],
+          "additionalProperties": false,
+          "properties": {
+            "script": { "type": "string", "pattern": "^[A-Za-z0-9._/-]+$", "maxLength": 200,
+                        "description": "Path relative to the unit's own directory in its installer checkout, e.g. `healthcheck.sh`." },
+            "doc":    { "type": "string", "maxLength": 400 }
+          }
+        }
+      ]
     },
 
     "health_timeout_s": {
@@ -335,6 +388,58 @@
       "description": "Set true when the app's web bundle requests assets from absolute root paths and its image has no base-path switch (no /docker-entrypoint.d/40-base-path.sh, no VITE_BASE_PATH). Such an app CANNOT be mounted at /<prefix>/: the shell loads and every asset request resolves against the host root — the appliance console — so the operator gets a blank page with a 200. The renderer then emits no path handler for it in any mode and gives it a root-served vhost at its own subdomain in domain mode, in BOTH routing modes. LAN/Tailscale has no per-app hostname to offer, so its emergency port becomes the access path and the console advertises that instead. Prefer fixing the app: adding base-path support upstream lets it path-mount like every other Vibe app and this flag can be dropped."
     },
 
+    "ingress": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "DESCRIBES where this unit is published, for a runtime that owns its own ingress. The appliance never renders from this - it is what lets the console link to a Sentinel module correctly without the appliance having to learn Cloudflare Access policies, gRPC http2Origin, WAF rate limits and ACME DNS-01 wildcards, all of which Sentinel's ingress already implements. Appliance apps omit it; their ingress comes from `routing`, `subdomain` and `rootServedOnly`.",
+      "properties": {
+        "via":      { "enum": ["tunnel", "mesh", "loopback", "none"] },
+        "access":   { "enum": ["protect", "bypass", "none"],
+                      "description": "Cloudflare Access posture. `bypass` is for machine-facing endpoints that cannot complete an interactive login - NetBird's agent traffic, and the Bitwarden clients that talk to Vaultwarden." },
+        "origin":   { "enum": ["http", "https", "http2"],
+                      "description": "http2 means an h2c origin (`http2Origin` in the tunnel config), which NetBird's gRPC requires and without which it does not work at all." },
+        "hostname": { "type": "string", "maxLength": 120,
+                      "description": "Host label under the firm domain, e.g. `wazuh`. Mesh-only names resolve to a private mesh IP in public DNS, which is allowed and is how the wildcard certificate covers them without a private CA." },
+        "path":     { "type": "string", "pattern": "^/.*$", "maxLength": 200 }
+      }
+    },
+
+    "resources": {
+      "type": "object",
+      "required": ["cores", "ramMb"],
+      "additionalProperties": false,
+      "description": "Floor this unit needs, checked as FREE capacity rather than installed capacity. The console runs it as a pre-flight before the Enable button is live: the appliance's reference host is a 1vcpu/2GB droplet and Sentinel's core alone wants 4 cores and 8 GB, so on most firm hosts the honest answer is a second host, and saying so up front beats a failed install.",
+      "properties": {
+        "cores":       { "type": "number",  "minimum": 0 },
+        "ramMb":       { "type": "integer", "minimum": 0 },
+        "diskFormula": { "type": "string",  "maxLength": 200,
+                         "description": "Human-readable derivation for units whose disk need is not a constant, e.g. agent count x retention with headroom." }
+      }
+    },
+
+    "hostPrereqs": {
+      "type": "array",
+      "uniqueItems": true,
+      "description": "Host-level facts that must hold before this unit can run, expressed as data so both installers and doctor.sh check the same list. Every entry here is a real failure that is otherwise discovered late and cryptically: OpenSearch simply will not start below the vm.max_map_count floor, and Falco's modern eBPF probe needs a kernel with BTF or it silently falls back to privileged mode.",
+      "items": {
+        "type": "string",
+        "pattern": "^(sysctl:[a-z0-9_.]+(>=|=)[0-9]+|kernel:>=[0-9]+\\.[0-9]+(\\+btf)?|pkg:[a-z0-9-]+|service:[a-z0-9-]+|timesync)$",
+        "maxLength": 80
+      }
+    },
+
+    "license": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "description": "Surfaced in the console catalog so an operator sees the terms before installing. NEVER enforced - the appliance does not gate installs on an entitlement check, and gating a security and compliance tool behind a network call is the wrong trade.",
+      "properties": {
+        "name": { "type": "string", "maxLength": 80 },
+        "note": { "type": "string", "maxLength": 400 },
+        "url":  { "type": "string", "maxLength": 200 }
+      }
+    },
+
     "migrations": {
       "type": "object",
       "required": ["command"],
@@ -353,6 +458,35 @@
       "properties": {
         "command":     { "type": "array", "items": { "type": "string" }, "minItems": 1 },
         "description": { "type": "string" }
+      }
+    },
+
+    "harnessGate": {
+      "type": "object",
+      "required": ["family"],
+      "additionalProperties": false,
+      "description": "Marks this unit as one whose upgrade is gated on a detection/integration harness having been run against the target version. The console SURFACES the state; the gate itself stays in vibe-sentinel-installer's upgrade.sh, where it was designed and tested and where there is deliberately no --force. These five families are gated because a break in them does not look like an outage: Uptime Kuma's socket.io API is unversioned, Vaultwarden migrates one-way over the firm's whole vault, NetBird is every agent's only path home, Authentik is the IdP, and Wazuh IS the detection engine - a broken decoder set reads as 'quiet'.",
+      "properties": {
+        "family": { "type": "string", "pattern": "^[a-z0-9-]+$", "maxLength": 40,
+                    "description": "Key into the installer's versions/manifest.json images map." },
+        "gated":  { "type": "boolean", "default": true },
+        "doc":    { "type": "string", "maxLength": 400 }
+      }
+    },
+
+    "disableRequires": {
+      "enum": ["compensating-control"],
+      "description": "Turning this unit off leaves a hole something else must fill, and the console must collect what that something is before proceeding. Set on Sentinel's Security Six modules (mesh, keys, pulse, print): a firm may legitimately use Tailscale instead of NetBird or 1Password instead of Vaultwarden, but the compliance scorecard still needs an answer, so 'off' without a recorded reason is refused rather than silently accepted."
+    },
+
+    "preUninstallExport": {
+      "type": "object",
+      "required": ["command"],
+      "additionalProperties": false,
+      "description": "Data export that MUST run before teardown. Incident records, reports, attestations and evidence are the firm's compliance artifacts, retained indefinitely, and several of them have to outlive the tool that produced them by years - so removal exports first and takes a typed confirmation to skip.",
+      "properties": {
+        "command":     { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "description": { "type": "string", "maxLength": 400 }
       }
     }
   },

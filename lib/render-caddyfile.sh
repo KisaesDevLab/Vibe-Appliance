@@ -156,6 +156,17 @@ def list_enabled_apps(state, manifests_dir):
                 file=sys.stderr,
             )
             continue
+        # Units another orchestrator owns are not ours to publish. A
+        # Sentinel module carries runtime:"sentinel" and is installed into its
+        # own compose project, on its own network, behind its own cloudflared
+        # with its own Access policies and wildcard certificate. Emitting a
+        # Caddy vhost for one would point this appliance's edge at a container
+        # that is not on vibe_net - at best a 502 on a hostname the operator
+        # never asked us to serve, at worst two proxies fighting over one
+        # public name. The console still reads these manifests; it just links
+        # to them rather than routing them.
+        if man.get("runtime", "appliance") != "appliance":
+            continue
         out.append((slug, man))
     return out
 
