@@ -1,6 +1,6 @@
 # Vibe Appliance — Sentinel Federation Addendum
 
-**Status:** Phase A and B landed 2026-08-28. Phases C–E are planned, not built.
+**Status:** Phases A, B and C landed 2026-08-28. Phases D and E are planned, not built.
 
 Vibe Sentinel is a security-monitoring and FTC Safeguards compliance appliance
 with its own installer (`KisaesDevLab/vibe-sentinel-installer`). A firm should
@@ -122,17 +122,40 @@ one that is simply unavailable when Sentinel runs on its own host.
 
 `modules/ai/setup.sh` now detects the appliance's router on the same host and
 prints the three steps to share it, instead of silently standing up a second
-one. Deciding the default belongs to Phase C or D.
+one. Deciding the default belongs to Phase D.
 
 ---
 
-## 5. What is not built yet
+## 5. Phase C: the manifests exist
 
-Phase A (the contract) and Phase B (the duplications) are done. Still planned:
+`vibe-sentinel-installer@651e66a` gives all nine modules a `manifest.json`
+conforming to this repo's schema, and makes its own `preflight/ports.sh`,
+`preflight/resources.sh` and `install.sh` read them instead of carrying copies.
+The copies had drifted: the port map was missing `443` and `3001` entirely
+while still listing six ports for a print module that no longer publishes them.
 
-- **Phase C** — Sentinel modules get manifests, and its installer reads them
-  instead of its hardcoded port map, boot order and resource table. This is
-  where the maintenance win actually lands.
+The installer vendors this repo's schema at `.schema/manifest.schema.json` and
+its CI fetches the real one from `main` to fail on drift, so changing
+`console/manifest.schema.json` here is changing a contract two repos depend on.
+`scripts/check-manifests.py` on that side verifies each manifest against
+`compose.yml`, `versions/manifest.json` and `install.sh`.
+
+The nine slugs, for when the console starts reading them:
+
+| slug | boot | host ports | gated | Security Six |
+|---|---|---|---|---|
+| `sentinel-core` | 10 | 1514, 1515, 55000, 9200, 8085 | wazuh | — |
+| `sentinel-edge` | 20 | 8080 | — | — |
+| `sentinel-runtime` | 30 | — | — | — |
+| `sentinel-mesh` | 40 | 3478/udp *(opt-in)* | netbird | yes |
+| `sentinel-keys` | 50 | 443 | vaultwarden | yes |
+| `sentinel-pulse` | 60 | 3001 | uptime-kuma | yes |
+| `sentinel-print` | 70 | 8632 | — | yes |
+| `sentinel-scan` | 80 | 9392 | — | — |
+| `sentinel-ai` | 90 | — *(no container)* | — | — |
+
+## 6. What is not built yet
+
 - **Phase D** — console federation: the collapsed *Security & Compliance* group,
   Enable/Disable routed by `runtime` via a new `lib/sentinel-module.sh`, and the
   copy-paste second-host flow.
@@ -140,5 +163,7 @@ Phase A (the contract) and Phase B (the duplications) are done. Still planned:
   `preUninstallExport` before teardown, and `hostPrereqs` in pre-flight.
 
 Until Phase D lands, nothing in `console/manifests/` carries
-`runtime: "sentinel"` — the skips above are inert, and are covered by tests
-rather than by any live manifest.
+`runtime: "sentinel"` — the skips in §1 are inert here, and are covered by
+tests rather than by any live manifest. Copying the nine manifests in is the
+first step of Phase D, not something to do early: the console has no way to
+enable them yet, so they would render as buttons that cannot work.
