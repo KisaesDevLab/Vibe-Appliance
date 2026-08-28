@@ -545,7 +545,7 @@ for target, kv_map in changes_by_file.items():
     with open(tmp, "w") as f:
         f.write("\n".join(new_lines) + "\n")
     os.chmod(tmp, 0o600)
-    os.rename(tmp, target)
+    os.replace(tmp, target)
 PYEOF
 }
 

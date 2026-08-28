@@ -50,6 +50,32 @@ const AFTER_RULES_OK = `#
 COMMIT
 `;
 
+// lib/state.sh serialises every read-modify-write behind an fcntl.flock, which
+// is POSIX-only and absent from native Windows Python. Without it, a state
+// write on a Windows dev box raised ModuleNotFoundError, the shell swallowed
+// it, and the round-trip test failed with an empty read-back rather than a
+// lock error - a false red that says nothing about the code under test.
+//
+// Supply a no-op stand-in on platforms that lack the real module, so the test
+// exercises the actual state logic everywhere. Serialising is irrelevant here
+// (one process, one writer), and on Linux - where the appliance runs and where
+// this guard has to mean something - the real module is always used.
+let PY_SHIM = null;
+function pythonShimPath() {
+  if (PY_SHIM !== null) return PY_SHIM;
+  const probe = require('node:child_process')
+    .spawnSync('python3', ['-c', 'import fcntl']);
+  if (probe.status === 0) { PY_SHIM = ''; return PY_SHIM; }
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'vibe-pyshim-'));
+  fs.writeFileSync(path.join(d, 'fcntl.py'),
+    '"""No-op stand-in for the POSIX fcntl module (test harness only)."""\n' +
+    'LOCK_EX = 2\nLOCK_SH = 1\nLOCK_UN = 8\nLOCK_NB = 4\n' +
+    'def flock(fd, op):\n    return None\n' +
+    'def lockf(fd, op, length=0, start=0, whence=0):\n    return None\n');
+  PY_SHIM = d;
+  return PY_SHIM;
+}
+
 // Run a snippet with a stubbed `ufw` on PATH and a fixture after.rules.
 function harness({ ufwOut = UFW_OK, ufwMissing = false, afterRules = AFTER_RULES_OK,
                    afterRulesMissing = false, consent = null, snippet }) {
@@ -80,7 +106,12 @@ ${snippet}
 # refuses. Land on 0 so the harness reports output, not a spawn failure.
 true
 `;
-  return execFileSync('bash', ['-c', script], { encoding: 'utf8' }).trim();
+  const shim = pythonShimPath();
+  const env = shim
+    ? { ...process.env,
+        PYTHONPATH: shim + (process.env.PYTHONPATH ? path.delimiter + process.env.PYTHONPATH : '') }
+    : process.env;
+  return execFileSync('bash', ['-c', script], { encoding: 'utf8', env }).trim();
 }
 
 const verdict = 'if lan_only_cookies_verify; then echo VERIFIED; else echo REFUSED; fi';

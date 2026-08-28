@@ -21,6 +21,16 @@ const { execFileSync } = require('node:child_process');
 const REPO = path.resolve(__dirname, '..', '..');
 const HELPER = path.join(REPO, 'lib', 'compose-files.sh');
 
+// Paths handed to bash. Two things bite on a Windows dev box, neither of which
+// shows up on the Ubuntu host this ships to: os.tmpdir() and path.join()
+// return backslash paths, which bash reads as escape sequences and silently
+// eats, so the source line arrived as `. C:UserskwkcpProjects...` and every
+// test in this file failed with "No such file or directory". And an unquoted
+// interpolation would break on a space in the path regardless of platform.
+// Convert to the POSIX form MSYS bash accepts, then single-quote. On Linux the
+// replace is a no-op and the quoting is still correct.
+const shPath = (p) => "'" + p.replace(/\\/g, '/').replace(/'/g, "'\\''") + "'";
+
 // Run compose_files in a throwaway APPLIANCE_DIR and return the resolved
 // file list, with the temp prefix stripped so assertions stay readable.
 function resolve(files, slug) {
@@ -32,9 +42,12 @@ function resolve(files, slug) {
     fs.writeFileSync(path.join(dir, f), 'services: {}\n');
   }
   const out = execFileSync('bash', ['-c',
-    `set -euo pipefail; APPLIANCE_DIR=${dir}; . ${HELPER}; compose_files ${slug || ''}; printf '%s\\n' "\${COMPOSE_FILES[@]}"`,
+    `set -euo pipefail; APPLIANCE_DIR=${shPath(dir)}; . ${shPath(HELPER)}; compose_files ${slug || ''}; printf '%s\\n' "\${COMPOSE_FILES[@]}"`,
   ], { encoding: 'utf8' });
-  return out.trim().split('\n').filter(x => x !== '-f').map(p => p.replace(dir + '/', ''));
+  // The helper echoes back whatever APPLIANCE_DIR held, so strip the POSIX form.
+  const prefix = dir.replace(/\\/g, '/') + '/';
+  return out.trim().split('\n').filter(x => x !== '-f')
+    .map(p => p.trim().replace(/\\/g, '/').replace(prefix, ''));
 }
 
 test('with no override files present, the list is just the tracked files', () => {

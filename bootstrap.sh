@@ -1032,7 +1032,7 @@ if changed:
     with open(tmp, "w") as f:
         json.dump(s, f, indent=2, sort_keys=True)
         f.write("\n")
-    os.rename(tmp, path)
+    os.replace(tmp, path)
     print(f"reconciled {len(demoted)} abandoned app(s): {', '.join(demoted)}", file=sys.stderr)
 PYEOF
 }

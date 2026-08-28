@@ -1758,7 +1758,7 @@ tmp = path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(s, f, indent=2, sort_keys=True)
     f.write("\n")
-os.rename(tmp, path)
+os.replace(tmp, path)
 PYEOF
 }
 
@@ -1797,7 +1797,7 @@ tmp = path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(s, f, indent=2, sort_keys=True)
     f.write("\n")
-os.rename(tmp, path)
+os.replace(tmp, path)
 PYEOF
 }
 

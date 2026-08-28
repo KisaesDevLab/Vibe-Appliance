@@ -1,7 +1,15 @@
 # lib/state.sh — read/write /opt/vibe/state.json.
 #
+# ATOMIC INSTALL: every writer here stages to <path>.tmp and lands it with
+# os.replace, never os.rename. Only os.replace is defined to overwrite an
+# existing destination on every platform - os.rename guarantees that on POSIX
+# alone, and raises FileExistsError elsewhere, which is how a state write on a
+# non-POSIX dev host failed silently under `set -uo pipefail` and read back as
+# an unchanged file rather than an error. Same reasoning as lib/secrets.sh's
+# _secrets_set_kv_in and lib/exit-domain-mode.sh.
+#
 # Idempotency: state_init creates state.json only if missing. All updates
-#   are atomic (write to .tmp, then rename) so a Ctrl-C mid-write never
+#   are atomic (write to .tmp, then replace) so a Ctrl-C mid-write never
 #   leaves a half-file behind.
 # Reverse: rm -f /opt/vibe/state.json. Bootstrap will recreate it on next run.
 #
@@ -70,7 +78,7 @@ tmp = path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(s, f, indent=2, sort_keys=True)
     f.write("\n")
-os.rename(tmp, path)
+os.replace(tmp, path)
 PYEOF
 }
 
@@ -130,7 +138,7 @@ tmp = path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(s, f, indent=2, sort_keys=True)
     f.write("\n")
-os.rename(tmp, path)
+os.replace(tmp, path)
 PYEOF
 }
 
@@ -174,6 +182,6 @@ tmp = path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(s, f, indent=2, sort_keys=True)
     f.write("\n")
-os.rename(tmp, path)
+os.replace(tmp, path)
 PYEOF
 }
