@@ -151,10 +151,17 @@ cd "$APPLIANCE_DIR" || { write_status failed preflight "Cannot enter ${APPLIANCE
 # machine that has never been touched — but a browser button that
 # silently discards an operator's hand-edit is a different thing. Tell
 # them instead.
+#
+# The recovery hint deliberately does NOT say `git reset --hard`. That
+# destroys the very edit we just refused to overwrite, and an operator
+# following it loses work. Host-specific customisation belongs in the
+# untracked override files (docker-compose.override.yml,
+# apps/<slug>.override.yml) — see docs/LOCAL_OVERRIDES.md — which keep
+# the tree clean and survive every update.
 if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
   log "working tree dirty; refusing"
   write_status failed preflight "The appliance has local file changes." \
-    "Someone edited files under ${APPLIANCE_DIR} directly. Updating would overwrite them. Review with: cd ${APPLIANCE_DIR} && sudo git status. Discard them with: sudo git reset --hard, then update again."
+    "Someone edited files under ${APPLIANCE_DIR} directly. Updating would overwrite them. Review with: cd ${APPLIANCE_DIR} && sudo git status. Move host-specific changes into an untracked override file (see docs/LOCAL_OVERRIDES.md) so they survive updates, then try again. Only if you are certain the edits are disposable: sudo git checkout -- ."
   exit 1
 fi
 
@@ -173,8 +180,15 @@ fi
 TO_SHA="$(git rev-parse "origin/${BRANCH}" 2>/dev/null || true)"
 log "remote commit ${TO_SHA}"
 
-if [[ -n "$FROM_SHA" && "$FROM_SHA" == "$TO_SHA" ]]; then
-  log "already up to date"
+# "Up to date" means HEAD already CONTAINS origin/<branch> — not that the
+# two SHAs are equal. An appliance carrying a local commit (a host-specific
+# override committed on top of upstream) is at origin/main + 1: never SHA-
+# equal, yet nothing is pending. Equality would report a phantom update
+# forever and then fail in the apply step every single time.
+#
+# `merge-base --is-ancestor` is the exact test and costs nothing.
+if [[ -n "$TO_SHA" ]] && git merge-base --is-ancestor "$TO_SHA" HEAD 2>/dev/null; then
+  log "already up to date (HEAD contains ${TO_SHA})"
   write_status success done "Already up to date. No changes to apply."
   exit 0
 fi
@@ -185,16 +199,28 @@ log "incoming: ${CHANGED:-unknown}"
 # --- Apply ------------------------------------------------------------
 
 write_status running pull "Downloading the update…"
-# --ff-only: never rewrite local history from a button. The dirty-tree
-# check above already guarantees nothing local is at risk, so a
-# non-fast-forward here means the branch genuinely diverged and a human
-# should look.
-if ! git merge --ff-only "origin/${BRANCH}" >>"$LOG_FILE" 2>&1; then
+# Rebase, not `merge --ff-only`. Both refuse to silently discard local
+# work, which is the property that matters here — but ff-only ALSO
+# refuses the legitimate case of an appliance carrying a host-specific
+# commit on top of upstream, and refuses it permanently: there is no
+# sequence of button presses that recovers, and the error told operators
+# to `git reset --hard`, destroying the very commit they meant to keep.
+#
+# Rebase replays local commits on top of the new upstream instead. A
+# genuine content conflict still stops us — it just stops recoverably.
+# --autostash is belt-and-braces; the dirty-tree preflight above means
+# there should be nothing to stash.
+if ! git rebase --autostash "origin/${BRANCH}" >>"$LOG_FILE" 2>&1; then
+  # Leave no half-finished rebase behind. Without this the repo sits in
+  # a detached REBASE_HEAD state and every later update fails at the
+  # preflight with a dirty tree, turning one conflict into a permanent
+  # outage of the update button.
+  git rebase --abort >>"$LOG_FILE" 2>&1 || true
   write_status failed pull "Could not apply the update cleanly." \
-    "The appliance's copy of the code has diverged from GitHub, so it can't be fast-forwarded. Recover with: cd ${APPLIANCE_DIR} && sudo git reset --hard origin/${BRANCH} && sudo bash ${APPLIANCE_DIR}/bootstrap.sh"
+    "This appliance carries local commits that conflict with the update, so they can't be replayed on top of it. Nothing was changed. Inspect with: cd ${APPLIANCE_DIR} && sudo git log --oneline origin/${BRANCH}..HEAD. Details in $LOG_FILE."
   exit 1
 fi
-log "fast-forwarded to ${TO_SHA}"
+log "rebased onto ${TO_SHA}"
 
 # --- Rebuild ----------------------------------------------------------
 #
