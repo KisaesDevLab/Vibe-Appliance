@@ -242,6 +242,12 @@ log_check_warn() {
 die() {
   local msg="${1:-bootstrap failed}"
   log_error "$msg"
+  # A second argument is an additional recovery hint — several call sites
+  # pass one (sentinel-module.sh, update.sh); dropping it silently threw
+  # away exactly the guidance the error-message convention requires.
+  if [[ -n "${2:-}" ]]; then
+    log_error "$2"
+  fi
   printf '\n%sBootstrap aborted.%s See %s for the structured log.\n' \
     "$_C_RED" "$_C_RESET" "$VIBE_LOG_FILE" >&2
   exit 1

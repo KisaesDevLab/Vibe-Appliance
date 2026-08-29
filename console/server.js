@@ -1894,6 +1894,13 @@ app.post('/api/v1/customer-visibility/:slug', requireAdmin, testRateLimit, async
 
 // One-off update check that the operator can fire by hand.
 app.post('/api/v1/update/check', requireAdmin, testRateLimit, async (_req, res) => {
+  // A check writes update_available flags into state.json while an
+  // in-flight lifecycle script may be mid-rewrite of the same entries;
+  // it is also instantly re-runnable, so refusing is cheap and honest.
+  if (SLUG_LOCKS.size) {
+    const held = [...SLUG_LOCKS.entries()].map(([s, l]) => `${l.action} ${s}`).join(', ');
+    return res.status(409).json({ error: 'operation in progress', detail: `App action(s) still running (${held}). Wait for them to finish, then re-check.` });
+  }
   await runShell(res, [UPDATE_SCRIPT, '--check'], 'update-check');
 });
 
@@ -2031,6 +2038,17 @@ app.post('/api/v1/admin/self-update', requireAdmin, testRateLimit, async (_req, 
       });
     }
   } catch { /* no prior run */ }
+
+  // Refuse while any per-app lifecycle script is running. self-update
+  // re-runs bootstrap, which re-renders every env file and may bounce
+  // the very containers an in-flight enable/update is halfway through.
+  if (SLUG_LOCKS.size) {
+    const held = [...SLUG_LOCKS.entries()].map(([s, l]) => `${l.action} ${s}`).join(', ');
+    return res.status(409).json({
+      ok: false,
+      error: `App lifecycle action(s) still running (${held}). Wait for them to finish, then retry the update.`,
+    });
+  }
 
   // setsid + nohup + & : the alpine helper pod exits immediately, the
   // updater keeps running under init. Redirect all three streams or the

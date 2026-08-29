@@ -100,12 +100,36 @@ fi
 
 log_step "looking up tunnel '$CF_TUNNEL_NAME'"
 search="$(cf_api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel?name=$CF_TUNNEL_NAME&is_deleted=false")"
+# Distinguish "API answered success with an empty result" (genuinely no
+# tunnel) from "API failed or was unreachable". The old parser coerced
+# both to an empty id, so a bad token or an outage read as "nothing to
+# delete" and teardown claimed success while the tunnel object and its
+# CNAMEs all remained at Cloudflare.
 TUNNEL_ID="$(python3 -c "
 import json, sys
-d = json.loads(sys.argv[1])
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    print('LOOKUP_ERROR'); raise SystemExit
+if not d.get('success', False):
+    print('LOOKUP_ERROR'); raise SystemExit
 res = d.get('result') or []
 print(res[0].get('id', '') if res else '')
-" "$search" 2>/dev/null || true)"
+" "$search" 2>/dev/null || echo LOOKUP_ERROR)"
+
+if [[ "$TUNNEL_ID" == "LOOKUP_ERROR" ]]; then
+  die "could not look up tunnel '$CF_TUNNEL_NAME' at Cloudflare — the API call failed or returned an error, so nothing on the Cloudflare side was verified or deleted. The connector container is stopped; DNS records and the tunnel object remain.
+
+  Common causes: expired/rotated API token, wrong CLOUDFLARE_ACCOUNT_ID, no network path to api.cloudflare.com.
+
+  Diagnose:
+    sudo grep '^CLOUDFLARE_' $VIBE_ENV_APPLIANCE
+    curl -sS -H 'Authorization: Bearer <token>' ${CF_API}/accounts/${CF_ACCOUNT_ID}/cfd_tunnel?is_deleted=false
+  Fix:
+    Restore a working token via Configuration → Network → Cloudflare
+    Tunnel → Rotate token, then click Tear down again (idempotent).
+    SSH equivalent: sudo bash $APPLIANCE_DIR/infra/cloudflared-down.sh"
+fi
 
 if [[ -z "$TUNNEL_ID" ]]; then
   log_info "no tunnel named '$CF_TUNNEL_NAME' found at Cloudflare; nothing to delete on that side"

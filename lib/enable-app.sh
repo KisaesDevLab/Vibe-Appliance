@@ -635,7 +635,7 @@ except Exception:
       dep_upstream="$(_manifest_field "$dep_manifest" 'next((m["upstream"] for m in (data["routing"].get("matchers") or []) if m.get("name") == "api"), data["routing"]["default_upstream"])')"
       dep_health="$(_manifest_field "$dep_manifest" 'data["health"]')"
       if [[ -n "$dep_upstream" && -n "$dep_health" ]]; then
-        if ! docker exec vibe-console curl -fsS -o /dev/null --max-time 5 "http://${dep_upstream}${dep_health}" >/dev/null 2>&1; then
+        if [[ "$(docker exec vibe-console curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://${dep_upstream}${dep_health}" 2>/dev/null)" != "200" ]]; then
           log_error "preflight FAIL: $slug requires $dep, which is enabled but not answering ${dep_upstream}${dep_health}"
           log_error "         Enabling $slug now would mint no token and fail the same way."
           log_error "         Diagnose: sudo docker logs --tail 40 ${dep_upstream%:*}"
@@ -656,7 +656,7 @@ except Exception:
   # before the app boots and crashes.
   local check_path
   check_path="$(mktemp -t "vibe-preflight-${slug}.XXXXXX")"
-  if _render_app_env "$slug" "$manifest" "$env_tmpl" "$check_path" >/dev/null 2>&1; then
+  if RENDER_CHECK_ONLY=1 _render_app_env "$slug" "$manifest" "$env_tmpl" "$check_path" "${VIBE_ENV_DIR}/${slug}.env" >/dev/null 2>&1; then
     local unfilled
     unfilled="$(grep -oE '@[A-Z_][A-Z_0-9]*@' "$check_path" 2>/dev/null | sort -u | tr '\n' ' ')"
     if [[ -n "$unfilled" ]]; then
@@ -1027,7 +1027,14 @@ _image_uid_gid() {
 }
 
 _render_app_env() {
+  # $5 (src) is the EXISTING env file to preserve values from; defaults
+  # to $out for the real enable path, where they are the same file. The
+  # preflight check-render passes a temp $out plus the real file as src —
+  # with RENDER_CHECK_ONLY=1 so the render also skips its two side
+  # effects (persisting the effective subdomain to state, and minting a
+  # router token that would be discarded with the temp file).
   local slug="$1" manifest="$2" tmpl="$3" out="$4"
+  local src="${5:-$4}"
 
   local subdomain mode domain tunnel_subdomain ip allowed_origin vite_base_path session_secure
   local staff_app_url client_portal_url
@@ -1046,15 +1053,17 @@ _render_app_env() {
   # isn't in the env template, so the render's merge step (below) carries
   # it forward on every re-render.
   local app_subdomain_override eff_subdomain routing_mode
-  app_subdomain_override="$(_extract_env_value "$out" VIBE_APP_SUBDOMAIN)"
+  app_subdomain_override="$(_extract_env_value "$src" VIBE_APP_SUBDOMAIN)"
   app_subdomain_override="${app_subdomain_override//[[:space:]]/}"
   if [[ -n "$app_subdomain_override" ]]; then
     eff_subdomain="$app_subdomain_override"
   else
     eff_subdomain="$subdomain"
   fi
-  _state_app_set "$slug" subdomain "$eff_subdomain" 2>/dev/null || \
-    log_warn "could not persist effective subdomain to state for $slug"
+  if [[ "${RENDER_CHECK_ONLY:-0}" != "1" ]]; then
+    _state_app_set "$slug" subdomain "$eff_subdomain" 2>/dev/null || \
+      log_warn "could not persist effective subdomain to state for $slug"
+  fi
 
   # Domain-mode routing style — mirrors lib/render-caddyfile.sh. Read
   # straight from appliance.env (settings-save writes it there). Blank or
@@ -1250,8 +1259,8 @@ PYEOF
   # `local db_pass=""` (not bare `local db_pass`) so the [[ -z ]] read
   # below doesn't fail under `set -u` when the if-branch is skipped.
   local db_pass=""
-  if [[ -f "$out" ]]; then
-    db_pass="$(_extract_db_password "$out")"
+  if [[ -f "$src" ]]; then
+    db_pass="$(_extract_db_password "$src")"
   fi
   [[ -z "$db_pass" ]] && db_pass="$(openssl rand -hex 32)"
 
@@ -1263,8 +1272,8 @@ PYEOF
   # @CONNECT_INTAKE_ENCRYPTION_KEY@; harmless on slugs whose template
   # doesn't carry the marker.
   local intake_key=""
-  if [[ -f "$out" ]]; then
-    intake_key="$(_extract_env_value "$out" "CONNECT_INTAKE_ENCRYPTION_KEY")"
+  if [[ -f "$src" ]]; then
+    intake_key="$(_extract_env_value "$src" "CONNECT_INTAKE_ENCRYPTION_KEY")"
   fi
   [[ -z "$intake_key" ]] && intake_key="$(openssl rand -base64 32 | tr -d '\n')"
 
@@ -1275,8 +1284,8 @@ PYEOF
   # once on first render and preserved on every subsequent re-render.
   # Harmless on slugs whose template doesn't reference @VS_KEK@.
   local vs_kek=""
-  if [[ -f "$out" ]]; then
-    vs_kek="$(_extract_env_value "$out" "VS_KEK")"
+  if [[ -f "$src" ]]; then
+    vs_kek="$(_extract_env_value "$src" "VS_KEK")"
   fi
   [[ -z "$vs_kek" ]] && vs_kek="$(openssl rand -base64 32 | tr -d '\n')"
 
@@ -1291,8 +1300,8 @@ PYEOF
   # re-bootstrap. Harmless on slugs whose
   # template doesn't reference @GATEWAY_ADMIN_KEY@.
   local gateway_admin_key=""
-  if [[ -f "$out" ]]; then
-    gateway_admin_key="$(_extract_env_value "$out" "GATEWAY_ADMIN_KEY")"
+  if [[ -f "$src" ]]; then
+    gateway_admin_key="$(_extract_env_value "$src" "GATEWAY_ADMIN_KEY")"
   fi
   [[ -z "$gateway_admin_key" ]] && gateway_admin_key="$(openssl rand -hex 32)"
 
@@ -1303,8 +1312,8 @@ PYEOF
   # re-renders by reading the MASTER_KEY line back from the existing env
   # file. Harmless on slugs whose template doesn't reference @MASTER_KEY@.
   local master_key=""
-  if [[ -f "$out" ]]; then
-    master_key="$(_extract_env_value "$out" "MASTER_KEY")"
+  if [[ -f "$src" ]]; then
+    master_key="$(_extract_env_value "$src" "MASTER_KEY")"
   fi
   [[ -z "$master_key" ]] && master_key="$(openssl rand -base64 32 | tr -d '\n')"
 
@@ -1316,15 +1325,15 @@ PYEOF
   # re-applies whatever value is here on every run. Harmless on slugs whose
   # template doesn't reference @ROUTER_ADMIN_PASSWORD@.
   local router_admin_password=""
-  if [[ -f "$out" ]]; then
-    router_admin_password="$(_extract_env_value "$out" "ROUTER_ADMIN_PASSWORD")"
+  if [[ -f "$src" ]]; then
+    router_admin_password="$(_extract_env_value "$src" "ROUTER_ADMIN_PASSWORD")"
   fi
   [[ -z "$router_admin_password" ]] && router_admin_password="$(openssl rand -hex 32)"
 
   # Vibe-1099's first-login admin password — same pattern, same rationale.
   local vibe1099_admin_password=""
-  if [[ -f "$out" ]]; then
-    vibe1099_admin_password="$(_extract_env_value "$out" "VIBE1099_ADMIN_PASSWORD")"
+  if [[ -f "$src" ]]; then
+    vibe1099_admin_password="$(_extract_env_value "$src" "VIBE1099_ADMIN_PASSWORD")"
   fi
   [[ -z "$vibe1099_admin_password" ]] && vibe1099_admin_password="$(openssl rand -hex 32)"
 
@@ -1337,15 +1346,22 @@ PYEOF
   # router-mode render without a valid token would refuse to boot (by design).
   local vibe_ai_mode="direct" vibe_ai_token=""
   if grep -q "@VIBE_AI_TOKEN@" "$tmpl" 2>/dev/null; then
-    if [[ -f "$out" ]]; then
-      vibe_ai_token="$(_extract_env_value "$out" "VIBE_AI_TOKEN")"
+    if [[ -f "$src" ]]; then
+      vibe_ai_token="$(_extract_env_value "$src" "VIBE_AI_TOKEN")"
     fi
     if [[ -n "$vibe_ai_token" ]]; then
       # keep the operator's mode choice on re-enable; default router since a token exists
-      vibe_ai_mode="$(_extract_env_value "$out" "VIBE_AI_MODE")"
+      vibe_ai_mode="$(_extract_env_value "$src" "VIBE_AI_MODE")"
       [[ -z "$vibe_ai_mode" ]] && vibe_ai_mode="router"
     else
-      vibe_ai_token="$(_mint_vibe_ai_token "$slug" || true)"
+      if [[ "${RENDER_CHECK_ONLY:-0}" == "1" ]]; then
+        # A check-render must not mint: each mint registers a row with
+        # the router, and a token minted here is discarded with the temp
+        # file — one orphan registration per preflight run.
+        vibe_ai_token=""
+      else
+        vibe_ai_token="$(_mint_vibe_ai_token "$slug" || true)"
+      fi
       if [[ -n "$vibe_ai_token" ]]; then
         vibe_ai_mode="router"
         log_ok "vibe-ai-router app token minted" app="$slug"
@@ -1387,7 +1403,7 @@ PYEOF
       g_name="${g_name%%[![:print:]]*}"; g_shape="${g_shape%%[![:print:]]*}"
       [[ -n "$g_name" ]] || continue
       g_value=""
-      [[ -f "$out" ]] && g_value="$(_extract_env_value "$out" "$g_name")"
+      [[ -f "$src" ]] && g_value="$(_extract_env_value "$src" "$g_name")"
       if [[ -z "$g_value" ]]; then
         case "$g_shape" in
           hex32)          g_value="$(openssl rand -hex 32)" ;;
@@ -1509,8 +1525,8 @@ PYEOF
   # Merge: keep operator-set keys from the existing file that don't
   # appear in the new render. Specifically useful for ANTHROPIC_API_KEY
   # and similar optional settings.
-  if [[ -f "$out" ]]; then
-    python3 - "$out" "$tmp" <<'PYEOF'
+  if [[ -f "$src" ]]; then
+    python3 - "$src" "$tmp" <<'PYEOF'
 import sys
 def parse(path):
     rows = {}
@@ -1656,8 +1672,9 @@ _wait_for_app_health() {
 
   local deadline=$(( $(date +%s) + timeout_s ))
   while (( $(date +%s) < deadline )); do
-    if docker exec vibe-console curl -fsS -o /dev/null --max-time 5 \
-         "http://${upstream}${health}" >>"$VIBE_LOG_FILE" 2>&1; then
+    # 200-only, per the health-check convention: -f alone passes 3xx.
+    if [[ "$(docker exec vibe-console curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+         "http://${upstream}${health}" 2>>"$VIBE_LOG_FILE")" == "200" ]]; then
       log_ok "$slug is healthy"
       return 0
     fi
@@ -1710,8 +1727,8 @@ _wait_for_extra_health() {
     log_step "waiting for $slug/$name health" upstream="$upstream" path="$path"
     deadline=$(( $(date +%s) + 60 ))
     while (( $(date +%s) < deadline )); do
-      if docker exec vibe-console curl -fsS -o /dev/null --max-time 5 \
-           "http://${upstream}${path}" >>"$VIBE_LOG_FILE" 2>&1; then
+      if [[ "$(docker exec vibe-console curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+           "http://${upstream}${path}" 2>>"$VIBE_LOG_FILE")" == "200" ]]; then
         log_ok "$slug/$name is healthy"
         continue 2
       fi

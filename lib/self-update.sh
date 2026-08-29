@@ -245,8 +245,12 @@ log "bootstrap completed"
 write_status running health "Waiting for the admin console to come back…"
 _healthy=0
 for _ in $(seq 1 60); do
-  if curl -fsS -m 3 http://127.0.0.1/caddy-health >/dev/null 2>&1 \
-     || docker inspect -f '{{.State.Running}}' vibe-console 2>/dev/null | grep -q true; then
+  # The console's own /health through Caddy, 200-only — the same probe
+  # doctor.sh trusts. The previous gate passed on /caddy-health (Caddy up,
+  # console possibly dead) or on the container merely existing in state
+  # "running" (crashlooping counts), so "Updated successfully" could show
+  # over an admin page that never came back.
+  if [[ "$(curl -s -o /dev/null -w '%{http_code}' -m 3 http://127.0.0.1/health 2>/dev/null)" == "200" ]]; then
     _healthy=1
     break
   fi

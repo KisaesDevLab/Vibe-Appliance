@@ -484,9 +484,14 @@ Fix:      that installer owns this module; its output names the failing service"
   upstream="$(_manifest_field "$manifest" 'data["routing"]["matchers"][0]["upstream"] if data["routing"].get("matchers") else data["routing"]["default_upstream"]')"
   health="$(_manifest_field "$manifest" 'data["health"]')"
 
-  if docker run --rm --network vibe_net curlimages/curl:latest \
-       -fsS -o /dev/null --max-time 5 "http://${upstream}${health}" \
-       >>"$VIBE_LOG_FILE" 2>&1; then
+  # Probe via the console container — same path enable-app.sh and
+  # update.sh use. The previous `docker run curlimages/curl:latest`
+  # needed a registry pull, so an OFFLINE host reported every healthy
+  # app as down; and -fsS passed 3xx while the message claimed 200.
+  local code
+  code="$(docker exec vibe-console curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+       "http://${upstream}${health}" 2>>"$VIBE_LOG_FILE" || true)"
+  if [[ "$code" == "200" ]]; then
     _check_pass "$upstream$health responds 200"
   else
     # `docker compose ... logs` walks every container declared in the
@@ -495,8 +500,9 @@ Fix:      that installer owns this module; its output names the failing service"
     # which is wrong for vibe-mybooks-api, vibe-payroll-api,
     # vibe-tax-research-api, vibe-glm-ocr (single), and vibe-tx-converter
     # (single).
-    _check_fail "$upstream$health did not respond 200" \
+    _check_fail "$upstream$health returned HTTP ${code:-000} (expected 200)" \
       "Diagnose: docker compose -f /opt/vibe/appliance/docker-compose.yml -f /opt/vibe/appliance/apps/${slug}.yml logs --tail 40
+          (if vibe-console itself is down, this probe cannot run: docker ps --filter name=^vibe-console\$)
 Fix:      restart the app via the admin Apps tab (Disable, then Enable)"
   fi
 

@@ -33,6 +33,23 @@ _pg_exec() {
          -c "$sql"
 }
 
+# Like _pg_exec, but the SQL arrives on stdin instead of argv, and
+# statement logging is suppressed for the session. Use for statements
+# that embed a secret (role passwords): `-c` puts the SQL — password
+# included — into the exec'd argv (visible to `ps` on the host), and a
+# failing statement is echoed verbatim into postgres's own log.
+_pg_exec_secret() {
+  local sql="$1"
+  printf 'SET log_min_error_statement = panic;\nSET log_statement = %s;\n%s\n' "'none'" "$sql" |
+  docker exec -i \
+    -e PGPASSWORD="${POSTGRES_PASSWORD:-}" \
+    "$VIBE_PG_CONTAINER" \
+    psql -v ON_ERROR_STOP=1 \
+         -U "${POSTGRES_USER:-postgres}" \
+         -d postgres \
+         -f -
+}
+
 # Run a SQL statement and return the result via stdout (no headers, no
 # row count).
 _pg_query() {
@@ -87,12 +104,12 @@ db_bootstrap_for_app() {
   role_exists="$(_pg_query "SELECT 1 FROM pg_roles WHERE rolname = '$(_pg_escape "$user")';" || true)"
   if [[ -z "$role_exists" ]]; then
     log_step "creating postgres role for $slug" role="$user"
-    _pg_exec "CREATE ROLE \"$(_pg_escape "$user")\" WITH LOGIN PASSWORD '$(_pg_escape "$pass")';" >>"$VIBE_LOG_FILE" 2>&1 \
+    _pg_exec_secret "CREATE ROLE \"$(_pg_escape "$user")\" WITH LOGIN PASSWORD '$(_pg_escape "$pass")';" >>"$VIBE_LOG_FILE" 2>&1 \
       || die "Could not create postgres role '$user'. See $VIBE_LOG_FILE."
   else
     log_info "postgres role already exists" role="$user"
     # Update the password each run so the env file is always authoritative.
-    _pg_exec "ALTER ROLE \"$(_pg_escape "$user")\" WITH PASSWORD '$(_pg_escape "$pass")';" >>"$VIBE_LOG_FILE" 2>&1 \
+    _pg_exec_secret "ALTER ROLE \"$(_pg_escape "$user")\" WITH PASSWORD '$(_pg_escape "$pass")';" >>"$VIBE_LOG_FILE" 2>&1 \
       || die "Could not align postgres password for role '$user'."
   fi
 

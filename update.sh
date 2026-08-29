@@ -384,6 +384,27 @@ cmd_update() {
   local services
   services="$(_app_services "$manifest")"
 
+  # Step 0: refuse a no-op "update". With a stale update_available flag
+  # (or a double-click after the update already landed), re-running this
+  # command would re-tag vibe-rollback-<slug> to the CURRENT image —
+  # destroying the only path back to the previous one — and then "update"
+  # to the image already running. When the remote digest matches the
+  # local one there is nothing to roll forward to, so stop here. If the
+  # digest check itself fails (offline host, non-GHCR image), proceed:
+  # the update may still be legitimate and every later step keeps its own
+  # safety net.
+  local server_image _remote_d _local_d
+  server_image="$(_manifest_field "$manifest" 'data["image"]["server"]')"
+  if [[ -n "$server_image" ]]; then
+    _remote_d="$(_remote_digest "$server_image" "$default_tag" || true)"
+    _local_d="$(_local_digest "$server_image" "$default_tag" || true)"
+    if [[ -n "$_remote_d" && -n "$_local_d" && "$_remote_d" == "$_local_d" ]]; then
+      log_ok "$slug already runs the latest image (${_local_d}) — nothing to update"
+      _state_app_set "$slug" update_available false
+      exit 0
+    fi
+  fi
+
   _state_app_set "$slug" status updating
 
   # Step 1: tag the CURRENTLY-RUNNING image as a rollback target BEFORE
@@ -756,8 +777,10 @@ _wait_for_health() {
   # uses now. Avoids spinning up a curlimages/curl container per probe.
   local deadline=$(( $(date +%s) + timeout_s ))
   while (( $(date +%s) < deadline )); do
-    if docker exec vibe-console curl -fsS -o /dev/null --max-time 5 \
-         "http://${upstream}${health}" >>"$VIBE_LOG_FILE" 2>&1; then
+    # 200-only, per the health-check convention: -f alone passes 3xx,
+    # which declared an app "running" while it was still redirecting.
+    if [[ "$(docker exec vibe-console curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+         "http://${upstream}${health}" 2>>"$VIBE_LOG_FILE")" == "200" ]]; then
       # Main surface is up; now every manifest.health_extra[] target must
       # answer too. This is the UPDATE-path counterpart of enable-app.sh's
       # _wait_for_extra_health, and it matters more here: the routing
@@ -812,8 +835,8 @@ _wait_for_extra_health() {
     log_step "waiting for $slug/$name health" upstream="$upstream" path="$path"
     deadline=$(( $(date +%s) + 60 ))
     while (( $(date +%s) < deadline )); do
-      if docker exec vibe-console curl -fsS -o /dev/null --max-time 5 \
-           "http://${upstream}${path}" >>"$VIBE_LOG_FILE" 2>&1; then
+      if [[ "$(docker exec vibe-console curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+           "http://${upstream}${path}" 2>>"$VIBE_LOG_FILE")" == "200" ]]; then
         log_ok "$slug/$name is healthy"
         continue 2
       fi
