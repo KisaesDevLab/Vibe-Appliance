@@ -50,6 +50,18 @@
       <div class="apps-list" id="apps-list"></div>
     </section>
 
+    <section id="sentinel-section" hidden>
+      <h2>Security &amp; Compliance (Vibe Sentinel)</h2>
+      <p class="muted" id="sentinel-summary">—</p>
+      <p class="muted section-note">
+        Installed and upgraded by <span class="mono">vibe-sentinel-installer</span>, not by this
+        appliance: its modules run in their own compose project with their own database and their
+        own ingress. This console lists them, reports what they need, and starts and stops them.
+      </p>
+      <p class="muted section-note" id="sentinel-licence" hidden></p>
+      <div class="apps-list" id="sentinel-list"></div>
+    </section>
+
     <section>
       <h2>Infra services</h2>
       <p class="muted">Backup, container UI, host UI. Configure backup destination inside Duplicati.</p>
@@ -769,25 +781,29 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
       if (!apps.length) {
         list.innerHTML = '<p class="muted">No manifests found in /opt/vibe/appliance/console/manifests.</p>';
         summary.textContent = '0 apps known';
+        renderSentinel([]);
         return;
       }
 
-      // Units another orchestrator installs get their own collapsed group.
-      // Nine Sentinel modules would otherwise nearly double this page and bury
-      // the eight Vibe apps a firm came for - and most firm hosts cannot run
-      // them anyway, so a flat list would show nine rows that can never enable.
+      // Units another orchestrator installs get their own section, not a card
+      // in the Apps grid. Nine Sentinel modules folded into one card was
+      // unreadable, and merging them flat into Apps would bury the eight Vibe
+      // apps a firm came for behind modules most firm hosts cannot even run.
       const own = apps.filter(a => (a.runtime || 'appliance') === 'appliance');
       const foreign = apps.filter(a => (a.runtime || 'appliance') !== 'appliance')
                           .sort((x, y) => (x.bootOrder ?? 999) - (y.bootOrder ?? 999));
 
       summary.textContent = own.length + ' app(s) registered, ' +
-        own.filter(a => a.enabled && a.status === 'running').length + ' running' +
-        (foreign.length ? ' · ' + foreign.length + ' Sentinel module(s)' : '');
+        own.filter(a => a.enabled && a.status === 'running').length + ' running';
 
-      list.innerHTML = own.map(renderAppCard).join('') +
-        (foreign.length ? renderForeignGroup(foreign) : '');
+      list.innerHTML = own.map(renderAppCard).join('');
+      wireAppActions(list);
 
-      list.querySelectorAll('button[data-action]').forEach(btn => {
+      renderSentinel(foreign);
+    }
+
+    function wireAppActions(root) {
+      root.querySelectorAll('button[data-action]').forEach(btn => {
         btn.addEventListener('click', () => toggle(btn));
       });
     }
@@ -797,34 +813,37 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
     // rather than guessed at.
     let _hostCapacity = null;
 
-    function renderForeignGroup(items) {
-      const running = items.filter(a => a.enabled && a.status === 'running').length;
-      const lic = items.find(a => a.license && a.license.name);
-      return `
-        <details class="app-card" id="sentinel-group"${_sentinelGroupOpen ? ' open' : ''}>
-          <summary class="app-card__title" style="cursor:pointer">
-            Security &amp; Compliance (Vibe Sentinel)
-            <span class="badge ${running ? 'badge--good' : ''}">${running} of ${items.length} running</span>
-          </summary>
-          <p class="muted app-card__desc" style="margin-top:0.6rem">
-            Installed and upgraded by <span class="mono">vibe-sentinel-installer</span>, not by this
-            appliance: its modules run in their own compose project with their own database and their
-            own ingress. This console lists them, reports what they need, and starts and stops them.
-            ${lic ? escapeHtml(lic.license && lic.license.name || (lic.license || {}).name || '') : ''}
-          </p>
-          ${lic && lic.license ? '<p class="muted app-card__desc"><strong>Licence:</strong> ' +
-             escapeHtml(lic.license.name) + (lic.license.note ? ' — ' + escapeHtml(lic.license.note) : '') +
-             '</p>' : ''}
-          <div style="margin-top:0.8rem">${items.map(renderAppCard).join('')}</div>
-        </details>`;
-    }
+    function renderSentinel(items) {
+      const section = document.getElementById('sentinel-section');
+      const list    = document.getElementById('sentinel-list');
+      const summary = document.getElementById('sentinel-summary');
+      const licence = document.getElementById('sentinel-licence');
 
-    // Preserved across the 15s refresh so an open group does not snap shut
-    // while an operator is reading it.
-    let _sentinelGroupOpen = false;
-    document.addEventListener('toggle', (e) => {
-      if (e.target && e.target.id === 'sentinel-group') _sentinelGroupOpen = e.target.open;
-    }, true);
+      if (!items.length) {
+        section.hidden = true;
+        list.innerHTML = '';
+        return;
+      }
+      section.hidden = false;
+
+      const running = items.filter(a => a.enabled && a.status === 'running').length;
+      summary.textContent = items.length + ' module(s) known, ' + running + ' running';
+
+      // The licence covers the whole Sentinel unit, so it is stated once for
+      // the section rather than repeated on nine cards.
+      const lic = items.find(a => a.license && a.license.name);
+      if (lic) {
+        licence.hidden = false;
+        licence.innerHTML = '<strong>Licence:</strong> ' + escapeHtml(lic.license.name) +
+          (lic.license.note ? ' — ' + escapeHtml(lic.license.note) : '');
+      } else {
+        licence.hidden = true;
+        licence.innerHTML = '';
+      }
+
+      list.innerHTML = items.map(renderAppCard).join('');
+      wireAppActions(list);
+    }
 
     function renderAppCard(a) {
         const foreign = (a.runtime || 'appliance') !== 'appliance';

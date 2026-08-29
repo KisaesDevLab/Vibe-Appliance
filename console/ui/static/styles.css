@@ -269,6 +269,15 @@ table.containers td.col-name { font-family: var(--mono); }
 }
 .support-notice a:hover { text-decoration: underline; }
 
+/* Explanatory prose under a section heading. Capped so a long paragraph
+   does not run the full width of a wide monitor. */
+.section-note {
+  max-width: 68ch;
+  margin: 0.35rem 0 0;
+  font-size: 0.95rem;
+}
+.section-note + .section-note { margin-top: 0.5rem; }
+
 /* ---------- App cards ---------- */
 
 .apps-list {
