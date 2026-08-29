@@ -860,6 +860,20 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
     // rather than guessed at.
     let _hostCapacity = null;
 
+    // Per-slug lifecycle-action state. _inflight keeps the 15s poll's
+    // re-render from resurrecting a clickable Enable while the script is
+    // still running (the server also 409s a duplicate — this is the UX
+    // half). _lastOutput survives re-renders so failure diagnostics don't
+    // vanish one poll tick after they appear.
+    const _inflight = new Map();   // slug -> action
+    const _lastOutput = new Map(); // slug -> combined stdout/stderr text
+    const ACTION_PROGRESS = {
+      enable:   'Enabling…',
+      disable:  'Disabling…',
+      update:   'Updating…',
+      rollback: 'Rolling back…',
+    };
+
     function renderSentinel(items) {
       const section = document.getElementById('sentinel-section');
       const list    = document.getElementById('sentinel-list');
@@ -899,6 +913,7 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
 
     function renderAppCard(a) {
         const foreign = (a.runtime || 'appliance') !== 'appliance';
+        const inflight = _inflight.get(a.slug);
         const notPublished = a.image_published === false;
         // A foreign runtime's images are not all on GHCR (Wazuh, Falco and
         // CrowdSec are not ours), and checkGhcrPublished correctly returns
@@ -964,6 +979,10 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
             ${foreign && a.hostPrereqs && a.hostPrereqs.length
                ? '<dt>host needs</dt><dd class="mono">' +
                  a.hostPrereqs.map(escapeHtml).join('<br>') + '</dd>' : ''}
+            ${foreign && a._cardLicence && a.license && a.license.name
+               ? '<dt>licence</dt><dd>' + escapeHtml(a.license.name) +
+                 (a.license.note ? ' <span class="muted">— ' + escapeHtml(a.license.note) + '</span>' : '') +
+                 '</dd>' : ''}
             ${foreign ? '' : `<dt>build</dt><dd>${
               // The build row replaces the prior "tag" row (which only
               // ever showed `latest` — useless for verifying an update
@@ -1078,9 +1097,6 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
 
       const card = document.getElementById('app-' + slug);
       const out = card.querySelector('.app-card__output');
-      out.hidden = true;
-      out.textContent = '';
-      _lastOutput.delete(slug);
 
       // Map UI action → API path.
       const apiPath =
@@ -1108,6 +1124,9 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
       }
 
       _inflight.set(slug, action);
+      out.hidden = true;
+      out.textContent = '';
+      _lastOutput.delete(slug);
       // Persist whatever lands in the output pane: the finally-refresh
       // re-renders the card, and without _lastOutput the re-render would
       // erase the operator's only diagnostic one round-trip after it

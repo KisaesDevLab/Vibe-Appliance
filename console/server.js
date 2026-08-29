@@ -5816,6 +5816,11 @@ async function runShell(res, args, action, extra = {}, onDone) {
   child.on('exit', (code) => {
     done();
     log('info', 'shell finished', { action, code, ...extra });
+    // 'error' may fire before 'exit' (both can fire for one child); the
+    // 500 is already sent then, and a second res.json() would throw
+    // ERR_HTTP_HEADERS_SENT inside this callback — outside Express's
+    // error pipeline — and take the whole console process down.
+    if (res.headersSent) return;
     // `extra` spreads FIRST so the reserved fields (action, exit_code,
     // stdout, stderr) override anything a caller might have passed
     // by accident. In JS object literals, later keys win — so a
@@ -5837,18 +5842,25 @@ async function runShell(res, args, action, extra = {}, onDone) {
 // UI renders as "already running". In-process state suffices — this
 // console is the only spawner of these scripts (browser buttons run
 // script files, per CLAUDE.md rule 4).
-const SLUG_LOCKS = new Map(); // slug -> action currently running
+const SLUG_LOCKS = new Map(); // slug -> { action, since: epoch ms }
 function acquireSlugLock(slug, action, res) {
   const held = SLUG_LOCKS.get(slug);
   if (held) {
+    const mins = Math.round((Date.now() - held.since) / 60000);
+    // No auto-expiry: the wedged child is still running, and expiring the
+    // lock would re-allow the exact concurrent run it exists to prevent.
+    // Instead the 409 carries the lock's age and the real recovery path.
     res.status(409).json({
       error: 'operation in progress',
-      detail: `A ${held} is already running for ${slug}. Wait for it to finish — ` +
-              'the card refreshes on its own — then retry.',
+      detail: `A ${held.action} for ${slug} has been running for ${mins} minute(s). ` +
+              'Normal enable/update runs finish within a few minutes — wait and retry. ' +
+              'If it looks wedged (10+ minutes), restart the console to clear it: ' +
+              'sudo docker restart vibe-console — lifecycle scripts are idempotent, ' +
+              'so re-running the action afterwards converges.',
     });
     return false;
   }
-  SLUG_LOCKS.set(slug, action);
+  SLUG_LOCKS.set(slug, { action, since: Date.now() });
   return true;
 }
 function releaseSlugLock(slug) { SLUG_LOCKS.delete(slug); }
@@ -5899,6 +5911,9 @@ async function runToggle(req, res, script, action, extraEnv) {
   child.on('exit', (code) => {
     log('info', 'toggle finished', { action, slug, code });
     release();
+    // 'error' may fire before 'exit'; see runShell — a second response
+    // here would crash the process with ERR_HTTP_HEADERS_SENT.
+    if (res.headersSent) return;
     res.status(code === 0 ? 200 : 500).json({
       action,
       slug,

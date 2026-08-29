@@ -1216,6 +1216,28 @@ def main():
 
 main()
 PYEOF
+  # The renderer's exit status is checked explicitly: both call sites run
+  # this function under a condition (`if ! render_caddyfile` /
+  # `render_caddyfile || {...}`), which suspends errexit for the whole
+  # function body — without this check a python exception would fall
+  # through and install $tmp, which is still the EMPTY mktemp file. An
+  # empty Caddyfile is *valid* config, so `caddy validate` would bless it
+  # and every route on the box would go dark.
+  local render_rc=$?
+  if [[ $render_rc -ne 0 ]]; then
+    rm -f "$tmp"
+    log_error "Caddyfile renderer exited non-zero (rc=$render_rc). Live config unchanged."
+    log_error "Common causes: a malformed console/manifests/<slug>.json, or state.json unreadable."
+    log_error "Diagnose: sudo python3 -m json.tool /opt/vibe/state.json; then each enabled manifest."
+    log_error "Fix the offending file and re-run: sudo bash /opt/vibe/appliance/bootstrap.sh"
+    return 1
+  fi
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    log_error "Caddyfile renderer produced an empty file. Live config unchanged."
+    log_error "This means the template rendered to nothing — check caddy/Caddyfile.tmpl and the snippets dir."
+    return 1
+  fi
 
   # Validate before installing. Skip when the caddy image isn't yet
   # locally present — that happens on the very first bootstrap before

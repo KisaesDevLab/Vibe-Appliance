@@ -429,8 +429,11 @@ cmd_update() {
     log_step "running migrations for $slug"
     if ! _run_migrations "$slug" "$manifest" "$default_tag"; then
       log_error "migrations failed; rolling back"
-      _do_rollback "$slug" "$manifest" "$backup_path" "migrations failed"
-      die "Update failed during migrations. Rolled back to prior version."
+      if _do_rollback "$slug" "$manifest" "$backup_path" "migrations failed"; then
+        die "Update failed during migrations. Rolled back to prior version."
+      else
+        die "Update failed during migrations, and the rollback did NOT fully complete — see the errors above and $VIBE_LOG_FILE before retrying."
+      fi
     fi
   fi
 
@@ -440,8 +443,11 @@ cmd_update() {
   if ! ( cd "$APPLIANCE_DIR" && \
          compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" up -d $services ) >>"$VIBE_LOG_FILE" 2>&1; then
     log_error "compose up failed; rolling back"
-    _do_rollback "$slug" "$manifest" "$backup_path" "compose up failed"
-    die "Update failed bringing up new images. Rolled back."
+    if _do_rollback "$slug" "$manifest" "$backup_path" "compose up failed"; then
+      die "Update failed bringing up new images. Rolled back."
+    else
+      die "Update failed bringing up new images, and the rollback did NOT fully complete — see the errors above and $VIBE_LOG_FILE before retrying."
+    fi
   fi
 
   # Step 7: health check. Per-app override via manifest.health_timeout_s
@@ -452,8 +458,11 @@ cmd_update() {
   log_step "waiting for $slug health (timeout ${health_timeout}s)"
   if ! _wait_for_health "$slug" "$manifest"; then
     log_error "health check timed out; rolling back"
-    _do_rollback "$slug" "$manifest" "$backup_path" "health check timeout"
-    die "Update failed at health check. Rolled back."
+    if _do_rollback "$slug" "$manifest" "$backup_path" "health check timeout"; then
+      die "Update failed at health check. Rolled back."
+    else
+      die "Update failed at health check, and the rollback did NOT fully complete — see the errors above and $VIBE_LOG_FILE before retrying."
+    fi
   fi
 
   # Step 8: run the manifest's seed if it never completed. Enable-app owns
@@ -528,7 +537,10 @@ for x in json.loads(sys.argv[1]):
 # ---- rollback ----------------------------------------------------------
 
 cmd_rollback() {
-  local slug="$1"
+  local slug="$1" with_db="${2:-}"
+  if [[ -n "$with_db" && "$with_db" != "--with-db" ]]; then
+    die "unknown rollback option: $with_db (only --with-db is supported)"
+  fi
   local manifest="$(_manifest_path "$slug")"
   [[ -f "$manifest" ]] || die "manifest not found: $manifest"
   # Units another orchestrator installs are not ours to update. A Sentinel
@@ -558,6 +570,25 @@ cmd_rollback() {
     compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" stop $services ) \
     >>"$VIBE_LOG_FILE" 2>&1 || true
 
+  # --with-db: also restore the newest pre-update DB backup while the
+  # containers are stopped. Off by default — restoring DESTROYS data
+  # written since the update, which is the operator's call, not ours.
+  if [[ "$with_db" == "--with-db" ]]; then
+    local backup_dir="/opt/vibe/data/apps/${slug}/pre-update-backups"
+    local latest_backup
+    latest_backup="$(ls -1t "$backup_dir"/*.gz 2>/dev/null | head -1 || true)"
+    if [[ -z "$latest_backup" ]]; then
+      die "--with-db was passed but no backup exists under $backup_dir. Nothing was changed — the containers are stopped; re-run without --with-db to bring the rollback image up."
+    fi
+    local db_name
+    db_name="$(_manifest_field "$manifest" 'data["database"]["name"]')"
+    log_step "restoring DB from $latest_backup"
+    if ! _pg_restore_for_app "$slug" "$db_name" "$latest_backup"; then
+      die "DB restore from $latest_backup failed — see $VIBE_LOG_FILE. Containers are stopped; fix the cause, then re-run: sudo bash /opt/vibe/appliance/update.sh $slug --rollback --with-db"
+    fi
+    log_ok "database restored from pre-update backup"
+  fi
+
   export APP_TAG="vibe-rollback-${slug}"
   if ! ( cd "$APPLIANCE_DIR" && \
          compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" up -d $services ) >>"$VIBE_LOG_FILE" 2>&1; then
@@ -568,6 +599,16 @@ cmd_rollback() {
   _state_app_set "$slug" status running image_tag "vibe-rollback-${slug}"
   _state_app_history_append "$slug" "rolled-back" "?" "vibe-rollback-${slug}" "manual rollback"
   log_ok "rollback complete for $slug"
+  if [[ "$with_db" != "--with-db" ]]; then
+    # The image is back but the database is whatever the update left —
+    # if the update ran migrations, old code is now running against the
+    # new schema. Say so, and hand over the surgical option instead of
+    # silently reporting success (CLAUDE.md: every error message carries
+    # its recovery).
+    log_warn "Database NOT restored: if this update ran migrations, the rolled-back code now runs against the migrated schema."
+    log_warn "To also restore the newest pre-update DB backup (DESTROYS data written since the update):"
+    log_warn "  sudo bash /opt/vibe/appliance/update.sh $slug --rollback --with-db"
+  fi
 }
 
 # ---- update internals --------------------------------------------------
@@ -699,14 +740,17 @@ _run_migrations() {
 
 _wait_for_health() {
   local slug="$1" manifest="$2"
-  local upstream health timeout_s
+  local upstream health timeout_s container
   # Single-line python expression — multi-line parses as two
   # statements and the second's leading whitespace yields
   # IndentationError. Same fix as enable-app.sh's _wait_for_app_health.
   upstream="$(_manifest_field "$manifest" 'data["routing"]["matchers"][0]["upstream"] if data["routing"].get("matchers") else data["routing"]["default_upstream"]')"
   health="$(_manifest_field "$manifest" 'data["health"]')"
-  timeout_s="$(_manifest_field "$manifest" 'data.get("health_timeout_s", 90)')"
-  timeout_s="${timeout_s:-90}"
+  # Default matches lib/enable-app.sh's _wait_for_app_health — the two
+  # copies MUST agree or updates fail on apps that enable fine.
+  timeout_s="$(_manifest_field "$manifest" 'data.get("health_timeout_s", 120)')"
+  timeout_s="${timeout_s:-120}"
+  container="${upstream%:*}"
 
   # Probe via `docker exec vibe-console curl` — same path enable-app.sh
   # uses now. Avoids spinning up a curlimages/curl container per probe.
@@ -726,6 +770,23 @@ _wait_for_health() {
       _wait_for_extra_health "$slug" "$manifest" && return 0
       return 1
     fi
+    # Crashloop fast-path, mirrored from enable-app.sh: a container that
+    # is not running will never answer /health — burning the rest of the
+    # timeout only hides the actual crash reason from the operator.
+    # Empty/unknown status can race compose right after `up -d`, so it
+    # means "keep waiting", not "crashed".
+    local status
+    status="$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null || true)"
+    case "$status" in
+      running|"") : ;;  # keep waiting
+      restarting|exited|dead|removing|paused|created)
+        log_error "container $container is in state '$status' — not waiting for /health"
+        log_error "last 50 lines of docker logs $container:"
+        docker logs --tail 50 "$container" 2>&1 | sed 's/^/  | /' >&2 || true
+        docker logs --tail 50 "$container" >>"$VIBE_LOG_FILE" 2>&1 || true
+        return 1
+        ;;
+    esac
     sleep 3
   done
   return 1
@@ -764,8 +825,23 @@ _wait_for_extra_health() {
   return "$rc"
 }
 
+# Returns 0 only when every rollback step succeeded (DB restored when a
+# backup existed, old image up). Non-zero means the rollback is
+# INCOMPLETE and the caller must not tell the operator "Rolled back."
 _do_rollback() {
   local slug="$1" manifest="$2" backup_path="$3" reason="$4"
+  local rc=0
+  local services
+  services="$(_app_services "$manifest")"
+
+  # Stop the (new) containers FIRST. They hold connections to the app
+  # database; DROP DATABASE below would be refused ("database is being
+  # accessed by other users") and the restore would fail while the old
+  # log message still claimed a clean rollback.
+  ( cd "$APPLIANCE_DIR" && \
+    compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" stop $services ) \
+    >>"$VIBE_LOG_FILE" 2>&1 || \
+    log_warn "stopping new containers before DB restore reported errors — continuing"
 
   # Restore DB from backup if we made one.
   if [[ -n "$backup_path" && -f "$backup_path" ]]; then
@@ -773,21 +849,31 @@ _do_rollback() {
     local db_name
     db_name="$(_manifest_field "$manifest" 'data["database"]["name"]')"
     if ! _pg_restore_for_app "$slug" "$db_name" "$backup_path"; then
-      log_warn "DB restore returned non-zero — manual inspection required"
+      rc=1
+      log_error "DB restore FAILED — the database may still hold the NEW (migrated) schema while the OLD image is about to start."
+      log_error "Diagnose: sudo tail -50 $VIBE_LOG_FILE"
+      log_error "Manual restore (after fixing the cause):"
+      log_error "  sudo bash -c 'set -a; . /opt/vibe/env/shared.env; gunzip -c $backup_path | docker exec -i -e PGPASSWORD=\$POSTGRES_PASSWORD vibe-postgres psql -v ON_ERROR_STOP=1 -U postgres -d ${db_name}'"
     fi
   fi
 
   # Restart with rollback tag.
-  local services
-  services="$(_app_services "$manifest")"
   export APP_TAG="vibe-rollback-${slug}"
-  ( cd "$APPLIANCE_DIR" && \
+  if ! ( cd "$APPLIANCE_DIR" && \
     compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" up -d $services ) \
-    >>"$VIBE_LOG_FILE" 2>&1 || \
-    log_warn "rollback bring-up failed too — both versions broken, manual recovery needed"
+    >>"$VIBE_LOG_FILE" 2>&1; then
+    rc=1
+    log_error "rollback bring-up failed too — both versions down, manual recovery needed"
+    log_error "Diagnose: sudo docker compose -f /opt/vibe/appliance/docker-compose.yml -f /opt/vibe/appliance/apps/${slug}.yml ps"
+  fi
 
-  _state_app_set "$slug" status failed update_error "$reason"
+  if (( rc == 0 )); then
+    _state_app_set "$slug" status failed update_error "$reason"
+  else
+    _state_app_set "$slug" status failed update_error "$reason (rollback incomplete — see /opt/vibe/logs)"
+  fi
   _state_app_history_append "$slug" "failed-rolled-back" "?" "?" "$reason"
+  return $rc
 }
 
 _pg_restore_for_app() {
@@ -795,7 +881,7 @@ _pg_restore_for_app() {
   # Drop and recreate the database, then pipe the gz dump in.
   docker exec -i -e PGPASSWORD="$POSTGRES_PASSWORD" vibe-postgres \
     psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d postgres \
-    -c "DROP DATABASE IF EXISTS \"${db_name}\";" >>"$VIBE_LOG_FILE" 2>&1 || return 1
+    -c "DROP DATABASE IF EXISTS \"${db_name}\" WITH (FORCE);" >>"$VIBE_LOG_FILE" 2>&1 || return 1
   docker exec -i -e PGPASSWORD="$POSTGRES_PASSWORD" vibe-postgres \
     psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d postgres \
     -c "CREATE DATABASE \"${db_name}\";" >>"$VIBE_LOG_FILE" 2>&1 || return 1
@@ -820,6 +906,11 @@ Usage:
   sudo update.sh --check <slug>         Check just one app.
   sudo update.sh <slug>                 Update <slug> with rollback safety net.
   sudo update.sh <slug> --rollback      Restore <slug> to its previous image.
+                                        (DB is NOT touched — a warning explains.)
+  sudo update.sh <slug> --rollback --with-db
+                                        Also restore the newest pre-update DB
+                                        backup. DESTROYS data written since the
+                                        update — deliberate opt-in only.
 
 Output: human-readable to stderr; --check also emits NDJSON on stdout.
 EOF
@@ -833,7 +924,7 @@ EOF
     slug="$1"
     shift
     case "${1:-}" in
-      --rollback) cmd_rollback "$slug" ;;
+      --rollback) shift; cmd_rollback "$slug" "${1:-}" ;;
       "")         cmd_update   "$slug" ;;
       *)          echo "unknown trailing arg: $1" >&2; exit 2 ;;
     esac

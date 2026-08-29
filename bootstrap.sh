@@ -55,6 +55,16 @@ export VIBE_STATE_FILE="${VIBE_DIR}/state.json"
 CONFIG_MODE="lan"
 CONFIG_DOMAIN=""
 CONFIG_EMAIL=""
+# Track whether the operator explicitly passed each network-identity flag
+# THIS invocation. A bare re-run (`sudo bash bootstrap.sh` — the recovery
+# step every error message recommends) must inherit the persisted
+# mode/domain/email from state.json rather than silently resetting a
+# domain-mode HTTPS install back to LAN defaults. Same pattern as
+# CONFIG_TAILSCALE_EXPLICIT below.
+CONFIG_MODE_EXPLICIT="false"
+CONFIG_DOMAIN_EXPLICIT="false"
+CONFIG_EMAIL_EXPLICIT="false"
+CONFIG_TUNNEL_SUBDOMAIN_EXPLICIT="false"
 # In domain mode every app serves from a single hostname under
 # `${TUNNEL_SUBDOMAIN}.${DOMAIN}` with path-prefix routing (mirroring
 # LAN mode). Default subdomain label is "vibe" — operators can override
@@ -179,14 +189,14 @@ EOF
 parse_flags() {
   while (( $# > 0 )); do
     case "$1" in
-      --mode)            CONFIG_MODE="${2:?--mode requires a value}"; shift 2 ;;
-      --mode=*)          CONFIG_MODE="${1#*=}"; shift ;;
-      --domain)          CONFIG_DOMAIN="${2:?--domain requires a value}"; shift 2 ;;
-      --domain=*)        CONFIG_DOMAIN="${1#*=}"; shift ;;
-      --tunnel-subdomain)   CONFIG_TUNNEL_SUBDOMAIN="${2:?--tunnel-subdomain requires a value}"; shift 2 ;;
-      --tunnel-subdomain=*) CONFIG_TUNNEL_SUBDOMAIN="${1#*=}"; shift ;;
-      --email)           CONFIG_EMAIL="${2:?--email requires a value}"; shift 2 ;;
-      --email=*)         CONFIG_EMAIL="${1#*=}"; shift ;;
+      --mode)            CONFIG_MODE="${2:?--mode requires a value}"; CONFIG_MODE_EXPLICIT="true"; shift 2 ;;
+      --mode=*)          CONFIG_MODE="${1#*=}"; CONFIG_MODE_EXPLICIT="true"; shift ;;
+      --domain)          CONFIG_DOMAIN="${2:?--domain requires a value}"; CONFIG_DOMAIN_EXPLICIT="true"; shift 2 ;;
+      --domain=*)        CONFIG_DOMAIN="${1#*=}"; CONFIG_DOMAIN_EXPLICIT="true"; shift ;;
+      --tunnel-subdomain)   CONFIG_TUNNEL_SUBDOMAIN="${2:?--tunnel-subdomain requires a value}"; CONFIG_TUNNEL_SUBDOMAIN_EXPLICIT="true"; shift 2 ;;
+      --tunnel-subdomain=*) CONFIG_TUNNEL_SUBDOMAIN="${1#*=}"; CONFIG_TUNNEL_SUBDOMAIN_EXPLICIT="true"; shift ;;
+      --email)           CONFIG_EMAIL="${2:?--email requires a value}"; CONFIG_EMAIL_EXPLICIT="true"; shift 2 ;;
+      --email=*)         CONFIG_EMAIL="${1#*=}"; CONFIG_EMAIL_EXPLICIT="true"; shift ;;
       --tailscale)       CONFIG_TAILSCALE="true"; CONFIG_TAILSCALE_EXPLICIT="true"; shift ;;
       --tailscale-authkey)        CONFIG_TAILSCALE_AUTHKEY="${2:?--tailscale-authkey requires a value}"; CONFIG_TAILSCALE="true"; CONFIG_TAILSCALE_EXPLICIT="true"; shift 2 ;;
       --tailscale-authkey=*)      CONFIG_TAILSCALE_AUTHKEY="${1#*=}"; CONFIG_TAILSCALE="true"; CONFIG_TAILSCALE_EXPLICIT="true"; shift ;;
@@ -551,6 +561,37 @@ For a CLEAN reset that DESTROYS the database, stop postgres first:
   sudo /opt/vibe/appliance/bootstrap.sh --reset-env
 
 (That second path loses every app's data — only do it on a fresh install.)
+HELP
+)"
+    fi
+    # "Not currently running" is NOT proof it's safe: postgres reads
+    # POSTGRES_PASSWORD from env only at INITIAL cluster creation, so an
+    # initialized data volume keeps the old password forever. Rotating
+    # shared.env against a stopped-but-initialized cluster produces the
+    # same lockout the guard above prevents, one restart later. A downed
+    # docker daemon also lands here (docker ps errors read as
+    # "not running"), which is exactly when guessing is most dangerous.
+    if [[ -f "${VIBE_DIR}/data/postgres/PG_VERSION" ]]; then
+      state_set_phase secrets failed "reset-env blocked: initialized postgres data present"
+      die "$(cat <<HELP
+--reset-env was passed but /opt/vibe/data/postgres already holds an
+initialized database. Rotating POSTGRES_PASSWORD in shared.env would
+lock the stack out of that data the moment postgres restarts.
+
+Pick one:
+
+  A. Keep the data — rotate manually against a RUNNING postgres:
+       sudo docker compose -f /opt/vibe/appliance/docker-compose.yml up -d postgres
+       NEW=\$(openssl rand -hex 32) && echo "\$NEW"
+       sudo docker exec -it vibe-postgres psql -U postgres \\
+         -c "ALTER USER postgres WITH PASSWORD '\$NEW';"
+       sudo nano /opt/vibe/env/shared.env   # set POSTGRES_PASSWORD to the same value
+       sudo docker compose -f /opt/vibe/appliance/docker-compose.yml restart postgres
+
+  B. DESTROY the data and start clean (loses every app's data):
+       sudo docker compose -f /opt/vibe/appliance/docker-compose.yml stop postgres
+       sudo rm -rf /opt/vibe/data/postgres
+       sudo /opt/vibe/appliance/bootstrap.sh --reset-env
 HELP
 )"
     fi
@@ -920,20 +961,50 @@ phase_apps() {
   # bootstrap. Operator must click Enable in admin (or run
   # `vibe enable <slug>`) to retry — that path resets status to
   # `enabling` and runs a fresh attempt with up-to-date manifests.
+  # Order matters: state.json's writers sort keys alphabetically, and
+  # iterating that order re-enables 'vibe-1040' before its requiredApps
+  # dependency 'vibe-ai-router' — 1040's preflight then probes a router
+  # that hasn't come back yet and dies. Emit dependency-ordered slugs
+  # instead (requiredApps within the enabled set first; alphabetical
+  # tiebreak; a manifest cycle falls back to alphabetical rather than
+  # hanging).
   local slugs
-  slugs="$(python3 - "$VIBE_STATE_FILE" <<'PYEOF' || true
-import json, sys
+  slugs="$(python3 - "$VIBE_STATE_FILE" "${APPLIANCE_DIR}/console/manifests" <<'PYEOF' || true
+import json, os, sys
+state_path, manifests_dir = sys.argv[1:3]
 try:
-    with open(sys.argv[1]) as f:
+    with open(state_path) as f:
         s = json.load(f)
 except Exception:
     sys.exit(0)
+enabled = []
 for slug, e in (s.get("apps", {}) or {}).items():
     if not e.get("enabled"):
         continue
     # Skip apps whose last attempt failed — operator decides when to retry.
     if e.get("status") == "failed":
         continue
+    enabled.append(slug)
+deps = {}
+for slug in enabled:
+    try:
+        with open(os.path.join(manifests_dir, slug + ".json")) as f:
+            m = json.load(f)
+        deps[slug] = [d for d in (m.get("requiredApps") or []) if d in enabled]
+    except Exception:
+        deps[slug] = []
+emitted, remaining = [], sorted(enabled)
+while remaining:
+    progressed = False
+    for slug in list(remaining):
+        if all(d in emitted for d in deps[slug]):
+            emitted.append(slug)
+            remaining.remove(slug)
+            progressed = True
+    if not progressed:
+        emitted.extend(remaining)  # dependency cycle: alphabetical fallback
+        break
+for slug in emitted:
     print(slug)
 PYEOF
 )"
@@ -955,7 +1026,13 @@ PYEOF
     if ( enable_app "$slug" ); then
       log_ok "app re-enabled" slug="$slug"
     else
-      log_warn "app re-enable failed; leaving in failed state" slug="$slug"
+      # Preflight failures die before enable_app's own _state_app_set
+      # runs, leaving stale enabled=true / status=running from before the
+      # reboot — a green badge on an app that is actually down. Record
+      # the failure so the console tells the truth and the next bootstrap
+      # skips it; the admin Enable button retries with a fresh attempt.
+      _state_app_set "$slug" status failed error "re-enable failed during bootstrap — see /opt/vibe/logs/bootstrap.log"
+      log_warn "app re-enable failed; marked status=failed in state" slug="$slug"
     fi
   done <<<"$slugs"
 }
@@ -1159,6 +1236,36 @@ main() {
   # this every bootstrap run keeps the symlink fresh if APPLIANCE_DIR
   # ever moves, and it's cheap.
   _install_vibe_cli
+
+  # A bare re-run inherits the persisted network identity. Every error
+  # message in this repo says "re-run bootstrap"; if that re-run reset
+  # mode/domain/email to defaults, the documented recovery path would
+  # silently convert a domain-mode HTTPS install into a broken LAN one
+  # (LAN Caddyfile, http origins in every app env). CLI flags win; state
+  # fills in whatever the operator didn't re-type this invocation.
+  _prev=""
+  if [[ "$CONFIG_MODE_EXPLICIT" != "true" ]]; then
+    _prev="$(state_get_config_kv mode)"
+    [[ -n "$_prev" ]] && CONFIG_MODE="$_prev"
+  fi
+  if [[ "$CONFIG_DOMAIN_EXPLICIT" != "true" ]]; then
+    _prev="$(state_get_config_kv domain)"
+    [[ -n "$_prev" ]] && CONFIG_DOMAIN="$_prev"
+  fi
+  if [[ "$CONFIG_EMAIL_EXPLICIT" != "true" ]]; then
+    _prev="$(state_get_config_kv email)"
+    [[ -n "$_prev" ]] && CONFIG_EMAIL="$_prev"
+  fi
+  if [[ "$CONFIG_TUNNEL_SUBDOMAIN_EXPLICIT" != "true" ]]; then
+    _prev="$(state_get_config_kv tunnel_subdomain)"
+    [[ -n "$_prev" ]] && CONFIG_TUNNEL_SUBDOMAIN="$_prev"
+  fi
+  # Re-validate the adopted combination the way parse_flags validates
+  # explicit flags — a hand-edited state.json can be inconsistent.
+  if [[ "$CONFIG_MODE" == "domain" && ( -z "$CONFIG_DOMAIN" || -z "$CONFIG_EMAIL" ) ]]; then
+    die "state.json says mode=domain but domain or email is missing.
+Re-run with the full identity: sudo bash bootstrap.sh --mode domain --domain YOUR.DOMAIN --email YOU@EXAMPLE.COM"
+  fi
 
   # Persist user-supplied config so phase 2 (Phase 2 of build) can read it.
   state_set_config_kv mode               "$CONFIG_MODE"
