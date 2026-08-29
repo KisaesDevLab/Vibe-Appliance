@@ -97,9 +97,14 @@ internal CUPS. Three assumed features do not exist yet and are tracked against
 the Vibe-Printer repo:
 
 - IPP Everywhere queue publishing
-- held release with PIN/web release at the device — so Sentinel's Decision 26
-  (on-site direct, off-site held) **cannot be enforced today**
 - the scanner inbox (SMB/FTPS/SMTP)
+
+Held release with PIN/web release at the device was a third gap, and is now
+**withdrawn rather than pending**: Sentinel's Decision 26 was removed from its
+build plan (v1.7, §11 R26) because the firm has no off-site printing to hold and
+the release station it depended on was never built. Its rules, schema columns
+and report language went with it. A control that cannot operate should not sit
+in a scorecard waiting to be believed.
 
 Both appliances may install this app, but only one should run the container on a
 shared host. They publish on different ports (this appliance fronts it via Caddy
