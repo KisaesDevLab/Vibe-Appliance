@@ -427,11 +427,19 @@ check_console_health() {
     # Tailscale mode binds Caddy's published ports to 127.0.0.1 on the
     # HOST (bootstrap's tailscale bind), so host.docker.internal has no
     # listener — probing it from in here false-FAILs every healthy
-    # tailscale install and sends the operator restarting a working
-    # Caddy. Report "cannot probe from here" instead of a fake verdict.
+    # tailscale install. Probe Caddy over the container network instead
+    # (it listens on :80 container-wide regardless of the host bind);
+    # if even that fails, say "cannot verify from here", never a fake
+    # verdict against the wrong address.
     if [[ "$(_state_get "config.mode")" == "tailscale" ]]; then
-      _check_warn "cannot probe Caddy from inside the console in tailscale mode (ports bind to the host's 127.0.0.1)" \
-        "Diagnose: run doctor on the host instead: sudo bash /opt/vibe/appliance/doctor.sh"
+      local c_code
+      c_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://caddy/health 2>/dev/null || true)"
+      if [[ "$c_code" == "200" ]]; then
+        _check_pass "200 via Caddy (http://caddy/health — container network; host ports bind to 127.0.0.1 in tailscale mode)"
+      else
+        _check_warn "cannot verify Caddy from inside the console in tailscale mode (container probe returned HTTP ${c_code:-000})" \
+          "Diagnose: run doctor on the host instead: sudo bash /opt/vibe/appliance/doctor.sh"
+      fi
       return
     fi
     target="http://host.docker.internal/health"
@@ -502,6 +510,9 @@ Fix:      that installer owns this module; its output names the failing service"
   code="$(probe_http_code "http://${upstream}${health}")"
   if [[ "$code" == "200" ]]; then
     _check_pass "$upstream$health responds 200"
+  elif [[ -z "$code" ]]; then
+    _check_warn "probe unavailable — vibe-console is not running, so $upstream$health cannot be checked from here" \
+      "Diagnose: docker ps --filter name=^vibe-console\$"
   else
     # `docker compose ... logs` walks every container declared in the
     # overlay, so it works for every app topology (single-container,
@@ -534,8 +545,13 @@ Fix:      restart the app via the admin Apps tab (Disable, then Enable)"
     x_code="$(probe_http_code "http://${x_upstream}${x_path}")"
     if [[ "$x_code" == "200" ]]; then
       _check_pass "$x_upstream$x_path responds 200"
+    elif [[ -z "$x_code" ]]; then
+      # Empty means the probe itself couldn't run (vibe-console down) —
+      # a very different situation from the app answering 000.
+      _check_warn "probe unavailable — vibe-console is not running, so $x_upstream$x_path cannot be checked from here" \
+        "Diagnose: docker ps --filter name=^vibe-console\$"
     else
-      _check_fail "$x_upstream$x_path returned HTTP ${x_code:-000} (expected 200)" \
+      _check_fail "$x_upstream$x_path returned HTTP ${x_code} (expected 200)" \
         "Diagnose: docker logs --tail 40 ${x_upstream%:*}
 Fix:      restart the app via the admin Apps tab (Disable, then Enable)"
     fi

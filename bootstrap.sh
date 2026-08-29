@@ -525,7 +525,19 @@ phase_secrets() {
   # That is safe because per-app DB role passwords are realigned by
   # db-bootstrap's ALTER ROLE on this same run, and app-level secrets
   # (JWT_SECRET etc.) take effect at the next enable.
+  # ENCRYPTION_KEY is preserved on the same grounds, and more so: apps
+  # derive their data-at-rest keys from it (Vibe-MyBooks'
+  # PLAID_ENCRYPTION_KEY, Vibe-Payroll's SECRETS_ENCRYPTION_KEY,
+  # Vibe-Tax-Research's MASTER_KEY, Vibe-Calculators' KMS key), and
+  # phase_apps re-renders every enabled app's env from the shared value —
+  # rotating it makes every previously encrypted row undecryptable, with
+  # no ALTER-ROLE-style realignment possible. Rotating it is deliberate
+  # manual surgery, never a side effect of --reset-env.
   _pg_preserve=""
+  _enc_preserve=""
+  if [[ "$CONFIG_RESET_ENV" == "true" && -f "$VIBE_ENV_SHARED" ]]; then
+    _enc_preserve="$(grep -m1 '^ENCRYPTION_KEY=' "$VIBE_ENV_SHARED" 2>/dev/null | cut -d= -f2- || true)"
+  fi
   if [[ "$CONFIG_RESET_ENV" == "true" && -f "${VIBE_DIR}/data/postgres/PG_VERSION" ]]; then
     _pg_preserve="$(grep -m1 '^POSTGRES_PASSWORD=' "$VIBE_ENV_SHARED" 2>/dev/null | cut -d= -f2- || true)"
     if [[ -z "$_pg_preserve" ]]; then
@@ -559,7 +571,7 @@ Pick one:
 HELP
 )"
     fi
-    log_warn "--reset-env: preserving POSTGRES_PASSWORD — the initialized cluster keeps the password it was created with. Every other secret is rotated; per-app DB roles are realigned automatically this run."
+    log_warn "--reset-env: preserving POSTGRES_PASSWORD and ENCRYPTION_KEY — the database keeps the password it was created with, and encrypted app data keeps its key. Every other secret is rotated; per-app DB roles are realigned automatically this run."
   fi
 
   if ! secrets_render \
@@ -569,32 +581,46 @@ HELP
     die "Could not render shared.env. See $VIBE_LOG_FILE."
   fi
 
-  # Put the preserved superuser password back — secrets_render archived
-  # the old file and regenerated every placeholder, this one included.
-  # Passed via the environment, never argv, so it stays out of `ps`.
-  if [[ -n "${_pg_preserve:-}" ]]; then
-    if ! _PG_PRESERVE="$_pg_preserve" python3 - "$VIBE_ENV_SHARED" <<'PYEOF'
+  # Put the preserved secrets back — secrets_render archived the old file
+  # and regenerated every placeholder, these included. Values travel via
+  # the environment (never argv, so nothing lands in `ps`), and the write
+  # is temp-file + os.replace: a torn in-place write here would truncate
+  # the file holding every core secret, during the one operation whose
+  # audience is recovery.
+  if [[ -n "${_pg_preserve:-}" || -n "${_enc_preserve:-}" ]]; then
+    if ! _PG_PRESERVE="${_pg_preserve:-}" _ENC_PRESERVE="${_enc_preserve:-}" \
+         python3 - "$VIBE_ENV_SHARED" <<'PYEOF'
 import os, sys
 path = sys.argv[1]
-val = os.environ["_PG_PRESERVE"]
+keep = {}
+if os.environ.get("_PG_PRESERVE"):
+    keep["POSTGRES_PASSWORD"] = os.environ["_PG_PRESERVE"]
+if os.environ.get("_ENC_PRESERVE"):
+    keep["ENCRYPTION_KEY"] = os.environ["_ENC_PRESERVE"]
 lines = open(path).read().splitlines()
 out = []
-hit = False
+hit = set()
 for l in lines:
-    if l.startswith("POSTGRES_PASSWORD="):
-        out.append("POSTGRES_PASSWORD=" + val)
-        hit = True
+    key = l.split("=", 1)[0] if "=" in l else None
+    if key in keep:
+        out.append(key + "=" + keep[key])
+        hit.add(key)
     else:
         out.append(l)
-if not hit:
-    out.append("POSTGRES_PASSWORD=" + val)
-open(path, "w").write("\n".join(out) + "\n")
+for key, val in keep.items():
+    if key not in hit:
+        out.append(key + "=" + val)
+tmp = path + ".tmp." + str(os.getpid())
+with open(tmp, "w") as f:
+    f.write("\n".join(out) + "\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
 PYEOF
     then
-      state_set_phase secrets failed "could not restore preserved POSTGRES_PASSWORD"
-      die "Could not write the preserved POSTGRES_PASSWORD back into $VIBE_ENV_SHARED." "The pre-reset file was archived as ${VIBE_ENV_SHARED}.bak.<timestamp> — restore it and re-run bootstrap."
+      state_set_phase secrets failed "could not restore preserved secrets"
+      die "Could not write the preserved POSTGRES_PASSWORD/ENCRYPTION_KEY back into $VIBE_ENV_SHARED." "The pre-reset file was archived as ${VIBE_ENV_SHARED}.bak.<timestamp> — restore it and re-run bootstrap."
     fi
-    log_info "preserved POSTGRES_PASSWORD restored into shared.env"
+    log_info "preserved secrets restored into shared.env" keys="POSTGRES_PASSWORD${_enc_preserve:+,ENCRYPTION_KEY}"
   fi
 
   # Render appliance.env — Tier 1 inline-editable settings (Phase 8.5
@@ -988,8 +1014,13 @@ for slug in enabled:
     try:
         with open(os.path.join(manifests_dir, slug + ".json")) as f:
             m = json.load(f)
-    except Exception:
-        m = {}
+    except Exception as e:
+        # Fail CLOSED: defaulting an unreadable manifest to "appliance"
+        # would feed a Sentinel module to enable_app (which refuses) and
+        # stamp a healthy installer-managed module failed. Skip it this
+        # run and say so; the next bootstrap retries.
+        print("bootstrap: cannot read manifest for enabled app %s (%s) - skipping its re-enable this run" % (slug, e), file=sys.stderr)
+        continue
     if (m.get("runtime") or "appliance") != "appliance":
         continue
     own.append(slug)

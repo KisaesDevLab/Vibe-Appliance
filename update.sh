@@ -192,14 +192,14 @@ _remote_digest() {
   esac
   local repo="${image#ghcr.io/}"
   local token
-  token="$(curl -fsS --max-time 8 "https://ghcr.io/token?scope=repository:${repo}:pull" \
+  token="$(curl -fsS --connect-timeout 3 --max-time 8 "https://ghcr.io/token?scope=repository:${repo}:pull" \
     | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("token",""))
 except: pass' 2>/dev/null || true)"
   [[ -n "$token" ]] || return 1
 
   local accept='application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.index.v1+json'
-  curl -fsSI --max-time 8 \
+  curl -fsSI --connect-timeout 3 --max-time 8 \
     -H "Authorization: Bearer ${token}" \
     -H "Accept: ${accept}" \
     "https://ghcr.io/v2/${repo}/manifests/${tag}" 2>/dev/null \
@@ -330,6 +330,21 @@ for slug, e in (s.get('apps',{}) or {}).items():
 
   local any_update_available="false"
   for slug in "${slugs[@]}"; do
+    # Units another orchestrator installs share state.apps but are not
+    # ours to check — their manifests have no image block, so _check_one
+    # emits nothing, check_failed stays false, and the stale-failed
+    # clear below would stamp a FAILED Sentinel module "running".
+    local _chk_manifest _chk_rt
+    _chk_manifest="$(_manifest_path "$slug")"
+    _chk_rt="appliance"
+    if [[ -f "$_chk_manifest" ]]; then
+      _chk_rt="$(_manifest_field "$_chk_manifest" 'data.get("runtime","appliance")')"
+      _chk_rt="${_chk_rt:-appliance}"
+    fi
+    if [[ "$_chk_rt" != "appliance" ]]; then
+      log_info "skipping $slug — runtime '$_chk_rt' is owned by its own installer"
+      continue
+    fi
     log_info "checking $slug"
     local has_update="false"
     local check_failed="false"
@@ -478,15 +493,13 @@ cmd_update() {
   fi
 
   # Step 5: run migrations against the new image (if declared).
+  # (Failure paths below share _rollback_and_die: roll back, then die
+  # with wording that is honest about whether the rollback completed.)
   if _manifest_has_migrations "$manifest"; then
     log_step "running migrations for $slug"
     if ! _run_migrations "$slug" "$manifest" "$default_tag"; then
       log_error "migrations failed; rolling back"
-      if _do_rollback "$slug" "$manifest" "$backup_path" "migrations failed"; then
-        die "Update failed during migrations. Rolled back to prior version."
-      else
-        die "Update failed during migrations, and the rollback did NOT fully complete — see the errors above and $VIBE_LOG_FILE before retrying."
-      fi
+      _rollback_and_die "$slug" "$manifest" "$backup_path" "migrations failed" "Update failed during migrations."
     fi
   fi
 
@@ -496,11 +509,7 @@ cmd_update() {
   if ! ( cd "$APPLIANCE_DIR" && \
          compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" up -d $services ) >>"$VIBE_LOG_FILE" 2>&1; then
     log_error "compose up failed; rolling back"
-    if _do_rollback "$slug" "$manifest" "$backup_path" "compose up failed"; then
-      die "Update failed bringing up new images. Rolled back."
-    else
-      die "Update failed bringing up new images, and the rollback did NOT fully complete — see the errors above and $VIBE_LOG_FILE before retrying."
-    fi
+    _rollback_and_die "$slug" "$manifest" "$backup_path" "compose up failed" "Update failed bringing up new images."
   fi
 
   # Step 7: health check. Per-app override via manifest.health_timeout_s
@@ -513,11 +522,7 @@ cmd_update() {
   log_step "waiting for $slug health (timeout ${health_timeout}s)"
   if ! _wait_for_health "$slug" "$manifest"; then
     log_error "health check timed out; rolling back"
-    if _do_rollback "$slug" "$manifest" "$backup_path" "health check timeout"; then
-      die "Update failed at health check. Rolled back."
-    else
-      die "Update failed at health check, and the rollback did NOT fully complete — see the errors above and $VIBE_LOG_FILE before retrying."
-    fi
+    _rollback_and_die "$slug" "$manifest" "$backup_path" "health check timeout" "Update failed at health check."
   fi
 
   # Step 8: run the manifest's seed if it never completed. Enable-app owns
@@ -642,9 +647,9 @@ cmd_rollback() {
     _db_dirty="$(python3 -c "import json;a=json.load(open('${VIBE_STATE_FILE}')).get('apps',{}).get('${slug}',{});print('true' if a.get('db_dirty') else '')" 2>/dev/null || true)"
     if [[ -n "$with_db_path" ]]; then
       chosen_backup="$with_db_path"
-      [[ -f "$chosen_backup" ]] || die "--with-db=$chosen_backup: file not found." "List the available dumps with: ls -lt $backup_dir/"
+      [[ -f "$chosen_backup" ]] || die "--with-db=$chosen_backup: file not found. NOTE: the app's containers are already STOPPED — re-run without --with-db to bring the rollback image up while you look." "List the available dumps with: ls -lt $backup_dir/"
     elif [[ "$_db_dirty" == "true" ]]; then
-      die "a previous update left the database in an unverified state (a restore failed), so the newest dump may be a POST-migration snapshot — auto-picking it could restore the wrong schema under the old image." "Pick the dump explicitly:
+      die "a previous update left the database in an unverified state (a restore failed), so the newest dump may be a POST-migration snapshot — auto-picking it could restore the wrong schema under the old image. NOTE: the app's containers are already STOPPED — re-run without --with-db to bring the rollback image up while you decide." "Pick the dump explicitly (restoring it also clears this safety flag):
   ls -lt $backup_dir/
   sudo bash /opt/vibe/appliance/update.sh $slug --rollback --with-db=$backup_dir/<file>.sql.gz"
     else
@@ -715,7 +720,11 @@ _do_pull() {
   local services
   services="$(_app_services "$manifest")"
   # Empty list -> whole-project pull, which fails on build-only services.
-  [[ -n "$services" ]] || return 1
+  if [[ -z "$services" ]]; then
+    log_error "could not derive compose services for $slug from its manifest routing — refusing a whole-project pull."
+    log_error "Fix routing.default_upstream / routing.matchers[].upstream in console/manifests/${slug}.json, then retry."
+    return 1
+  fi
   ( cd "$APPLIANCE_DIR" && \
     compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" pull $services ) >>"$VIBE_LOG_FILE" 2>&1
 }
@@ -915,6 +924,17 @@ _wait_for_extra_health() {
   return "$rc"
 }
 
+# Roll back, then die with wording that is honest about whether the
+# rollback completed — the one place the "Rolled back." sentence lives.
+_rollback_and_die() {
+  local slug="$1" manifest="$2" backup_path="$3" reason="$4" prefix="$5"
+  if _do_rollback "$slug" "$manifest" "$backup_path" "$reason"; then
+    die "$prefix Rolled back to prior version."
+  else
+    die "$prefix The rollback did NOT fully complete — see the errors above and $VIBE_LOG_FILE before retrying."
+  fi
+}
+
 # Returns 0 only when every rollback step succeeded (DB restored when a
 # backup existed, old image up). Non-zero means the rollback is
 # INCOMPLETE and the caller must not tell the operator "Rolled back."
@@ -955,6 +975,8 @@ _do_rollback() {
       log_error "Diagnose: sudo tail -50 $VIBE_LOG_FILE"
       log_error "Manual restore (after fixing the cause):"
       log_error "  sudo bash -c 'set -a; . /opt/vibe/env/shared.env; gunzip -c $backup_path | docker exec -i -e PGPASSWORD=\$POSTGRES_PASSWORD vibe-postgres psql -v ON_ERROR_STOP=1 -U postgres -d ${db_name}'"
+      log_error "Or, simpler — this restores the same dump AND clears the safety flag:"
+      log_error "  sudo bash /opt/vibe/appliance/update.sh $slug --rollback --with-db=$backup_path"
     else
       _state_app_set "$slug" db_dirty false
     fi

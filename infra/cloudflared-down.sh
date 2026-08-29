@@ -100,17 +100,20 @@ log_step "stopping cloudflared container (if running)"
     docker compose -f docker-compose.yml -f infra/cloudflared.yml rm -sf cloudflared \
   ) >>"$VIBE_LOG_FILE" 2>&1 || true
 
-# Bail before any API work if we don't have credentials. The container
-# is down — that alone may be all the operator wanted (e.g. they're
-# rotating the API token and want to start clean).
-if [[ -z "$CF_TUNNEL_API_TOKEN" || -z "$CF_ACCOUNT_ID" || -z "$CF_ZONE_ID" ]]; then
-  log_warn "Cloudflare API credentials not in $VIBE_ENV_APPLIANCE — container is stopped, but DNS records and the tunnel object remain at Cloudflare. Re-add the creds under Configuration → Network → Cloudflare Tunnel, then click Tear down again to clean up the rest."
-  exit 0
-fi
-
+# --local-only needs no API credentials — it exists precisely for the
+# case where they are gone for good. It must run BEFORE the creds gate,
+# whose early exit would otherwise dead-end the escape hatch in its own
+# headline scenario (token revoked AND removed from appliance.env),
+# leaving TUNNEL_TOKEN in shared.env and Caddy stuck in tunnel mode.
 if (( LOCAL_ONLY == 1 )); then
   log_warn "--local-only: skipping every Cloudflare API step. The tunnel object and its CNAMEs remain at Cloudflare — delete them by hand: dash.cloudflare.com → your zone → DNS (CNAMEs pointing at *.cfargotunnel.com), then Zero Trust → Networks → Tunnels → delete '$CF_TUNNEL_NAME'."
   TUNNEL_ID=""
+elif [[ -z "$CF_TUNNEL_API_TOKEN" || -z "$CF_ACCOUNT_ID" || -z "$CF_ZONE_ID" ]]; then
+  # Bail before any API work if we don't have credentials. The container
+  # is down — that alone may be all the operator wanted (e.g. they're
+  # rotating the API token and want to start clean).
+  log_warn "Cloudflare API credentials not in $VIBE_ENV_APPLIANCE — container is stopped, but DNS records and the tunnel object remain at Cloudflare. Re-add the creds under Configuration → Network → Cloudflare Tunnel, then click Tear down again to clean up the rest — or run this script with --local-only to clean up only the host side."
+  exit 0
 fi
 
 # --- 2. Look up tunnel ID by name --------------------------------------

@@ -2020,17 +2020,18 @@ app.post('/api/v1/admin/cookie-policy', requireAdmin, testRateLimit, async (req,
 
 app.post('/api/v1/admin/self-update', requireAdmin, testRateLimit, async (_req, res) => {
   // Don't stack runs. self-update.sh also holds an flock, so this is the
-  // friendly check rather than the load-bearing one.
-  try {
-    const cur = JSON.parse(fs.readFileSync(SELF_UPDATE_STATUS, 'utf8'));
-    if (cur && cur.state === 'running') {
-      return res.status(409).json({
-        ok: false,
-        error: 'An update is already running (started ' + (cur.started_at || 'recently') + '). Watch its progress instead of starting another.',
-        status: cur,
-      });
-    }
-  } catch { /* no prior run */ }
+  // friendly check rather than the load-bearing one. Uses the SAME
+  // staleness-capped reader as every other gate: a raw uncapped read
+  // would let a SIGKILL'd updater's leftover 'running' file block
+  // self-update forever while everything else unblocks after 30 min.
+  const cur = selfUpdateRunning();
+  if (cur) {
+    return res.status(409).json({
+      ok: false,
+      error: 'An update is already running (started ' + (cur.started_at || 'recently') + '). Watch its progress instead of starting another.',
+      status: cur,
+    });
+  }
 
   // Refuse while anything else holds the board: a global op (a tunnel
   // provision or teardown, a mode switch — all rewrite the Caddyfile and
@@ -2041,6 +2042,24 @@ app.post('/api/v1/admin/self-update', requireAdmin, testRateLimit, async (_req, 
   // acquireSlugLock both consult — the lock itself dies with this
   // process when bootstrap recreates the console, by design.
   if (refuseIfBusy(res, 'Wait for it to finish, then retry the update.')) return;
+
+  // Cover the launch window: the detached script writes its own
+  // state=running only after flock + preflight (~seconds). Until then an
+  // enable could slip past every gate and run under bootstrap's env
+  // re-renders — so claim the status file NOW; the script's first
+  // write_status overwrites this with richer detail.
+  try {
+    const seed = JSON.stringify({
+      run_id: 'launching', state: 'running', phase: 'launch',
+      message: 'Starting the appliance update…', error: null,
+      started_at: new Date().toISOString(), finished_at: null,
+    });
+    const tmpSeed = SELF_UPDATE_STATUS + '.tmp.' + process.pid;
+    fs.writeFileSync(tmpSeed, seed);
+    fs.renameSync(tmpSeed, SELF_UPDATE_STATUS);
+  } catch (err) {
+    log('warn', 'could not seed self-update status file', { err: err.message });
+  }
 
   // setsid + nohup + & : the alpine helper pod exits immediately, the
   // updater keeps running under init. Redirect all three streams or the
@@ -2914,8 +2933,7 @@ app.get('/api/v1/admin/cloudflare/status', requireAdmin, async (_req, res) => {
   let lastRunTs = null;
   try {
     const logPath = path.join(LOGS_DIR, 'cloudflared.log');
-    const buf = fs.readFileSync(logPath, 'utf8');
-    const tail = buf.slice(-16 * 1024);
+    const tail = tailFile(logPath, 16 * 1024);
     const lines = tail.split('\n').filter(Boolean);
     for (let i = lines.length - 1; i >= 0; i--) {
       try {
@@ -4415,7 +4433,11 @@ const SCOPE_RE = /^(appliance|per-app:[a-z][a-z0-9-]+)$/;
 // so the limit is intentionally low. Reuses the per-IP testRateLimit
 // middleware — which is keyed by req.path, so save and test endpoints
 // have separate buckets.
-app.post('/api/v1/settings/save', requireAdmin, testRateLimit, (req, res) => {
+// Under the global lock: a save rewrites env files and force-recreates
+// every dependent app with a health-gated rollback — interleaving it
+// with a mode switch (env re-renders) or an update of the same slug
+// (between its stop and up) lets two writers clobber each other's work.
+app.post('/api/v1/settings/save', requireAdmin, testRateLimit, globalOp('settings save'), (req, res) => {
   const body = req.body || {};
   if (!Array.isArray(body.changes) || body.changes.length === 0) {
     return res.status(400).json({ error: 'changes array required and non-empty' });
@@ -4955,7 +4977,7 @@ app.post('/api/v1/admin/analyze-log', requireAdmin, async (req, res) => {
   const full = path.join(LOGS_DIR, logName);
   let raw = '';
   try {
-    raw = fs.readFileSync(full, 'utf8');
+    raw = tailFile(full, 1024 * 1024);
   } catch (err) {
     return res.status(200).json({
       ok: false, code: 'log-empty',
@@ -5923,19 +5945,31 @@ function acquireGlobalLock(action, res) {
 function releaseGlobalLock() { GLOBAL_LOCK = null; }
 
 // Express middleware form: hold the global lock for the request's
-// lifetime. Released when the response finishes (runShell-based
-// handlers respond on child exit, so that covers the script too) or the
-// connection closes. A client disconnect mid-script releases early —
-// accepted: rarer than the wedged-forever alternative, and the 409 text
-// documents the recovery either way.
+// lifetime. Released only when the response FINISHES — runShell-based
+// handlers respond on child exit, so that covers the script too. A
+// client disconnect ('close' without 'finish') deliberately does NOT
+// release: the guarded script is still rewriting the Caddyfile, and
+// freeing the lock there is exactly the interleaving it exists to
+// prevent. A disconnect therefore leaks the lock until the console
+// restarts — the 409 text documents that recovery. The release is
+// ownership-checked so a late event can never clear a NEWER op's lock.
 function globalOp(action) {
   return (_req, res, next) => {
     if (!acquireGlobalLock(action, res)) return;
-    res.on('finish', releaseGlobalLock);
-    res.on('close', releaseGlobalLock);
+    const mine = GLOBAL_LOCK;
+    res.on('finish', () => { if (GLOBAL_LOCK === mine) releaseGlobalLock(); });
     next();
   };
 }
+
+// A throw inside an async route handler that already acquired a lock is
+// outside Express's error pipeline; without this, Node >= 15 crashes the
+// whole console (killing every in-flight lifecycle child) on the first
+// unhandled rejection. Log and keep serving — the lock recovery path
+// (restart the console) is already documented in every 409.
+process.on('unhandledRejection', (err) => {
+  log('error', 'unhandled promise rejection', { err: (err && err.message) || String(err) });
+});
 
 function acquireSlugLock(slug, action, res) {
   // A global op owns every shared surface a lifecycle script touches —
@@ -5945,7 +5979,8 @@ function acquireSlugLock(slug, action, res) {
     const mins = Math.round((Date.now() - GLOBAL_LOCK.since) / 60000);
     res.status(409).json({
       error: 'operation in progress',
-      detail: `A ${GLOBAL_LOCK.action} is running (${mins} minute(s) so far) — app actions are paused until it finishes.`,
+      detail: `A ${GLOBAL_LOCK.action} is running (${mins} minute(s) so far) — app actions are paused until it finishes.` +
+              ' If it looks wedged (10+ minutes), restart the console: sudo docker restart vibe-console.',
     });
     return false;
   }
@@ -6040,6 +6075,31 @@ async function runToggle(req, res, script, action, extraEnv) {
 function trim(s, max = 16 * 1024) {
   if (s.length <= max) return s;
   return s.slice(0, max) + `\n…(${s.length - max} bytes truncated)`;
+}
+
+// Read only the LAST maxBytes of a file. The JSONL logs under
+// /opt/vibe/logs are append-only and nothing rotates them, so a
+// months-old install can hold hundreds of MB — readFileSync of the whole
+// file (then split) allocates several times that on the event loop and
+// OOMs the console exactly when the operator opens the Logs tab to
+// diagnose a problem. Throws on open/stat errors like readFileSync would.
+function tailFile(fullPath, maxBytes = 512 * 1024) {
+  const fd = fs.openSync(fullPath, 'r');
+  try {
+    const size = fs.fstatSync(fd).size;
+    const want = Math.min(size, maxBytes);
+    const buf = Buffer.alloc(want);
+    fs.readSync(fd, buf, 0, want, size - want);
+    let text = buf.toString('utf8');
+    if (want < size) {
+      // Drop the first (almost certainly partial) line of the window.
+      const nl = text.indexOf('\n');
+      if (nl >= 0) text = text.slice(nl + 1);
+    }
+    return text;
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 // Phase 8.5 Workstream D — emergency access URL.
@@ -6407,7 +6467,7 @@ app.get('/api/v1/logs/:name', requireAdmin, (req, res) => {
 
   let content = '';
   try {
-    content = fs.readFileSync(full, 'utf8');
+    content = tailFile(full, 1024 * 1024);
   } catch (err) {
     return res.status(500).type('text/plain').send('Could not read log: ' + err.code + '\n');
   }
@@ -6533,6 +6593,13 @@ const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const UPDATE_CHECK_INITIAL_DELAY_MS = 5 * 60 * 1000;  // give the stack 5 min to settle on boot
 
 function runUpdateCheckBackground() {
+  // The interactive check endpoint refuses while anything runs; the
+  // timer must not sneak past the same fences — a check writes
+  // update_available/status flags an in-flight script may be mid-write.
+  if (GLOBAL_LOCK || SLUG_LOCKS.size || selfUpdateRunning()) {
+    log('info', 'background update check skipped — appliance busy');
+    return;
+  }
   log('info', 'background update check starting');
   const child = spawn('/bin/bash', [UPDATE_SCRIPT, '--check'], {
     env: { ...process.env, APPLIANCE_DIR, VIBE_DIR, NO_COLOR: '1' },

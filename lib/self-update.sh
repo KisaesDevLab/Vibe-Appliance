@@ -100,6 +100,11 @@ import json,sys
 try: print(json.load(open(sys.argv[1])).get("state",""))
 except Exception: print("")
 ' "$STATUS_FILE" 2>/dev/null || true)"
+    # A flock-loser exits non-zero while the winner's status says
+    # running — that is the winner's file, not ours to stamp failed.
+    if [[ -n "${VIBE_SELF_UPDATE_SKIP_EXIT_STATUS:-}" ]]; then
+      return 0
+    fi
     if [[ "$cur" == "running" ]]; then
       write_status failed unknown \
         "Update stopped unexpectedly (exit $rc)." \
@@ -124,9 +129,13 @@ if command -v flock >/dev/null 2>&1; then
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then
     log "another self-update holds the lock; refusing"
-    write_status failed preflight \
-      "Another update is already in progress." \
-      "A self-update is already running on this host. Wait for it to finish, then check status again."
+    # Do NOT touch the status file here: the WINNING run owns it and has
+    # written state=running — overwriting that with 'failed' makes the
+    # UI think no update is in flight while bootstrap is mid-surgery.
+    # The console's own pre-check already 409s duplicate launches; this
+    # path only fires for a raced SSH invocation, and the log line above
+    # is its answer. Skip the exit trap's unexpected-stop write too.
+    VIBE_SELF_UPDATE_SKIP_EXIT_STATUS=1
     exit 1
   fi
 else

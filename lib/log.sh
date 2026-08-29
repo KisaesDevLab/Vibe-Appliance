@@ -80,6 +80,20 @@ _json_escape() {
 _log_jsonl() {
   local level="$1"; shift
   local msg="$1"; shift
+
+  # Size-capped rotation: these files are append-only for the life of
+  # the appliance, and the console tails them on request — unbounded
+  # growth eventually stalls (or OOMs) the very tools an operator opens
+  # during an outage. One prior generation (.1) is kept for post-mortems.
+  # stat -c%s is a single syscall per line — cheap at this write rate.
+  if [[ -n "${VIBE_LOG_FILE:-}" && -f "$VIBE_LOG_FILE" ]]; then
+    local _sz
+    _sz="$(stat -c%s "$VIBE_LOG_FILE" 2>/dev/null || echo 0)"
+    if (( _sz > 10 * 1024 * 1024 )); then
+      mv -f "$VIBE_LOG_FILE" "${VIBE_LOG_FILE}.1" 2>/dev/null || true
+    fi
+  fi
+
   local ts
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
