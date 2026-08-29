@@ -16,7 +16,7 @@ For each phase: list deliverables, success criteria, what's out of scope, and an
 
 **Deliverables.**
 - `README.md` (minimal — what this is, install command, link to docs).
-- `LICENSE` — Elastic License 2.0.
+- `LICENSE` — PolyForm Internal Use 1.0.0 (was Elastic License 2.0 until 2026-08-28).
 - `.gitignore`.
 - `bootstrap.sh` with the eight-phase framework. Phases 1 (pre-flight) and 2 (Docker install) implemented. Phases 3–8 stubbed (print `PHASE N: not yet implemented` and exit clean).
 - `lib/log.sh` — JSONL + pretty-printer logging functions.

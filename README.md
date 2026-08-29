@@ -40,6 +40,11 @@ For contributors:
 
 ## License
 
-Elastic License 2.0 (ELv2). See [`LICENSE`](LICENSE).
+PolyForm Internal Use 1.0.0. See [`LICENSE`](LICENSE).
+
+Any purpose is permitted except providing a product that competes with the
+appliance, or with any product Kisaes provides using it. The composed app
+images are licensed separately by their own publishers — see the family
+inventory in [`docs/CONNECT_BLOCKED.md`](docs/CONNECT_BLOCKED.md).
 
 Built by [Kisaes LLC](https://kisaes.com).
