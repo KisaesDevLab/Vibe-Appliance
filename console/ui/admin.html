@@ -1207,7 +1207,9 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
         const data = await r.json().catch(() => ({}));
         if (!r.ok) {
           stat.style.color = '#8b3a1c';
-          stat.textContent = 'Check failed: ' + (data.stderr || data.error || 'HTTP ' + r.status);
+          // 409s carry their guidance in `detail` ("wait for the running
+          // action, then re-check") — show it, not just the error code.
+          stat.textContent = 'Check failed: ' + (data.stderr || data.detail || data.error || 'HTTP ' + r.status);
         } else {
           stat.style.color = '';
           stat.textContent = 'Checked at ' + new Date().toISOString();

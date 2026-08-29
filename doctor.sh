@@ -44,6 +44,8 @@ VIBE_DISK_HISTORY="${VIBE_DISK_HISTORY:-${VIBE_DIR}/data/.disk-history}"
 
 # shellcheck source=/dev/null
 . "${APPLIANCE_DIR}/lib/log.sh"
+# shellcheck source=/dev/null
+. "${APPLIANCE_DIR}/lib/health-probe.sh"
 log_init
 
 DOCTOR_JSON=0
@@ -422,6 +424,16 @@ check_console_health() {
   # host shell, plain 127.0.0.1 works.
   local target="http://127.0.0.1/health"
   if _in_container; then
+    # Tailscale mode binds Caddy's published ports to 127.0.0.1 on the
+    # HOST (bootstrap's tailscale bind), so host.docker.internal has no
+    # listener — probing it from in here false-FAILs every healthy
+    # tailscale install and sends the operator restarting a working
+    # Caddy. Report "cannot probe from here" instead of a fake verdict.
+    if [[ "$(_state_get "config.mode")" == "tailscale" ]]; then
+      _check_warn "cannot probe Caddy from inside the console in tailscale mode (ports bind to the host's 127.0.0.1)" \
+        "Diagnose: run doctor on the host instead: sudo bash /opt/vibe/appliance/doctor.sh"
+      return
+    fi
     target="http://host.docker.internal/health"
   fi
   # -w '%{http_code}' prints "000" on connection failure, so the
@@ -484,13 +496,10 @@ Fix:      that installer owns this module; its output names the failing service"
   upstream="$(_manifest_field "$manifest" 'data["routing"]["matchers"][0]["upstream"] if data["routing"].get("matchers") else data["routing"]["default_upstream"]')"
   health="$(_manifest_field "$manifest" 'data["health"]')"
 
-  # Probe via the console container — same path enable-app.sh and
-  # update.sh use. The previous `docker run curlimages/curl:latest`
-  # needed a registry pull, so an OFFLINE host reported every healthy
-  # app as down; and -fsS passed 3xx while the message claimed 200.
+  # Shared probe (lib/health-probe.sh): 200-only, via the console
+  # container — no registry pull, so offline hosts don't false-fail.
   local code
-  code="$(docker exec vibe-console curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-       "http://${upstream}${health}" 2>>"$VIBE_LOG_FILE" || true)"
+  code="$(probe_http_code "http://${upstream}${health}")"
   if [[ "$code" == "200" ]]; then
     _check_pass "$upstream$health responds 200"
   else
@@ -521,12 +530,12 @@ Fix:      restart the app via the admin Apps tab (Disable, then Enable)"
   while read -r x_name x_upstream x_path; do
     [[ -n "$x_name" ]] || continue
     _check_begin "App health · $slug/$x_name"
-    if docker run --rm --network vibe_net curlimages/curl:latest \
-         -fsS -o /dev/null --max-time 5 "http://${x_upstream}${x_path}" \
-         >>"$VIBE_LOG_FILE" 2>&1; then
+    local x_code
+    x_code="$(probe_http_code "http://${x_upstream}${x_path}")"
+    if [[ "$x_code" == "200" ]]; then
       _check_pass "$x_upstream$x_path responds 200"
     else
-      _check_fail "$x_upstream$x_path did not respond 200" \
+      _check_fail "$x_upstream$x_path returned HTTP ${x_code:-000} (expected 200)" \
         "Diagnose: docker logs --tail 40 ${x_upstream%:*}
 Fix:      restart the app via the admin Apps tab (Disable, then Enable)"
     fi

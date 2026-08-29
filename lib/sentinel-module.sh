@@ -75,8 +75,11 @@ fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
 try:
     with open(path) as f:
         s = json.load(f)
-except (FileNotFoundError, ValueError):
+except FileNotFoundError:
     s = {"schemaVersion": 1, "config": {}, "phases": {}, "apps": {}}
+except ValueError as e:
+    print("state.json is MALFORMED (%s) - refusing to replace it with an empty default. Back it up and fix the JSON (sudo python3 -m json.tool /opt/vibe/state.json), or restore a known-good copy, then re-run." % e, file=sys.stderr)
+    sys.exit(1)
 entry = s.setdefault("apps", {}).setdefault(slug, {})
 it = iter(kvs)
 for k in it:
@@ -119,7 +122,19 @@ _sm_check_resources() { # <slug> -> 0 ok, 1 too small (message already printed)
   need_cores="$(_sm_field "$manifest" '(data.get("resources") or {}).get("cores", 0)')"
   need_mem="$(_sm_field "$manifest" '(data.get("resources") or {}).get("ramMb", 0)')"
   [[ -n "$need_cores" && -n "$need_mem" ]] || return 0
-  local need_cpu10; need_cpu10="$(python3 -c "print(round(float('${need_cores:-0}') * 10))")"
+  # need_cores comes from a manifest another repo ships (the federation
+  # contract) — pass it as ARGV, never interpolated into python source:
+  # an interpolated value is a root code-exec vector, and a malformed one
+  # must degrade to "no floor declared", not crash the enable.
+  local need_cpu10
+  need_cpu10="$(python3 -c "
+import sys
+try:
+    print(round(float(sys.argv[1]) * 10))
+except Exception:
+    print(0)
+" "${need_cores:-0}")"
+  [[ "$need_mem" =~ ^[0-9]+$ ]] || need_mem=0
   (( need_cpu10 > 0 || need_mem > 0 )) || return 0
 
   local cores mem_avail
@@ -328,7 +343,14 @@ sentinel_module_disable() { # <slug> [reason] [approver]
   fi
 
   _sm_ensure_installer
-  _sm_installed || { log_ok "Sentinel is not installed on this host; nothing to disable."; return 0; }
+  _sm_installed || {
+    # Still flip the state: a module stuck enabled=true (the installer
+    # was removed out-of-band) would otherwise show enabled forever, and
+    # every later disable would "succeed" without changing anything.
+    _sm_state_set "$slug" enabled false status stopped error ""
+    log_ok "Sentinel is not installed on this host; nothing to disable — marked disabled in state."
+    return 0
+  }
 
   _sm_state_set "$slug" status stopping
   local -a extra=()

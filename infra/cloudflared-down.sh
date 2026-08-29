@@ -56,6 +56,18 @@ _VIBE_TMP_PATTERN="${VIBE_ENV_DIR}/*.tmp.$$"
 # shellcheck disable=SC2064
 trap "rm -f ${_VIBE_TMP_PATTERN}" EXIT
 
+# --local-only: skip every Cloudflare API step and clean up only the
+# host side (container, TUNNEL_TOKEN). The escape hatch for a token that
+# is gone for good — revoked account, deleted zone — where the API steps
+# can never succeed again and the operator cleans the Cloudflare side by
+# hand in the dashboard.
+LOCAL_ONLY=0
+if [[ "${1:-}" == "--local-only" ]]; then
+  LOCAL_ONLY=1
+elif [[ -n "${1:-}" ]]; then
+  die "unknown flag: $1 (only --local-only is supported)"
+fi
+
 _get_env_value() {
   local key="$1"
   [[ -f "$VIBE_ENV_APPLIANCE" ]] || return 0
@@ -96,8 +108,14 @@ if [[ -z "$CF_TUNNEL_API_TOKEN" || -z "$CF_ACCOUNT_ID" || -z "$CF_ZONE_ID" ]]; t
   exit 0
 fi
 
+if (( LOCAL_ONLY == 1 )); then
+  log_warn "--local-only: skipping every Cloudflare API step. The tunnel object and its CNAMEs remain at Cloudflare — delete them by hand: dash.cloudflare.com → your zone → DNS (CNAMEs pointing at *.cfargotunnel.com), then Zero Trust → Networks → Tunnels → delete '$CF_TUNNEL_NAME'."
+  TUNNEL_ID=""
+fi
+
 # --- 2. Look up tunnel ID by name --------------------------------------
 
+if (( LOCAL_ONLY == 0 )); then
 log_step "looking up tunnel '$CF_TUNNEL_NAME'"
 search="$(cf_api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel?name=$CF_TUNNEL_NAME&is_deleted=false")"
 # Distinguish "API answered success with an empty result" (genuinely no
@@ -128,7 +146,10 @@ if [[ "$TUNNEL_ID" == "LOOKUP_ERROR" ]]; then
   Fix:
     Restore a working token via Configuration → Network → Cloudflare
     Tunnel → Rotate token, then click Tear down again (idempotent).
-    SSH equivalent: sudo bash $APPLIANCE_DIR/infra/cloudflared-down.sh"
+    SSH equivalent: sudo bash $APPLIANCE_DIR/infra/cloudflared-down.sh
+  If the token is gone for good (account closed, token unrecoverable),
+  clean up only the host side and handle Cloudflare in the dashboard:
+    sudo bash $APPLIANCE_DIR/infra/cloudflared-down.sh --local-only"
 fi
 
 if [[ -z "$TUNNEL_ID" ]]; then
@@ -136,6 +157,7 @@ if [[ -z "$TUNNEL_ID" ]]; then
 else
   log_info "tunnel found" id="$TUNNEL_ID"
 fi
+fi  # LOCAL_ONLY == 0
 
 # --- 3. Delete CNAMEs that point at this tunnel ------------------------
 

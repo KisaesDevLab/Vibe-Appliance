@@ -224,16 +224,11 @@ parse_flags() {
     *) _pre_die "--mode must be one of: domain, lan, tailscale (got '$CONFIG_MODE')" ;;
   esac
 
-  # --mode domain has hard prerequisites: a real domain the operator owns
-  # AND an ACME contact email. Without these, phase_caddy would silently
-  # render a broken site (empty hostname, no email for Let's Encrypt
-  # subscriber agreement) and phase_core_up would bring up a Caddy that
-  # immediately fails to issue any cert. Catch it at flag parse so the
-  # operator sees the problem before any resource is allocated.
-  if [[ "$CONFIG_MODE" == "domain" ]]; then
-    [[ -n "$CONFIG_DOMAIN" ]] || _pre_die "--mode domain requires --domain DOMAIN (the domain you own and have pointed at this host)"
-    [[ -n "$CONFIG_EMAIL"  ]] || _pre_die "--mode domain requires --email EMAIL (Let's Encrypt ACME contact address)"
-  fi
+  # --mode domain needs a domain AND an ACME email, but they may come
+  # from a previous run's state.json rather than this command line —
+  # lib/exit-domain-mode.sh, for one, prints a re-entry command with no
+  # --email. The effective-config validation in main(), which runs after
+  # state adoption and before any phase, enforces the requirement.
 
   # Validate the tunnel subdomain label. RFC 1035: 1-63 chars, [a-z0-9],
   # may contain '-' but not at the ends. Reject dots so the operator
@@ -519,82 +514,52 @@ phase_secrets() {
   log_phase_banner 4 "Generate secrets" "secrets"
   state_set_phase secrets running
 
-  # --reset-env guard: rotating POSTGRES_PASSWORD in shared.env without
-  # also ALTER USER-ing the running postgres would lock the appliance
-  # out of its own data. Postgres reads the password from env at
-  # INITIAL DB creation only; subsequent boots use whatever's in the
-  # data volume. So an env-side rotation alone leaves the rest of the
-  # stack with the new password trying to authenticate against a
-  # postgres still running on the OLD password — every connection
-  # fails until manual reconciliation.
-  #
-  # Refuse the reset if postgres is up. The error points at the manual
-  # ALTER USER procedure that does the right thing.
-  if [[ "$CONFIG_RESET_ENV" == "true" ]]; then
-    if docker ps --filter name=^vibe-postgres$ --filter status=running -q 2>/dev/null | grep -q .; then
-      state_set_phase secrets failed "reset-env blocked: postgres running"
+  # --reset-env vs. the initialized database: postgres reads
+  # POSTGRES_PASSWORD from env only at INITIAL cluster creation, so an
+  # initialized data volume keeps the password it was created with —
+  # rotating it in shared.env (running OR stopped cluster, either way)
+  # locks the whole stack out of its own data. Earlier versions refused
+  # --reset-env outright here, which made the rotation documented in
+  # CREDENTIALS.txt a dead end on every real install. Instead: preserve
+  # POSTGRES_PASSWORD across the reset and rotate everything else.
+  # That is safe because per-app DB role passwords are realigned by
+  # db-bootstrap's ALTER ROLE on this same run, and app-level secrets
+  # (JWT_SECRET etc.) take effect at the next enable.
+  _pg_preserve=""
+  if [[ "$CONFIG_RESET_ENV" == "true" && -f "${VIBE_DIR}/data/postgres/PG_VERSION" ]]; then
+    _pg_preserve="$(grep -m1 '^POSTGRES_PASSWORD=' "$VIBE_ENV_SHARED" 2>/dev/null | cut -d= -f2- || true)"
+    if [[ -z "$_pg_preserve" ]]; then
+      state_set_phase secrets failed "reset-env blocked: current POSTGRES_PASSWORD unreadable"
       die "$(cat <<HELP
---reset-env was passed but vibe-postgres is currently running.
-Rotating POSTGRES_PASSWORD in shared.env without also updating
-the running postgres would lock the appliance out of its own data.
-
-To rotate safely on a live install, do this manually instead:
-
-  1. Generate a new password and capture it:
-       NEW=\$(openssl rand -hex 32)
-       echo "\$NEW"
-
-  2. ALTER USER on the running postgres (uses the OLD password):
-       sudo docker exec -it vibe-postgres psql -U postgres \\
-         -c "ALTER USER postgres WITH PASSWORD '\$NEW';"
-
-  3. Update /opt/vibe/env/shared.env's POSTGRES_PASSWORD to the same value:
-       sudo nano /opt/vibe/env/shared.env
-
-  4. Restart postgres so the rest of the stack reconnects cleanly:
-       sudo docker compose -f /opt/vibe/appliance/docker-compose.yml restart postgres
-
-For a CLEAN reset that DESTROYS the database, stop postgres first:
-
-  sudo docker compose -f /opt/vibe/appliance/docker-compose.yml stop postgres
-  sudo rm -rf /opt/vibe/data/postgres
-  sudo /opt/vibe/appliance/bootstrap.sh --reset-env
-
-(That second path loses every app's data — only do it on a fresh install.)
-HELP
-)"
-    fi
-    # "Not currently running" is NOT proof it's safe: postgres reads
-    # POSTGRES_PASSWORD from env only at INITIAL cluster creation, so an
-    # initialized data volume keeps the old password forever. Rotating
-    # shared.env against a stopped-but-initialized cluster produces the
-    # same lockout the guard above prevents, one restart later. A downed
-    # docker daemon also lands here (docker ps errors read as
-    # "not running"), which is exactly when guessing is most dangerous.
-    if [[ -f "${VIBE_DIR}/data/postgres/PG_VERSION" ]]; then
-      state_set_phase secrets failed "reset-env blocked: initialized postgres data present"
-      die "$(cat <<HELP
---reset-env was passed but /opt/vibe/data/postgres already holds an
-initialized database. Rotating POSTGRES_PASSWORD in shared.env would
-lock the stack out of that data the moment postgres restarts.
+--reset-env was passed, an initialized database exists at
+${VIBE_DIR}/data/postgres, but the CURRENT password could not be read
+from ${VIBE_ENV_SHARED} — so the reset cannot preserve it, and rotating
+blind would lock the stack out of its own data.
 
 Pick one:
 
-  A. Keep the data — rotate manually against a RUNNING postgres:
+  A. Keep the data — restore a readable shared.env first (a backup was
+     archived as ${VIBE_ENV_SHARED}.bak.<timestamp> on previous resets):
+       ls -l ${VIBE_ENV_SHARED}*
+     then re-run:  sudo /opt/vibe/appliance/bootstrap.sh --reset-env
+
+     Or set a known password on the running cluster without typing it
+     into a command line (psql prompts; nothing lands in history/logs):
        sudo docker compose -f /opt/vibe/appliance/docker-compose.yml up -d postgres
-       NEW=\$(openssl rand -hex 32) && echo "\$NEW"
-       sudo docker exec -it vibe-postgres psql -U postgres \\
-         -c "ALTER USER postgres WITH PASSWORD '\$NEW';"
-       sudo nano /opt/vibe/env/shared.env   # set POSTGRES_PASSWORD to the same value
-       sudo docker compose -f /opt/vibe/appliance/docker-compose.yml restart postgres
+       sudo docker exec -it vibe-postgres psql -U postgres
+         \password postgres
+         \q
+       sudo nano ${VIBE_ENV_SHARED}   # set POSTGRES_PASSWORD to the same value
+     then re-run:  sudo /opt/vibe/appliance/bootstrap.sh --reset-env
 
   B. DESTROY the data and start clean (loses every app's data):
        sudo docker compose -f /opt/vibe/appliance/docker-compose.yml stop postgres
-       sudo rm -rf /opt/vibe/data/postgres
+       sudo rm -rf ${VIBE_DIR}/data/postgres
        sudo /opt/vibe/appliance/bootstrap.sh --reset-env
 HELP
 )"
     fi
+    log_warn "--reset-env: preserving POSTGRES_PASSWORD — the initialized cluster keeps the password it was created with. Every other secret is rotated; per-app DB roles are realigned automatically this run."
   fi
 
   if ! secrets_render \
@@ -602,6 +567,34 @@ HELP
         "$CONFIG_RESET_ENV"; then
     state_set_phase secrets failed "render failed"
     die "Could not render shared.env. See $VIBE_LOG_FILE."
+  fi
+
+  # Put the preserved superuser password back — secrets_render archived
+  # the old file and regenerated every placeholder, this one included.
+  # Passed via the environment, never argv, so it stays out of `ps`.
+  if [[ -n "${_pg_preserve:-}" ]]; then
+    if ! _PG_PRESERVE="$_pg_preserve" python3 - "$VIBE_ENV_SHARED" <<'PYEOF'
+import os, sys
+path = sys.argv[1]
+val = os.environ["_PG_PRESERVE"]
+lines = open(path).read().splitlines()
+out = []
+hit = False
+for l in lines:
+    if l.startswith("POSTGRES_PASSWORD="):
+        out.append("POSTGRES_PASSWORD=" + val)
+        hit = True
+    else:
+        out.append(l)
+if not hit:
+    out.append("POSTGRES_PASSWORD=" + val)
+open(path, "w").write("\n".join(out) + "\n")
+PYEOF
+    then
+      state_set_phase secrets failed "could not restore preserved POSTGRES_PASSWORD"
+      die "Could not write the preserved POSTGRES_PASSWORD back into $VIBE_ENV_SHARED." "The pre-reset file was archived as ${VIBE_ENV_SHARED}.bak.<timestamp> — restore it and re-run bootstrap."
+    fi
+    log_info "preserved POSTGRES_PASSWORD restored into shared.env"
   fi
 
   # Render appliance.env — Tier 1 inline-editable settings (Phase 8.5
@@ -985,14 +978,29 @@ for slug, e in (s.get("apps", {}) or {}).items():
     if e.get("status") == "failed":
         continue
     enabled.append(slug)
+# Units another orchestrator installs share the state.apps namespace
+# (lib/sentinel-module.sh writes there) but are NOT ours to enable —
+# enable_app refuses them by design, and marking them failed here would
+# paint a red badge on a module that is healthy under its own installer.
+own = []
 deps = {}
 for slug in enabled:
     try:
         with open(os.path.join(manifests_dir, slug + ".json")) as f:
             m = json.load(f)
-        deps[slug] = [d for d in (m.get("requiredApps") or []) if d in enabled]
+    except Exception:
+        m = {}
+    if (m.get("runtime") or "appliance") != "appliance":
+        continue
+    own.append(slug)
+for slug in own:
+    try:
+        with open(os.path.join(manifests_dir, slug + ".json")) as f:
+            m = json.load(f)
+        deps[slug] = [d for d in (m.get("requiredApps") or []) if d in own]
     except Exception:
         deps[slug] = []
+enabled = own
 emitted, remaining = [], sorted(enabled)
 while remaining:
     progressed = False
@@ -1028,11 +1036,12 @@ PYEOF
     else
       # Preflight failures die before enable_app's own _state_app_set
       # runs, leaving stale enabled=true / status=running from before the
-      # reboot — a green badge on an app that is actually down. Record
-      # the failure so the console tells the truth and the next bootstrap
-      # skips it; the admin Enable button retries with a fresh attempt.
-      _state_app_set "$slug" status failed error "re-enable failed during bootstrap — see /opt/vibe/logs/bootstrap.log"
-      log_warn "app re-enable failed; marked status=failed in state" slug="$slug"
+      # reboot — a green badge on an app that is actually down. Set only
+      # the status: enable_app's later failure paths record a SPECIFIC
+      # error ("db bootstrap failed", "health check timeout") that a
+      # generic message here would clobber.
+      _state_app_set "$slug" status failed
+      log_warn "app re-enable failed; marked status=failed in state — see ${VIBE_LOG_DIR}/bootstrap.log" slug="$slug"
     fi
   done <<<"$slugs"
 }
@@ -1205,7 +1214,7 @@ main() {
   local lib="${APPLIANCE_DIR}/lib"
   for f in log.sh compose-files.sh state.sh lan-only-cookies.sh preflight.sh secrets.sh render-caddyfile.sh \
            render-haproxy.sh ufw-rules.sh \
-           db-bootstrap.sh enable-app.sh disable-app.sh; do
+           health-probe.sh db-bootstrap.sh enable-app.sh disable-app.sh; do
     if [[ ! -f "${lib}/${f}" ]]; then
       _pre_die "missing ${lib}/${f}. Is this a complete clone of the Vibe-Appliance repo?"
     fi
@@ -1260,11 +1269,19 @@ main() {
     _prev="$(state_get_config_kv tunnel_subdomain)"
     [[ -n "$_prev" ]] && CONFIG_TUNNEL_SUBDOMAIN="$_prev"
   fi
-  # Re-validate the adopted combination the way parse_flags validates
-  # explicit flags — a hand-edited state.json can be inconsistent.
+  # Validate the EFFECTIVE config — explicit flags and adopted state
+  # values alike. Values from a hand-edited state.json get the same
+  # checks parse_flags applies to flags; nothing unvalidated flows into
+  # state_set_config_kv or the Caddy/env renders.
+  case "$CONFIG_MODE" in
+    domain|lan|tailscale) ;;
+    *) die "effective mode '$CONFIG_MODE' is not one of: domain, lan, tailscale." "Fix state.json's config.mode, or pass --mode explicitly." ;;
+  esac
   if [[ "$CONFIG_MODE" == "domain" && ( -z "$CONFIG_DOMAIN" || -z "$CONFIG_EMAIL" ) ]]; then
-    die "state.json says mode=domain but domain or email is missing.
-Re-run with the full identity: sudo bash bootstrap.sh --mode domain --domain YOUR.DOMAIN --email YOU@EXAMPLE.COM"
+    die "mode is 'domain' but domain or ACME email is missing (from both flags and state.json)." "Re-run with the full identity: sudo bash bootstrap.sh --mode domain --domain YOUR.DOMAIN --email YOU@EXAMPLE.COM"
+  fi
+  if ! [[ "$CONFIG_TUNNEL_SUBDOMAIN" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+    die "effective tunnel subdomain '$CONFIG_TUNNEL_SUBDOMAIN' is not a valid DNS label." "Fix state.json's config.tunnel_subdomain, or pass --tunnel-subdomain."
   fi
 
   # Persist user-supplied config so phase 2 (Phase 2 of build) can read it.

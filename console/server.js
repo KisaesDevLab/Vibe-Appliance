@@ -237,8 +237,11 @@ fcntl.flock(lk.fileno(), fcntl.LOCK_EX)
 try:
     with open(path) as f:
         s = json.load(f)
-except (FileNotFoundError, ValueError):
+except FileNotFoundError:
     s = {"schemaVersion": 1, "config": {}, "phases": {}, "apps": {}}
+except ValueError as e:
+    print("state.json is MALFORMED (%s) - refusing to replace it with an empty default. Back it up and fix the JSON, or restore a known-good copy." % e, file=sys.stderr)
+    sys.exit(1)
 for k, v in patch.items():
     if isinstance(v, dict) and isinstance(s.get(k), dict):
         for kk, vv in v.items():
@@ -1897,17 +1900,16 @@ app.post('/api/v1/update/check', requireAdmin, testRateLimit, async (_req, res) 
   // A check writes update_available flags into state.json while an
   // in-flight lifecycle script may be mid-rewrite of the same entries;
   // it is also instantly re-runnable, so refusing is cheap and honest.
-  if (SLUG_LOCKS.size) {
-    const held = [...SLUG_LOCKS.entries()].map(([s, l]) => `${l.action} ${s}`).join(', ');
-    return res.status(409).json({ error: 'operation in progress', detail: `App action(s) still running (${held}). Wait for them to finish, then re-check.` });
-  }
+  if (refuseIfBusy(res, 'Wait for it to finish, then re-check.')) return;
   await runShell(res, [UPDATE_SCRIPT, '--check'], 'update-check');
 });
 
 // Reclaim disk by removing images not referenced by any container
 // (running or stopped). Active app images are kept. Removed images are
 // re-pulled on the next enable-app / update run.
-app.post('/api/v1/admin/prune-images', requireAdmin, testRateLimit, async (_req, res) => {
+// Under the global lock: an update between its pull and its `up` holds
+// the new image by tag only — a concurrent prune could delete it.
+app.post('/api/v1/admin/prune-images', requireAdmin, testRateLimit, globalOp('image prune'), async (_req, res) => {
   await runShell(res, [PRUNE_SCRIPT], 'prune-images');
 });
 
@@ -2017,15 +2019,6 @@ app.post('/api/v1/admin/cookie-policy', requireAdmin, testRateLimit, async (req,
 });
 
 app.post('/api/v1/admin/self-update', requireAdmin, testRateLimit, async (_req, res) => {
-  // Refuse while a tunnel provision is in flight. Both re-render the
-  // Caddyfile and bounce containers; interleaving them is how you get a
-  // half-written config on a box nobody can reach. Mirrors the guard the
-  // Network tab already applies to mode switching.
-  try {
-    const c = docker.getContainer('vibe-cloudflared');
-    await c.inspect();   // presence only — provisioning state is the file below
-  } catch { /* no connector is fine */ }
-
   // Don't stack runs. self-update.sh also holds an flock, so this is the
   // friendly check rather than the load-bearing one.
   try {
@@ -2039,16 +2032,15 @@ app.post('/api/v1/admin/self-update', requireAdmin, testRateLimit, async (_req, 
     }
   } catch { /* no prior run */ }
 
-  // Refuse while any per-app lifecycle script is running. self-update
-  // re-runs bootstrap, which re-renders every env file and may bounce
-  // the very containers an in-flight enable/update is halfway through.
-  if (SLUG_LOCKS.size) {
-    const held = [...SLUG_LOCKS.entries()].map(([s, l]) => `${l.action} ${s}`).join(', ');
-    return res.status(409).json({
-      ok: false,
-      error: `App lifecycle action(s) still running (${held}). Wait for them to finish, then retry the update.`,
-    });
-  }
+  // Refuse while anything else holds the board: a global op (a tunnel
+  // provision or teardown, a mode switch — all rewrite the Caddyfile and
+  // bounce containers, and self-update's bootstrap would interleave), a
+  // per-app lifecycle script (bootstrap re-renders every env file under
+  // it), or an earlier detached self-update. After launch, the detached
+  // updater is tracked by its status file, which refuseIfBusy and
+  // acquireSlugLock both consult — the lock itself dies with this
+  // process when bootstrap recreates the console, by design.
+  if (refuseIfBusy(res, 'Wait for it to finish, then retry the update.')) return;
 
   // setsid + nohup + & : the alpine helper pod exits immediately, the
   // updater keeps running under init. Redirect all three streams or the
@@ -2332,7 +2324,7 @@ app.post('/api/v1/admin/cloudflare/discover', requireAdmin, testRateLimit, async
 // is already in appliance.env (re-provision flow). The script itself
 // validates that each slug names a real, ENABLED app — invalid slugs
 // surface as warnings in stdout/stderr and are skipped.
-app.post('/api/v1/admin/cloudflare/provision', requireAdmin, testRateLimit, async (req, res) => {
+app.post('/api/v1/admin/cloudflare/provision', requireAdmin, testRateLimit, globalOp('Cloudflare tunnel provision'), async (req, res) => {
   // Tunnel ingress forwards to https://caddy:443 with noTLSVerify.
   // In LAN/Tailscale modes Caddy has no :443 listener at all — every
   // tunnel request would 502 silently. Hard-fail at the API layer
@@ -2387,7 +2379,7 @@ app.post('/api/v1/admin/cloudflare/provision', requireAdmin, testRateLimit, asyn
 // explicitly tear down first if they want to switch accounts. We can't
 // delete the old token at Cloudflare from here (a token can't delete
 // itself); the response advises the operator to do that manually.
-app.post('/api/v1/admin/cloudflare/rotate-token', requireAdmin, testRateLimit, async (req, res) => {
+app.post('/api/v1/admin/cloudflare/rotate-token', requireAdmin, testRateLimit, globalOp('Cloudflare token rotation'), async (req, res) => {
   const apiToken = (req.body && req.body.apiToken || '').trim();
   if (!apiToken) {
     return res.status(400).json({ ok: false, error: 'apiToken required in request body' });
@@ -2883,7 +2875,7 @@ function writeEnvKey(filePath, key, value) {
 // the CNAMEs that point at this tunnel, deletes the tunnel object at
 // Cloudflare, strips TUNNEL_TOKEN from shared.env. Same idempotent
 // runShell pattern.
-app.post('/api/v1/admin/cloudflare/teardown', requireAdmin, testRateLimit, async (_req, res) => {
+app.post('/api/v1/admin/cloudflare/teardown', requireAdmin, testRateLimit, globalOp('Cloudflare tunnel teardown'), async (_req, res) => {
   await runShell(res, [CLOUDFLARED_DOWN_SCRIPT], 'cloudflared-down');
 });
 
@@ -3512,7 +3504,7 @@ const EMAIL_RE  = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // Single DNS label — same rule bootstrap.sh enforces for --tunnel-subdomain.
 const DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
-app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, async (req, res) => {
+app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, globalOp('network mode switch'), async (req, res) => {
   const body  = req.body || {};
   const mode  = typeof body.mode === 'string' ? body.mode : '';
   const domain = typeof body.domain === 'string' ? body.domain.trim().toLowerCase() : '';
@@ -3867,7 +3859,7 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, async
 // stray click can't flip the entire appliance. The UI gates the
 // button behind a typed-confirm modal; this server-side check is a
 // belt for that suspenders.
-app.post('/api/v1/admin/network/exit-domain-mode', requireAdmin, testRateLimit, async (req, res) => {
+app.post('/api/v1/admin/network/exit-domain-mode', requireAdmin, testRateLimit, globalOp('exit-domain-mode'), async (req, res) => {
   const confirm = (req.body && req.body.confirm || '').trim();
   if (confirm !== 'lan') {
     return res.status(400).json({
@@ -5861,7 +5853,110 @@ async function runShell(res, args, action, extra = {}, onDone) {
 // console is the only spawner of these scripts (browser buttons run
 // script files, per CLAUDE.md rule 4).
 const SLUG_LOCKS = new Map(); // slug -> { action, since: epoch ms }
+
+// --- Global operation lock -------------------------------------------
+// One appliance-wide mutex for operations that rewrite shared surfaces
+// (Caddyfile, every env file, the image cache) or restart core
+// containers: self-update, network-mode switch, exit-domain-mode,
+// cloudflare provision/rotate/teardown, prune-images. A global op needs
+// the whole board quiet (no slug locks), and slug actions must not
+// start under a global op — interleaving them is how a half-written
+// Caddyfile ships or a mid-update image gets pruned.
+let GLOBAL_LOCK = null; // { action, since } | null
+
+function slugLocksSummary() {
+  return [...SLUG_LOCKS.entries()].map(([s, l]) => `${l.action} ${s}`).join(', ');
+}
+
+// The detached self-updater outlives this process (bootstrap recreates
+// the console container), so GLOBAL_LOCK alone can't cover it — the
+// status file it maintains does. Stale-cap at 30 minutes: a hard-killed
+// updater leaves 'running' behind forever, and blocking every action on
+// that would wedge the appliance.
+function selfUpdateRunning() {
+  try {
+    const cur = JSON.parse(fs.readFileSync(SELF_UPDATE_STATUS, 'utf8'));
+    if (cur && cur.state === 'running') {
+      const t = Date.parse(cur.started_at || '') || 0;
+      if (Date.now() - t < 30 * 60 * 1000) return cur;
+    }
+  } catch { /* no prior run */ }
+  return null;
+}
+
+// 409 (and return true) when any global op, slug action, or detached
+// self-update is in flight. One response shape for every caller.
+function refuseIfBusy(res, advice) {
+  const tail = advice ? ` ${advice}` : ' Wait for it to finish, then retry.';
+  if (GLOBAL_LOCK) {
+    const mins = Math.round((Date.now() - GLOBAL_LOCK.since) / 60000);
+    res.status(409).json({
+      error: 'operation in progress',
+      detail: `A ${GLOBAL_LOCK.action} has been running for ${mins} minute(s).${tail}` +
+              ' If it looks wedged (10+ minutes), restart the console: sudo docker restart vibe-console.',
+    });
+    return true;
+  }
+  const su = selfUpdateRunning();
+  if (su) {
+    res.status(409).json({
+      error: 'operation in progress',
+      detail: `An appliance self-update is running (started ${su.started_at || 'recently'}).${tail}`,
+    });
+    return true;
+  }
+  if (SLUG_LOCKS.size) {
+    res.status(409).json({
+      error: 'operation in progress',
+      detail: `App action(s) still running (${slugLocksSummary()}).${tail}`,
+    });
+    return true;
+  }
+  return false;
+}
+
+function acquireGlobalLock(action, res) {
+  if (refuseIfBusy(res)) return false;
+  GLOBAL_LOCK = { action, since: Date.now() };
+  return true;
+}
+function releaseGlobalLock() { GLOBAL_LOCK = null; }
+
+// Express middleware form: hold the global lock for the request's
+// lifetime. Released when the response finishes (runShell-based
+// handlers respond on child exit, so that covers the script too) or the
+// connection closes. A client disconnect mid-script releases early —
+// accepted: rarer than the wedged-forever alternative, and the 409 text
+// documents the recovery either way.
+function globalOp(action) {
+  return (_req, res, next) => {
+    if (!acquireGlobalLock(action, res)) return;
+    res.on('finish', releaseGlobalLock);
+    res.on('close', releaseGlobalLock);
+    next();
+  };
+}
+
 function acquireSlugLock(slug, action, res) {
+  // A global op owns every shared surface a lifecycle script touches —
+  // and the detached self-updater's bootstrap re-renders env files while
+  // it runs. Refuse slug actions under either.
+  if (GLOBAL_LOCK) {
+    const mins = Math.round((Date.now() - GLOBAL_LOCK.since) / 60000);
+    res.status(409).json({
+      error: 'operation in progress',
+      detail: `A ${GLOBAL_LOCK.action} is running (${mins} minute(s) so far) — app actions are paused until it finishes.`,
+    });
+    return false;
+  }
+  const su = selfUpdateRunning();
+  if (su) {
+    res.status(409).json({
+      error: 'operation in progress',
+      detail: `An appliance self-update is running (started ${su.started_at || 'recently'}) — app actions are paused until it finishes.`,
+    });
+    return false;
+  }
   const held = SLUG_LOCKS.get(slug);
   if (held) {
     const mins = Math.round((Date.now() - held.since) / 60000);

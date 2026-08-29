@@ -45,6 +45,8 @@ VIBE_ENV_SHARED="${VIBE_ENV_SHARED:-${VIBE_ENV_DIR}/shared.env}"
 # shellcheck source=/dev/null
 . "${APPLIANCE_DIR}/lib/log.sh"
 . "${APPLIANCE_DIR}/lib/compose-files.sh"
+# shellcheck source=/dev/null
+. "${APPLIANCE_DIR}/lib/health-probe.sh"
 log_init
 
 # ---- helpers -----------------------------------------------------------
@@ -76,8 +78,11 @@ fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
 try:
     with open(path) as f:
         s = json.load(f)
-except (FileNotFoundError, ValueError):
+except FileNotFoundError:
     s = {"schemaVersion": 1, "config": {}, "phases": {}, "apps": {}}
+except ValueError as e:
+    print("state.json is MALFORMED (%s) - refusing to replace it with an empty default. Back it up and fix the JSON (sudo python3 -m json.tool /opt/vibe/state.json), or restore a known-good copy, then re-run." % e, file=sys.stderr)
+    sys.exit(1)
 apps = s.setdefault("apps", {})
 entry = apps.setdefault(slug, {})
 it = iter(kvs)
@@ -148,8 +153,11 @@ fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
 try:
     with open(path) as f:
         s = json.load(f)
-except (FileNotFoundError, ValueError):
+except FileNotFoundError:
     s = {"schemaVersion": 1, "config": {}, "phases": {}, "apps": {}}
+except ValueError as e:
+    print("state.json is MALFORMED (%s) - refusing to replace it with an empty default. Back it up and fix the JSON (sudo python3 -m json.tool /opt/vibe/state.json), or restore a known-good copy, then re-run." % e, file=sys.stderr)
+    sys.exit(1)
 apps = s.setdefault("apps", {})
 entry = apps.setdefault(slug, {})
 hist = entry.setdefault("update_history", [])
@@ -383,23 +391,43 @@ cmd_update() {
 
   local services
   services="$(_app_services "$manifest")"
+  # An empty service list turns every scoped `docker compose stop/up`
+  # below into a WHOLE-PROJECT command — stopping postgres, caddy and the
+  # console. Refuse up front rather than three steps in.
+  [[ -n "$services" ]] || die "could not derive any compose services for $slug from its manifest routing (upstreams must look like service:port)." "Fix routing.default_upstream / routing.matchers[].upstream in console/manifests/${slug}.json, then retry."
 
   # Step 0: refuse a no-op "update". With a stale update_available flag
-  # (or a double-click after the update already landed), re-running this
+  # (or a re-click after the update already landed), re-running this
   # command would re-tag vibe-rollback-<slug> to the CURRENT image —
-  # destroying the only path back to the previous one — and then "update"
-  # to the image already running. When the remote digest matches the
-  # local one there is nothing to roll forward to, so stop here. If the
-  # digest check itself fails (offline host, non-GHCR image), proceed:
-  # the update may still be legitimate and every later step keeps its own
-  # safety net.
-  local server_image _remote_d _local_d
-  server_image="$(_manifest_field "$manifest" 'data["image"]["server"]')"
-  if [[ -n "$server_image" ]]; then
-    _remote_d="$(_remote_digest "$server_image" "$default_tag" || true)"
-    _local_d="$(_local_digest "$server_image" "$default_tag" || true)"
-    if [[ -n "$_remote_d" && -n "$_local_d" && "$_remote_d" == "$_local_d" ]]; then
-      log_ok "$slug already runs the latest image (${_local_d}) — nothing to update"
+  # destroying the only path back to the previous one. Three constraints
+  # keep this guard from refusing legitimate work:
+  #   1. Only short-circuit when state says the app is RUNNING the
+  #      default tag. After a rollback (image_tag=vibe-rollback-*) or in
+  #      a failed state, "update" is the repair path even though the
+  #      :latest cache already matches the remote.
+  #   2. Compare EVERY manifest image (server, client, extras[]). A
+  #      client-only release must not be refused because image.server is
+  #      unchanged — cmd_check flags those, and refusing here would clear
+  #      the flag forever.
+  #   3. If any digest can't be fetched (offline, non-GHCR), proceed —
+  #      every later step keeps its own safety net.
+  local _cur_tag _cur_status
+  _cur_tag="$(python3 -c "import json;a=json.load(open('${VIBE_STATE_FILE}')).get('apps',{}).get('${slug}',{});print(a.get('image_tag',''))" 2>/dev/null || true)"
+  _cur_status="$(python3 -c "import json;a=json.load(open('${VIBE_STATE_FILE}')).get('apps',{}).get('${slug}',{});print(a.get('status',''))" 2>/dev/null || true)"
+  if [[ "$_cur_status" == "running" && ( -z "$_cur_tag" || "$_cur_tag" == "$default_tag" ) ]]; then
+    local _all_match=1 _checked=0 _k _img _remote_d _local_d
+    while IFS='=' read -r _k _img; do
+      [[ -n "$_img" ]] || continue
+      _remote_d="$(_remote_digest "$_img" "$default_tag" || true)"
+      _local_d="$(_local_digest "$_img" "$default_tag" || true)"
+      if [[ -z "$_remote_d" || -z "$_local_d" || "$_remote_d" != "$_local_d" ]]; then
+        _all_match=0
+        break
+      fi
+      _checked=1
+    done < <(_manifest_images "$manifest")
+    if (( _all_match == 1 && _checked == 1 )); then
+      log_ok "$slug already runs the latest images — nothing to update"
       _state_app_set "$slug" update_available false
       exit 0
     fi
@@ -436,6 +464,10 @@ cmd_update() {
       die "Could not back up $db_name. See $VIBE_LOG_FILE."
     }
     log_info "DB backup saved" path="$backup_path"
+    # Remember exactly which dump belongs to this update so a later
+    # --rollback --with-db restores THIS one, not whatever file happens
+    # to be newest by mtime.
+    _state_app_set "$slug" last_backup "$backup_path"
   fi
 
   # Step 4: stop app containers (data volumes preserved).
@@ -473,9 +505,11 @@ cmd_update() {
 
   # Step 7: health check. Per-app override via manifest.health_timeout_s
   # (vibe-glm-ocr pins this to 300s for the bundled vision-model load).
+  # Default matches _wait_for_health and lib/enable-app.sh (120s) — this
+  # variable only feeds the log line; the wait itself reads the manifest.
   local health_timeout
-  health_timeout="$(_manifest_field "$manifest" 'data.get("health_timeout_s", 90)')"
-  health_timeout="${health_timeout:-90}"
+  health_timeout="$(_manifest_field "$manifest" 'data.get("health_timeout_s", 120)')"
+  health_timeout="${health_timeout:-120}"
   log_step "waiting for $slug health (timeout ${health_timeout}s)"
   if ! _wait_for_health "$slug" "$manifest"; then
     log_error "health check timed out; rolling back"
@@ -499,7 +533,7 @@ cmd_update() {
   _run_app_seed_if_needed "$slug" "$manifest" \
     || log_warn "seed for $slug did not complete; check container logs and re-run manually if login fails" slug="$slug"
 
-  _state_app_set "$slug" status running update_available false image_tag "$default_tag"
+  _state_app_set "$slug" status running update_available false image_tag "$default_tag" db_dirty false
   _state_app_history_append "$slug" "succeeded" "$current_tag" "$default_tag" ""
   log_ok "update succeeded for $slug" tag="$default_tag"
 }
@@ -558,10 +592,12 @@ for x in json.loads(sys.argv[1]):
 # ---- rollback ----------------------------------------------------------
 
 cmd_rollback() {
-  local slug="$1" with_db="${2:-}"
-  if [[ -n "$with_db" && "$with_db" != "--with-db" ]]; then
-    die "unknown rollback option: $with_db (only --with-db is supported)"
-  fi
+  local slug="$1" with_db="${2:-}" with_db_path=""
+  case "$with_db" in
+    ""|--with-db) ;;
+    --with-db=*) with_db_path="${with_db#--with-db=}"; with_db="--with-db" ;;
+    *) die "unknown rollback option: $with_db (only --with-db[=/path/to/dump.sql.gz] is supported)" ;;
+  esac
   local manifest="$(_manifest_path "$slug")"
   [[ -f "$manifest" ]] || die "manifest not found: $manifest"
   # Units another orchestrator installs are not ours to update. A Sentinel
@@ -586,27 +622,51 @@ cmd_rollback() {
 
   local services
   services="$(_app_services "$manifest")"
+  [[ -n "$services" ]] || die "could not derive any compose services for $slug from its manifest routing — a bare compose stop would hit the ENTIRE stack (postgres, caddy, console)." "Fix routing.default_upstream / routing.matchers[].upstream in console/manifests/${slug}.json, then retry."
 
   ( cd "$APPLIANCE_DIR" && \
     compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" stop $services ) \
     >>"$VIBE_LOG_FILE" 2>&1 || true
 
-  # --with-db: also restore the newest pre-update DB backup while the
-  # containers are stopped. Off by default — restoring DESTROYS data
-  # written since the update, which is the operator's call, not ours.
+  # --with-db: also restore a pre-update DB backup while the containers
+  # are stopped. Off by default — restoring DESTROYS data written since
+  # the update, which is the operator's call, not ours. Selection order:
+  # an explicit --with-db=PATH wins; else the exact dump the last update
+  # recorded (state.apps.<slug>.last_backup); else newest-by-mtime. When
+  # a failed restore left the database dirty (db_dirty=true), the newest
+  # dump may be a POST-migration snapshot, so auto-pick is refused and
+  # the operator must name the dump.
   if [[ "$with_db" == "--with-db" ]]; then
-    local backup_dir="/opt/vibe/data/apps/${slug}/pre-update-backups"
-    local latest_backup
-    latest_backup="$(ls -1t "$backup_dir"/*.gz 2>/dev/null | head -1 || true)"
-    if [[ -z "$latest_backup" ]]; then
+    local backup_dir="${VIBE_DIR}/data/apps/${slug}/pre-update-backups"
+    local chosen_backup="" _db_dirty _state_backup
+    _db_dirty="$(python3 -c "import json;a=json.load(open('${VIBE_STATE_FILE}')).get('apps',{}).get('${slug}',{});print('true' if a.get('db_dirty') else '')" 2>/dev/null || true)"
+    if [[ -n "$with_db_path" ]]; then
+      chosen_backup="$with_db_path"
+      [[ -f "$chosen_backup" ]] || die "--with-db=$chosen_backup: file not found." "List the available dumps with: ls -lt $backup_dir/"
+    elif [[ "$_db_dirty" == "true" ]]; then
+      die "a previous update left the database in an unverified state (a restore failed), so the newest dump may be a POST-migration snapshot — auto-picking it could restore the wrong schema under the old image." "Pick the dump explicitly:
+  ls -lt $backup_dir/
+  sudo bash /opt/vibe/appliance/update.sh $slug --rollback --with-db=$backup_dir/<file>.sql.gz"
+    else
+      _state_backup="$(python3 -c "import json;a=json.load(open('${VIBE_STATE_FILE}')).get('apps',{}).get('${slug}',{});print(a.get('last_backup',''))" 2>/dev/null || true)"
+      if [[ -n "$_state_backup" && -f "$_state_backup" ]]; then
+        chosen_backup="$_state_backup"
+      else
+        chosen_backup="$(ls -1t "$backup_dir"/*.gz 2>/dev/null | head -1 || true)"
+        [[ -n "$chosen_backup" ]] && log_warn "state.json records no usable last_backup — falling back to the newest file by mtime: $chosen_backup"
+      fi
+    fi
+    if [[ -z "$chosen_backup" ]]; then
       die "--with-db was passed but no backup exists under $backup_dir. Nothing was changed — the containers are stopped; re-run without --with-db to bring the rollback image up."
     fi
     local db_name
     db_name="$(_manifest_field "$manifest" 'data["database"]["name"]')"
-    log_step "restoring DB from $latest_backup"
-    if ! _pg_restore_for_app "$slug" "$db_name" "$latest_backup"; then
-      die "DB restore from $latest_backup failed — see $VIBE_LOG_FILE. Containers are stopped; fix the cause, then re-run: sudo bash /opt/vibe/appliance/update.sh $slug --rollback --with-db"
+    log_step "restoring DB from $chosen_backup"
+    if ! _pg_restore_for_app "$slug" "$db_name" "$chosen_backup"; then
+      _state_app_set "$slug" db_dirty true
+      die "DB restore from $chosen_backup failed — see $VIBE_LOG_FILE. Containers are stopped; fix the cause, then re-run: sudo bash /opt/vibe/appliance/update.sh $slug --rollback --with-db"
     fi
+    _state_app_set "$slug" db_dirty false
     log_ok "database restored from pre-update backup"
   fi
 
@@ -614,7 +674,15 @@ cmd_rollback() {
   if ! ( cd "$APPLIANCE_DIR" && \
          compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" up -d $services ) >>"$VIBE_LOG_FILE" 2>&1; then
     _state_app_set "$slug" status failed update_error "rollback up failed"
-    die "Rollback bring-up failed for $slug. Manual recovery: see /opt/vibe/data/apps/${slug}/pre-update-backups/."
+    die "Rollback bring-up failed for $slug. Manual recovery: see ${VIBE_DIR}/data/apps/${slug}/pre-update-backups/."
+  fi
+
+  # A rollback image that crashloops must not get a green badge — wait
+  # for the same 200-only health gate the update path uses.
+  log_step "waiting for $slug health on the rollback image"
+  if ! _wait_for_health "$slug" "$manifest"; then
+    _state_app_set "$slug" status failed update_error "rollback image failed health check"
+    die "The rollback image came up but never answered /health with 200." "Diagnose: sudo docker compose -f /opt/vibe/appliance/docker-compose.yml -f /opt/vibe/appliance/apps/${slug}.yml logs --tail 50"
   fi
 
   _state_app_set "$slug" status running image_tag "vibe-rollback-${slug}"
@@ -646,6 +714,8 @@ _do_pull() {
   local manifest="$(_manifest_path "$slug")"
   local services
   services="$(_app_services "$manifest")"
+  # Empty list -> whole-project pull, which fails on build-only services.
+  [[ -n "$services" ]] || return 1
   ( cd "$APPLIANCE_DIR" && \
     compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" pull $services ) >>"$VIBE_LOG_FILE" 2>&1
 }
@@ -777,10 +847,8 @@ _wait_for_health() {
   # uses now. Avoids spinning up a curlimages/curl container per probe.
   local deadline=$(( $(date +%s) + timeout_s ))
   while (( $(date +%s) < deadline )); do
-    # 200-only, per the health-check convention: -f alone passes 3xx,
-    # which declared an app "running" while it was still redirecting.
-    if [[ "$(docker exec vibe-console curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-         "http://${upstream}${health}" 2>>"$VIBE_LOG_FILE")" == "200" ]]; then
+    # 200-only via the shared probe (lib/health-probe.sh).
+    if probe_health_200 "http://${upstream}${health}"; then
       # Main surface is up; now every manifest.health_extra[] target must
       # answer too. This is the UPDATE-path counterpart of enable-app.sh's
       # _wait_for_extra_health, and it matters more here: the routing
@@ -835,8 +903,7 @@ _wait_for_extra_health() {
     log_step "waiting for $slug/$name health" upstream="$upstream" path="$path"
     deadline=$(( $(date +%s) + 60 ))
     while (( $(date +%s) < deadline )); do
-      if [[ "$(docker exec vibe-console curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-           "http://${upstream}${path}" 2>>"$VIBE_LOG_FILE")" == "200" ]]; then
+      if probe_health_200 "http://${upstream}${path}"; then
         log_ok "$slug/$name is healthy"
         continue 2
       fi
@@ -856,6 +923,16 @@ _do_rollback() {
   local rc=0
   local services
   services="$(_app_services "$manifest")"
+  if [[ -z "$services" ]]; then
+    # A bare `docker compose stop` (no service list) stops the ENTIRE
+    # merged project — postgres, caddy, and the console reporting this
+    # very rollback. Refuse the compose verbs and report incomplete.
+    log_error "could not derive compose services for $slug from its manifest routing — refusing to run compose against the whole project."
+    log_error "Fix routing.default_upstream / routing.matchers[].upstream in console/manifests/${slug}.json, then re-run the rollback."
+    _state_app_set "$slug" status failed update_error "$reason (rollback incomplete — manifest routing yields no services)"
+    _state_app_history_append "$slug" "failed-rolled-back" "?" "?" "$reason"
+    return 1
+  fi
 
   # Stop the (new) containers FIRST. They hold connections to the app
   # database; DROP DATABASE below would be refused ("database is being
@@ -873,10 +950,13 @@ _do_rollback() {
     db_name="$(_manifest_field "$manifest" 'data["database"]["name"]')"
     if ! _pg_restore_for_app "$slug" "$db_name" "$backup_path"; then
       rc=1
+      _state_app_set "$slug" db_dirty true
       log_error "DB restore FAILED — the database may still hold the NEW (migrated) schema while the OLD image is about to start."
       log_error "Diagnose: sudo tail -50 $VIBE_LOG_FILE"
       log_error "Manual restore (after fixing the cause):"
       log_error "  sudo bash -c 'set -a; . /opt/vibe/env/shared.env; gunzip -c $backup_path | docker exec -i -e PGPASSWORD=\$POSTGRES_PASSWORD vibe-postgres psql -v ON_ERROR_STOP=1 -U postgres -d ${db_name}'"
+    else
+      _state_app_set "$slug" db_dirty false
     fi
   fi
 
@@ -930,9 +1010,10 @@ Usage:
   sudo update.sh <slug>                 Update <slug> with rollback safety net.
   sudo update.sh <slug> --rollback      Restore <slug> to its previous image.
                                         (DB is NOT touched — a warning explains.)
-  sudo update.sh <slug> --rollback --with-db
-                                        Also restore the newest pre-update DB
-                                        backup. DESTROYS data written since the
+  sudo update.sh <slug> --rollback --with-db[=PATH]
+                                        Also restore the pre-update DB backup
+                                        (the one the last update recorded, or
+                                        PATH). DESTROYS data written since the
                                         update — deliberate opt-in only.
 
 Output: human-readable to stderr; --check also emits NDJSON on stdout.

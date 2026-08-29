@@ -64,8 +64,11 @@ fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
 try:
     with open(path) as f:
         s = json.load(f)
-except (FileNotFoundError, ValueError):
+except FileNotFoundError:
     s = {"schemaVersion": int(schema_version), "config": {}, "phases": {}, "apps": {}}
+except ValueError as e:
+    print("state.json is MALFORMED (%s) - refusing to replace it with an empty default. Back it up and fix the JSON (sudo python3 -m json.tool /opt/vibe/state.json), or restore a known-good copy, then re-run." % e, file=sys.stderr)
+    sys.exit(1)
 phases = s.setdefault("phases", {})
 entry = {
     "status": status,
@@ -124,8 +127,11 @@ fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
 try:
     with open(path) as f:
         s = json.load(f)
-except (FileNotFoundError, ValueError):
+except FileNotFoundError:
     s = {"schemaVersion": int(schema_version), "config": {}, "phases": {}, "apps": {}}
+except ValueError as e:
+    print("state.json is MALFORMED (%s) - refusing to replace it with an empty default. Back it up and fix the JSON (sudo python3 -m json.tool /opt/vibe/state.json), or restore a known-good copy, then re-run." % e, file=sys.stderr)
+    sys.exit(1)
 host = s.setdefault("host_services", {})
 entry = {
     "status": status,
@@ -171,8 +177,11 @@ fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
 try:
     with open(path) as f:
         s = json.load(f)
-except (FileNotFoundError, ValueError):
+except FileNotFoundError:
     s = {"schemaVersion": int(schema_version), "config": {}, "phases": {}, "apps": {}}
+except ValueError as e:
+    print("state.json is MALFORMED (%s) - refusing to replace it with an empty default. Back it up and fix the JSON (sudo python3 -m json.tool /opt/vibe/state.json), or restore a known-good copy, then re-run." % e, file=sys.stderr)
+    sys.exit(1)
 config = s.setdefault("config", {})
 if val == "":
     config.pop(key, None)

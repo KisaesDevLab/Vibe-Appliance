@@ -40,7 +40,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   APPLIANCE_DIR="${APPLIANCE_DIR:-$(cd "${_self_dir}/.." && pwd)}"
   export APPLIANCE_DIR
   # shellcheck source=/dev/null
-  for _f in log.sh compose-files.sh state.sh secrets.sh db-bootstrap.sh render-caddyfile.sh render-haproxy.sh; do
+  for _f in log.sh compose-files.sh state.sh secrets.sh health-probe.sh db-bootstrap.sh render-caddyfile.sh render-haproxy.sh; do
     . "${_self_dir}/${_f}"
   done
   log_init
@@ -635,7 +635,7 @@ except Exception:
       dep_upstream="$(_manifest_field "$dep_manifest" 'next((m["upstream"] for m in (data["routing"].get("matchers") or []) if m.get("name") == "api"), data["routing"]["default_upstream"])')"
       dep_health="$(_manifest_field "$dep_manifest" 'data["health"]')"
       if [[ -n "$dep_upstream" && -n "$dep_health" ]]; then
-        if [[ "$(docker exec vibe-console curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://${dep_upstream}${dep_health}" 2>/dev/null)" != "200" ]]; then
+        if ! probe_health_200 "http://${dep_upstream}${dep_health}"; then
           log_error "preflight FAIL: $slug requires $dep, which is enabled but not answering ${dep_upstream}${dep_health}"
           log_error "         Enabling $slug now would mint no token and fail the same way."
           log_error "         Diagnose: sudo docker logs --tail 40 ${dep_upstream%:*}"
@@ -1672,9 +1672,8 @@ _wait_for_app_health() {
 
   local deadline=$(( $(date +%s) + timeout_s ))
   while (( $(date +%s) < deadline )); do
-    # 200-only, per the health-check convention: -f alone passes 3xx.
-    if [[ "$(docker exec vibe-console curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-         "http://${upstream}${health}" 2>>"$VIBE_LOG_FILE")" == "200" ]]; then
+    # 200-only via the shared probe (lib/health-probe.sh).
+    if probe_health_200 "http://${upstream}${health}"; then
       log_ok "$slug is healthy"
       return 0
     fi
@@ -1727,8 +1726,7 @@ _wait_for_extra_health() {
     log_step "waiting for $slug/$name health" upstream="$upstream" path="$path"
     deadline=$(( $(date +%s) + 60 ))
     while (( $(date +%s) < deadline )); do
-      if [[ "$(docker exec vibe-console curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-           "http://${upstream}${path}" 2>>"$VIBE_LOG_FILE")" == "200" ]]; then
+      if probe_health_200 "http://${upstream}${path}"; then
         log_ok "$slug/$name is healthy"
         continue 2
       fi
@@ -1759,8 +1757,11 @@ fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
 try:
     with open(path) as f:
         s = json.load(f)
-except (FileNotFoundError, ValueError):
+except FileNotFoundError:
     s = {"schemaVersion": 1, "config": {}, "phases": {}, "apps": {}}
+except ValueError as e:
+    print("state.json is MALFORMED (%s) - refusing to replace it with an empty default. Back it up and fix the JSON (sudo python3 -m json.tool /opt/vibe/state.json), or restore a known-good copy, then re-run." % e, file=sys.stderr)
+    sys.exit(1)
 apps = s.setdefault("apps", {})
 entry = apps.setdefault(slug, {})
 it = iter(kvs)

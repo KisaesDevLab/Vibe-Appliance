@@ -697,12 +697,15 @@ import json, sys
 print(json.load(open(sys.argv[1]))['health'])
 PYEOF
 )"
+  # Default matches lib/enable-app.sh and update.sh (120s): a lower one
+  # here rolled back settings saves for apps that legitimately take
+  # 90-120s to come back — apps that enable and update fine.
   timeout_s="$(python3 - "$manifest" <<'PYEOF' 2>/dev/null
 import json, sys
-print(json.load(open(sys.argv[1])).get('health_timeout_s', 90))
+print(json.load(open(sys.argv[1])).get('health_timeout_s', 120))
 PYEOF
 )"
-  timeout_s="${timeout_s:-90}"
+  timeout_s="${timeout_s:-120}"
 
   # Empty upstream/health means manifest fields were missing or the
   # python parse failed silently. Probing http:/// would just stall
@@ -718,8 +721,10 @@ PYEOF
 
   local deadline=$(( $(date +%s) + timeout_s ))
   while (( $(date +%s) < deadline )); do
-    if docker exec vibe-console curl -fsS -o /dev/null --max-time 5 \
-         "http://${upstream}${health}" >>"$VIBE_LOG_FILE" 2>&1; then
+    # 200-only via the shared probe (lib/health-probe.sh) — -f alone
+    # passed 3xx, declaring a redirecting app healthy right before the
+    # save was committed on that basis.
+    if probe_health_200 "http://${upstream}${health}"; then
       log_ok "$slug healthy"
       return 0
     fi
@@ -787,6 +792,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   . "${APPLIANCE_DIR}/lib/log.sh"
   # shellcheck source=/dev/null
   . "${APPLIANCE_DIR}/lib/secrets.sh"
+  # shellcheck source=/dev/null
+  . "${APPLIANCE_DIR}/lib/health-probe.sh"
   log_init
   log_set_phase "settings-save"
 

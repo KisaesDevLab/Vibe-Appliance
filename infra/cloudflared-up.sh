@@ -475,21 +475,34 @@ fi
 
 log_step "looking up tunnel '$CF_TUNNEL_NAME'"
 tunnel_search="$(cf_api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel?name=$CF_TUNNEL_NAME&is_deleted=false")"
-# Inline try/except (not 2>/dev/null) so parse failures reach the
-# operator instead of silently coercing TUNNEL_ID to empty and
-# treating it as "no tunnel found" — which then creates a duplicate
-# tunnel at Cloudflare. The empty stdout still triggers the
-# create-new-tunnel branch below, but stderr now explains why.
+# A parse failure or an API error (success:false — a 429, a 5xx, a
+# token that lost scope) must NOT read as "no tunnel found": that path
+# CREATES a second tunnel with the same name and repoints CNAMEs at it,
+# and a later teardown deletes whichever one the name lookup returns
+# first. Distinguish hard: only success:true with an empty result means
+# the tunnel genuinely does not exist.
 TUNNEL_ID="$(python3 -c "
 import json, sys
 try:
     d = json.loads(sys.argv[1])
 except Exception as e:
     print(f'[cloudflared-up] JSON parse failed for tunnel search: {e}; body excerpt: {sys.argv[1][:200]!r}', file=sys.stderr)
+    print('LOOKUP_ERROR')
+    sys.exit(0)
+if not d.get('success', False):
+    for err in (d.get('errors') or []):
+        print('[cloudflared-up] Cloudflare API error on tunnel search: code=%s message=%s' % (err.get('code'), err.get('message')), file=sys.stderr)
+    print('LOOKUP_ERROR')
     sys.exit(0)
 res = d.get('result') or []
 print(res[0].get('id', '') if res else '')
-" "$tunnel_search" || true)"
+" "$tunnel_search" || echo LOOKUP_ERROR)"
+
+if [[ "$TUNNEL_ID" == "LOOKUP_ERROR" ]]; then
+  die "could not look up tunnel '$CF_TUNNEL_NAME' — the Cloudflare API call failed or returned an error (see above). Refusing to continue: creating a tunnel without a trustworthy lookup can produce a DUPLICATE tunnel with the same name.
+  Diagnose: re-run in a minute (rate limits pass); verify the token still has Account.Cloudflare Tunnel:Edit.
+  Then re-run: sudo bash $APPLIANCE_DIR/infra/cloudflared-up.sh (idempotent)"
+fi
 
 if [[ -z "$TUNNEL_ID" ]]; then
   log_step "creating tunnel '$CF_TUNNEL_NAME'"
