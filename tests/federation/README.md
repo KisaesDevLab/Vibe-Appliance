@@ -84,3 +84,40 @@ docker run --rm -v "$PWD:/w/appliance:ro"   -v "$PWD/tests/federation/api-shape.
 script used `cond and ok(...) or bad(...)`, which is wrong — `ok()` returns
 `None`, so the `or` branch ran every time and every assertion printed both an
 OK and a FAIL. It is an `if/else` now.
+
+## e2e-verify.sh
+
+The whole-system sweep across BOTH repos: 31 checks in 21 sections covering
+syntax (85 shell scripts, 35 JSON, 24 YAML, 13 JS), manifest schema validity
+and cross-repo parity, the real compose merge for four module combinations,
+security, route protection, the renderer skips, every lifecycle refusal, and
+`doctor.sh` on a state containing a foreign unit.
+
+```bash
+docker run --rm -v "$PWD:/w/appliance:ro"   -v "$PWD/../vibe-sentinel-installer:/w/inst:ro"   -v "$PWD/tests/federation/e2e-verify.sh:/tmp/e2e.sh:ro"   node:20-bookworm bash -c '
+    apt-get update -qq && apt-get install -y -qq python3 python3-yaml python3-jsonschema jq curl
+    bash /tmp/e2e.sh'
+```
+
+The security sections are the point, and two of them found real defects on
+their first run:
+
+- **`eval` on manifest content.** `uninstall.sh` joined
+  `preUninstallExport.command` into a string and `eval`-ed it as root. Manifests
+  are *data* — the design intends them to arrive from each app's own repository
+  — so that was arbitrary code execution from a manifest, and it broke on any
+  path containing a space besides. Now split back into an argv vector and
+  exec'd directly. `manifest-injection.sh` proves it: a manifest whose command
+  contains `hi; touch /tmp/PWNED` prints the string instead of running it, while
+  a legitimate multi-argument command still executes.
+- **Customer-landing exposure.** All nine Sentinel manifests defaulted to
+  `userFacing: true`, and `userFacing !== false` is the *only* manifest-level
+  gate on both the public landing endpoint and the Settings → Customer landing
+  tab. An operator could have put Wazuh, CrowdSec or Vaultwarden on a firm's
+  client-facing page — behind a URL that 404s, since this appliance renders no
+  route for a foreign runtime. All nine now set `userFacing: false`, and a test
+  asserts it.
+
+Two of its own checks were also wrong at first and were fixed rather than
+silenced: the secret-in-log grep matched `$SECRETS_DIR`, a directory path, and
+reported it as a leak; it now matches only names that hold secret *material*.

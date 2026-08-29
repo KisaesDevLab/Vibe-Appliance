@@ -4,7 +4,8 @@
   "displayName": "Sentinel AI Routing",
   "description": "Model routing config for the Sentinel worker's summaries. Ships no container.",
   "runtime": "sentinel",
-  "_doc": "Config only: it writes /etc/vibe-sentinel/ai/router-client.json and starts nothing. Local vibellm by default; cloud Anthropic is opt-in, metadata-only, and every call is written to the disclosure log. When the Vibe Appliance's vibe-ai-router is on the same host, setup.sh says so - two routers for one firm means two sets of provider keys, two cost ledgers and two disclosure logs.",
+  "userFacing": false,
+  "_doc": "Config only: it writes /etc/vibe-sentinel/ai/router-client.json and starts nothing. Local vibellm by default; cloud Anthropic is opt-in, metadata-only, and every call is written to the disclosure log. When the Vibe Appliance's vibe-ai-router is on the same host, setup.sh says so - two routers for one firm means two sets of provider keys, two cost ledgers and two disclosure logs. NOT CUSTOMER-FACING: userFacing is false because the ONLY manifest-level gate on the public landing page and on the Settings > Customer landing tab is `userFacing !== false`. Without it an operator could toggle Wazuh, CrowdSec or Vaultwarden onto a firm's client-facing page - and the URL the console would print for it 404s anyway, since this appliance renders no route for a foreign runtime. These are staff and infrastructure surfaces reached through Sentinel's own ingress.",
   "bootOrder": 90,
   "requiredApps": [
     "sentinel-core"

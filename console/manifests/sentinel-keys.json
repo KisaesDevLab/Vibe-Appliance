@@ -4,7 +4,8 @@
   "displayName": "Vaultwarden Password Manager",
   "description": "The firm password manager - Security Six. Runs on the shared Sentinel Postgres, separate database.",
   "runtime": "sentinel",
-  "_doc": "THE :443 CONFLICT. On a host that also runs the Vibe Appliance, its Caddy binds 0.0.0.0:443 and wins over this specific bind. Use tunnel mode there - which is what most firms should pick anyway, since Bitwarden clients cannot complete an interactive Cloudflare Access login. Access protects /admin only. Vaultwarden migrates its schema one-way over the firm's entire vault, which is why it is harness-gated.",
+  "userFacing": false,
+  "_doc": "THE :443 CONFLICT. On a host that also runs the Vibe Appliance, its Caddy binds 0.0.0.0:443 and wins over this specific bind. Use tunnel mode there - which is what most firms should pick anyway, since Bitwarden clients cannot complete an interactive Cloudflare Access login. Access protects /admin only. Vaultwarden migrates its schema one-way over the firm's entire vault, which is why it is harness-gated. NOT CUSTOMER-FACING: userFacing is false because the ONLY manifest-level gate on the public landing page and on the Settings > Customer landing tab is `userFacing !== false`. Without it an operator could toggle Wazuh, CrowdSec or Vaultwarden onto a firm's client-facing page - and the URL the console would print for it 404s anyway, since this appliance renders no route for a foreign runtime. These are staff and infrastructure surfaces reached through Sentinel's own ingress.",
   "bootOrder": 50,
   "requiredApps": [
     "sentinel-core"

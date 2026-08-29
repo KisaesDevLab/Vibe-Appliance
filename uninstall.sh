@@ -235,10 +235,14 @@ for f in sorted(os.listdir(d)):
     cmd = exp.get("command")
     if not cmd:
         continue
-    key = " ".join(cmd)
+    if not all(isinstance(a, str) for a in cmd):
+        continue
+    key = "".join(cmd)
     if key in seen:
         continue
     seen.add(key)
+    #  between argv elements, tabs between fields: the command is handed
+    # back as a VECTOR, never as a string a shell could re-parse.
     print("%s	%s	%s" % (m.get("runtime"), key, exp.get("description", "")))
 PYEOF
 )"
@@ -256,7 +260,22 @@ PYEOF
       note  "    sudo bash <its installer>/uninstall.sh"
       continue
     fi
-    if ( cd "$dir" && eval "$cmd" ); then
+    # NOT eval. `cmd` comes from a manifest, and manifests are DATA - the
+    # design intends them to arrive from each app's own repository. Running
+    # `eval` on that content would make any manifest able to execute arbitrary
+    # shell as root during an uninstall, and would break on a legitimate path
+    # containing a space besides. Split the NUL-ish separator back into an
+    # argv array and exec it directly.
+    local -a argv=()
+    local _a
+    while IFS= read -r -d $'' _a || [[ -n "$_a" ]]; do
+      argv+=("$_a")
+    done < <(printf '%s' "$cmd")
+    if [[ ${#argv[@]} -eq 0 ]]; then
+      warn "${runtime} preUninstallExport has an empty command; nothing run."
+      continue
+    fi
+    if ( cd "$dir" && "${argv[@]}" ); then
       ok "${runtime} data exported"
     else
       warn "${runtime} export reported errors - check its output above."

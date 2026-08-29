@@ -4,7 +4,8 @@
   "displayName": "NetBird Private Network",
   "description": "The firm's private network - Security Six #6. Management, signal and dashboard.",
   "runtime": "sentinel",
-  "_doc": "The gRPC surfaces need an h2c origin (http2Origin); without it NetBird does not work at all. The relay is the ONE possible inbound port on the whole appliance and stays off until a failed NAT test plus QI consent, recorded in the risk assessment. Bringing this module up rebinds every mesh-only listener from loopback to the real mesh IP.",
+  "userFacing": false,
+  "_doc": "The gRPC surfaces need an h2c origin (http2Origin); without it NetBird does not work at all. The relay is the ONE possible inbound port on the whole appliance and stays off until a failed NAT test plus QI consent, recorded in the risk assessment. Bringing this module up rebinds every mesh-only listener from loopback to the real mesh IP. NOT CUSTOMER-FACING: userFacing is false because the ONLY manifest-level gate on the public landing page and on the Settings > Customer landing tab is `userFacing !== false`. Without it an operator could toggle Wazuh, CrowdSec or Vaultwarden onto a firm's client-facing page - and the URL the console would print for it 404s anyway, since this appliance renders no route for a foreign runtime. These are staff and infrastructure surfaces reached through Sentinel's own ingress.",
   "bootOrder": 40,
   "requiredApps": [
     "sentinel-core"

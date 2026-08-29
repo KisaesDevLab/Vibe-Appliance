@@ -4,7 +4,8 @@
   "displayName": "CrowdSec Perimeter Blocking",
   "description": "CrowdSec decision engine with an nftables bouncer and a Cloudflare Worker bouncer.",
   "runtime": "sentinel",
-  "_doc": "Drives the HOST firewall through the nftables bouncer, so it is not portable to a rootless or nested container runtime.",
+  "userFacing": false,
+  "_doc": "Drives the HOST firewall through the nftables bouncer, so it is not portable to a rootless or nested container runtime. NOT CUSTOMER-FACING: userFacing is false because the ONLY manifest-level gate on the public landing page and on the Settings > Customer landing tab is `userFacing !== false`. Without it an operator could toggle Wazuh, CrowdSec or Vaultwarden onto a firm's client-facing page - and the URL the console would print for it 404s anyway, since this appliance renders no route for a foreign runtime. These are staff and infrastructure surfaces reached through Sentinel's own ingress.",
   "bootOrder": 20,
   "requiredApps": [
     "sentinel-core"

@@ -92,7 +92,16 @@ PYEOF
 }
 
 # --- guards ----------------------------------------------------------------
+# Same shape console/server.js gates its routes with. Path traversal is
+# already contained here by the .json suffix plus the existence check below,
+# but that is incidental rather than stated - and this is also a root CLI an
+# operator can call directly. Make the guarantee local.
+_sm_require_slug() { # <slug>
+  [[ "$1" =~ ^[a-z][a-z0-9-]+$ ]] || die "invalid slug '$1'" "Slugs are lowercase letters, digits and dashes, starting with a letter."
+}
+
 _sm_require_sentinel() { # <slug>
+  _sm_require_slug "$1"
   local manifest; manifest="$(_sm_manifest "$1")"
   [[ -f "$manifest" ]] || die "no manifest for '$1' under ${APPLIANCE_DIR}/console/manifests/"
   local runtime; runtime="$(_sm_field "$manifest" 'data.get("runtime","appliance")')"

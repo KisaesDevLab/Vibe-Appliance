@@ -717,3 +717,18 @@ test('a Security Six module is disable-gated and a non-Six one is not', () => {
       'sentinel-core must not be disable-gated; it is refused outright instead');
   }
 });
+
+test('a foreign-runtime unit is never offered to the customer landing page', () => {
+  // `userFacing !== false` is the ONLY manifest-level gate on both the public
+  // landing endpoint and the Settings > Customer landing tab. A Sentinel
+  // module left at the default would appear there as a toggle, and an
+  // operator could put Wazuh or Vaultwarden on a firm's client-facing page —
+  // with a URL that 404s, because this appliance renders no route for a
+  // runtime it does not own. These are staff and infrastructure surfaces.
+  for (const { file, data } of manifests) {
+    if (runtimeOf(data) === 'appliance') continue;
+    assert.strictEqual(data.userFacing, false,
+      `${file}: a ${runtimeOf(data)} unit must set userFacing:false, or it can be ` +
+      'toggled onto the public customer landing page');
+  }
+});

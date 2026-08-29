@@ -4,7 +4,8 @@
   "displayName": "Greenbone Vulnerability Scanning",
   "description": "Network and device vulnerability scanning. Off by default; Wazuh already covers installed packages.",
   "runtime": "sentinel",
-  "_doc": "Off by default and worth leaving off unless the firm has network gear or printers to scan. Needs two env keys added by hand before it will build - see modules/scan/env.schema.",
+  "userFacing": false,
+  "_doc": "Off by default and worth leaving off unless the firm has network gear or printers to scan. Needs two env keys added by hand before it will build - see modules/scan/env.schema. NOT CUSTOMER-FACING: userFacing is false because the ONLY manifest-level gate on the public landing page and on the Settings > Customer landing tab is `userFacing !== false`. Without it an operator could toggle Wazuh, CrowdSec or Vaultwarden onto a firm's client-facing page - and the URL the console would print for it 404s anyway, since this appliance renders no route for a foreign runtime. These are staff and infrastructure surfaces reached through Sentinel's own ingress.",
   "bootOrder": 80,
   "requiredApps": [
     "sentinel-core"

@@ -4,7 +4,8 @@
   "displayName": "Uptime Kuma Availability Monitoring",
   "description": "Availability and certificate monitoring - the evidence that the safeguards were actually running.",
   "runtime": "sentinel",
-  "_doc": "Its socket.io API is unversioned and has changed between releases, so the Sentinel monitor adapter is written against one verified build. A break here is silent - monitors quietly stop being managed and nothing looks wrong - which is why the upgrade is harness-gated.",
+  "userFacing": false,
+  "_doc": "Its socket.io API is unversioned and has changed between releases, so the Sentinel monitor adapter is written against one verified build. A break here is silent - monitors quietly stop being managed and nothing looks wrong - which is why the upgrade is harness-gated. NOT CUSTOMER-FACING: userFacing is false because the ONLY manifest-level gate on the public landing page and on the Settings > Customer landing tab is `userFacing !== false`. Without it an operator could toggle Wazuh, CrowdSec or Vaultwarden onto a firm's client-facing page - and the URL the console would print for it 404s anyway, since this appliance renders no route for a foreign runtime. These are staff and infrastructure surfaces reached through Sentinel's own ingress.",
   "bootOrder": 60,
   "requiredApps": [
     "sentinel-core"

@@ -4,7 +4,8 @@
   "displayName": "Sentinel Core",
   "description": "Detection and compliance control plane: Sentinel API/web/worker, Wazuh, Authentik, ntfy.",
   "runtime": "sentinel",
-  "_doc": "Required; every other module depends on it. vm.max_map_count is not advisory - OpenSearch will not start below it.",
+  "userFacing": false,
+  "_doc": "Required; every other module depends on it. vm.max_map_count is not advisory - OpenSearch will not start below it. NOT CUSTOMER-FACING: userFacing is false because the ONLY manifest-level gate on the public landing page and on the Settings > Customer landing tab is `userFacing !== false`. Without it an operator could toggle Wazuh, CrowdSec or Vaultwarden onto a firm's client-facing page - and the URL the console would print for it 404s anyway, since this appliance renders no route for a foreign runtime. These are staff and infrastructure surfaces reached through Sentinel's own ingress.",
   "bootOrder": 10,
   "ownsInfra": [
     "postgres",
