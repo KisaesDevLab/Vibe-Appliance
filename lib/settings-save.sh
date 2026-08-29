@@ -433,9 +433,27 @@ PYEOF
 )"
   fi
 
-  local rc=0 slug
+  local rc=0 slug _rr_manifest _rr_rt
   while IFS= read -r slug; do
     [[ -z "$slug" ]] && continue
+    # Units another orchestrator installs share state.apps but have no
+    # appliance routing to reconcile (render-caddyfile skips them), and
+    # enable-app.sh refuses them by design — running it here produced a
+    # permanent, un-clearable "routing may be stale" warning on every
+    # routing-mode save. Fail closed on an unreadable manifest.
+    _rr_manifest="${APPLIANCE_DIR}/console/manifests/${slug}.json"
+    if [[ ! -f "$_rr_manifest" ]]; then
+      log_warn "routing-reconcile: skipping $slug — manifest missing"
+      continue
+    fi
+    _rr_rt="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('runtime','appliance'))" "$_rr_manifest" 2>/dev/null || true)"
+    if [[ -z "$_rr_rt" ]]; then
+      log_warn "routing-reconcile: skipping $slug — manifest unreadable"
+      continue
+    fi
+    if [[ "$_rr_rt" != "appliance" ]]; then
+      continue
+    fi
     log_step "routing-reconcile: re-enabling $slug (env re-render + force-recreate + Caddy)"
     if ! bash "${APPLIANCE_DIR}/lib/enable-app.sh" "$slug" >>"$VIBE_LOG_FILE" 2>&1; then
       log_warn "routing-reconcile: enable-app failed for $slug; its routing may be stale" \

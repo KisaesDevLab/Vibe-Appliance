@@ -334,12 +334,21 @@ for slug, e in (s.get('apps',{}) or {}).items():
     # ours to check — their manifests have no image block, so _check_one
     # emits nothing, check_failed stays false, and the stale-failed
     # clear below would stamp a FAILED Sentinel module "running".
+    # Fail CLOSED, mirroring bootstrap's phase_apps: a missing or
+    # unreadable manifest must not be presumed "appliance" — that path
+    # feeds _check_one nothing, leaves check_failed false, and the
+    # stale-failed clear below would stamp a failed Sentinel module
+    # (or any mystery entry) "running".
     local _chk_manifest _chk_rt
     _chk_manifest="$(_manifest_path "$slug")"
-    _chk_rt="appliance"
-    if [[ -f "$_chk_manifest" ]]; then
-      _chk_rt="$(_manifest_field "$_chk_manifest" 'data.get("runtime","appliance")')"
-      _chk_rt="${_chk_rt:-appliance}"
+    if [[ ! -f "$_chk_manifest" ]]; then
+      log_warn "skipping $slug — manifest missing; cannot verify its runtime"
+      continue
+    fi
+    _chk_rt="$(_manifest_field "$_chk_manifest" 'data.get("runtime","appliance")')"
+    if [[ -z "$_chk_rt" ]]; then
+      log_warn "skipping $slug — manifest unreadable; cannot verify its runtime"
+      continue
     fi
     if [[ "$_chk_rt" != "appliance" ]]; then
       log_info "skipping $slug — runtime '$_chk_rt' is owned by its own installer"

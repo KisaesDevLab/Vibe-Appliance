@@ -70,7 +70,17 @@ const LOG_NAMES = new Set([
   'disable-app.log',
   'update.log',
   'prune-images.log',
+  'cloudflared.log',
+  'exit-domain-mode.log',
+  'self-update.log',
 ]);
+// lib/log.sh rotates a log past 10 MB to <name>.log.1 — the generation
+// holding exactly the evidence an operator opens the Logs tab for.
+// Accept those too; still a strict allowlist, still no path input.
+function logNameAllowed(name) {
+  if (LOG_NAMES.has(name)) return true;
+  return name.endsWith('.1') && LOG_NAMES.has(name.slice(0, -2));
+}
 
 // Slug pattern: must match manifest.schema.json's slug constraint. Used
 // to gatekeep enable/disable endpoints — prevents path traversal via
@@ -2047,16 +2057,28 @@ app.post('/api/v1/admin/self-update', requireAdmin, testRateLimit, async (_req, 
   // state=running only after flock + preflight (~seconds). Until then an
   // enable could slip past every gate and run under bootstrap's env
   // re-renders — so claim the status file NOW; the script's first
-  // write_status overwrites this with richer detail.
+  // write_status overwrites this with richer detail. Never overwrite an
+  // EXISTING 'running' status (raw read, no staleness cap): a genuinely
+  // long run past the cap would lose its rollback_cmd/from_sha to this
+  // seed, and its flock will make this launch a silent loser anyway.
+  let seeded = false;
   try {
-    const seed = JSON.stringify({
-      run_id: 'launching', state: 'running', phase: 'launch',
-      message: 'Starting the appliance update…', error: null,
-      started_at: new Date().toISOString(), finished_at: null,
-    });
-    const tmpSeed = SELF_UPDATE_STATUS + '.tmp.' + process.pid;
-    fs.writeFileSync(tmpSeed, seed);
-    fs.renameSync(tmpSeed, SELF_UPDATE_STATUS);
+    let existingRunning = false;
+    try {
+      const raw = JSON.parse(fs.readFileSync(SELF_UPDATE_STATUS, 'utf8'));
+      existingRunning = !!(raw && raw.state === 'running');
+    } catch { /* absent or unreadable — seed freely */ }
+    if (!existingRunning) {
+      const seed = JSON.stringify({
+        run_id: 'launching', state: 'running', phase: 'launch',
+        message: 'Starting the appliance update…', error: null,
+        started_at: new Date().toISOString(), finished_at: null,
+      });
+      const tmpSeed = SELF_UPDATE_STATUS + '.tmp.' + process.pid;
+      fs.writeFileSync(tmpSeed, seed);
+      fs.renameSync(tmpSeed, SELF_UPDATE_STATUS);
+      seeded = true;
+    }
   } catch (err) {
     log('warn', 'could not seed self-update status file', { err: err.message });
   }
@@ -2073,6 +2095,17 @@ app.post('/api/v1/admin/self-update', requireAdmin, testRateLimit, async (_req, 
   const result = await runOnHost(launch);
   if (result.code !== 0) {
     log('error', 'self-update launch failed', { code: result.code, stderr: trim(result.stderr, 400) });
+    // The seed says state=running; nothing is. Left in place it would
+    // 409 every action (and any retry) for 30 minutes.
+    if (seeded) {
+      try {
+        fs.writeFileSync(SELF_UPDATE_STATUS, JSON.stringify({
+          run_id: 'launching', state: 'failed', phase: 'launch',
+          message: 'The update could not be started.', error: trim(result.stderr, 300) || ('exit ' + result.code),
+          started_at: new Date().toISOString(), finished_at: new Date().toISOString(),
+        }));
+      } catch { /* the 30-min cap remains the backstop */ }
+    }
     return res.status(500).json({
       ok: false,
       error: 'Could not start the update: ' + (trim(result.stderr, 300) || `exit ${result.code}`) +
@@ -3721,6 +3754,12 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, globa
     // — promoting from manual to automatic.
     const enabledSlugs = Object.entries(state.apps || {})
       .filter(([, e]) => e && e.enabled && e.status !== 'failed')
+      // Units another orchestrator installs share state.apps but have no
+      // appliance env to re-render, and enable-app.sh refuses them by
+      // design — spawning it here made every mode switch report a
+      // phantom failure for a healthy Sentinel module. Fail closed on a
+      // slug with no loaded manifest.
+      .filter(([slug]) => MANIFESTS[slug] && appRuntime(MANIFESTS[slug]) === 'appliance')
       .map(([slug]) => slug);
     const newTunnelSub = state.config.tunnel_subdomain || 'vibe';
     const configChanged = prevMode !== mode
@@ -4950,7 +4989,7 @@ app.post('/api/v1/admin/analyze-log', requireAdmin, async (req, res) => {
   const ctxJson = ctx ? JSON.stringify(ctx).slice(0, 4096) : '';
 
   // Validate the log name against the existing whitelist.
-  if (!LOG_NAMES.has(logName)) {
+  if (!logNameAllowed(logName)) {
     return res.status(400).json({
       ok: false, code: 'log-not-allowed',
       message: `Log "${logName}" is not in the allow-list.`,
@@ -5886,6 +5925,21 @@ const SLUG_LOCKS = new Map(); // slug -> { action, since: epoch ms }
 // Caddyfile ships or a mid-update image gets pruned.
 let GLOBAL_LOCK = null; // { action, since } | null
 
+// The one accessor every gate uses. Self-expires a lock held past 45
+// minutes: a leak (client disconnect mid-script, a killed console child)
+// must not require the novice operator to run a terminal command before
+// any button works again. 45 min comfortably exceeds every guarded
+// script's worst case.
+function globalLockHeld() {
+  if (!GLOBAL_LOCK) return null;
+  if (Date.now() - GLOBAL_LOCK.since > 45 * 60 * 1000) {
+    log('warn', 'expiring stale global lock', { action: GLOBAL_LOCK.action });
+    GLOBAL_LOCK = null;
+    return null;
+  }
+  return GLOBAL_LOCK;
+}
+
 function slugLocksSummary() {
   return [...SLUG_LOCKS.entries()].map(([s, l]) => `${l.action} ${s}`).join(', ');
 }
@@ -5910,12 +5964,13 @@ function selfUpdateRunning() {
 // self-update is in flight. One response shape for every caller.
 function refuseIfBusy(res, advice) {
   const tail = advice ? ` ${advice}` : ' Wait for it to finish, then retry.';
-  if (GLOBAL_LOCK) {
-    const mins = Math.round((Date.now() - GLOBAL_LOCK.since) / 60000);
+  const gl = globalLockHeld();
+  if (gl) {
+    const mins = Math.round((Date.now() - gl.since) / 60000);
     res.status(409).json({
       error: 'operation in progress',
-      detail: `A ${GLOBAL_LOCK.action} has been running for ${mins} minute(s).${tail}` +
-              ' If it looks wedged (10+ minutes), restart the console: sudo docker restart vibe-console.',
+      detail: `A ${gl.action} has been running for ${mins} minute(s).${tail}` +
+              ' A wedged lock clears itself after 45 minutes.',
     });
     return true;
   }
@@ -5957,7 +6012,15 @@ function globalOp(action) {
   return (_req, res, next) => {
     if (!acquireGlobalLock(action, res)) return;
     const mine = GLOBAL_LOCK;
-    res.on('finish', () => { if (GLOBAL_LOCK === mine) releaseGlobalLock(); });
+    const release = () => { if (GLOBAL_LOCK === mine) releaseGlobalLock(); };
+    res.on('finish', release);
+    // 'finish' never fires on a destroyed socket, so a client who closed
+    // the tab mid-script would leak the lock even after the script
+    // completed cleanly. On 'close', release only once the handler has
+    // ATTEMPTED its response (headersSent) — i.e. the guarded work is
+    // done; a disconnect mid-work still holds, and the 45-minute
+    // self-expiry is the backstop for that case.
+    res.on('close', () => { if (res.headersSent) release(); });
     next();
   };
 }
@@ -5975,12 +6038,13 @@ function acquireSlugLock(slug, action, res) {
   // A global op owns every shared surface a lifecycle script touches —
   // and the detached self-updater's bootstrap re-renders env files while
   // it runs. Refuse slug actions under either.
-  if (GLOBAL_LOCK) {
-    const mins = Math.round((Date.now() - GLOBAL_LOCK.since) / 60000);
+  const gl = globalLockHeld();
+  if (gl) {
+    const mins = Math.round((Date.now() - gl.since) / 60000);
     res.status(409).json({
       error: 'operation in progress',
-      detail: `A ${GLOBAL_LOCK.action} is running (${mins} minute(s) so far) — app actions are paused until it finishes.` +
-              ' If it looks wedged (10+ minutes), restart the console: sudo docker restart vibe-console.',
+      detail: `A ${gl.action} is running (${mins} minute(s) so far) — app actions are paused until it finishes.` +
+              ' A wedged lock clears itself after 45 minutes.',
     });
     return false;
   }
@@ -6089,8 +6153,10 @@ function tailFile(fullPath, maxBytes = 512 * 1024) {
     const size = fs.fstatSync(fd).size;
     const want = Math.min(size, maxBytes);
     const buf = Buffer.alloc(want);
-    fs.readSync(fd, buf, 0, want, size - want);
-    let text = buf.toString('utf8');
+    // The file can shrink between fstat and read (log rotation) — use
+    // the actual bytesRead, or the tail comes back padded with NULs.
+    const got = fs.readSync(fd, buf, 0, want, size - want);
+    let text = buf.subarray(0, got).toString('utf8');
     if (want < size) {
       // Drop the first (almost certainly partial) line of the window.
       const nl = text.indexOf('\n');
@@ -6434,7 +6500,7 @@ app.get('/api/v1/doctor', requireAdmin, async (_req, res) => {
 app.get('/api/v1/logs', requireAdmin, (_req, res) => {
   let files = [];
   try {
-    files = fs.readdirSync(LOGS_DIR).filter((f) => LOG_NAMES.has(f));
+    files = fs.readdirSync(LOGS_DIR).filter((f) => logNameAllowed(f));
   } catch (err) {
     log('warn', 'logs dir unreadable', { dir: LOGS_DIR, err: err.code });
   }
@@ -6455,7 +6521,7 @@ app.get('/api/v1/logs', requireAdmin, (_req, res) => {
 
 app.get('/api/v1/logs/:name', requireAdmin, (req, res) => {
   const name = req.params.name;
-  if (!LOG_NAMES.has(name)) {
+  if (!logNameAllowed(name)) {
     return res.status(404).type('text/plain').send('Unknown log\n');
   }
   const full = path.join(LOGS_DIR, name);
@@ -6596,7 +6662,7 @@ function runUpdateCheckBackground() {
   // The interactive check endpoint refuses while anything runs; the
   // timer must not sneak past the same fences — a check writes
   // update_available/status flags an in-flight script may be mid-write.
-  if (GLOBAL_LOCK || SLUG_LOCKS.size || selfUpdateRunning()) {
+  if (globalLockHeld() || SLUG_LOCKS.size || selfUpdateRunning()) {
     log('info', 'background update check skipped — appliance busy');
     return;
   }

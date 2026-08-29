@@ -533,10 +533,18 @@ phase_secrets() {
   # rotating it makes every previously encrypted row undecryptable, with
   # no ALTER-ROLE-style realignment possible. Rotating it is deliberate
   # manual surgery, never a side effect of --reset-env.
+  # SETTINGS_ENCRYPTION_KEY (Duplicati's settings DB — its own template
+  # comment says "if lost, the settings DB is unrecoverable") and
+  # DUPLICATI_PASSPHRASE (decrypts every existing backup archive) bind to
+  # persistent data the same way, so they ride the same preserve.
   _pg_preserve=""
   _enc_preserve=""
+  _dup_settings_preserve=""
+  _dup_pass_preserve=""
   if [[ "$CONFIG_RESET_ENV" == "true" && -f "$VIBE_ENV_SHARED" ]]; then
     _enc_preserve="$(grep -m1 '^ENCRYPTION_KEY=' "$VIBE_ENV_SHARED" 2>/dev/null | cut -d= -f2- || true)"
+    _dup_settings_preserve="$(grep -m1 '^SETTINGS_ENCRYPTION_KEY=' "$VIBE_ENV_SHARED" 2>/dev/null | cut -d= -f2- || true)"
+    _dup_pass_preserve="$(grep -m1 '^DUPLICATI_PASSPHRASE=' "$VIBE_ENV_SHARED" 2>/dev/null | cut -d= -f2- || true)"
   fi
   if [[ "$CONFIG_RESET_ENV" == "true" && -f "${VIBE_DIR}/data/postgres/PG_VERSION" ]]; then
     _pg_preserve="$(grep -m1 '^POSTGRES_PASSWORD=' "$VIBE_ENV_SHARED" 2>/dev/null | cut -d= -f2- || true)"
@@ -571,7 +579,7 @@ Pick one:
 HELP
 )"
     fi
-    log_warn "--reset-env: preserving POSTGRES_PASSWORD and ENCRYPTION_KEY — the database keeps the password it was created with, and encrypted app data keeps its key. Every other secret is rotated; per-app DB roles are realigned automatically this run."
+    log_warn "--reset-env: preserving the data-bound secrets (POSTGRES_PASSWORD, ENCRYPTION_KEY, SETTINGS_ENCRYPTION_KEY, DUPLICATI_PASSPHRASE) — the database, encrypted app data, Duplicati's settings DB and existing backup archives all keep the keys they were created with. Every other secret is rotated; per-app DB roles are realigned automatically this run."
   fi
 
   if ! secrets_render \
@@ -587,8 +595,9 @@ HELP
   # is temp-file + os.replace: a torn in-place write here would truncate
   # the file holding every core secret, during the one operation whose
   # audience is recovery.
-  if [[ -n "${_pg_preserve:-}" || -n "${_enc_preserve:-}" ]]; then
+  if [[ -n "${_pg_preserve:-}" || -n "${_enc_preserve:-}" || -n "${_dup_settings_preserve:-}" || -n "${_dup_pass_preserve:-}" ]]; then
     if ! _PG_PRESERVE="${_pg_preserve:-}" _ENC_PRESERVE="${_enc_preserve:-}" \
+         _DUP_SETTINGS_PRESERVE="${_dup_settings_preserve:-}" _DUP_PASS_PRESERVE="${_dup_pass_preserve:-}" \
          python3 - "$VIBE_ENV_SHARED" <<'PYEOF'
 import os, sys
 path = sys.argv[1]
@@ -597,6 +606,10 @@ if os.environ.get("_PG_PRESERVE"):
     keep["POSTGRES_PASSWORD"] = os.environ["_PG_PRESERVE"]
 if os.environ.get("_ENC_PRESERVE"):
     keep["ENCRYPTION_KEY"] = os.environ["_ENC_PRESERVE"]
+if os.environ.get("_DUP_SETTINGS_PRESERVE"):
+    keep["SETTINGS_ENCRYPTION_KEY"] = os.environ["_DUP_SETTINGS_PRESERVE"]
+if os.environ.get("_DUP_PASS_PRESERVE"):
+    keep["DUPLICATI_PASSPHRASE"] = os.environ["_DUP_PASS_PRESERVE"]
 lines = open(path).read().splitlines()
 out = []
 hit = set()
@@ -620,7 +633,8 @@ PYEOF
       state_set_phase secrets failed "could not restore preserved secrets"
       die "Could not write the preserved POSTGRES_PASSWORD/ENCRYPTION_KEY back into $VIBE_ENV_SHARED." "The pre-reset file was archived as ${VIBE_ENV_SHARED}.bak.<timestamp> — restore it and re-run bootstrap."
     fi
-    log_info "preserved secrets restored into shared.env" keys="POSTGRES_PASSWORD${_enc_preserve:+,ENCRYPTION_KEY}"
+    log_info "preserved secrets restored into shared.env" \
+      keys="${_pg_preserve:+POSTGRES_PASSWORD,}${_enc_preserve:+ENCRYPTION_KEY,}${_dup_settings_preserve:+SETTINGS_ENCRYPTION_KEY,}${_dup_pass_preserve:+DUPLICATI_PASSPHRASE,}"
   fi
 
   # Render appliance.env — Tier 1 inline-editable settings (Phase 8.5

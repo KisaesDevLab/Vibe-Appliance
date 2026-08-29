@@ -616,10 +616,13 @@ This file is mode 600 and stored at: ${VIBE_CREDS_FILE}
 
 ROTATING SECRETS
   sudo /opt/vibe/appliance/bootstrap.sh --reset-env
-  WARNING: this rotates every secret in shared.env, including
-  encryption keys. Any data already encrypted with the previous
-  keys will be unrecoverable. Use only on a fresh install or when
-  you know none of the apps have stored encrypted data yet.
+  Safe on a live install: the data-bound secrets (POSTGRES_PASSWORD,
+  ENCRYPTION_KEY, SETTINGS_ENCRYPTION_KEY, DUPLICATI_PASSPHRASE) are
+  preserved so the database, encrypted app data, and existing backups
+  stay readable. Everything else (JWT secrets, admin passwords, API
+  keys) is rotated; re-open this file afterwards for the new values.
+  Rotating the preserved keys themselves is deliberate manual surgery —
+  ask before attempting it.
 
 NEXT STEPS
   Open ${server_url}/        — public landing page

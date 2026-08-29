@@ -5056,7 +5056,12 @@ const SETTINGS_JS_VERSION = '2026-07-30-tunnel-scope-and-rootserved-urls';
                `Snapshot at ${escapeHtml(data.snapshot || 'unknown')}. Manual recovery may be required — see /opt/vibe/logs/.`;
         break;
       default:
-        html = `<strong>Error:</strong> ${escapeHtml(data.reason || data.error || 'unknown')}`;
+        // 409s from the appliance's operation locks put their guidance
+        // ("wait for the running action…") in `detail` — without it the
+        // operator gets a dead-end "operation in progress".
+        html = `<strong>Error:</strong> ${escapeHtml(data.reason || data.detail || data.error || 'unknown')}` +
+               (data.detail && data.error && data.detail !== data.error
+                 ? `<br>${escapeHtml(data.detail)}` : '');
     }
     resultEl.innerHTML = html;
   }
