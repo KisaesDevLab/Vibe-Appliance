@@ -212,12 +212,17 @@ live rather than hypothetical.
 
 **The catalog.** `/api/v1/apps` surfaces `runtime`, `resources`, `hostPrereqs`,
 `license`, `ingress`, `disableRequires`, `harnessGate` and `bootOrder`. The
-admin page renders anything non-`appliance` into a collapsed *Security &
-Compliance (Vibe Sentinel)* group ordered by `bootOrder` — nine modules would
-otherwise nearly double the page and bury the apps a firm came for. A foreign
-unit's card drops the rows that only make sense for a container this appliance
-runs (build identity, the URL Caddy serves) and gains the ones that decide
-whether it can run here at all.
+admin page renders `runtime: "sentinel"` units into their own always-visible
+*Security & Compliance (Vibe Sentinel)* section below the Apps grid — one card
+per module, ordered by `bootOrder` — so the modules neither bury the apps a
+firm came for nor collapse into a single unreadable card. The section is
+hidden when no sentinel manifests are present; its licence is stated once for
+the section only while every module declares identical terms, per-card
+otherwise. A manifest declaring a runtime the console does not know is
+surfaced as a visible error in the Apps section, never silently grouped under
+the Sentinel heading. A foreign unit's card drops the rows that only make
+sense for a container this appliance runs (build identity, the URL Caddy
+serves) and gains the ones that decide whether it can run here at all.
 
 **The resource gate.** `/api/v1/admin/status` now reports `mem_available_mb`
 from `/proc/meminfo` — free memory, not `MemTotal`, because a 2 GB droplet

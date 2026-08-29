@@ -388,6 +388,19 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
       return '<span class="badge badge--muted">' + escapeHtml(status || 'unknown') + '</span>';
     }
 
+    // One definition of "running" for every counter and per-item check on
+    // this page. Tighten it in one place (e.g. to a health-gated check)
+    // and every section header stays in agreement.
+    function isRunning(a) { return a.enabled && a.status === 'running'; }
+    function countRunning(items) { return items.filter(isRunning).length; }
+
+    // Show-and-fill or hide-and-clear an element atomically, so a hidden
+    // element never carries stale content into its next unhide.
+    function showIf(el, html) {
+      if (html) { el.hidden = false; el.innerHTML = html; }
+      else      { el.hidden = true;  el.innerHTML = ''; }
+    }
+
     // ---------- data loaders ----------
     // 401 means the basic-auth credentials cached by the browser are no
     // longer valid (server restart with rotated CONSOLE_ADMIN_PASSWORD,
@@ -470,7 +483,7 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
     // lands).
     function renderSetupBanners(settings, config, tsLive) {
       const wrap = document.getElementById('setup-banners');
-      if (!settings) { wrap.hidden = true; return; }
+      if (!settings) { showIf(wrap, ''); return; }
       const banners = [];
       const a = settings.appliance || {};
 
@@ -502,14 +515,12 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
         });
       }
 
-      if (!banners.length) { wrap.hidden = true; wrap.innerHTML = ''; return; }
-      wrap.hidden = false;
-      wrap.innerHTML = banners.map(b => `
+      showIf(wrap, banners.map(b => `
         <div class="${b.severity === 'critical' ? 'error-banner' : 'card'}" style="margin-bottom: 0.75rem;">
           <strong>${b.severity === 'critical' ? '⚠ ' : '↗ '}</strong>
           ${escapeHtml(b.msg)}
           <a href="${b.link}" style="margin-left: 0.5rem;">${escapeHtml(b.linkText)}</a>
-        </div>`).join('');
+        </div>`).join(''));
     }
 
     // Phase 8.5 v1.2 — Avahi/UFW host status. Source-of-truth is
@@ -638,7 +649,7 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
         return;
       }
       list.innerHTML = '<div class="apps-list">' + credItems.map(item => {
-        const enabled = item.enabled && item.status === 'running';
+        const enabled = isRunning(item);
         const t = item.type || 'unknown';
 
         // Type-derived defaults; explicit per-item note wins. The four
@@ -790,21 +801,57 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
       // unreadable, and merging them flat into Apps would bury the eight Vibe
       // apps a firm came for behind modules most firm hosts cannot even run.
       const own = apps.filter(a => (a.runtime || 'appliance') === 'appliance');
-      const foreign = apps.filter(a => (a.runtime || 'appliance') !== 'appliance')
-                          .sort((x, y) => (x.bootOrder ?? 999) - (y.bootOrder ?? 999));
+      const sentinel = apps.filter(a => a.runtime === 'sentinel')
+                           .sort((x, y) => (x.bootOrder ?? 999) - (y.bootOrder ?? 999));
+      // `runtime` is a closed enum today ("appliance" | "sentinel"). Anything
+      // else must fail visibly here — not render under the Sentinel heading
+      // with recovery guidance naming the wrong installer.
+      const unknown = apps.filter(a =>
+        (a.runtime || 'appliance') !== 'appliance' && a.runtime !== 'sentinel');
 
       summary.textContent = own.length + ' app(s) registered, ' +
-        own.filter(a => a.enabled && a.status === 'running').length + ' running';
+        countRunning(own) + ' running';
 
-      list.innerHTML = own.map(renderAppCard).join('');
-      wireAppActions(list);
+      const unknownBanner = unknown.length
+        ? '<div class="error-banner">Manifest(s) with a runtime this console does not know: ' +
+          unknown.map(a => '<span class="mono">' + escapeHtml(a.slug) +
+            '</span> (runtime: <span class="mono">' + escapeHtml(a.runtime) + '</span>)').join(', ') +
+          '. Update the appliance to a version that understands that runtime, or fix the manifest.</div>'
+        : '';
+      // Manifests exist but none are appliance-run: without this note the
+      // section would show a headed, unexplained empty grid.
+      const emptyOwnNote = !own.length
+        ? '<p class="muted">No appliance-managed apps registered — every manifest in ' +
+          '/opt/vibe/appliance/console/manifests belongs to another runtime. If Vibe apps ' +
+          'are missing here, restore their manifest files and reload.</p>'
+        : '';
 
-      renderSentinel(foreign);
+      renderCards(list, own, unknownBanner + emptyOwnNote);
+      renderSentinel(sentinel);
     }
 
-    function wireAppActions(root) {
-      root.querySelectorAll('button[data-action]').forEach(btn => {
-        btn.addEventListener('click', () => toggle(btn));
+    // innerHTML replacement snaps open <details> shut on every 15s poll —
+    // capture which cards have one open and restore it after the render.
+    function renderCards(list, items, extraHtml) {
+      const open = new Set(
+        [...list.querySelectorAll('details[open]')]
+          .map(d => d.closest('.app-card') && d.closest('.app-card').id)
+          .filter(Boolean));
+      list.innerHTML = (extraHtml || '') + items.map(renderAppCard).join('');
+      open.forEach(id => {
+        const card = document.getElementById(id);
+        const d = card && card.querySelector('details');
+        if (d) d.open = true;
+      });
+    }
+
+    // One delegated click listener per list, installed once — it survives
+    // every innerHTML re-render, so there is no per-render wiring to keep
+    // in lockstep with the card markup.
+    for (const id of ['apps-list', 'sentinel-list']) {
+      document.getElementById(id).addEventListener('click', (ev) => {
+        const btn = ev.target.closest('button[data-action]');
+        if (btn && !btn.disabled) toggle(btn);
       });
     }
 
@@ -822,27 +869,32 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
       if (!items.length) {
         section.hidden = true;
         list.innerHTML = '';
+        summary.textContent = '—';
+        showIf(licence, '');
         return;
       }
       section.hidden = false;
 
-      const running = items.filter(a => a.enabled && a.status === 'running').length;
-      summary.textContent = items.length + ' module(s) known, ' + running + ' running';
+      summary.textContent = items.length + ' module(s) known, ' + countRunning(items) + ' running';
 
-      // The licence covers the whole Sentinel unit, so it is stated once for
-      // the section rather than repeated on nine cards.
-      const lic = items.find(a => a.license && a.license.name);
-      if (lic) {
-        licence.hidden = false;
-        licence.innerHTML = '<strong>Licence:</strong> ' + escapeHtml(lic.license.name) +
-          (lic.license.note ? ' — ' + escapeHtml(lic.license.note) : '');
+      // State the licence once for the section ONLY while every module
+      // declares the same terms. The manifests' own note says third-party
+      // components keep their own licenses — the moment one module differs,
+      // a single section line would misstate the rest, so fall back to a
+      // per-card licence row instead.
+      const withLic = items.filter(a => a.license && a.license.name);
+      const licNames = new Set(withLic.map(a => a.license.name));
+      const uniform = withLic.length === items.length && licNames.size === 1;
+      if (uniform) {
+        const lic = withLic[0];
+        showIf(licence, '<strong>Licence:</strong> ' + escapeHtml(lic.license.name) +
+          (lic.license.note ? ' — ' + escapeHtml(lic.license.note) : ''));
       } else {
-        licence.hidden = true;
-        licence.innerHTML = '';
+        showIf(licence, '');
       }
+      items.forEach(a => { a._cardLicence = !uniform; });
 
-      list.innerHTML = items.map(renderAppCard).join('');
-      wireAppActions(list);
+      renderCards(list, items, '');
     }
 
     function renderAppCard(a) {
@@ -977,6 +1029,9 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
           ${a.error ? '<div class="error-banner">' + escapeHtml(a.error) + '</div>' : ''}
           ${a.update_error ? '<div class="error-banner">last update error: ' + escapeHtml(a.update_error) + '</div>' : ''}
           <div class="app-card__actions">
+            ${inflight
+              ? '<button class="btn" disabled>' + escapeHtml(ACTION_PROGRESS[inflight] || 'Working…') + '</button>'
+              : `
             ${!foreign && a.enabled && a.update_available
               ? '<button class="btn"             data-action="update"   data-slug="' + escapeHtml(a.slug) + '" title="Pull the newer tag from GHCR, recreate, and roll back automatically on health failure">Update</button>'
               : ''}
@@ -991,7 +1046,7 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
               : ''}
             ${foreign && a.enabled
               ? '<span class="muted" style="align-self:center">Updates run through the Sentinel installer\'s own harness-gated upgrade.</span>'
-              : ''}
+              : ''}`}
           </div>
           ${a.update_history && a.update_history.length ? `
             <details class="app-card__history">
@@ -1007,7 +1062,9 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
                 `).join('')}
               </ul>
             </details>` : ''}
-          <pre class="app-card__output" hidden></pre>
+          ${_lastOutput.has(a.slug)
+            ? '<pre class="app-card__output">' + escapeHtml(_lastOutput.get(a.slug)) + '</pre>'
+            : '<pre class="app-card__output" hidden></pre>'}
         </article>
       `;
     }
@@ -1015,17 +1072,15 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
     async function toggle(btn) {
       const slug   = btn.dataset.slug;
       const action = btn.dataset.action;
+      if (_inflight.has(slug)) return; // double-fire guard (e.g. double-click)
       btn.disabled = true;
-      btn.textContent =
-        action === 'enable'   ? 'Enabling…' :
-        action === 'disable'  ? 'Disabling…' :
-        action === 'update'   ? 'Updating…' :
-        action === 'rollback' ? 'Rolling back…' : 'Working…';
+      btn.textContent = ACTION_PROGRESS[action] || 'Working…';
 
       const card = document.getElementById('app-' + slug);
       const out = card.querySelector('.app-card__output');
       out.hidden = true;
       out.textContent = '';
+      _lastOutput.delete(slug);
 
       // Map UI action → API path.
       const apiPath =
@@ -1052,6 +1107,16 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
         body = JSON.stringify({ reason: reason.trim(), approver: approver.trim() });
       }
 
+      _inflight.set(slug, action);
+      // Persist whatever lands in the output pane: the finally-refresh
+      // re-renders the card, and without _lastOutput the re-render would
+      // erase the operator's only diagnostic one round-trip after it
+      // appeared.
+      const showOut = (text) => {
+        out.hidden = false;
+        out.textContent = text;
+        _lastOutput.set(slug, text);
+      };
       try {
         const r = await fetch(apiPath, {
           method: 'POST',
@@ -1060,19 +1125,19 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
         });
         const data = await r.json();
         if (!r.ok) {
-          out.hidden = false;
-          out.textContent =
-            'exit=' + data.exit_code + '\n\n' +
-            (data.stderr || data.error || '') + '\n' + (data.stdout || '');
+          // 409 (already running) and 4xx rejections carry error/detail,
+          // not exit_code/stderr — render whichever fields exist.
+          showOut(
+            (data.exit_code != null ? 'exit=' + data.exit_code + '\n\n' : '') +
+            (data.stderr || data.detail || data.error || 'HTTP ' + r.status) +
+            '\n' + (data.stdout || ''));
         } else if (data.stderr || data.stdout) {
-          out.hidden = false;
-          out.textContent =
-            (data.stderr || '') + '\n' + (data.stdout || '');
+          showOut((data.stderr || '') + '\n' + (data.stdout || ''));
         }
       } catch (err) {
-        out.hidden = false;
-        out.textContent = 'request failed: ' + err.message;
+        showOut('request failed: ' + err.message);
       } finally {
+        _inflight.delete(slug);
         await refresh();
       }
     }

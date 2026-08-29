@@ -3916,14 +3916,18 @@ app.post('/api/v1/update/:slug', requireAdmin, testRateLimit, async (req, res) =
   const slug = req.params.slug;
   if (!SLUG_RE.test(slug)) return res.status(400).json({ error: 'invalid slug' });
   if (!MANIFESTS[slug])    return res.status(404).json({ error: 'unknown app' });
-  await runShell(res, [UPDATE_SCRIPT, slug], 'update', { slug });
+  if (!acquireSlugLock(slug, 'update', res)) return;
+  await runShell(res, [UPDATE_SCRIPT, slug], 'update', { slug },
+                 () => releaseSlugLock(slug));
 });
 
 app.post('/api/v1/update/:slug/rollback', requireAdmin, testRateLimit, async (req, res) => {
   const slug = req.params.slug;
   if (!SLUG_RE.test(slug)) return res.status(400).json({ error: 'invalid slug' });
   if (!MANIFESTS[slug])    return res.status(404).json({ error: 'unknown app' });
-  await runShell(res, [UPDATE_SCRIPT, slug, '--rollback'], 'rollback', { slug });
+  if (!acquireSlugLock(slug, 'rollback', res)) return;
+  await runShell(res, [UPDATE_SCRIPT, slug, '--rollback'], 'rollback', { slug },
+                 () => releaseSlugLock(slug));
 });
 
 // --- Infra services (Phase 8) ------------------------------------------
@@ -5789,20 +5793,28 @@ async function containerRunning(name) {
   }
 }
 
-async function runShell(res, args, action, extra = {}) {
+async function runShell(res, args, action, extra = {}, onDone) {
   log('info', 'spawn shell', { action, ...extra });
   const child = spawn('/bin/bash', args, {
     env: { ...process.env, APPLIANCE_DIR, VIBE_DIR, NO_COLOR: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  // Fired exactly once when the child is finished with, however it ends
+  // ('error' without 'exit', or both). Callers use it to release locks;
+  // the once-guard keeps a late 'exit' after an 'error' from releasing a
+  // lock some newer request has since acquired.
+  let doneFired = false;
+  const done = () => { if (!doneFired) { doneFired = true; if (onDone) onDone(); } };
   let stdout = ''; let stderr = '';
   child.stdout.on('data', (d) => { stdout += d.toString(); });
   child.stderr.on('data', (d) => { stderr += d.toString(); });
   child.on('error', (err) => {
     log('error', 'shell spawn failed', { action, err: err.message });
+    done();
     if (!res.headersSent) res.status(500).json({ error: 'spawn failed', detail: err.message });
   });
   child.on('exit', (code) => {
+    done();
     log('info', 'shell finished', { action, code, ...extra });
     // `extra` spreads FIRST so the reserved fields (action, exit_code,
     // stdout, stderr) override anything a caller might have passed
@@ -5819,6 +5831,28 @@ async function runShell(res, args, action, extra = {}) {
   });
 }
 
+// Per-slug lifecycle lock. Enable/disable/update/rollback scripts run for
+// tens of seconds; a second concurrent run for the same slug would race
+// the first on compose up / health-check, so it is refused with a 409 the
+// UI renders as "already running". In-process state suffices — this
+// console is the only spawner of these scripts (browser buttons run
+// script files, per CLAUDE.md rule 4).
+const SLUG_LOCKS = new Map(); // slug -> action currently running
+function acquireSlugLock(slug, action, res) {
+  const held = SLUG_LOCKS.get(slug);
+  if (held) {
+    res.status(409).json({
+      error: 'operation in progress',
+      detail: `A ${held} is already running for ${slug}. Wait for it to finish — ` +
+              'the card refreshes on its own — then retry.',
+    });
+    return false;
+  }
+  SLUG_LOCKS.set(slug, action);
+  return true;
+}
+function releaseSlugLock(slug) { SLUG_LOCKS.delete(slug); }
+
 async function runToggle(req, res, script, action, extraEnv) {
   const slug = req.params.slug;
   if (!SLUG_RE.test(slug)) {
@@ -5827,6 +5861,11 @@ async function runToggle(req, res, script, action, extraEnv) {
   if (!MANIFESTS[slug]) {
     return res.status(404).json({ error: 'unknown app' });
   }
+  if (!acquireSlugLock(slug, action, res)) return;
+  // Once-guarded so a late 'exit' after an 'error' can't release a lock a
+  // newer request has since acquired.
+  let released = false;
+  const release = () => { if (!released) { released = true; releaseSlugLock(slug); } };
 
   log('info', 'spawn toggle', { action, slug, script });
 
@@ -5851,6 +5890,7 @@ async function runToggle(req, res, script, action, extraEnv) {
 
   child.on('error', (err) => {
     log('error', 'spawn failed', { action, slug, err: err.message });
+    release();
     if (!res.headersSent) {
       res.status(500).json({ error: 'spawn failed', detail: err.message });
     }
@@ -5858,6 +5898,7 @@ async function runToggle(req, res, script, action, extraEnv) {
 
   child.on('exit', (code) => {
     log('info', 'toggle finished', { action, slug, code });
+    release();
     res.status(code === 0 ? 200 : 500).json({
       action,
       slug,
