@@ -190,7 +190,15 @@ _sm_check_host_prereqs() { # <slug> -> 0 ok, 1 unmet
   local manifest; manifest="$(_sm_manifest "$1")"
   local reqs; reqs="$(_sm_field "$manifest" 'chr(10).join(data.get("hostPrereqs") or [])')"
   [[ -n "$reqs" ]] || return 0
-  local unmet="" r key want have pth s ts
+  # Every unmet item renders through log_check_fail — title, causes,
+  # diagnose and fix each on their OWN line. The previous one-blob
+  # rendering ran items together, and a paste of its combined
+  # "tee -a 99-vibe-sentinel.conf ... pkg:auditd" line handed tee the
+  # next unmet item as a second output file: the operator got a stray
+  # ~/pkg:auditd and no sysctl.d drop-in, so the fix didn't survive
+  # reboot.
+  local unmet=0 r key want have pth s ts
+  local next="next:Fix the items above, then retry: click Enable again in the console, or sudo VIBE_SENTINEL_ACTION=enable bash /opt/vibe/appliance/lib/sentinel-module.sh $1"
   while IFS= read -r r; do
     r="${r%%[![:print:]]*}"
     [[ -n "$r" ]] || continue
@@ -207,26 +215,45 @@ _sm_check_host_prereqs() { # <slug> -> 0 ok, 1 unmet
         have=""
         if [[ -r "$pth" ]]; then IFS= read -r have <"$pth" || true; fi
         if [[ ! "$have" =~ ^[0-9]+$ ]]; then
-          unmet+=$'\n'"  $r  (currently: unknown — cannot read ${pth} from here)  verify on the host: sysctl -n ${key}"
+          log_check_fail "Sentinel host prereq: ${key}" \
+            "Cannot read ${pth} from here, so ${key} is unverifiable — treated as unmet rather than guessed at." \
+            "diagnose:cat ${pth}" \
+            "fix:Verify on the host: sysctl -n ${key}" \
+            "$next"
+          unmet=$((unmet + 1))
         elif (( have >= want )); then
-          log_ok "prereq ok: $key=$have (needs >= $want)"
+          log_check_pass "Sentinel host prereq: ${key}=${have} (needs >= ${want})"
         else
-          unmet+=$'\n'"  $r  (currently: ${have})  fix: sudo sysctl -w ${key}=${want} && echo '${key}=${want}' | sudo tee -a /etc/sysctl.d/99-vibe-sentinel.conf"
+          # Plain tee, not tee -a: the file is ours alone, so overwrite
+          # is idempotent where append duplicates a line per paste.
+          log_check_fail "Sentinel host prereq: ${key} >= ${want}" \
+            "${key} is ${have}. This floor is not advisory — OpenSearch simply will not start below it." \
+            "fix:sudo sysctl -w ${key}=${want}" \
+            "fix:echo '${key}=${want}' | sudo tee /etc/sysctl.d/99-vibe-sentinel.conf" \
+            "$next"
+          unmet=$((unmet + 1))
         fi
         ;;
       kernel:*)
         want="${r#kernel:>=}"; want="${want%%+*}"
         have="$(uname -r | cut -d- -f1)"
         if [[ "$(printf '%s\n%s\n' "$want" "$have" | sort -V | head -1)" == "$want" ]]; then
-          log_ok "prereq ok: kernel $have (needs >= $want)"
+          log_check_pass "Sentinel host prereq: kernel ${have} (needs >= ${want})"
         else
-          unmet+=$'\n'"  $r  (currently: $have)  fix: this needs a newer kernel; the module falls back to a privileged probe and records a risk item"
+          log_check_fail "Sentinel host prereq: kernel >= ${want}" \
+            "This kernel is ${have}." \
+            "fix:This needs a newer kernel; the module falls back to a privileged probe and records a risk item." \
+            "$next"
+          unmet=$((unmet + 1))
         fi
         if [[ "$r" == *"+btf" ]]; then
           if [[ -r /sys/kernel/btf/vmlinux ]]; then
-            log_ok "prereq ok: kernel BTF present"
+            log_check_pass "Sentinel host prereq: kernel BTF present"
           else
-            unmet+=$'\n'"  kernel BTF (/sys/kernel/btf/vmlinux)  fix: without it Falco cannot use the modern eBPF probe"
+            log_check_fail "Sentinel host prereq: kernel BTF" \
+              "/sys/kernel/btf/vmlinux is absent — without it Falco cannot use the modern eBPF probe." \
+              "$next"
+            unmet=$((unmet + 1))
           fi
         fi
         ;;
@@ -241,14 +268,35 @@ _sm_check_host_prereqs() { # <slug> -> 0 ok, 1 unmet
           s="$(state_get_host_service "pkg:${key}" status)"
           ts="$(state_get_host_service "pkg:${key}" at)"
           case "$s" in
-            installed) log_ok "prereq ok: $key installed (per state.host_services as of ${ts:-unknown})" ;;
-            missing)   unmet+=$'\n'"  $r  (missing per state.host_services as of ${ts:-unknown})  fix: sudo apt-get install -y $key  — then refresh the attestation: sudo bash /opt/vibe/appliance/doctor.sh" ;;
-            *)         unmet+=$'\n'"  $r  (cannot verify from the console container — no host_services entry)  fix: sudo bash /opt/vibe/appliance/doctor.sh on the host records it; a re-run of bootstrap does too" ;;
+            installed)
+              log_check_pass "Sentinel host prereq: ${key} installed (per state.host_services as of ${ts:-unknown})"
+              ;;
+            missing)
+              log_check_fail "Sentinel host prereq: ${key}" \
+                "${key} is not installed (per state.host_services as of ${ts:-unknown})." \
+                "fix:sudo apt-get install -y ${key}" \
+                "fix:sudo bash /opt/vibe/appliance/doctor.sh   # refreshes the attestation" \
+                "$next"
+              unmet=$((unmet + 1))
+              ;;
+            *)
+              log_check_fail "Sentinel host prereq: ${key}" \
+                "Cannot verify ${key} from the console container — no state.host_services entry." \
+                "cause:Bootstrap predates the attestation, or doctor has not run on the host since." \
+                "fix:sudo bash /opt/vibe/appliance/doctor.sh   # on the host; records the attestation" \
+                "fix:A re-run of bootstrap records it too." \
+                "$next"
+              unmet=$((unmet + 1))
+              ;;
           esac
         elif command -v "$key" >/dev/null 2>&1 || dpkg -s "$key" >/dev/null 2>&1; then
-          log_ok "prereq ok: $key installed"
+          log_check_pass "Sentinel host prereq: ${key} installed"
         else
-          unmet+=$'\n'"  $r  fix: sudo apt-get install -y $key"
+          log_check_fail "Sentinel host prereq: ${key}" \
+            "${key} is not installed." \
+            "fix:sudo apt-get install -y ${key}" \
+            "$next"
+          unmet=$((unmet + 1))
         fi
         ;;
       timesync)
@@ -259,27 +307,46 @@ _sm_check_host_prereqs() { # <slug> -> 0 ok, 1 unmet
           s="$(state_get_host_service timesync status)"
           ts="$(state_get_host_service timesync at)"
           case "$s" in
-            active)   log_ok "prereq ok: time synchronised (per state.host_services as of ${ts:-unknown})" ;;
-            inactive) unmet+=$'\n'"  timesync  (inactive per state.host_services as of ${ts:-unknown})  fix: sudo systemctl enable --now systemd-timesyncd  — then refresh the attestation: sudo bash /opt/vibe/appliance/doctor.sh" ;;
-            *)        unmet+=$'\n'"  timesync  (cannot verify from the console container — no host_services entry)  fix: sudo bash /opt/vibe/appliance/doctor.sh on the host records it; a re-run of bootstrap does too" ;;
+            active)
+              log_check_pass "Sentinel host prereq: time synchronised (per state.host_services as of ${ts:-unknown})"
+              ;;
+            inactive)
+              log_check_fail "Sentinel host prereq: timesync" \
+                "Time is not synchronised (per state.host_services as of ${ts:-unknown})." \
+                "fix:sudo systemctl enable --now systemd-timesyncd" \
+                "fix:sudo bash /opt/vibe/appliance/doctor.sh   # refreshes the attestation" \
+                "$next"
+              unmet=$((unmet + 1))
+              ;;
+            *)
+              log_check_fail "Sentinel host prereq: timesync" \
+                "Cannot verify time sync from the console container — no state.host_services entry." \
+                "cause:Bootstrap predates the attestation, or doctor has not run on the host since." \
+                "fix:sudo bash /opt/vibe/appliance/doctor.sh   # on the host; records the attestation" \
+                "fix:A re-run of bootstrap records it too." \
+                "$next"
+              unmet=$((unmet + 1))
+              ;;
           esac
         elif timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes \
            || systemctl is-active --quiet systemd-timesyncd 2>/dev/null \
            || systemctl is-active --quiet chrony 2>/dev/null; then
-          log_ok "prereq ok: time synchronised"
+          log_check_pass "Sentinel host prereq: time synchronised"
         else
-          unmet+=$'\n'"  timesync  fix: sudo systemctl enable --now systemd-timesyncd"
+          log_check_fail "Sentinel host prereq: timesync" \
+            "Time is not synchronised." \
+            "fix:sudo systemctl enable --now systemd-timesyncd" \
+            "$next"
+          unmet=$((unmet + 1))
         fi
         ;;
       *) log_warn "unknown hostPrereq '$r'; not checked" slug="$1" ;;
     esac
   done <<< "$reqs"
 
-  [[ -z "$unmet" ]] && return 0
-  log_error "Host prerequisites for $1 are not met:$unmet"
-  log_error "         Every one of these is a failure that is otherwise found late and"
-  log_error "         cryptically - OpenSearch simply will not start below the"
-  log_error "         vm.max_map_count floor."
+  (( unmet == 0 )) && return 0
+  log_error "Host prerequisites for $1 are not met: ${unmet} unmet — see the FAIL blocks above."
+  log_error "         Every one of these is a failure that is otherwise found late and cryptically."
   return 1
 }
 

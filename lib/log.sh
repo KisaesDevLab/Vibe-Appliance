@@ -177,6 +177,10 @@ log_phase_banner() {
 #   cause:    "Some common cause"
 #   diagnose: "command to run to diagnose"
 #   fix:      "command or instruction to fix"
+#   next:     "closing next-step line" (optional; at most one — the last
+#             wins. Defaults to "Re-run bootstrap when fixed.", which is
+#             right for pre-flight but wrong for e.g. the console's
+#             Enable button, whose retry is a click, not a bootstrap.)
 #
 # Each line is rendered grouped under its header.
 log_check_fail() {
@@ -188,6 +192,7 @@ log_check_fail() {
   printf '        %s\n\n' "$desc" >&2
 
   local causes=() diagnoses=() fixes=()
+  local next="Re-run bootstrap when fixed."
   local kv key val
   for kv in "$@"; do
     key="${kv%%:*}"
@@ -197,6 +202,7 @@ log_check_fail() {
       cause)    causes+=("$val") ;;
       diagnose) diagnoses+=("$val") ;;
       fix)      fixes+=("$val") ;;
+      next)     next="$val" ;;
       *)        : ;;
     esac
   done
@@ -227,7 +233,7 @@ log_check_fail() {
     printf '\n' >&2
   fi
 
-  printf '        Re-run bootstrap when fixed.\n\n' >&2
+  printf '        %s\n\n' "$next" >&2
 
   _log_jsonl error "check failed: $title" desc="$desc"
 }
