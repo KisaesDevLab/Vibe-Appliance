@@ -934,6 +934,15 @@ for name, svc in cfg.get("services", {}).items():
 phase_infra() {
   log_set_phase "infra"
 
+  # Automatic security patches for the host OS. Deliberately BEFORE the
+  # cockpit gate: --no-cockpit opts out of a host admin UI, not out of
+  # security updates. Non-fatal, like everything in this phase.
+  log_step "enabling automatic security updates (unattended-upgrades)"
+  if ! ( cd "$APPLIANCE_DIR" && /bin/bash infra/unattended-upgrades-setup.sh ); then
+    log_warn "unattended-upgrades setup failed; automatic security patches are OFF" \
+      "fix:sudo bash /opt/vibe/appliance/infra/unattended-upgrades-setup.sh"
+  fi
+
   if [[ "$CONFIG_COCKPIT" != "true" ]]; then
     log_info "skipping cockpit install (--no-cockpit)"
     return 0

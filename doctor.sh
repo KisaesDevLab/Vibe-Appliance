@@ -712,6 +712,39 @@ check_avahi_status() {
   _check_pass "advertising as ${hn}.local"
 }
 
+check_system_updates() {
+  _check_begin "Host OS updates"
+  # One code path for host and container: the attestation was refreshed
+  # moments ago when doctor runs on the host (see the refresh block at
+  # the top of main), and in-container it is the only truthful source —
+  # apt inside the console container answers for the wrong OS.
+  local s ts d
+  s="$(state_get_host_service system-updates status)"
+  ts="$(state_get_host_service system-updates at)"
+  d="$(state_get_host_service system-updates detail)"
+  case "$s" in
+    up-to-date)
+      _check_pass "up to date (${d:-} — as of ${ts:-unknown})" ;;
+    updates-available)
+      _check_warn "${d:-updates pending} (as of ${ts:-unknown})" \
+        "Fix: admin Host services panel → Open system updates (Cockpit), or: sudo apt-get update && sudo apt-get -y upgrade" ;;
+    security-updates-available)
+      _check_warn "${d:-security updates pending} (as of ${ts:-unknown})" \
+        "Security updates normally install automatically overnight. To apply now: admin Host services panel → Open system updates (Cockpit), or: sudo apt-get update && sudo apt-get -y upgrade" ;;
+    reboot-required)
+      _check_warn "${d:-reboot required} (as of ${ts:-unknown})" \
+        "Fix: reboot when convenient (LAN users lose access for ~1 min): sudo reboot" ;;
+    unknown)
+      _check_warn "pending-update count could not be determined" \
+        "Diagnose on the host: sudo apt-get -s upgrade | grep -c '^Inst '" ;;
+    "")
+      _check_warn "no host_services entry — run doctor on the host (or re-run bootstrap) to populate" \
+        "Fix: sudo bash /opt/vibe/appliance/doctor.sh" ;;
+    *)
+      _check_warn "unexpected status: $s" ;;
+  esac
+}
+
 check_recent_errors() {
   _check_begin "Recent errors in /opt/vibe/logs"
   local cutoff_min=60
@@ -1015,15 +1048,17 @@ check_ufw_rules() {
 
 _human_out "$(printf '\n%s===== Vibe Appliance — doctor =====%s\n' "${_C_BOLD:-}" "${_C_RESET:-}")"
 
-# Refresh the Sentinel host-prereq attestation (state.host_services
-# pkg:*/timesync entries) while doctor is on the host, where dpkg and
-# systemd answer truthfully. Without this, the only refresh after an
-# operator installs a missing package would be a full re-bootstrap.
-# Host + root only (state.json is root-owned); an in-container doctor is
-# the consumer of this data, not the producer. Gated on state.json
-# existing so doctor on an un-bootstrapped host stays write-free.
+# Refresh the host-side attestations (state.host_services: Sentinel
+# pkg:*/timesync prereqs, and the system-updates picture) while doctor
+# is on the host, where dpkg/systemd/apt answer truthfully. Without
+# this, the only refresh after an operator installs a package or runs
+# updates would be a full re-bootstrap. Host + root only (state.json is
+# root-owned); an in-container doctor is the consumer of this data, not
+# the producer. Gated on state.json existing so doctor on an
+# un-bootstrapped host stays write-free.
 if ! state_in_container && [[ "${EUID:-$(id -u)}" -eq 0 && -f "$VIBE_STATE_FILE" ]]; then
   preflight_sentinel_host_prereqs || true
+  preflight_host_updates || true
 fi
 
 check_host_os
@@ -1045,6 +1080,7 @@ check_console_health
 check_cockpit_reachability      # Workstream A
 check_emergency_proxy           # Workstream D
 check_ufw_rules                 # Workstream D
+check_system_updates            # host OS update picture (attestation)
 check_settings_audit_db         # Workstream C
 check_cookie_policy             # security-gate drift
 check_claude_code               # Workstream B

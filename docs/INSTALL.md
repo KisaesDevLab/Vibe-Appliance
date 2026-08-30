@@ -778,6 +778,7 @@ configured as the whole-tree net until the release notes say otherwise.
 | Roll back a bad update              | Admin → click **Roll back** on the card.                     |
 | See container state                 | Admin → **Containers** table, OR `portainer.<domain>` (LAN).  |
 | See host metrics                    | `cockpit.<domain>` on the LAN (sudo-user login).             |
+| Update the Linux system itself      | Admin → **Host services** → **Open system updates** (Cockpit). Security patches also install themselves nightly (unattended-upgrades, enabled by bootstrap). |
 
 Every admin action has a corresponding `vibe ...` CLI command if you
 prefer the terminal — see `vibe --help`.

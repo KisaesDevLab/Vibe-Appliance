@@ -44,6 +44,20 @@ cockpit_install() {
     log_ok "cockpit installed"
   fi
 
+  # cockpit-packagekit is the Software Updates page — the browser path
+  # for "update the Linux system" that the console's Host services panel
+  # links to. It is a Recommends of the cockpit metapackage, so the
+  # --no-install-recommends install above never pulled it. Guarded
+  # separately (not inside the cockpit branch) so EXISTING installs pick
+  # the page up on their next bootstrap, not just fresh ones.
+  if ! dpkg -s cockpit-packagekit >/dev/null 2>&1; then
+    log_step "installing cockpit-packagekit (Software Updates page)"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y -qq --no-install-recommends cockpit-packagekit \
+      >>"$VIBE_LOG_FILE" 2>&1 || \
+      log_warn "cockpit-packagekit install failed; host updates stay SSH-only (sudo apt-get update && sudo apt-get -y upgrade)"
+  fi
+
   # `sscg` (Simple Self-Signed Certificate Generator) is Cockpit's
   # preferred cert backend — it produces certs with proper SAN entries
   # so browsers stop complaining about CN/IP mismatch once the CA is

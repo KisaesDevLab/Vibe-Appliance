@@ -125,6 +125,23 @@ docker run --rm -v "$PWD:/w/appliance:ro" ubuntu:24.04 bash -c \
 
 **Verified 2026-08-30:** all 33 assertions pass.
 
+## host-updates.sh
+
+Exercises the host-OS update attestation (`preflight_host_updates` in
+lib/preflight.sh — the producer behind the console's "System updates" row and
+doctor's "Host OS updates" check) and `infra/unattended-upgrades-setup.sh`,
+against real apt in an ubuntu:24.04 container. Asserts the writer records a
+truthful status + count + the automatic-updates flag (never a fabricated
+zero), that `/run/reboot-required` flips the status, that the setup script
+installs, writes `20auto-upgrades`, attests, and converges on a second run,
+and that the writer then reports automatic security updates as on.
+
+```bash
+docker run --rm -v "$PWD:/w/appliance:ro" ubuntu:24.04 bash -c \
+  'apt-get update -qq && apt-get install -y -qq python3 \
+   && bash /w/appliance/tests/federation/host-updates.sh'
+```
+
 ## e2e-verify.sh
 
 The whole-system sweep across BOTH repos: 31 checks in 21 sections covering

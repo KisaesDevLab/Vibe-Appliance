@@ -4406,22 +4406,63 @@ const HOST_SERVICE_FIXES = {
         '  sudo bash /opt/vibe/appliance/lib/ufw-rules.sh',
     },
   },
+  // SSH fallback for operators who prefer the terminal; the row's
+  // primary path is the Cockpit Software Updates button (link field).
+  'system-updates': {
+    'updates-available': {
+      summary: 'Non-security updates are pending. Install from the Cockpit button above, or via SSH:',
+      command: 'sudo apt-get update && sudo apt-get -y upgrade',
+    },
+    'security-updates-available': {
+      summary: 'Security updates are pending — these normally install themselves overnight. To apply now, use the Cockpit button above, or via SSH:',
+      command: 'sudo apt-get update && sudo apt-get -y upgrade',
+    },
+    'reboot-required': {
+      summary: 'A kernel or core library was updated; the new version takes effect on reboot. The appliance is down ~1 minute and every app comes back on its own:',
+      command: 'sudo reboot',
+    },
+  },
 };
 
 const HOST_SERVICE_LABELS = {
   avahi: 'Avahi (mDNS — <hostname>.local resolution)',
   ufw:   'UFW firewall (gates emergency ports 5171:5198)',
+  'system-updates': 'System updates (host Ubuntu packages)',
+};
+
+// Which statuses count as healthy, per slug. avahi/ufw predate this map
+// and keep their single 'active'.
+const HOST_SERVICE_OK = {
+  avahi: ['active'],
+  ufw:   ['active'],
+  'system-updates': ['up-to-date'],
 };
 
 app.get('/api/v1/host-services', requireAdmin, (_req, res) => {
   const state = readState();
   const recorded = state.host_services || {};
+  const config = state.config || {};
   const out = [];
-  for (const slug of ['avahi', 'ufw']) {
+  for (const slug of ['avahi', 'ufw', 'system-updates']) {
     const entry = recorded[slug] || {};
     const status = entry.status || 'unknown';
-    const ok = (status === 'active');
+    const ok = (HOST_SERVICE_OK[slug] || ['active']).includes(status);
     const fix = (HOST_SERVICE_FIXES[slug] || {})[status] || null;
+    // The system-updates row gets a real button: Cockpit's Software
+    // Updates page (cockpit-packagekit, installed by
+    // infra/cockpit-install.sh). The console cannot run apt on the host
+    // from inside its container — Cockpit is the host-side tool that
+    // can, with privilege, progress, and the reboot prompt handled.
+    // Status refreshes on every bootstrap and every host-side doctor run.
+    let link = null;
+    if (slug === 'system-updates') {
+      const { url, note } = cockpitUrl(config);
+      link = {
+        url: url ? `${url.replace(/\/$/, '')}/updates` : null,
+        label: 'Open system updates (Cockpit)',
+        note: note || 'LAN/Tailscale only — Cockpit is never exposed publicly',
+      };
+    }
     out.push({
       slug,
       label:  HOST_SERVICE_LABELS[slug] || slug,
@@ -4430,6 +4471,7 @@ app.get('/api/v1/host-services', requireAdmin, (_req, res) => {
       detail: entry.detail || '',
       at:     entry.at || null,
       fix,
+      link,
     });
   }
   res.json({ host_services: out });

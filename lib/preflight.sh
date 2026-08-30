@@ -549,6 +549,70 @@ PYEOF
   return 0
 }
 
+# ---- host OS update attestation ----------------------------------------
+# Not a gate: records the host's pending-update picture into
+# state.host_services["system-updates"] so the console's Host services
+# panel (and doctor, in-container) can show "N updates (M security),
+# reboot required" without being able to run apt from a container.
+# Same producer pattern as preflight_sentinel_host_prereqs: written on
+# the host as root by bootstrap phase 1 and refreshed by doctor's host
+# path, each entry carrying state.sh's `at` timestamp.
+#
+# Counting: /usr/lib/update-notifier/apt-check (update-notifier-common,
+# present on stock Ubuntu Server) prints "total;security" to stderr and
+# is the accurate, fast source. Fallback: `apt-get -s upgrade` counted
+# by hand — a simulation, no lock held, no changes made. If neither
+# yields a number the entry says so rather than fabricating a zero
+# (same unknown-is-not-zero principle as the sentinel sysctl probe).
+# Always returns 0.
+preflight_host_updates() {
+  command -v apt-get >/dev/null 2>&1 || return 0
+
+  local total="" security=""
+  if [[ -x /usr/lib/update-notifier/apt-check ]]; then
+    local out
+    out="$(/usr/lib/update-notifier/apt-check 2>&1 >/dev/null || true)"
+    if [[ "$out" =~ ^([0-9]+)\;([0-9]+)$ ]]; then
+      total="${BASH_REMATCH[1]}"; security="${BASH_REMATCH[2]}"
+    fi
+  fi
+  if [[ -z "$total" ]]; then
+    local sim
+    sim="$(apt-get -s upgrade 2>/dev/null | grep '^Inst ' || true)"
+    if [[ -n "$sim" ]]; then
+      total="$(printf '%s\n' "$sim" | wc -l | tr -d ' ')"
+      security="$(printf '%s\n' "$sim" | grep -c -- '-security' || true)"
+    elif apt-get -s upgrade >/dev/null 2>&1; then
+      total=0; security=0
+    fi
+  fi
+
+  local unattended="off"
+  if apt-config dump APT::Periodic::Unattended-Upgrade 2>/dev/null | grep -q '"1"'; then
+    unattended="on"
+  fi
+
+  local status detail
+  if [[ -z "$total" ]]; then
+    status="unknown"
+    detail="could not count pending updates (apt lists unreadable?); automatic security updates: ${unattended}"
+  elif [[ -f /run/reboot-required ]]; then
+    status="reboot-required"
+    detail="${total} update(s) pending (${security:-0} security); a kernel or core library update needs a reboot to take effect; automatic security updates: ${unattended}"
+  elif (( ${security:-0} > 0 )); then
+    status="security-updates-available"
+    detail="${total} update(s) pending, ${security} security; automatic security updates: ${unattended}"
+  elif (( total > 0 )); then
+    status="updates-available"
+    detail="${total} non-security update(s) pending; automatic security updates: ${unattended}"
+  else
+    status="up-to-date"
+    detail="no pending package updates; automatic security updates: ${unattended}"
+  fi
+  state_set_host_service system-updates "$status" "$detail"
+  return 0
+}
+
 # ---- aggregator --------------------------------------------------------
 # Run every check. Return 0 if all PASSED (including WARN), non-zero with
 # the count of FAILED checks otherwise. Bootstrap exits on a non-zero
@@ -590,6 +654,10 @@ preflight_run_all() {
   # into state.host_services while we're on the host, where dpkg and
   # systemd answer truthfully. Not a gate; never adds to $errors.
   preflight_sentinel_host_prereqs
+
+  # Host OS update picture (pending/security counts, reboot-required)
+  # for the console's Host services panel. Not a gate either.
+  preflight_host_updates
 
   return "$errors"
 }

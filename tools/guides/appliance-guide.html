@@ -212,9 +212,14 @@ rolls out.</p>
 <tr><td>Roll back</td><td>Click <strong>Roll back</strong> on the card</td></tr>
 <tr><td>Container detail</td><td>Portainer (Infra services; LAN/Tailscale only)</td></tr>
 <tr><td>Host metrics</td><td>Cockpit (Infra services; LAN/Tailscale only)</td></tr>
+<tr><td>Update the Linux system</td><td>Admin → <strong>Host services</strong> → <strong>Open system updates</strong> (Cockpit). The row shows how many updates are pending and whether a reboot is due.</td></tr>
 </tbody>
 </table>
-<p>Updates are never automatic — nothing changes until you click.</p>
+<p>App updates are never automatic — nothing changes until you click. The one
+exception, on purpose, is Linux <em>security</em> patches: the appliance turns
+on Ubuntu's unattended security updates at install time, so those land nightly
+on their own (no automatic reboot; the Host services row tells you when a
+reboot is due).</p>
 </section>
 
 <section>

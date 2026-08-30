@@ -559,6 +559,16 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
             <button class="btn btn--ghost" data-host-fix="${escapeHtml(s.slug)}" type="button">Copy fix command</button>
             <span class="muted" style="font-size:0.85em;margin-left:0.6rem;">Run via Cockpit Terminal or SSH, then re-run bootstrap to refresh status.</span>
           </div>` : '';
+        // Click-to-open action for rows that have a real destination —
+        // system-updates links Cockpit's Software Updates page, the
+        // host-side tool that can actually run apt (the console can't,
+        // from inside its container).
+        const linkBlock = (s.link && s.link.url)
+          ? '<p style="margin:0.6rem 0 0;"><a class="btn" href="' + escapeHtml(s.link.url) + '" target="_blank" rel="noopener">' + escapeHtml(s.link.label) + '</a>' +
+            (s.link.note ? '<span class="muted" style="font-size:0.85em;margin-left:0.6rem;">' + escapeHtml(s.link.note) + '</span>' : '') + '</p>'
+          : (s.link && s.link.note
+              ? '<p class="muted" style="margin:0.6rem 0 0;font-size:0.9em">' + escapeHtml(s.link.note) + '</p>'
+              : '');
         return `
           <article class="app-card">
             <header class="app-card__head">
@@ -567,6 +577,7 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
             </header>
             ${at ? '<p class="app-card__desc">' + at + '</p>' : ''}
             ${detail}
+            ${linkBlock}
             ${fixBlock}
           </article>`;
       }).join('');
