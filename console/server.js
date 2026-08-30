@@ -6047,8 +6047,13 @@ const SLUG_LOCKS = new Map(); // slug -> { action, since: epoch ms }
 let GLOBAL_LOCK = null; // { action, since } | null
 
 // Count of console-spawned script children currently alive. The lock
-// expiry below must never fire while a guarded script is still running —
+// expiry below must not fire while a guarded script is still running —
 // that would re-admit the interleaving the lock exists to prevent.
+// Coverage note: runShell/runToggle/settings-save/mode-switch children
+// are tracked; the tailscale handlers' tsHost/runOnHost helper pods are
+// NOT (they also serve unlocked probe paths, where counting them would
+// wrongly suppress expiry) — those operations normally finish in
+// seconds, so a >45-min hang there is accepted as out of scope.
 let ACTIVE_CHILDREN = 0;
 function trackChild(child) {
   ACTIVE_CHILDREN += 1;
@@ -6134,14 +6139,17 @@ function acquireGlobalLock(action, res) {
 function releaseGlobalLock() { GLOBAL_LOCK = null; }
 
 // Express middleware form: hold the global lock for the request's
-// lifetime. Released only when the response FINISHES — runShell-based
-// handlers respond on child exit, so that covers the script too. A
-// client disconnect ('close' without 'finish') deliberately does NOT
-// release: the guarded script is still rewriting the Caddyfile, and
-// freeing the lock there is exactly the interleaving it exists to
-// prevent. A disconnect therefore leaks the lock until the console
-// restarts — the 409 text documents that recovery. The release is
-// ownership-checked so a late event can never clear a NEWER op's lock.
+// lifetime. Release policy, in full (the inline comments below match):
+//   - 'finish' (response sent) releases — runShell-based handlers
+//     respond on child exit, so that covers the script too.
+//   - 'close' releases only when headersSent — a disconnect AFTER the
+//     work completed ('finish' never fires on a destroyed socket).
+//   - a disconnect MID-work holds the lock on purpose (the script is
+//     still rewriting shared surfaces); globalLockHeld()'s 45-minute
+//     self-expiry — gated on no tracked children — is the backstop,
+//     and the 409 text tells the operator about that self-clear.
+// The release is ownership-checked so a late event can never clear a
+// NEWER op's lock.
 function globalOp(action) {
   return (_req, res, next) => {
     if (!acquireGlobalLock(action, res)) return;
@@ -6162,8 +6170,9 @@ function globalOp(action) {
 // A throw inside an async route handler that already acquired a lock is
 // outside Express's error pipeline; without this, Node >= 15 crashes the
 // whole console (killing every in-flight lifecycle child) on the first
-// unhandled rejection. Log and keep serving — the lock recovery path
-// (restart the console) is already documented in every 409.
+// unhandled rejection. Log and keep serving — a lock orphaned by such a
+// throw clears via globalLockHeld()'s 45-minute self-expiry, which the
+// global-lock 409s point the operator at.
 process.on('unhandledRejection', (err) => {
   log('error', 'unhandled promise rejection', { err: (err && err.message) || String(err) });
 });

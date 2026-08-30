@@ -899,8 +899,12 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
       // a single section line would misstate the rest, so fall back to a
       // per-card licence row instead.
       const withLic = items.filter(a => a.license && a.license.name);
-      const licNames = new Set(withLic.map(a => a.license.name));
-      const uniform = withLic.length === items.length && licNames.size === 1;
+      // "Same terms" must include the note — two modules can share a
+      // licence NAME while their notes state different terms (commercial
+      // exception vs bundled third-party components), and the section
+      // line renders the first module's note as if it covered all.
+      const licKeys = new Set(withLic.map(a => a.license.name + '\u0000' + (a.license.note || '')));
+      const uniform = withLic.length === items.length && licKeys.size === 1;
       if (uniform) {
         const lic = withLic[0];
         showIf(licence, '<strong>Licence:</strong> ' + escapeHtml(lic.license.name) +

@@ -102,14 +102,19 @@ PYEOF
 }
 
 # Clear the "failed" status + update_error fields for an app, but only when
-# they're actually stale. Called by --check after a successful up-to-date
-# verification: if the registry matches what's running, whatever caused the
-# prior failure has been resolved (typically: operator fixed the issue
-# manually, like we did for the vibe-console pull bug on cpa2web). Without
-# this, `vibe status` shows "failed" forever even when the app is healthy.
+# they're actually stale. Called by --check after an up-to-date
+# verification. NOTE the limits of that verification: it compares the
+# registry against the LOCAL TAG CACHE, not against the image the running
+# container actually uses — the caller therefore adds its own gates
+# (primary container running, image_tag not a rollback tag) before
+# invoking this. Without this clear, `vibe status` shows "failed" forever
+# even when the operator fixed the issue manually.
 #
 # Intentionally CONSERVATIVE: only touches status when it's currently
-# "failed". Doesn't downgrade a "running"/"updating" to anything else.
+# "failed". Doesn't downgrade a "running"/"updating" to anything else,
+# and deliberately does NOT touch swap_dirty: "a container is running"
+# can be true precisely BECAUSE a rollback bring-up failed to replace
+# it, so only health-gated bring-up paths may clear that flag.
 _state_app_clear_failed_if_stale() {
   local slug="$1"
   python3 - "$VIBE_STATE_FILE" "$slug" <<'PYEOF'
@@ -130,13 +135,10 @@ if not entry:
     sys.exit(0)
 if entry.get("status") != "failed":
     sys.exit(0)
-# The registry matched the local digest (caller's invariant); the prior
-# failure is no longer the current state. Clear it.
+# The registry matched the local digest and the caller's gates held; the
+# prior failure is no longer the current state. Clear it.
 entry["status"] = "running"
 entry["update_error"] = None
-# The container is verifiably running (caller's gate), so a lingering
-# rollback-bring-up-failed marker is stale too.
-entry.pop("swap_dirty", None)
 entry["at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 tmp = path + ".tmp"
 with open(tmp, "w") as f:
@@ -375,6 +377,17 @@ for slug, e in (s.get('apps',{}) or {}).items():
         saw_never_pulled="true"
       fi
     done < <(_check_one "$slug")
+    # An app running its ROLLBACK image is a special case the digest
+    # comparison cannot see: the local :defaultTag cache matches the
+    # remote (the update that failed already pulled it), but what is
+    # RUNNING is the old version — a roll-forward is available by
+    # construction, and the failure evidence must not be cleared.
+    local _cc_tag
+    _cc_tag="$(python3 -c "import json;a=json.load(open('${VIBE_STATE_FILE}')).get('apps',{}).get('${slug}',{});print(a.get('image_tag',''))" 2>/dev/null || true)"
+    if [[ "$_cc_tag" == "vibe-rollback-${slug}" ]]; then
+      has_update="true"
+      any_update_available="true"
+    fi
     _state_app_set "$slug" update_available "$has_update"
     # If the check succeeded for every image AND no update is available,
     # the registry matches what's running — any prior "pull failed" /
@@ -488,7 +501,8 @@ cmd_update() {
   log_step "tagging rollback image for $slug (pre-pull)"
   if ! _tag_rollback "$slug" "$manifest"; then
     # (The keep-existing guard inside _tag_rollback keys on swap_dirty,
-    # which cmd_update does not touch — safe to read from state there.)
+    # which nothing has written between the step-0 read and this call —
+    # cmd_update's own clear of it happens only in the success epilogue.)
     # Stamp failed first: every other post-'updating' failure path does,
     # and a stuck status=updating would leave the badge lying forever.
     _state_app_set "$slug" status failed update_error "rollback tag capture failed"

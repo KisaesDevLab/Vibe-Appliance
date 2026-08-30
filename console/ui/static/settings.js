@@ -1815,14 +1815,10 @@ const SETTINGS_JS_VERSION = '2026-07-30-tunnel-scope-and-rootserved-urls';
 
     const body = section.querySelector('[data-mode-body]');
     body.innerHTML = '';
-    body.appendChild(el('p', { class: 'help' }, ['Switching mode… (Caddyfile rerender + reload, ~5–10s)']));
+    body.appendChild(el('p', { class: 'help' }, ['Switching mode… every enabled app is re-rendered and restarted — this can take several minutes. Leave this page open.']));
 
     let data;
     try {
-      // 120s timeout — switching modes triggers a Caddyfile re-render
-      // and reload that can take 5-10s normally and longer if Caddy
-      // is slow to reload (large config, busy daemon). Hung scripts
-      // shouldn't deadlock the UI.
       const r = await fetchWithTimeout('/api/v1/admin/network-mode/switch', {
         method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
