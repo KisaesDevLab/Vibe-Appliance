@@ -2123,19 +2123,22 @@ app.post('/api/v1/admin/self-update', requireAdmin, testRateLimit, async (_req, 
   // state=running only after flock + preflight (~seconds). Until then an
   // enable could slip past every gate and run under bootstrap's env
   // re-renders — so claim the status file NOW; the script's first
-  // write_status overwrites this with richer detail. Never overwrite an
-  // EXISTING 'running' status (raw read, no staleness cap): a genuinely
-  // long run past the cap would lose its rollback_cmd/from_sha to this
-  // seed, and its flock will make this launch a silent loser anyway.
+  // write_status overwrites this with richer detail. The guard below is
+  // a RAW read (no staleness cap) on purpose: a live run past the
+  // 30-minute cap passes the capped gates above, and seeding over its
+  // file would destroy run_id/from_sha/rollback_cmd while its flock
+  // makes this launch a silent loser anyway. The residual case — a
+  // stale SIGKILL'd 'running' file — leaves this launch window
+  // unseeded, which the real run's first write_status covers within
+  // seconds; that trade is the safe direction.
   let seeded = false;
   try {
-    // Same 30-min-capped reader as every other gate. A raw read here
-    // let a stale SIGKILL'd 'running' file simultaneously open the
-    // gates AND suppress the seed — re-opening the unlocked launch
-    // window the seed exists to close, and skipping the launch-failure
-    // cleanup. A genuinely live long run never reaches this line: the
-    // capped pre-check above already 409'd it.
-    if (!selfUpdateRunning()) {
+    let existingRunning = false;
+    try {
+      const raw = JSON.parse(fs.readFileSync(SELF_UPDATE_STATUS, 'utf8'));
+      existingRunning = !!(raw && raw.state === 'running');
+    } catch { /* absent or unreadable — seed freely */ }
+    if (!existingRunning) {
       const seed = JSON.stringify({
         run_id: 'launching', state: 'running', phase: 'launch',
         message: 'Starting the appliance update…', error: null,

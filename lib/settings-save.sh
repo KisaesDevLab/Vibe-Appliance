@@ -455,7 +455,10 @@ PYEOF
       continue
     fi
     log_step "routing-reconcile: re-enabling $slug (env re-render + force-recreate + Caddy)"
-    if ! bash "${APPLIANCE_DIR}/lib/enable-app.sh" "$slug" >>"$VIBE_LOG_FILE" 2>&1; then
+    # </dev/null: enable-app's db-bootstrap runs `docker exec -i`, which
+    # drains inherited stdin — the rest of this loop's slug list — so
+    # without it only the first app would ever be reconciled.
+    if ! bash "${APPLIANCE_DIR}/lib/enable-app.sh" "$slug" >>"$VIBE_LOG_FILE" 2>&1 </dev/null; then
       log_warn "routing-reconcile: enable-app failed for $slug; its routing may be stale" \
         "diagnose:sudo tail -50 $VIBE_LOG_FILE" \
         "fix:sudo bash ${APPLIANCE_DIR}/lib/enable-app.sh $slug"

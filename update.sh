@@ -134,6 +134,9 @@ if entry.get("status") != "failed":
 # failure is no longer the current state. Clear it.
 entry["status"] = "running"
 entry["update_error"] = None
+# The container is verifiably running (caller's gate), so a lingering
+# rollback-bring-up-failed marker is stale too.
+entry.pop("swap_dirty", None)
 entry["at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 tmp = path + ".tmp"
 with open(tmp, "w") as f:
@@ -483,11 +486,9 @@ cmd_update() {
   # silently tag the new image as the rollback (making rollback a
   # no-op — the historical bug this ordering fix addresses).
   log_step "tagging rollback image for $slug (pre-pull)"
-  # _cur_status was read at step 0, BEFORE the status=updating stamp —
-  # reading it inside _tag_rollback would never see "running" and the
-  # keep-existing guard would freeze the rollback tag at the oldest
-  # image forever.
   if ! _tag_rollback "$slug" "$manifest"; then
+    # (The keep-existing guard inside _tag_rollback keys on swap_dirty,
+    # which cmd_update does not touch — safe to read from state there.)
     # Stamp failed first: every other post-'updating' failure path does,
     # and a stuck status=updating would leave the badge lying forever.
     _state_app_set "$slug" status failed update_error "rollback tag capture failed"

@@ -275,7 +275,11 @@ PYEOF
       warn "${runtime} preUninstallExport has an empty command; nothing run."
       continue
     fi
-    if ( cd "$dir" && "${argv[@]}" ); then
+    # </dev/null: an export command that reads stdin (docker exec -i is
+    # this codebase's norm) would otherwise drain the loop's remaining
+    # runtime rows — silently skipping later exports right before
+    # destructive removal.
+    if ( cd "$dir" && "${argv[@]}" </dev/null ); then
       ok "${runtime} data exported"
     else
       warn "${runtime} export reported errors - check its output above."

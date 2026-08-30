@@ -308,7 +308,7 @@ print((json.load(open('${manifest}')).get('runtime') or 'appliance'))
   # this the admin card renders a "compose up failed" banner alongside
   # the running badge after a successful retry, because _state_app_set
   # only merges keys — it never removes them.
-  _state_app_clear_keys "$slug" error update_error
+  _state_app_clear_keys "$slug" error update_error swap_dirty db_dirty
 
   # Refresh /opt/vibe/CREDENTIALS.txt so apps whose first-login secrets
   # are generated at enable time (e.g. vibe-ai-router's
