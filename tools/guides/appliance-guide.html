@@ -1,0 +1,169 @@
+<!-- Body fragment for the appliance setup guide. Wrapped in the shared
+     page chrome by tools/guides/generate.mjs. Content is a condensation
+     of docs/INSTALL.md — when the two drift, INSTALL.md is the source of
+     truth and this file owes an update. -->
+
+<section>
+<h2>1. What you are setting up</h2>
+<p>The Vibe Appliance is a single Linux server that runs your firm's Vibe
+stack — Trial Balance, MyBooks, Connect, Tax-Research, Payroll &amp; Time,
+Practice Management, and the rest — plus the supporting infrastructure
+(database, cache, TLS, backup, monitoring). One install. One server. No fleet.</p>
+<p>You need to be able to copy a command into a terminal and to know your
+firm's domain name. You do <em>not</em> need to have used Docker before.
+Day-to-day operation after the install happens entirely in a browser.</p>
+<div class="callout">
+<p><strong>The design promise:</strong> every step can be re-run safely. If an
+install fails halfway, fix the thing the error message names and run the same
+command again — it picks up where it stopped. Every error the appliance prints
+includes a recovery hint.</p>
+</div>
+</section>
+
+<section>
+<h2>2. Pick a mode</h2>
+<table>
+<thead><tr><th>Mode</th><th>Best for</th><th>You need</th></tr></thead>
+<tbody>
+<tr><td><strong>Domain</strong></td><td>The firm's web-facing install</td><td>A domain name you own; ideally a free Cloudflare account</td></tr>
+<tr><td><strong>LAN</strong></td><td>A physical box in the office, internal-only</td><td>Nothing beyond the office network</td></tr>
+<tr><td><strong>Tailscale</strong></td><td>Internal-only, reachable from anywhere</td><td>A Tailscale account + an authkey</td></tr>
+</tbody>
+</table>
+<p>Domain + Tailscale can run together: public for clients, tailnet-only for
+staff admin. In every mode, all apps share <strong>one hostname</strong> with a
+path per app — e.g. <code>https://vibe.firm.com/tb/</code>,
+<code>http://&lt;host&gt;.local/mybooks/</code>. Enabling more apps never
+creates DNS work.</p>
+</section>
+
+<section>
+<h2>3. The quickest path (domain + Cloudflare Tunnel)</h2>
+<p>Recommended for most firms: no router changes, no port forwarding, real TLS
+handled by Cloudflare. Seven steps, about 30 minutes including account setup.</p>
+<ol>
+<li><strong>Create an Ubuntu 24.04 droplet</strong> at DigitalOcean.
+Recommended size <code>s-2vcpu-4gb</code> ($24/mo) — runs every app with
+headroom. (<code>s-1vcpu-2gb</code> works for two or three apps.) Note its
+public IP.</li>
+<li><strong>SSH in:</strong> <code>ssh root@&lt;droplet-ip&gt;</code>. On
+Windows, PowerShell's built-in <code>ssh</code> works.</li>
+<li><strong>Create a Cloudflare API token</strong> (your domain's DNS must be
+on Cloudflare — free, and your registrar doesn't change). Profile → API
+Tokens → Create Token → Custom token, with permissions
+<em>Account → Cloudflare Tunnel → Edit</em> and <em>Zone → DNS → Edit</em> on
+your zone. Copy it immediately — Cloudflare shows it once.</li>
+<li><strong>Run the installer</strong> on the droplet, replacing the two
+placeholder values:
+<pre><code>curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh \
+  | sudo bash -s -- \
+    --mode domain \
+    --domain firm.com \
+    --tunnel-subdomain vibe \
+    --email admin@firm.com</code></pre>
+It runs eight numbered phases over 5–15 minutes, then prints your console URL
+and admin password. <strong>Copy the password now</strong> — it also lives in
+<code>/opt/vibe/CREDENTIALS.txt</code> on the server.</li>
+<li><strong>Open the admin console</strong> at
+<code>https://&lt;droplet-ip&gt;/admin</code>. Your browser warns about a
+self-signed certificate — that's expected before the tunnel exists; click
+through. Username <code>admin</code>, paste the password.</li>
+<li><strong>Provision the Cloudflare Tunnel:</strong> in the console,
+<em>Configuration → Network → Cloudflare Tunnel</em>. Paste the API token, let
+the wizard discover your account and zone, click <em>Use these values</em>,
+<em>Save</em>, then <em>Provision tunnel now</em>. About 30 seconds later the
+appliance is live at <code>https://vibe.firm.com/</code> with real TLS.</li>
+<li><strong>Enable your first app</strong> — see §6 below.</li>
+</ol>
+</section>
+
+<section>
+<h2>4. The other install commands</h2>
+<p>Same installer, different flags. Run on the server as root.</p>
+<h3>LAN mode (the default — no flags)</h3>
+<pre><code>curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash</code></pre>
+<h3>Tailscale mode</h3>
+<p>Generate an authkey at login.tailscale.com → Settings → Keys, then:</p>
+<pre><code>curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash -s -- \
+  --mode tailscale \
+  --tailscale-authkey tskey-auth-XXXXXX</code></pre>
+<h3>Domain mode with your own port forwarding (no tunnel)</h3>
+<p>If you can forward ports 80/443 to the server, add one DNS A record
+(<code>vibe.firm.com → server IP</code>) and run the domain-mode command from
+§3 step 4; certificates are issued automatically on the first request.
+Cloudflare DNS-01, Namecheap DNS-01 and Namecheap Dynamic DNS variants are
+covered in <code>docs/INSTALL.md</code> §2.</p>
+<div class="callout--warn callout">
+<p><strong>If a phase fails:</strong> don't re-run blindly. Read the message —
+it names what failed, the common causes, a diagnose command and a fix. Fix
+that one thing, then run the same install command again. Re-running is safe
+and it converges.</p>
+</div>
+</section>
+
+<section>
+<h2>5. Your credentials</h2>
+<p>Everything you need is in one root-only file on the server:</p>
+<pre><code>sudo cat /opt/vibe/CREDENTIALS.txt</code></pre>
+<ul>
+<li><strong>Console URL</strong> — domain mode <code>https://vibe.firm.com/admin</code>; LAN <code>http://&lt;server-ip&gt;/admin</code>; Tailscale <code>https://&lt;host&gt;.&lt;tailnet&gt;.ts.net/admin</code>.</li>
+<li><strong>Username</strong> <code>admin</code> and the 64-character <strong>password</strong> — paste it, don't type it.</li>
+<li>The <strong>Duplicati backup passphrase</strong> — see §7; losing it makes backups unrecoverable.</li>
+</ul>
+<p>Store the password and the backup passphrase in your firm's password
+manager now.</p>
+</section>
+
+<section>
+<h2>6. Enable apps</h2>
+<ol>
+<li>In the admin console, scroll to <strong>Apps</strong>. Each Vibe app has a card.</li>
+<li>Click <strong>Enable</strong> — Vibe Trial Balance is the recommended first app.</li>
+<li>Within ~2 minutes the badge goes <code>not-installed → enabling… → running</code>, and the card shows the live URL. No DNS work is ever needed for a new app.</li>
+<li>Open the URL, sign in with the credentials from the console's <strong>First-login info</strong> panel, and set a real password when prompted.</li>
+</ol>
+<p><strong>Each app card links its own setup guide (PDF)</strong> — enabling
+steps, where to sign in, and the settings that particular app needs.</p>
+</section>
+
+<section>
+<h2>7. Set up backups before real work</h2>
+<p>Do this before trusting the appliance with client data. In the console →
+<strong>Infra services</strong> → <strong>Duplicati (backup)</strong>
+(reachable from the LAN or Tailscale only — never exposed publicly):</p>
+<ol>
+<li>Set Duplicati's web password.</li>
+<li>Add a backup: source paths <code>/source/vibe-data</code> and <code>/source/vibe-env</code> are already mounted read-only.</li>
+<li>Destination: an off-site target you own — S3-compatible storage, Backblaze B2, or rsync.net. Don't leave it unset.</li>
+<li>Encryption passphrase: the <code>DUPLICATI_PASSPHRASE</code> value from <code>/opt/vibe/CREDENTIALS.txt</code>. <strong>If you lose this passphrase, your backups are unrecoverable.</strong></li>
+<li>Schedule nightly. Run one backup manually, then test restoring a single file to a scratch path so you know the recovery path works.</li>
+</ol>
+</section>
+
+<section>
+<h2>8. Daily operation</h2>
+<table>
+<thead><tr><th>Task</th><th>How</th></tr></thead>
+<tbody>
+<tr><td>Open the appliance</td><td>Visit the console URL</td></tr>
+<tr><td>Run diagnostics</td><td>Admin → <strong>Doctor</strong> → Run, or <code>sudo vibe doctor</code></td></tr>
+<tr><td>Read logs</td><td>Admin → <strong>Logs</strong>, or <code>sudo vibe logs &lt;name&gt;</code></td></tr>
+<tr><td>Update an app</td><td>An <em>update available</em> badge appears on its card → click <strong>Update</strong>. A database backup is taken first; a failed update rolls back automatically.</td></tr>
+<tr><td>Roll back</td><td>Click <strong>Roll back</strong> on the card</td></tr>
+<tr><td>Container detail</td><td>Portainer (Infra services; LAN/Tailscale only)</td></tr>
+<tr><td>Host metrics</td><td>Cockpit (Infra services; LAN/Tailscale only)</td></tr>
+</tbody>
+</table>
+<p>Updates are never automatic — nothing changes until you click.</p>
+</section>
+
+<section>
+<h2>9. When something breaks</h2>
+<ul>
+<li><strong><code>sudo vibe doctor</code> is the single best first move.</strong> It checks the host, the core services, every enabled app, DNS and certificates, and prints exactly which check failed and what to do.</li>
+<li>Every error message follows the same shape: what failed → common causes → a diagnose command → a fix command → the next step. Do what it says, in order.</li>
+<li>Re-running the installer is always safe. It repairs a half-finished state rather than damaging a good one.</li>
+<li><code>docs/TROUBLESHOOTING.md</code> in the appliance repository is keyed by symptom, from "console doesn't load" up.</li>
+<li>Disaster path: with your Duplicati backup and its passphrase, a fresh server plus the same install command plus a restore of <code>/opt/vibe/data</code> and <code>/opt/vibe/env</code> brings everything back.</li>
+</ul>
+</section>

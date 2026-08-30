@@ -1,0 +1,16 @@
+<!-- Extra section for the vibe-time-billing guide. Facts sourced from the
+     manifest's _doc and env help text. -->
+<div class="callout--warn callout">
+<p><strong>Document storage starts in evaluation mode.</strong> The app ships
+with <code>STORAGE_PROVIDER=mock</code> so your first enable succeeds — but
+mock storage is <strong>throwaway</strong>: uploaded documents are not
+durable. Before storing real client documents, create a firm-owned Backblaze
+B2 bucket, fill in the five B2 fields on the <strong>Application</strong>
+settings tab, and switch the storage backend to <code>b2</code>. The app
+restarts on save.</p>
+</div>
+<p>The client portal is a separate surface (<code>portal.&lt;your-domain&gt;</code>
+in domain mode) with its own sign-in realm — staff sessions and client
+sessions never mix. Portal magic-link and payment flows require HTTPS, so
+they will not work over the plain-HTTP emergency port; that port is for staff
+recovery access only.</p>
