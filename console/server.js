@@ -6049,10 +6049,12 @@ let GLOBAL_LOCK = null; // { action, since } | null
 // Count of console-spawned script children currently alive. The lock
 // expiry below must not fire while a guarded script is still running —
 // that would re-admit the interleaving the lock exists to prevent.
-// Coverage note: runShell/runToggle/settings-save/mode-switch children
-// are tracked; the tailscale handlers' tsHost/runOnHost helper pods are
-// NOT (they also serve unlocked probe paths, where counting them would
-// wrongly suppress expiry) — those operations normally finish in
+// Coverage note: runShell/runToggle/settings-save children and the
+// mode-switch handler's own bash/docker script children are tracked;
+// tsHost/runOnHost helper pods are NOT, wherever they run — including
+// the mode-switch tailscale prerequisite probe and the cookie-policy
+// handlers (they also serve unlocked probe paths, where counting them
+// would wrongly suppress expiry). Those pods normally finish in
 // seconds, so a >45-min hang there is accepted as out of scope.
 let ACTIVE_CHILDREN = 0;
 function trackChild(child) {

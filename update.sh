@@ -377,14 +377,21 @@ for slug, e in (s.get('apps',{}) or {}).items():
         saw_never_pulled="true"
       fi
     done < <(_check_one "$slug")
-    # An app running its ROLLBACK image is a special case the digest
-    # comparison cannot see: the local :defaultTag cache matches the
-    # remote (the update that failed already pulled it), but what is
-    # RUNNING is the old version — a roll-forward is available by
-    # construction, and the failure evidence must not be cleared.
-    local _cc_tag
+    # Two states the digest comparison cannot see (the failed update
+    # already refreshed the local :defaultTag cache, so it matches the
+    # remote while what's RUNNING is something else):
+    #   - image_tag=vibe-rollback-*: a completed rollback — the old
+    #     version serves, so a roll-forward is available by construction.
+    #   - swap_dirty=true: a HALF-failed rollback (some services on the
+    #     rollback image, some down or on the bad one) — image_tag never
+    #     got the rollback stamp, but the failure evidence must survive
+    #     and the repair update must stay offered.
+    # Either way: force update_available and thereby suppress the
+    # stale-failed clear below.
+    local _cc_tag _cc_swap
     _cc_tag="$(python3 -c "import json;a=json.load(open('${VIBE_STATE_FILE}')).get('apps',{}).get('${slug}',{});print(a.get('image_tag',''))" 2>/dev/null || true)"
-    if [[ "$_cc_tag" == "vibe-rollback-${slug}" ]]; then
+    _cc_swap="$(python3 -c "import json;a=json.load(open('${VIBE_STATE_FILE}')).get('apps',{}).get('${slug}',{});print('true' if a.get('swap_dirty') else '')" 2>/dev/null || true)"
+    if [[ "$_cc_tag" == "vibe-rollback-${slug}" || "$_cc_swap" == "true" ]]; then
       has_update="true"
       any_update_available="true"
     fi
@@ -396,10 +403,10 @@ for slug, e in (s.get('apps',{}) or {}).items():
     # reflects reality.
     # never_pulled means there is NO local image — the clear's invariant
     # ("registry matches what's running") is false, and clearing would
-    # green-badge an app with no images and no containers. Digest
-    # equality alone is also not proof: after a rollback whose bring-up
-    # failed, images exist and match while ZERO containers run — so the
-    # primary container must actually be running before the clear.
+    # green-badge an app with no images and no containers. The
+    # container-running check below covers the zero-containers case;
+    # the rollback/swap_dirty forcing ABOVE covers the cases where a
+    # container runs but not the image the digest comparison looked at.
     if [[ "$check_failed" == "false" && "$has_update" == "false" && "$saw_never_pulled" == "false" ]]; then
       local _cc_upstream _cc_container
       _cc_upstream="$(_manifest_field "$_chk_manifest" 'data["routing"]["matchers"][0]["upstream"] if data["routing"].get("matchers") else data["routing"]["default_upstream"]')"
