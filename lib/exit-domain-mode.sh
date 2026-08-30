@@ -10,8 +10,9 @@
 #   - Cloudflare Tunnel is misbehaving and you need direct LAN access back.
 #   - You're stuck in a half-configured state and want a clean baseline.
 #
-# Idempotency: safe to re-run. If already in LAN mode, only the
-# Caddyfile re-render + reload happen.
+# Idempotency: safe to re-run. A re-run repeats the Caddyfile re-render
+# and re-renders + restarts every enabled app (step 4b) — converging,
+# but not cheap: expect a container bounce and health wait per app.
 #
 # Reverse: sudo bash /opt/vibe/appliance/bootstrap.sh --mode domain --domain <yours>
 #
@@ -108,7 +109,7 @@ with open(tmp, "w") as f:
 os.replace(tmp, p)
 PYEOF
 then
-  die "could not write mode=lan into $VIBE_STATE_FILE — nothing was switched." "Diagnose: df -h /opt; ls -l $VIBE_STATE_FILE. Fix the cause, then re-run this script."
+  die "could not write mode=lan into $VIBE_STATE_FILE — the appliance is still in domain mode. NOTE: the cloudflared connector was already stopped in step 1; restart it if you need the tunnel back while you fix this: sudo docker compose -f $APPLIANCE_DIR/docker-compose.yml -f $APPLIANCE_DIR/infra/cloudflared.yml start cloudflared" "Diagnose: df -h /opt; ls -l $VIBE_STATE_FILE. Fix the cause, then re-run this script."
 fi
 
 # --- 3. Flip CLOUDFLARE_TUNNEL_ENABLED off ---------------------------

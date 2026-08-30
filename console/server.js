@@ -1123,7 +1123,6 @@ app.get('/api/v1/public/apps', async (_req, res) => {
   // live in _appliance.json under the "Landing page" category and
   // are persisted to /opt/vibe/env/appliance.env via settings-save.
   const appliance = parseEnvFile(path.join(ENV_DIR, 'appliance.env'));
-  const showLanFallback   = (appliance.LANDING_SHOW_LAN_FALLBACK   || 'true').trim() !== 'false';
   const showTailnetIp     = (appliance.LANDING_SHOW_TAILNET_IP     || 'false').trim() === 'true';
   const showTailnetHttps  = (appliance.LANDING_SHOW_TAILNET_HTTPS  || 'false').trim() === 'true';
   const showStaffSignin   = (appliance.LANDING_SHOW_STAFF_SIGNIN   || 'true').trim() !== 'false';
@@ -3155,16 +3154,29 @@ const _EMPTY_DAEMON = { backendState: null, hostname: null, ip: null, serve_conf
 let _daemonCache = { value: { ..._EMPTY_DAEMON }, ts: 0 };
 
 let _daemonInflight = null;
+let _daemonGen = 0; // bumped by _invalidateDaemonCache; stale probes see it
 async function _liveTailscaleState() {
   if (Date.now() - _daemonCache.ts < _DAEMON_TTL_MS) {
     return _daemonCache.value;
   }
   // Coalesce: the unauthenticated landing API can trigger this, and N
   // concurrent cache misses would spawn N parallel docker probes on a
-  // 1vcpu droplet. Everyone awaits the one in flight.
+  // 1vcpu droplet. Everyone awaits the one in flight. A probe started
+  // before an invalidation must neither stamp the cache (its answer
+  // predates the change) nor clear a NEWER probe's inflight handle —
+  // both are generation-checked.
   if (_daemonInflight) return _daemonInflight;
-  _daemonInflight = _liveTailscaleStateUncached().finally(() => { _daemonInflight = null; });
-  return _daemonInflight;
+  const gen = _daemonGen;
+  const probe = _liveTailscaleStateUncached().then((out) => {
+    if (gen === _daemonGen) {
+      _daemonCache = { value: out, ts: Date.now() };
+    }
+    return out;
+  }).finally(() => {
+    if (_daemonInflight === probe) _daemonInflight = null;
+  });
+  _daemonInflight = probe;
+  return probe;
 }
 async function _liveTailscaleStateUncached() {
   const probe = await tsHost('status', '--json');
@@ -3190,11 +3202,11 @@ async function _liveTailscaleStateUncached() {
     const text = (serveProbe.stdout || '').trim();
     out.serve_configured = serveProbe.code === 0 && text && text !== 'No serve config';
   }
-  _daemonCache = { value: out, ts: Date.now() };
   return out;
 }
 
 function _invalidateDaemonCache() {
+  _daemonGen += 1;
   _daemonCache = { value: { ..._EMPTY_DAEMON }, ts: 0 };
   // Also drop any probe already in flight: it predates the change that
   // triggered this invalidation, and a post-invalidate caller joining it
@@ -4045,6 +4057,11 @@ app.post('/api/v1/admin/change-admin-password', requireAdmin, testRateLimit, (re
   }
 
   adminPasswordOverride = hash;
+  // The throttled cheap-compare path must stop accepting the OLD
+  // password immediately — this rotation may exist precisely because
+  // that password leaked, and a saturated bucket would otherwise keep
+  // admitting it for the life of the process.
+  _knownGoodPass = null;
   log('info', 'admin password rotated via inline flow');
   // Audit-log the rotation without recording the password value.
   try {

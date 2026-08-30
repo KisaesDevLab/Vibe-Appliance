@@ -478,8 +478,13 @@ cmd_update() {
   # reading it inside _tag_rollback would never see "running" and the
   # keep-existing guard would freeze the rollback tag at the oldest
   # image forever.
-  _tag_rollback "$slug" "$manifest" "$_cur_status" \
-    || die "Could not capture a rollback tag for EVERY image of $slug — refusing to update without a complete rollback path. See $VIBE_LOG_FILE."
+  if ! _tag_rollback "$slug" "$manifest" "$_cur_status"; then
+    # Stamp failed first: every other post-'updating' failure path does,
+    # and a stuck status=updating would also mis-arm the keep-existing
+    # rollback guard on the NEXT update attempt.
+    _state_app_set "$slug" status failed update_error "rollback tag capture failed"
+    die "Could not capture a rollback tag for EVERY image of $slug — refusing to update without a complete rollback path." "If the manifest recently gained a new image (client/extras) that was never pulled, pull it first: sudo bash /opt/vibe/appliance/lib/enable-app.sh $slug — then retry the update. Otherwise see $VIBE_LOG_FILE."
+  fi
 
   # Step 2: pull the new image(s).
   log_step "pulling new images for $slug"
