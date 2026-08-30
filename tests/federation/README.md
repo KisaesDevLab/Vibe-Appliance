@@ -85,6 +85,39 @@ script used `cond and ok(...) or bad(...)`, which is wrong — `ok()` returns
 `None`, so the `or` branch ran every time and every assertion printed both an
 OK and a FAIL. It is an `if/else` now.
 
+## prereq-check.sh
+
+Exercises `_sm_check_host_prereqs` (lib/sentinel-module.sh) and
+`preflight_sentinel_host_prereqs` (lib/preflight.sh) — the host-prereq checker
+the Enable button runs *inside the console container*, and the host-side
+attestation writer it reads from. Pins down two regressions:
+
+- **An unreadable probe is "unverifiable", never a fabricated number.**
+  `sysctl -n ... || echo 0` once reported `vm.max_map_count=0` from the console
+  container while the host read 262144 — the probe being unavailable is not the
+  value being zero. The checker now reads `/proc/sys` (not namespaced, so
+  correct from either side), and an unreadable key fails as unknown.
+- **In-container `pkg:`/`timesync` read `state.host_services`, not the
+  container's own dpkg/systemd namespace.** The test proves it by attesting
+  `auditd` as installed in a container where it is not: a PASS can only have
+  come from the attestation. With no entry, the verdict is "cannot verify",
+  failing closed with the doctor-refresh hint.
+
+It also asserts the sysctl fix hint pastes cleanly (plain `tee` into the
+dedicated sysctl.d file, no trailing prereq token on the line — the `tee -a`
+blob once swallowed `pkg:auditd` as a second output file), that the writer is
+manifest-driven and ignores non-Sentinel manifests, and the full
+writer→checker round trip. `VIBE_CONTAINER_SENTINEL` (lib/state.sh) is the
+seam that drives both branches from inside the test's own container.
+
+```bash
+docker run --rm -v "$PWD:/w/appliance:ro" ubuntu:24.04 bash -c \
+  'apt-get update -qq && apt-get install -y -qq python3 \
+   && bash /w/appliance/tests/federation/prereq-check.sh'
+```
+
+**Verified 2026-08-30:** all 33 assertions pass.
+
 ## e2e-verify.sh
 
 The whole-system sweep across BOTH repos: 31 checks in 21 sections covering
