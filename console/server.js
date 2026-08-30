@@ -38,6 +38,7 @@ const STATE_PATH     = path.join(VIBE_DIR, 'state.json');
 const SQLITE_DIR     = path.join(VIBE_DIR, 'data', 'console');
 const SQLITE_PATH    = path.join(SQLITE_DIR, 'console.sqlite');
 const MANIFESTS_DIR  = path.join(__dirname, 'manifests');
+const GUIDES_DIR     = path.join(__dirname, 'guides');
 const ENABLE_SCRIPT  = path.join(APPLIANCE_DIR, 'lib', 'enable-app.sh');
 const DISABLE_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'disable-app.sh');
 // Lifecycle for units another orchestrator owns. Same argv shape as the two
@@ -318,6 +319,22 @@ function loadManifests() {
 
 const MANIFESTS = loadManifests();
 log('info', 'manifests loaded', { count: Object.keys(MANIFESTS).length, slugs: Object.keys(MANIFESTS) });
+
+// Printable setup guides (console/guides/*.pdf), built from the same
+// manifests by tools/guides/build-guides.sh. Convention over console
+// code: an app has a guide when a PDF named by its slug exists, so a
+// new app needs no change here. Scanned once at startup — the set only
+// changes with a console rebuild, which restarts this process.
+const GUIDES = (() => {
+  try {
+    return new Set(fs.readdirSync(GUIDES_DIR).filter((f) => f.endsWith('.pdf')));
+  } catch (err) {
+    log('warn', 'guides directory unreadable — app cards will show no guide links', { dir: GUIDES_DIR, err: err.code });
+    return new Set();
+  }
+})();
+log('info', 'guides loaded', { count: GUIDES.size });
+const appGuideUrl = (m) => (GUIDES.has(`${m.slug}.pdf`) ? `/guides/${m.slug}.pdf` : null);
 
 // Phase 8.5 v1.2 — appliance-only settings registry. Holds operator-
 // level Tier-1 settings (TAILSCALE_ENABLED, DNS_PROVIDER, UPDATE_CHANNEL,
@@ -1071,6 +1088,18 @@ app.get('/', (_req, res) => {
   res.sendFile(path.join(__dirname, 'ui', 'index.html'));
 });
 
+// Printable setup guides (PDF). Admin-gated like the pages that link
+// them — the app cards live behind /admin, and the guides describe the
+// operator surface, not the customer one. Same no-cache/ETag policy as
+// /static so a console rebuild's fresh PDFs are picked up immediately.
+app.use('/guides', requireAdmin, express.static(GUIDES_DIR, {
+  fallthrough: false,
+  maxAge: 0,
+  setHeaders: (res) => {
+    res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+  },
+}));
+
 // Admin shell.
 app.get('/admin', requireAdmin, (_req, res) => {
   res.sendFile(path.join(__dirname, 'ui', 'admin.html'));
@@ -1739,6 +1768,10 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
         displayName: m.displayName,
         description: m.description,
         subdomain: m.subdomain,
+        // Printable setup guide for this app, when one ships in the
+        // console image (console/guides/<slug>.pdf). Null for a foreign
+        // runtime — Sentinel's docs travel with Sentinel's installer.
+        guide: appGuideUrl(m),
         // rootServedOnly + the RESOLVED primary subdomain. The
         // Cloudflare-Tunnel wizard needs both to print a URL that
         // matches what Caddy actually serves: lib/render-caddyfile.sh

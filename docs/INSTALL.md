@@ -722,6 +722,11 @@ Repeat for the other apps you want enabled. On a 2 GiB droplet, two or
 three apps running comfortably is realistic. For all eight, plan on at
 least 4 GiB RAM (`s-2vcpu-4gb`) — see the droplet-sizing table in §1.
 
+Every app card also links a printable **Setup guide (PDF)** for that
+app — the enable steps, where to sign in, and the settings that app
+needs — and the Apps section header links the appliance-wide guide.
+Print them or hand them to whoever operates the box.
+
 ---
 
 ## 8. Configure backups

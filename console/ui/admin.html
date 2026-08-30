@@ -43,6 +43,9 @@
     <section>
       <h2>Apps</h2>
       <p class="muted" id="apps-summary">—</p>
+      <p class="muted small">New to the appliance? Start with the
+        <a href="/guides/appliance.pdf" target="_blank" rel="noopener">appliance setup guide (PDF)</a>
+        — each app card below links its own guide.</p>
       <div class="cta-row">
         <button class="btn btn--ghost" id="updates-check">Check for updates</button>
         <span class="muted" id="updates-status"></span>
@@ -977,6 +980,7 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
           <p class="muted app-card__desc">${escapeHtml(a.description)}</p>
           <dl class="kv app-card__kv">
             <dt>slug</dt><dd>${escapeHtml(a.slug)}</dd>
+            ${a.guide ? '<dt>guide</dt><dd><a href="' + escapeHtml(a.guide) + '" target="_blank" rel="noopener">Setup guide (PDF)</a></dd>' : ''}
             ${a.subdomain ? '<dt>subdomain</dt><dd>' + escapeHtml(a.subdomain) + '</dd>' : ''}
             ${foreign && a.resources ? '<dt>needs</dt><dd>' + (a.resources.cores || 0) +
                ' cores · ' + (a.resources.ramMb || 0) + ' MB free' +

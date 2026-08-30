@@ -56,6 +56,12 @@ COPY ui/ ./ui/
 # top-level only.
 COPY manifests/ ./manifests/
 
+# Printable setup guides (PDF), one per app plus the appliance's own,
+# built by tools/guides/build-guides.sh and committed. server.js scans
+# /app/guides at startup and each app card links its own guide; without
+# this COPY the links silently disappear (the scan warns and degrades).
+COPY guides/ ./guides/
+
 # Server-side helper modules (cf-helpers.js, etc.). server.js does
 # `require('./lib/cf-helpers')` at module-load time, so missing this
 # directory crashes the console container on startup with

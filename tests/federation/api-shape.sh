@@ -43,6 +43,12 @@ fi
 
 curl -fsS -u admin:probe-pass "http://127.0.0.1:39117/api/v1/admin/status" -o /tmp/status.json 2>/dev/null
 
+# Setup-guide route: authenticated fetch must yield a real PDF; the same
+# URL without credentials must be refused (the guides sit behind /admin's
+# auth, like the cards that link them).
+curl -fsS -u admin:probe-pass "http://127.0.0.1:39117/guides/vibe-tb.pdf" -o /tmp/guide.pdf 2>/dev/null || true
+curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:39117/guides/vibe-tb.pdf" > /tmp/guide.unauth 2>/dev/null || true
+
 python3 - <<'PY'
 import json, sys
 apps = json.load(open('/tmp/apps.json'))['apps']
@@ -63,7 +69,7 @@ foreign = [a for a in apps if a.get('runtime', 'appliance') != 'appliance']
 
 print('apps returned: %d  (%d appliance, %d sentinel)' % (len(apps), len(own), len(foreign)))
 check(len(foreign) == 9, 'all nine Sentinel modules present', 'expected 9 sentinel rows, got %d' % len(foreign))
-check(len(own) == 11, 'all eleven Vibe apps present', 'expected 11 vibe rows, got %d' % len(own))
+check(len(own) == 12, 'all twelve Vibe apps present', 'expected 12 vibe rows, got %d' % len(own))
 
 core = by.get('sentinel-core')
 if not core:
@@ -81,6 +87,9 @@ else:
     check(core.get('disableRequires') is None,
           'core is not Security Six', 'core should not require a compensating control')
     check(core.get('bootOrder') == 10, 'bootOrder surfaced', 'bootOrder wrong: %r' % core.get('bootOrder'))
+    check(core.get('guide') is None,
+          'no setup guide claimed for a foreign unit',
+          'sentinel-core guide should be null, got %r' % core.get('guide'))
 
 keys = by.get('sentinel-keys')
 if keys:
@@ -98,6 +107,21 @@ if tb:
           'a Vibe app carries no resource floor', 'vibe-tb should have no resources')
     check(tb.get('url', '').startswith('http'),
           'a Vibe app still gets its URL', 'vibe-tb url wrong: %r' % tb.get('url'))
+    check(tb.get('guide') == '/guides/vibe-tb.pdf',
+          'setup guide surfaced', 'vibe-tb guide wrong: %r' % tb.get('guide'))
+
+try:
+    head = open('/tmp/guide.pdf', 'rb').read(5)
+    check(head == b'%PDF-', 'authenticated guide fetch returns a real PDF',
+          'guide fetch returned %r, not a PDF' % head)
+except Exception as exc:
+    check(False, '', 'guide fetch failed: %s' % exc)
+try:
+    code = open('/tmp/guide.unauth').read().strip()
+    check(code == '401', 'unauthenticated guide fetch is refused (401)',
+          'unauthenticated guide fetch returned HTTP %s' % code)
+except Exception as exc:
+    check(False, '', 'unauth guide probe failed: %s' % exc)
 
 try:
     st = json.load(open('/tmp/status.json'))
