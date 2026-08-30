@@ -1548,14 +1548,17 @@ const SETTINGS_JS_VERSION = '2026-07-30-tunnel-scope-and-rootserved-urls';
         status.style.color = '';
         status.textContent = 'Stopping connector, re-rendering Caddyfile, reloading Caddy…';
         try {
-          // 120s timeout — the script does Caddy reload + state.json
-          // rewrite + container stop. Healthy runs are <10s; the cap
-          // exists so a hung script can't deadlock the UI.
+          // 15-minute timeout — beyond Caddy reload + state rewrite, the
+          // script now re-renders and RESTARTS every enabled app for LAN
+          // mode (up to ~2 min of health wait each). Aborting early
+          // destroys the socket, shows a false failure, and wedges the
+          // server's global lock until its expiry — so the cap must
+          // exceed the worst honest run, not the old <10s happy path.
           const r = await fetchWithTimeout('/api/v1/admin/network/exit-domain-mode', {
             method: 'POST', credentials: 'same-origin',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ confirm: 'lan' }),
-          }, 120_000);
+          }, 900_000);
           const data = await r.json().catch(() => ({}));
           if (r.ok && data.exit_code === 0) {
             status.style.color = 'var(--good)';
@@ -1828,7 +1831,10 @@ const SETTINGS_JS_VERSION = '2026-07-30-tunnel-scope-and-rootserved-urls';
           domain: sel.mode === 'domain' ? sel.domain : undefined,
           email:  sel.mode === 'domain' ? sel.email  : undefined,
         }),
-      }, 120_000);
+        // 15 min, not 120s: the switch re-renders every enabled app's
+        // env and bounces containers; an early abort shows a false
+        // failure and wedges the global lock until its expiry.
+      }, 900_000);
       data = await r.json().catch(() => ({}));
       data._http = r.status;
     } catch (err) {

@@ -1076,7 +1076,9 @@ PYEOF
     # process) on every error path. Without this subshell, a failed
     # re-enable would terminate the bootstrap entirely rather than
     # falling through to the warn-and-continue branch below.
-    if ( enable_app "$slug" ); then
+    # </dev/null: enable_app's db-bootstrap runs `docker exec -i`, which
+    # drains inherited stdin — the rest of this loop's slug list.
+    if ( enable_app "$slug" </dev/null ); then
       log_ok "app re-enabled" slug="$slug"
     else
       # Preflight failures die before enable_app's own _state_app_set

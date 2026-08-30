@@ -2129,12 +2129,13 @@ app.post('/api/v1/admin/self-update', requireAdmin, testRateLimit, async (_req, 
   // seed, and its flock will make this launch a silent loser anyway.
   let seeded = false;
   try {
-    let existingRunning = false;
-    try {
-      const raw = JSON.parse(fs.readFileSync(SELF_UPDATE_STATUS, 'utf8'));
-      existingRunning = !!(raw && raw.state === 'running');
-    } catch { /* absent or unreadable — seed freely */ }
-    if (!existingRunning) {
+    // Same 30-min-capped reader as every other gate. A raw read here
+    // let a stale SIGKILL'd 'running' file simultaneously open the
+    // gates AND suppress the seed — re-opening the unlocked launch
+    // window the seed exists to close, and skipping the launch-failure
+    // cleanup. A genuinely live long run never reaches this line: the
+    // capped pre-check above already 409'd it.
+    if (!selfUpdateRunning()) {
       const seed = JSON.stringify({
         run_id: 'launching', state: 'running', phase: 'launch',
         message: 'Starting the appliance update…', error: null,
@@ -4059,9 +4060,11 @@ app.post('/api/v1/admin/change-admin-password', requireAdmin, testRateLimit, (re
   adminPasswordOverride = hash;
   // The throttled cheap-compare path must stop accepting the OLD
   // password immediately — this rotation may exist precisely because
-  // that password leaked, and a saturated bucket would otherwise keep
-  // admitting it for the life of the process.
-  _knownGoodPass = null;
+  // that password leaked. Seed the NEW (just-verified) password rather
+  // than clearing: the operator's own stale tabs will saturate their IP
+  // bucket with old-credential polls right after a rotation, and a null
+  // cache would then reject the correct new password too.
+  _knownGoodPass = next;
   log('info', 'admin password rotated via inline flow');
   // Audit-log the rotation without recording the password value.
   try {
@@ -4664,6 +4667,12 @@ app.post('/api/v1/settings/save', requireAdmin, testRateLimit, globalOp('setting
 
   child.on('exit', code => {
     try { fs.unlinkSync(tempPath); } catch {}
+    // 'error' may fire before 'exit' (both can fire for one child — see
+    // runShell): the 500 is already sent then, and a second res.json()
+    // here would throw ERR_HTTP_HEADERS_SENT outside Express's pipeline
+    // and kill the console. Skip the response AND the audit rows — the
+    // save never ran.
+    if (res.headersSent) return;
 
     let result;
     try {

@@ -168,7 +168,10 @@ PYEOF
 )"
 while IFS= read -r _edm_slug; do
   [[ -z "$_edm_slug" ]] && continue
-  if bash "${APPLIANCE_DIR}/lib/enable-app.sh" "$_edm_slug" >>"$VIBE_LOG_FILE" 2>&1; then
+  # </dev/null: enable-app's db-bootstrap runs `docker exec -i`, which
+  # drains inherited stdin — i.e. the REST of this loop's here-string —
+  # so without it only the first app would ever be re-rendered.
+  if bash "${APPLIANCE_DIR}/lib/enable-app.sh" "$_edm_slug" >>"$VIBE_LOG_FILE" 2>&1 </dev/null; then
     log_ok "re-rendered $_edm_slug for LAN mode"
   else
     log_warn "re-render failed for $_edm_slug — it may keep domain-mode cookies/origins until re-enabled" \

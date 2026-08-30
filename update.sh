@@ -380,9 +380,18 @@ for slug, e in (s.get('apps',{}) or {}).items():
     # reflects reality.
     # never_pulled means there is NO local image — the clear's invariant
     # ("registry matches what's running") is false, and clearing would
-    # green-badge an app with no images and no containers.
+    # green-badge an app with no images and no containers. Digest
+    # equality alone is also not proof: after a rollback whose bring-up
+    # failed, images exist and match while ZERO containers run — so the
+    # primary container must actually be running before the clear.
     if [[ "$check_failed" == "false" && "$has_update" == "false" && "$saw_never_pulled" == "false" ]]; then
-      _state_app_clear_failed_if_stale "$slug"
+      local _cc_upstream _cc_container
+      _cc_upstream="$(_manifest_field "$_chk_manifest" 'data["routing"]["matchers"][0]["upstream"] if data["routing"].get("matchers") else data["routing"]["default_upstream"]')"
+      _cc_container="${_cc_upstream%:*}"
+      if [[ -n "$_cc_container" ]] && \
+         [[ "$(docker inspect --format '{{.State.Status}}' "$_cc_container" 2>/dev/null || true)" == "running" ]]; then
+        _state_app_clear_failed_if_stale "$slug"
+      fi
     fi
   done
 
@@ -478,12 +487,11 @@ cmd_update() {
   # reading it inside _tag_rollback would never see "running" and the
   # keep-existing guard would freeze the rollback tag at the oldest
   # image forever.
-  if ! _tag_rollback "$slug" "$manifest" "$_cur_status"; then
+  if ! _tag_rollback "$slug" "$manifest"; then
     # Stamp failed first: every other post-'updating' failure path does,
-    # and a stuck status=updating would also mis-arm the keep-existing
-    # rollback guard on the NEXT update attempt.
+    # and a stuck status=updating would leave the badge lying forever.
     _state_app_set "$slug" status failed update_error "rollback tag capture failed"
-    die "Could not capture a rollback tag for EVERY image of $slug — refusing to update without a complete rollback path." "If the manifest recently gained a new image (client/extras) that was never pulled, pull it first: sudo bash /opt/vibe/appliance/lib/enable-app.sh $slug — then retry the update. Otherwise see $VIBE_LOG_FILE."
+    die "Could not capture a rollback tag for EVERY image of $slug — refusing to update without a complete rollback path." "The log above names the image that could not be tagged. If it is a newly added image that was never pulled, pull JUST that image directly — sudo docker pull <image>:<tag> — then retry the update. Do NOT run enable-app.sh as a workaround: it pulls and boots the NEW server image without this script's backup and rollback net."
   fi
 
   # Step 2: pull the new image(s).
@@ -565,7 +573,7 @@ cmd_update() {
   _run_app_seed_if_needed "$slug" "$manifest" \
     || log_warn "seed for $slug did not complete; check container logs and re-run manually if login fails" slug="$slug"
 
-  _state_app_set "$slug" status running update_available false image_tag "$default_tag" db_dirty false
+  _state_app_set "$slug" status running update_available false image_tag "$default_tag" db_dirty false swap_dirty false
   _state_app_history_append "$slug" "succeeded" "$current_tag" "$default_tag" ""
   log_ok "update succeeded for $slug" tag="$default_tag"
 }
@@ -670,27 +678,26 @@ cmd_rollback() {
     fi
   done < <(_manifest_images "$manifest")
 
-  ( cd "$APPLIANCE_DIR" && \
-    compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" stop $services ) \
-    >>"$VIBE_LOG_FILE" 2>&1 || true
-
-  # --with-db: also restore a pre-update DB backup while the containers
-  # are stopped. Off by default — restoring DESTROYS data written since
-  # the update, which is the operator's call, not ours. Selection order:
-  # an explicit --with-db=PATH wins; else the exact dump the last update
-  # recorded (state.apps.<slug>.last_backup); else newest-by-mtime. When
-  # a failed restore left the database dirty (db_dirty=true), the newest
-  # dump may be a POST-migration snapshot, so auto-pick is refused and
-  # the operator must name the dump.
+  # --with-db pre-flights run BEFORE anything stops — every check below
+  # is read-only (state + filesystem), so a typo'd path or a db_dirty
+  # refusal must cost nothing, not an outage. Off by default — restoring
+  # DESTROYS data written since the update, which is the operator's
+  # call, not ours. Selection order: an explicit --with-db=PATH wins;
+  # else the exact dump the last update recorded
+  # (state.apps.<slug>.last_backup); else newest-by-mtime. When a failed
+  # restore left the database dirty (db_dirty=true), the newest dump may
+  # be a POST-migration snapshot, so auto-pick is refused and the
+  # operator must name the dump.
+  local chosen_backup="" db_name=""
   if [[ "$with_db" == "--with-db" ]]; then
     local backup_dir="${VIBE_DIR}/data/apps/${slug}/pre-update-backups"
-    local chosen_backup="" _db_dirty _state_backup
+    local _db_dirty _state_backup
     _db_dirty="$(python3 -c "import json;a=json.load(open('${VIBE_STATE_FILE}')).get('apps',{}).get('${slug}',{});print('true' if a.get('db_dirty') else '')" 2>/dev/null || true)"
     if [[ -n "$with_db_path" ]]; then
       chosen_backup="$with_db_path"
-      [[ -f "$chosen_backup" ]] || die "--with-db=$chosen_backup: file not found. NOTE: the app's containers are already STOPPED — re-run without --with-db to bring the rollback image up while you look." "List the available dumps with: ls -lt $backup_dir/"
+      [[ -f "$chosen_backup" ]] || die "--with-db=$chosen_backup: file not found — nothing was changed; the app keeps running." "List the available dumps with: ls -lt $backup_dir/"
     elif [[ "$_db_dirty" == "true" ]]; then
-      die "a previous update left the database in an unverified state (a restore failed), so the newest dump may be a POST-migration snapshot — auto-picking it could restore the wrong schema under the old image. NOTE: the app's containers are already STOPPED — re-run without --with-db to bring the rollback image up while you decide." "Pick the dump explicitly (restoring it also clears this safety flag):
+      die "a previous update left the database in an unverified state (a restore failed), so the newest dump may be a POST-migration snapshot — auto-picking it could restore the wrong schema under the old image. Nothing was changed; the app keeps running." "Pick the dump explicitly (restoring it also clears this safety flag):
   ls -lt $backup_dir/
   sudo bash /opt/vibe/appliance/update.sh $slug --rollback --with-db=$backup_dir/<file>.sql.gz"
     else
@@ -703,10 +710,16 @@ cmd_rollback() {
       fi
     fi
     if [[ -z "$chosen_backup" ]]; then
-      die "--with-db was passed but no backup exists under $backup_dir. Nothing was changed — the containers are stopped; re-run without --with-db to bring the rollback image up."
+      die "--with-db was passed but no backup exists under $backup_dir — nothing was changed; the app keeps running." "Re-run without --with-db for an image-only rollback."
     fi
-    local db_name
     db_name="$(_manifest_field "$manifest" 'data["database"]["name"]')"
+  fi
+
+  ( cd "$APPLIANCE_DIR" && \
+    compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" stop $services ) \
+    >>"$VIBE_LOG_FILE" 2>&1 || true
+
+  if [[ "$with_db" == "--with-db" ]]; then
     log_step "restoring DB from $chosen_backup"
     if ! _pg_restore_for_app "$slug" "$db_name" "$chosen_backup"; then
       _state_app_set "$slug" db_dirty true
@@ -719,7 +732,7 @@ cmd_rollback() {
   export APP_TAG="vibe-rollback-${slug}"
   if ! ( cd "$APPLIANCE_DIR" && \
          compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" up -d $services ) >>"$VIBE_LOG_FILE" 2>&1; then
-    _state_app_set "$slug" status failed update_error "rollback up failed"
+    _state_app_set "$slug" status failed update_error "rollback up failed" swap_dirty true
     die "Rollback bring-up failed for $slug. Manual recovery: see ${VIBE_DIR}/data/apps/${slug}/pre-update-backups/."
   fi
 
@@ -731,7 +744,7 @@ cmd_rollback() {
     die "The rollback image came up but never answered /health with 200." "Diagnose: sudo docker compose -f /opt/vibe/appliance/docker-compose.yml -f /opt/vibe/appliance/apps/${slug}.yml logs --tail 50"
   fi
 
-  _state_app_set "$slug" status running image_tag "vibe-rollback-${slug}"
+  _state_app_set "$slug" status running image_tag "vibe-rollback-${slug}" swap_dirty false
   _state_app_history_append "$slug" "rolled-back" "?" "vibe-rollback-${slug}" "manual rollback"
   log_ok "rollback complete for $slug"
   if [[ "$with_db" != "--with-db" ]]; then
@@ -771,14 +784,17 @@ _do_pull() {
 }
 
 _tag_rollback() {
-  # $3 is the app's status BEFORE cmd_update stamped it "updating" —
-  # passed in because reading state here would always see "updating".
-  local slug="$1" manifest="$2" _tr_status="${3:-}"
+  local slug="$1" manifest="$2"
   local rollback_tag="vibe-rollback-${slug}"
-  # When the app was NOT healthy-running (a prior update failed and its
-  # rollback bring-up failed too), the containers may be on the NEW bad
-  # image — tagging that over an existing rollback tag would destroy the
-  # only path back to the last-good version. Keep an existing tag then.
+  # swap_dirty=true means a prior update's rollback BRING-UP failed, so
+  # the containers may still be on the NEW bad image — tagging that over
+  # an existing rollback tag would destroy the only path back. Any
+  # broader signal (status=failed from an unrelated preflight, or the
+  # 'updating' stamp cmd_update just wrote) must NOT trip this: those
+  # failures leave the healthy old containers running, and freezing the
+  # tag then strands rollbacks one version too far back.
+  local _tr_swap_dirty
+  _tr_swap_dirty="$(python3 -c "import json;a=json.load(open('${VIBE_STATE_FILE}')).get('apps',{}).get('${slug}',{});print('true' if a.get('swap_dirty') else '')" 2>/dev/null || true)"
   # The currently-running image is at the manifest's defaultTag — not
   # hardcoded `:latest`, which breaks apps that pin to a version tag
   # (vibe-shield ships at v1.1.5; inspecting `:latest` for it returns
@@ -814,9 +830,9 @@ _tag_rollback() {
     local image_no_tag="${image%:*}"
     local container_name
     container_name="$(basename "$image_no_tag")"
-    if [[ "$_tr_status" != "running" ]] && \
+    if [[ "$_tr_swap_dirty" == "true" ]] && \
        docker image inspect "${image}:${rollback_tag}" >/dev/null 2>&1; then
-      log_warn "keeping existing ${image}:${rollback_tag} — the app was not healthy-running, so the current image is not a safe rollback target" slug="$slug"
+      log_warn "keeping existing ${image}:${rollback_tag} — a prior rollback bring-up failed, so the current image may be the bad one" slug="$slug"
       continue
     fi
     if [[ -n "$container_name" ]]; then
@@ -1051,12 +1067,24 @@ _do_rollback() {
 
   # Restart with rollback tag.
   export APP_TAG="vibe-rollback-${slug}"
+  local _up_ok=1
   if ! ( cd "$APPLIANCE_DIR" && \
     compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" up -d $services ) \
     >>"$VIBE_LOG_FILE" 2>&1; then
     rc=1
+    _up_ok=0
     log_error "rollback bring-up failed too — both versions down, manual recovery needed"
     log_error "Diagnose: sudo docker compose -f /opt/vibe/appliance/docker-compose.yml -f /opt/vibe/appliance/apps/${slug}.yml ps"
+  fi
+  if (( _up_ok == 1 )); then
+    # Record what is actually running now. Without image_tag the step-0
+    # no-op guard's rolled-back exemption never fires for auto-rollbacks:
+    # the local :latest cache matches the remote, the background check
+    # green-badges the app, and the retry update is refused as "nothing
+    # to update" while the app silently stays on the old version.
+    _state_app_set "$slug" image_tag "vibe-rollback-${slug}" swap_dirty false
+  else
+    _state_app_set "$slug" swap_dirty true
   fi
 
   if (( rc == 0 )); then
