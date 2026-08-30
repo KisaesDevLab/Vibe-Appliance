@@ -1,0 +1,33 @@
+<!-- Extra section for the vibe-backup guide. Facts sourced from the
+     Vibe-Backup repo's docs/operator-quickstart.md and the appliance
+     overlay (apps/vibe-backup.yml). -->
+<p><strong>First-time setup (~10 minutes, once).</strong> After enabling, open the
+app from its card link:</p>
+<ol>
+<li>Create a Backblaze account at <code>backblaze.com</code> (B2 Cloud Storage) and put the <em>firm's</em> payment card on it — the storage bill is the firm's.</li>
+<li>In Backblaze: App Keys → <strong>Generate New Master Application Key</strong>.</li>
+<li>In this app's wizard: enter the firm name and that master key. The wizard creates the bucket, the immutability lock, and restricted keys itself — you never touch the Backblaze console again, and the master key is used once and never stored.</li>
+<li><strong>Print the Recovery Kit and put it in the safe.</strong> Type the six words from the kit back into the app. Backups begin only after this — a backup whose passphrase is lost is not a backup, so the system refuses to start without the confirmed kit.</li>
+</ol>
+<div class="callout--warn callout">
+<p><strong>The Recovery Kit is the master key to all firm and client data.</strong>
+Safe or safe-deposit box, two named custodians. Losing it is a security
+incident. When the app announces a new kit (once a year), print and confirm the
+new one before shredding the old.</p>
+</div>
+<p><strong>What it protects — and doesn't.</strong> It protects the Vibe appliance:
+databases, documents, settings, and keys, nightly, verified by a monthly
+restore drill. It does <em>not</em> back up workstations, office file servers,
+email, or other tax software — those need their own backup.</p>
+<div class="callout">
+<p><strong>Coverage today — keep Duplicati configured too.</strong> Per-app
+databases and key material are captured as each Vibe app ships its backup
+contract, and that rollout is still in progress. Until the appliance's release
+notes say otherwise, treat this app and the Duplicati backup (appliance guide,
+"Set up backups") as a pair, not a replacement.</p>
+</div>
+<p><strong>Day to day:</strong> nothing. The card in this app shows
+<em>Last verified restore</em> — the number that matters, because it means a
+restore was actually performed and every module could decrypt its data. If the
+card is red it says what is wrong in one sentence; the most common cause is an
+expired card on the Backblaze account.</p>

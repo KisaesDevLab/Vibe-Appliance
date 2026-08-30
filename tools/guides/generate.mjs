@@ -112,7 +112,19 @@ ${bodyHtml}
 
 // ---- per-app guide -------------------------------------------------------
 
+// userFacing:false + no subdomains[] — the appliance's "no Caddy
+// surface" contract: the app's screen has no login of its own, so its
+// ONE address is the console's authenticated proxy mount.
+const noCaddySurface = (m) => m.userFacing === false && !(m.subdomains || []).length;
+
 function whereItRuns(m) {
+  if (noCaddySurface(m)) {
+    return `<table><tbody><tr><td style="width:30mm"><strong>All modes</strong></td>
+<td>Admin console → <strong>Apps</strong> → the <strong>${esc(m.displayName)}</strong> card → its
+<code>url</code> link (<code>/admin/apps/${esc(m.slug)}/</code>). This app publishes no direct
+address anywhere — its screen has no sign-in of its own, so the only way in is through the
+console's own authentication.</td></tr></tbody></table>`;
+  }
   const prefix = pathPrefix(m);
   const rows = [];
   if (m.rootServedOnly === true) {
@@ -198,6 +210,15 @@ function windowsSection(m, eport) {
   const prefix = pathPrefix(m);
   const winNotesFile = path.join(NOTES_DIR, `${m.slug}.windows.html`);
   const winNotes = fs.existsSync(winNotesFile) ? fs.readFileSync(winNotesFile, 'utf8') : '';
+  if (noCaddySurface(m)) {
+    return `
+<p>There is nothing to install on Windows for this app — it runs on the appliance
+server, and its one address is the admin-console link from the previous section.
+Reach the admin console from Windows the way you normally do (the appliance
+setup guide's Windows section covers each mode), open this app's card, and
+follow its link. Bookmark the opened page (Ctrl+D) if you use it often.</p>
+${winNotes}`;
+  }
   const lanUrl = m.rootServedOnly === true
     ? (eport ? `<code>http://&lt;server-ip&gt;:${eport}/</code> (this app's LAN address is its emergency port)` : 'the address shown on the app card')
     : `<code>http://&lt;server-ip&gt;/${esc(prefix)}/</code>`;
@@ -256,8 +277,7 @@ ${m.database?.name ? `<tr><td><strong>Data lives in</strong></td><td>database <c
 <li>On the <strong>${esc(m.displayName)}</strong> card, click <strong>Enable</strong>.</li>
 <li>Watch the badge: <code>not-installed → enabling… → running</code>. This usually takes a minute or two (first enable pulls the app's images).</li>
 </ol>
-<p>Behind the button, the appliance creates the app's database and a restricted database
-user, writes its configuration file from a template, starts its containers, and only
+<p>Behind the button, the appliance ${m.database?.name ? 'creates the app’s database and a restricted database user, writes' : 'writes'} the app's configuration file from a template, starts its containers, and only
 reports <strong>running</strong> once the app's own health check answers that it is fully
 ready. If enabling fails, the card shows the error with a recovery hint — fix the cause
 and click Enable again; re-running is always safe.</p>`],
