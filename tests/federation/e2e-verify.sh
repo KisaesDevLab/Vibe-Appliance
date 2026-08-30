@@ -211,9 +211,13 @@ chk $? "no committed credentials" "possible credentials above"
 sec "9. Security: secrets never reach the log stream"
 # Names that HOLD secret material, not names that merely mention it. The first
 # cut of this check matched any variable containing SECRET/KEY/PASSWORD and so
-# fired on $SECRETS_DIR — a directory path — and reported it as a leak.
+# fired on $SECRETS_DIR — a directory path — and reported it as a leak. It
+# also fired on \$POSTGRES_PASSWORD in update.sh's copy-paste restore hint —
+# a backslash-escaped reference that prints literally and never expands, so
+# no material reaches the log. The [^\#] guard requires the $ to be
+# unescaped: only an unescaped $VAR / ${VAR} actually expands into the line.
 SECRET_VARS='VIBE_PRINT_SECRET|MASTER_KEY|vibe_ai_token|db_pass|ROUTER_ADMIN_PASSWORD|gateway_admin_key|vs_kek|JWT_SECRET|ENCRYPTION_KEY|POSTGRES_PASSWORD|RESTIC_PASSWORD|AUTHENTIK_SECRET_KEY|WAZUH_API_PASSWORD|tin_hash_salt|session_secret|vibe1099_admin_password|intake_key'
-hits=$(grep -rnE "log_(info|ok|warn|error|step)[^#]*[$]\{?($SECRET_VARS)" \
+hits=$(grep -rnE "log_(info|ok|warn|error|step)[^#]*[^\#][$]\{?($SECRET_VARS)" \
         "$APP"/lib/*.sh "$APP"/*.sh "$INST"/lib/*.sh "$INST"/modules/*.sh 2>/dev/null \
         | grep -v '^[^:]*:[0-9]*: *#' || true)
 [ -z "$hits" ] && ok "no secret-bearing variable is logged" || bad "possible secret in a log line:

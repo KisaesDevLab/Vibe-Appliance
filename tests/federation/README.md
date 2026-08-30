@@ -154,3 +154,7 @@ their first run:
 Two of its own checks were also wrong at first and were fixed rather than
 silenced: the secret-in-log grep matched `$SECRETS_DIR`, a directory path, and
 reported it as a leak; it now matches only names that hold secret *material*.
+The same grep later fired on `\$POSTGRES_PASSWORD` inside update.sh's
+copy-paste restore hint — a backslash-escaped reference that prints literally
+and never expands, so no material reaches the log; it now requires the `$` to
+be unescaped, which is the only form that actually expands into a log line.
