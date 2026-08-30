@@ -474,8 +474,12 @@ cmd_update() {
   # silently tag the new image as the rollback (making rollback a
   # no-op — the historical bug this ordering fix addresses).
   log_step "tagging rollback image for $slug (pre-pull)"
-  _tag_rollback "$slug" "$manifest" \
-    || die "Could not capture rollback tag for $slug — refusing to update without a safe rollback path. See $VIBE_LOG_FILE."
+  # _cur_status was read at step 0, BEFORE the status=updating stamp —
+  # reading it inside _tag_rollback would never see "running" and the
+  # keep-existing guard would freeze the rollback tag at the oldest
+  # image forever.
+  _tag_rollback "$slug" "$manifest" "$_cur_status" \
+    || die "Could not capture a rollback tag for EVERY image of $slug — refusing to update without a complete rollback path. See $VIBE_LOG_FILE."
 
   # Step 2: pull the new image(s).
   log_step "pulling new images for $slug"
@@ -762,14 +766,14 @@ _do_pull() {
 }
 
 _tag_rollback() {
-  local slug="$1" manifest="$2"
+  # $3 is the app's status BEFORE cmd_update stamped it "updating" —
+  # passed in because reading state here would always see "updating".
+  local slug="$1" manifest="$2" _tr_status="${3:-}"
   local rollback_tag="vibe-rollback-${slug}"
-  # When the app is NOT healthy-running (a prior update failed and its
+  # When the app was NOT healthy-running (a prior update failed and its
   # rollback bring-up failed too), the containers may be on the NEW bad
   # image — tagging that over an existing rollback tag would destroy the
   # only path back to the last-good version. Keep an existing tag then.
-  local _tr_status
-  _tr_status="$(python3 -c "import json;a=json.load(open('${VIBE_STATE_FILE}')).get('apps',{}).get('${slug}',{});print(a.get('status',''))" 2>/dev/null || true)"
   # The currently-running image is at the manifest's defaultTag — not
   # hardcoded `:latest`, which breaks apps that pin to a version tag
   # (vibe-shield ships at v1.1.5; inspecting `:latest` for it returns
@@ -780,7 +784,7 @@ _tag_rollback() {
   default_tag="$(_manifest_field "$manifest" 'data["image"]["defaultTag"]')"
   [[ -n "$default_tag" ]] || { log_error "manifest missing image.defaultTag" slug="$slug"; return 1; }
 
-  local ok="false"
+  local _tr_missed=0
   while IFS='=' read -r key image; do
     [[ -z "$key" ]] && continue
     local current_id=""
@@ -807,8 +811,7 @@ _tag_rollback() {
     container_name="$(basename "$image_no_tag")"
     if [[ "$_tr_status" != "running" ]] && \
        docker image inspect "${image}:${rollback_tag}" >/dev/null 2>&1; then
-      log_warn "keeping existing ${image}:${rollback_tag} — the app is not healthy-running, so the current image is not a safe rollback target" slug="$slug"
-      ok="true"
+      log_warn "keeping existing ${image}:${rollback_tag} — the app was not healthy-running, so the current image is not a safe rollback target" slug="$slug"
       continue
     fi
     if [[ -n "$container_name" ]]; then
@@ -827,14 +830,18 @@ _tag_rollback() {
     fi
 
     if [[ -n "$current_id" ]]; then
-      docker tag "$current_id" "${image}:${rollback_tag}" >>"$VIBE_LOG_FILE" 2>&1 && ok="true"
+      docker tag "$current_id" "${image}:${rollback_tag}" >>"$VIBE_LOG_FILE" 2>&1 || _tr_missed=1
     else
+      # ALL-or-nothing: one untagged image means the "safe rollback
+      # path" is a lie — cmd_rollback's pre-flight requires the tag on
+      # every image and would refuse the rollback this update promised.
       log_warn "no running container and no local ${image}:${default_tag} tag for $slug" \
         image="$image" container="$container_name" \
         "diagnose:sudo docker ps -a --filter name=${container_name}; sudo docker image ls ${image}"
+      _tr_missed=1
     fi
   done < <(_manifest_images "$manifest")
-  [[ "$ok" == "true" ]]
+  [[ "${_tr_missed:-0}" -eq 0 ]]
 }
 
 _pg_dump_for_app() {

@@ -86,7 +86,12 @@ except Exception: pass
 
 log_step "resetting state.config (mode=$old_mode → lan, domain=${old_domain:-unset} → cleared)"
 
-python3 - "$VIBE_STATE_FILE" <<'PYEOF'
+# This write IS the mode switch — everything after (the LAN Caddyfile
+# render, the success summary) trusts it. The script runs without -e,
+# so an unguarded failure here (disk full, unwritable state.json —
+# plausible in exactly the degraded states this escape hatch targets)
+# would re-render the broken DOMAIN config and still print success.
+if ! python3 - "$VIBE_STATE_FILE" <<'PYEOF'
 import json, os, sys
 p = sys.argv[1]
 try:
@@ -102,16 +107,24 @@ with open(tmp, "w") as f:
   json.dump(s, f, indent=2)
 os.replace(tmp, p)
 PYEOF
+then
+  die "could not write mode=lan into $VIBE_STATE_FILE — nothing was switched." "Diagnose: df -h /opt; ls -l $VIBE_STATE_FILE. Fix the cause, then re-run this script."
+fi
 
 # --- 3. Flip CLOUDFLARE_TUNNEL_ENABLED off ---------------------------
 
 if [[ -f "$VIBE_ENV_APPLIANCE" ]] && grep -q '^CLOUDFLARE_TUNNEL_ENABLED=true' "$VIBE_ENV_APPLIANCE"; then
   log_step "disabling CLOUDFLARE_TUNNEL_ENABLED in appliance.env"
   tmp="${VIBE_ENV_APPLIANCE}.tmp.$$"
-  sed 's|^CLOUDFLARE_TUNNEL_ENABLED=true|CLOUDFLARE_TUNNEL_ENABLED=false|' \
-    "$VIBE_ENV_APPLIANCE" > "$tmp"
-  chmod 600 "$tmp"
-  mv "$tmp" "$VIBE_ENV_APPLIANCE"
+  if sed 's|^CLOUDFLARE_TUNNEL_ENABLED=true|CLOUDFLARE_TUNNEL_ENABLED=false|' \
+       "$VIBE_ENV_APPLIANCE" > "$tmp"; then
+    chmod 600 "$tmp"
+    mv "$tmp" "$VIBE_ENV_APPLIANCE" \
+      || log_warn "could not replace $VIBE_ENV_APPLIANCE — CLOUDFLARE_TUNNEL_ENABLED stays true; edit it by hand"
+  else
+    rm -f "$tmp"
+    log_warn "could not rewrite $VIBE_ENV_APPLIANCE — CLOUDFLARE_TUNNEL_ENABLED stays true; edit it by hand"
+  fi
 fi
 
 # --- 4. Re-render Caddyfile + reload caddy ---------------------------
@@ -121,6 +134,46 @@ log_step "re-rendering Caddyfile in LAN mode"
 . "${APPLIANCE_DIR}/lib/render-caddyfile.sh"
 render_caddyfile || die "Caddyfile render failed. Re-run sudo bash $APPLIANCE_DIR/bootstrap.sh --mode lan to recover."
 reload_caddyfile || log_warn "Caddy reload failed; try: sudo docker compose -f $APPLIANCE_DIR/docker-compose.yml restart caddy"
+
+# --- 4b. Re-render enabled apps for LAN mode --------------------------
+#
+# Every enabled app still has domain-mode values BAKED into its running
+# env (SESSION_SECURE=true, ALLOWED_ORIGIN=https://<old-domain>) — over
+# plain-HTTP LAN access the browser drops the Secure cookie and sign-in
+# loops forever, and origin checks reject the LAN origin. enable_app is
+# the idempotent re-render + restart; skip units another orchestrator
+# owns, fail closed on unreadable manifests, and warn-and-continue so
+# one bad app doesn't strand the rest of the recovery.
+log_step "re-rendering enabled apps for LAN mode"
+_edm_slugs="$(python3 - "$VIBE_STATE_FILE" "${APPLIANCE_DIR}/console/manifests" <<'PYEOF' || true
+import json, os, sys
+state_path, manifests_dir = sys.argv[1:3]
+try:
+    s = json.load(open(state_path))
+except Exception:
+    sys.exit(0)
+for slug, e in (s.get("apps") or {}).items():
+    if not e.get("enabled") or e.get("status") == "failed":
+        continue
+    try:
+        m = json.load(open(os.path.join(manifests_dir, slug + ".json")))
+    except Exception as ex:
+        print("exit-domain-mode: cannot read manifest for %s (%s) - skipping" % (slug, ex), file=sys.stderr)
+        continue
+    if (m.get("runtime") or "appliance") != "appliance":
+        continue
+    print(slug)
+PYEOF
+)"
+while IFS= read -r _edm_slug; do
+  [[ -z "$_edm_slug" ]] && continue
+  if bash "${APPLIANCE_DIR}/lib/enable-app.sh" "$_edm_slug" >>"$VIBE_LOG_FILE" 2>&1; then
+    log_ok "re-rendered $_edm_slug for LAN mode"
+  else
+    log_warn "re-render failed for $_edm_slug — it may keep domain-mode cookies/origins until re-enabled" \
+      "fix:sudo bash ${APPLIANCE_DIR}/lib/enable-app.sh $_edm_slug"
+  fi
+done <<< "$_edm_slugs"
 
 # --- 5. Print recovery summary ---------------------------------------
 

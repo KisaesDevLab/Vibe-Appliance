@@ -850,9 +850,11 @@ async function ddnsUpdateCycle(force = false) {
     ddnsState.last_ip    = ip;
     ddnsState.last_error = null;
   } else {
-    // Do NOT record last_ip: the same-IP short-circuit would then skip
-    // every retry for as long as the ISP keeps this IP, leaving the
-    // failed records stale for weeks while the UI said ok.
+    // Reset last_ip entirely: leaving the PREVIOUS successful IP in
+    // place still trips the same-IP short-circuit when the address is
+    // unchanged (a failed forced run for a newly added host would never
+    // retry). A null last_ip guarantees the next tick attempts again.
+    ddnsState.last_ip = null;
     ddnsState.last_error = `update failed for ${failedHosts.length} host(s): ${failedHosts.join(', ')}`;
   }
 
@@ -965,14 +967,30 @@ function recordAuthFailure(ip) {
   } else {
     rec.count += 1;
   }
-  if (AUTH_FAILS.size > 10000) AUTH_FAILS.clear(); // memory cap
+  if (AUTH_FAILS.size > 10000) {
+    // Evict expired buckets first — a blanket clear() would also wipe
+    // the active attacker's bucket, re-arming 20 fresh scrypt guesses.
+    for (const [k, v] of AUTH_FAILS) {
+      if (now > v.resetAt) AUTH_FAILS.delete(k);
+    }
+    if (AUTH_FAILS.size > 10000) AUTH_FAILS.clear(); // pathological fallback
+  }
 }
+
+// The last password that verified successfully, held in memory only
+// (it is on the wire of every Basic-auth request anyway; never logged,
+// never persisted). Lets a throttled bucket still admit CORRECT
+// credentials with a cheap constant-time compare — behind the
+// Cloudflare tunnel or a NAT every remote client shares one req.ip,
+// so without this an anonymous attacker looping junk headers could
+// lock the firm's real admin out for as long as the attack runs.
+let _knownGoodPass = null;
 
 function hasAdminCreds(req) {
   const header = req.headers.authorization || '';
   if (!header.toLowerCase().startsWith('basic ')) return false;
   const ip = req.ip || 'unknown';
-  if (authThrottled(ip)) return false;
+  const throttled = authThrottled(ip);
   let decoded;
   try {
     decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
@@ -983,11 +1001,23 @@ function hasAdminCreds(req) {
   if (sep < 0) return false;
   const user = decoded.slice(0, sep);
   const pass = decoded.slice(sep + 1);
+  if (throttled) {
+    // No scrypt while saturated — but known-good credentials still pass
+    // via a cheap compare, so the legitimate admin behind the same
+    // shared IP is never locked out by someone else's guessing.
+    if (_knownGoodPass !== null &&
+        constantTimeStringEquals(user, ADMIN_USER) &&
+        constantTimeStringEquals(pass, _knownGoodPass)) {
+      return true;
+    }
+    return false;
+  }
   if (!constantTimeStringEquals(user, ADMIN_USER) || !verifyAdminPassword(pass)) {
     recordAuthFailure(ip);
     log('warn', 'admin auth failed', { user });
     return false;
   }
+  _knownGoodPass = pass;
   return true;
 }
 
@@ -1137,11 +1167,13 @@ app.get('/api/v1/public/apps', async (_req, res) => {
       // single-button layout.
       const clientLanding = appClientLandingEntries(m, config, live || undefined);
       if (clientLanding.length) out.clientLanding = clientLanding;
-      if (showLanFallback) {
-        // http://<host_ip>/<prefix>/ via Caddy. Null in domain mode and
-        // when host_ip hasn't been cached yet.
-        out.lanFallbackUrl = appLanFallbackUrl(m, config);
-      }
+      // lanFallbackUrl is deliberately NOT on this payload either (same
+      // reasoning as emergencyUrl above): in the default single-host
+      // routing it is http://<host_ip>/<prefix>/ — the firm's internal
+      // LAN address plus the app path map, served unauthenticated and,
+      // behind the Cloudflare tunnel, to the whole internet. The landing
+      // page never rendered it; only admin.html consumes it, from the
+      // admin-only /api/v1/apps.
       if (showTailnetIp && live) {
         out.tailnetUrl = appTailnetUrl(m, config, live);
       }
@@ -3164,6 +3196,10 @@ async function _liveTailscaleStateUncached() {
 
 function _invalidateDaemonCache() {
   _daemonCache = { value: { ..._EMPTY_DAEMON }, ts: 0 };
+  // Also drop any probe already in flight: it predates the change that
+  // triggered this invalidation, and a post-invalidate caller joining it
+  // would get the stale answer AND re-stamp the cache for a full TTL.
+  _daemonInflight = null;
 }
 
 // 5-minute in-memory cache for apt-cache policy probes. The Update
@@ -3739,10 +3775,10 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, globa
   ];
 
   const render = await new Promise((resolve) => {
-    const child = spawn('/bin/bash', renderArgs, {
+    const child = trackChild(spawn('/bin/bash', renderArgs, {
       env: { ...process.env, APPLIANCE_DIR, VIBE_DIR, NO_COLOR: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    }));
     let stdout = ''; let stderr = '';
     child.stdout.on('data', d => { stdout += d.toString(); });
     child.stderr.on('data', d => { stderr += d.toString(); });
@@ -3765,14 +3801,14 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, globa
     // operator sees a transient blip if they're hitting an app at the
     // same instant.
     const portRecreate = await new Promise((resolve) => {
-      const child = spawn('docker', [
+      const child = trackChild(spawn('docker', [
         'compose', '-f', path.join(APPLIANCE_DIR, 'docker-compose.yml'),
         'up', '-d', '--no-deps', 'caddy',
       ], {
         env: { ...process.env, APPLIANCE_DIR, VIBE_DIR, NO_COLOR: '1' },
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: APPLIANCE_DIR,
-      });
+      }));
       let stderr = '';
       child.stderr.on('data', d => { stderr += d.toString(); });
       child.on('exit', code => resolve({ code, stderr }));
@@ -3930,8 +3966,8 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, globa
   } catch (err) { rollbackErr = 'restore failed: ' + err.message; }
 
   const rollbackReload = await new Promise((resolve) => {
-    const child = spawn('docker', ['exec', 'vibe-caddy', 'caddy', 'reload', '--config', '/etc/caddy/Caddyfile'],
-      { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = trackChild(spawn('docker', ['exec', 'vibe-caddy', 'caddy', 'reload', '--config', '/etc/caddy/Caddyfile'],
+      { stdio: ['ignore', 'pipe', 'pipe'] }));
     let stderr = '';
     child.stderr.on('data', d => { stderr += d.toString(); });
     child.on('exit', code => resolve({ code, stderr }));
@@ -4591,10 +4627,10 @@ app.post('/api/v1/settings/save', requireAdmin, testRateLimit, globalOp('setting
     change_count: body.changes.length,
   });
 
-  const child = spawn('/bin/bash', [SETTINGS_SAVE_SCRIPT, 'apply', tempPath], {
+  const child = trackChild(spawn('/bin/bash', [SETTINGS_SAVE_SCRIPT, 'apply', tempPath], {
     env: { ...process.env, APPLIANCE_DIR, VIBE_DIR, NO_COLOR: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  }));
 
   let stdout = '';
   let stderr = '';

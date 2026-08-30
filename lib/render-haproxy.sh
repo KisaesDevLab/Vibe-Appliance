@@ -428,6 +428,24 @@ with open(out_path, "w", encoding="utf-8") as f:
 
 print(f"rendered {len(frontends)} frontend(s)")
 PYEOF
+  # Callers run this function under `if !` / `|| log_warn`, which
+  # suspends errexit for the whole body — without an explicit check a
+  # python exception would fall through and install $tmp, still the
+  # EMPTY mktemp file, wiping every emergency frontend while reporting
+  # success (validation is skipped when the haproxy image isn't pulled).
+  local render_rc=$?
+  if [[ $render_rc -ne 0 ]]; then
+    rm -f "$tmp"
+    log_error "haproxy.cfg renderer exited non-zero (rc=$render_rc). Live config unchanged."
+    log_error "Common causes: a malformed console/manifests/<slug>.json, or a non-UTF-8 locale."
+    log_error "Diagnose: sudo python3 -m json.tool /opt/vibe/state.json; then each enabled manifest."
+    return 1
+  fi
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    log_error "haproxy.cfg renderer produced an empty file. Live config unchanged."
+    return 1
+  fi
 
   # Validate via a one-shot haproxy container if the image is available
   # locally. On first bootstrap, phase_pull runs before phase_caddy so
