@@ -73,7 +73,7 @@ through. Username <code>admin</code>, paste the password.</li>
 the wizard discover your account and zone, click <em>Use these values</em>,
 <em>Save</em>, then <em>Provision tunnel now</em>. About 30 seconds later the
 appliance is live at <code>https://vibe.firm.com/</code> with real TLS.</li>
-<li><strong>Enable your first app</strong> — see §6 below.</li>
+<li><strong>Enable your first app</strong> — see §7 below.</li>
 </ol>
 </section>
 
@@ -102,20 +102,75 @@ and it converges.</p>
 </section>
 
 <section>
-<h2>5. Your credentials</h2>
+<h2>5. Setting up from a Windows computer</h2>
+<p>The appliance itself runs on Ubuntu Linux, never on Windows — but Windows is
+a perfectly good machine to drive the install from, and most firms will operate
+it from Windows desktops afterwards. Everything below is built into Windows 10
+and 11; there is nothing to buy or download except, optionally, Tailscale.</p>
+
+<h3>Running the install from Windows</h3>
+<ol>
+<li>Open <strong>Terminal</strong> (or <strong>PowerShell</strong>) from the
+Start menu — Windows includes the <code>ssh</code> command; you do not need
+PuTTY.</li>
+<li>Connect to your server: <code>ssh root@&lt;droplet-ip&gt;</code>. The first
+connection asks whether to trust the host's fingerprint — type
+<code>yes</code>.</li>
+<li>Copy the install command from §3 or §4 and paste it into the terminal
+window: <strong>right-click pastes</strong> in the Windows terminal
+(Ctrl+Shift+V also works — plain Ctrl+V may not). Paste the whole multi-line
+command in one go; the trailing backslashes make it a single command.</li>
+<li>Everything you type from here runs <em>on the server</em> — the Windows
+machine is only the window. When the install finishes, you can close the
+terminal; the appliance keeps running.</li>
+</ol>
+
+<h3>Reaching the appliance from Windows afterwards</h3>
+<ul>
+<li><strong>Domain mode:</strong> open the console URL in Edge or Chrome —
+real certificate, nothing special to do.</li>
+<li><strong>LAN mode:</strong> recent Windows 10/11 resolves
+<code>&lt;host&gt;.local</code> names out of the box, but some office networks
+and VPN clients block that discovery traffic. If the <code>.local</code> name
+doesn't load, use the server's IP address (<code>http://&lt;server-ip&gt;/admin</code>).
+For clean names on the LAN admin surfaces (<code>cockpit.</code>,
+<code>portainer.</code>, <code>backup.</code>), your IT person can add lines to
+<code>C:\Windows\System32\drivers\etc\hosts</code> (edited as Administrator)
+pointing those names at the server's LAN IP — the small-office substitute for
+split-DNS.</li>
+<li><strong>Tailscale mode:</strong> install the Tailscale app for Windows
+from <code>tailscale.com/download</code> on each staff machine and sign in to
+the firm's tailnet; the console and app URLs then work from anywhere. The
+tray icon shows connection state.</li>
+<li>Before the Cloudflare tunnel is provisioned (§3 step 6), the browser
+warns about a self-signed certificate — expected; click
+<em>Advanced → Continue</em>. Once the tunnel is up, the warning is gone for
+the public URL.</li>
+</ul>
+
+<h3>Trying it locally on a Windows machine</h3>
+<p>For a local or test install without a cloud server, run Ubuntu Server 24.04
+in a virtual machine on the Windows box (Hyper-V or VirtualBox), give the VM a
+bridged network connection so it gets its own LAN address, then follow the LAN
+install inside the VM. Running the appliance directly on Windows or under WSL
+is not supported.</p>
+</section>
+
+<section>
+<h2>6. Your credentials</h2>
 <p>Everything you need is in one root-only file on the server:</p>
 <pre><code>sudo cat /opt/vibe/CREDENTIALS.txt</code></pre>
 <ul>
 <li><strong>Console URL</strong> — domain mode <code>https://vibe.firm.com/admin</code>; LAN <code>http://&lt;server-ip&gt;/admin</code>; Tailscale <code>https://&lt;host&gt;.&lt;tailnet&gt;.ts.net/admin</code>.</li>
 <li><strong>Username</strong> <code>admin</code> and the 64-character <strong>password</strong> — paste it, don't type it.</li>
-<li>The <strong>Duplicati backup passphrase</strong> — see §7; losing it makes backups unrecoverable.</li>
+<li>The <strong>Duplicati backup passphrase</strong> — see §8; losing it makes backups unrecoverable.</li>
 </ul>
 <p>Store the password and the backup passphrase in your firm's password
 manager now.</p>
 </section>
 
 <section>
-<h2>6. Enable apps</h2>
+<h2>7. Enable apps</h2>
 <ol>
 <li>In the admin console, scroll to <strong>Apps</strong>. Each Vibe app has a card.</li>
 <li>Click <strong>Enable</strong> — Vibe Trial Balance is the recommended first app.</li>
@@ -127,7 +182,7 @@ steps, where to sign in, and the settings that particular app needs.</p>
 </section>
 
 <section>
-<h2>7. Set up backups before real work</h2>
+<h2>8. Set up backups before real work</h2>
 <p>Do this before trusting the appliance with client data. In the console →
 <strong>Infra services</strong> → <strong>Duplicati (backup)</strong>
 (reachable from the LAN or Tailscale only — never exposed publicly):</p>
@@ -141,7 +196,7 @@ steps, where to sign in, and the settings that particular app needs.</p>
 </section>
 
 <section>
-<h2>8. Daily operation</h2>
+<h2>9. Daily operation</h2>
 <table>
 <thead><tr><th>Task</th><th>How</th></tr></thead>
 <tbody>
@@ -158,7 +213,7 @@ steps, where to sign in, and the settings that particular app needs.</p>
 </section>
 
 <section>
-<h2>9. When something breaks</h2>
+<h2>10. When something breaks</h2>
 <ul>
 <li><strong><code>sudo vibe doctor</code> is the single best first move.</strong> It checks the host, the core services, every enabled app, DNS and certificates, and prints exactly which check failed and what to do.</li>
 <li>Every error message follows the same shape: what failed → common causes → a diagnose command → a fix command → the next step. Do what it says, in order.</li>

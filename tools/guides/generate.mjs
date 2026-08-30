@@ -190,36 +190,67 @@ function firstLoginSection(m) {
   return html;
 }
 
-function appGuide(m) {
+// Windows-workstation section, emitted for every app: the app itself
+// runs on the server, so the Windows side is reaching it. Per-app
+// Windows caveats, when a manifest can't carry them, go in
+// tools/guides/notes/<slug>.windows.html and are appended here.
+function windowsSection(m, eport) {
   const prefix = pathPrefix(m);
+  const winNotesFile = path.join(NOTES_DIR, `${m.slug}.windows.html`);
+  const winNotes = fs.existsSync(winNotesFile) ? fs.readFileSync(winNotesFile, 'utf8') : '';
+  const lanUrl = m.rootServedOnly === true
+    ? (eport ? `<code>http://&lt;server-ip&gt;:${eport}/</code> (this app's LAN address is its emergency port)` : 'the address shown on the app card')
+    : `<code>http://&lt;server-ip&gt;/${esc(prefix)}/</code>`;
+  return `
+<p>There is nothing to install on Windows for this app — it runs on the appliance
+server, and you use it from a browser (Microsoft Edge or Chrome, as your firm
+prefers). What follows is the Windows side of reaching it in each mode.</p>
+<ul>
+<li><strong>Domain mode:</strong> just open the URL from the previous section.
+The certificate is real, so there is nothing to click through.</li>
+<li><strong>LAN mode:</strong> recent Windows 10 and 11 resolve
+<code>&lt;host&gt;.local</code> addresses out of the box, but some office
+networks and VPN clients block that discovery traffic. If the
+<code>.local</code> address doesn't load, use the server's IP address
+instead: ${lanUrl}. The exact working URL is always shown on this app's card
+in the admin console.</li>
+<li><strong>Tailscale mode:</strong> install the Tailscale app for Windows
+from <code>tailscale.com/download</code>, sign in to the firm's tailnet, and
+the tailnet URL from the section above works. The Tailscale icon in the
+system tray shows whether you're connected.</li>
+<li><strong>Bookmark it:</strong> once the right URL loads, save it as a
+browser favorite (Ctrl+D) — or let your IT person pin it via a browser
+shortcut on each staff desktop.</li>
+</ul>
+${winNotes}`;
+}
+
+function appGuide(m) {
   const eport = emergencyPort(m);
   const deps = (m.depends || []).join(', ');
   const notesFile = path.join(NOTES_DIR, `${m.slug}.html`);
   const notes = fs.existsSync(notesFile) ? fs.readFileSync(notesFile, 'utf8') : '';
   const extras = (m.subdomains || []).filter((s) => s && Number.isInteger(s.emergencyPort) && s.emergencyPort !== eport);
 
-  const body = `
-<section>
-<h2>1. What this app is</h2>
+  // Ordered sections, numbered on render so an optional section never
+  // forces hand-renumbering. A falsy html drops the section.
+  const sections = [
+    ['What this app is', `
 <p>${esc(m.description)}</p>
 <table><tbody>
 <tr><td style="width:38mm"><strong>App id (slug)</strong></td><td><code>${esc(m.slug)}</code></td></tr>
 ${deps ? `<tr><td><strong>Uses</strong></td><td>the appliance's shared ${esc(deps)} — nothing separate to install</td></tr>` : ''}
 ${m.database?.name ? `<tr><td><strong>Data lives in</strong></td><td>database <code>${esc(m.database.name)}</code> inside the appliance's Postgres — covered by your Duplicati backups and by the automatic pre-update dump</td></tr>` : ''}
-</tbody></table>
-</section>
+</tbody></table>`],
 
-<section>
-<h2>2. Before you enable it</h2>
+    ['Before you enable it', `
 <ul>
 <li>The appliance itself must be installed and healthy — see the <strong>Vibe Appliance setup guide</strong> first if you haven't done that yet.</li>
 <li>Each running app uses memory. Two or three apps fit a 2&nbsp;GB server; for all of them plan on 4&nbsp;GB or more.</li>
 <li>If the card shows an <em>image not published</em> badge, the app's build isn't available yet — the Enable button stays off until it is.</li>
-</ul>
-</section>
+</ul>`],
 
-<section>
-<h2>3. Enable the app</h2>
+    ['Enable the app', `
 <ol>
 <li>Open the admin console and scroll to <strong>Apps</strong>.</li>
 <li>On the <strong>${esc(m.displayName)}</strong> card, click <strong>Enable</strong>.</li>
@@ -229,33 +260,26 @@ ${m.database?.name ? `<tr><td><strong>Data lives in</strong></td><td>database <c
 user, writes its configuration file from a template, starts its containers, and only
 reports <strong>running</strong> once the app's own health check answers that it is fully
 ready. If enabling fails, the card shows the error with a recovery hint — fix the cause
-and click Enable again; re-running is always safe.</p>
-</section>
+and click Enable again; re-running is always safe.</p>`],
 
-<section>
-<h2>4. Open it and sign in</h2>
+    ['Open it and sign in', `
 ${whereItRuns(m)}
-${firstLoginSection(m)}
-</section>
+${firstLoginSection(m)}`],
 
-<section>
-<h2>5. Settings</h2>
-${settingsSection(m)}
-</section>
+    ['Setup on Windows', windowsSection(m, eport)],
 
-${notes ? `<section><h2>6. Notes for this app</h2>${notes}</section>` : ''}
+    ['Settings', settingsSection(m)],
 
-<section>
-<h2>${notes ? '7' : '6'}. Updates and rollback</h2>
+    notes ? ['Notes for this app', notes] : null,
+
+    ['Updates and rollback', `
 <ul>
 <li>When a newer build is available, the card shows an <strong>update available</strong> badge. Click <strong>Update</strong>.</li>
 <li>Before updating, the appliance takes a database backup automatically. If the updated app fails its health check, it is rolled back to the previous version — and the <strong>Roll back</strong> button lets you do the same by hand.</li>
 <li>Updates are never automatic; nothing changes until you click.</li>
-</ul>
-</section>
+</ul>`],
 
-<section>
-<h2>${notes ? '8' : '7'}. If something goes wrong</h2>
+    ['If something goes wrong', `
 <ul>
 <li><strong>Run the doctor first.</strong> Admin console → <strong>Doctor</strong> → Run (or <code>sudo vibe doctor</code> on the server). It names the failing check and the fix.</li>
 <li><strong>Read the card.</strong> Errors on the app card include a recovery hint; the output panel under the buttons shows the last action's log.</li>
@@ -264,9 +288,12 @@ ${eport ? `<li><strong>Emergency access.</strong> If the normal URL is down but 
 }${extras.length ? extras.map((s) => ` The ${esc(s.audience || s.name)} surface has its own emergency port: <code>http://&lt;server-ip&gt;:${s.emergencyPort}/</code>.`).join('') : ''}</li>` : ''}
 <li><strong>Disable / Enable</strong> from the card restarts the app cleanly. Disabling never deletes data.</li>
 <li>Still stuck? <code>docs/TROUBLESHOOTING.md</code> in the appliance repository is keyed by symptom.</li>
-</ul>
-</section>
-`;
+</ul>`],
+  ].filter(Boolean);
+
+  const body = sections
+    .map(([title, html], i) => `<section>\n<h2>${i + 1}. ${esc(title)}</h2>${html}\n</section>`)
+    .join('\n\n');
   return page(
     `${m.displayName} — Setup`,
     `Enable, sign in, and configure ${m.displayName} on your Vibe Appliance.`,
