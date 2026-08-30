@@ -220,6 +220,14 @@ for slug in all_app_slugs:
                 "name_suffix": "_" + sd.get("name", "").replace("-", "_"),
                 "label_suffix": label_suffix,
                 "note":  sd.get("emergencyNote") or m.get("emergencyNote") or "",
+                # Per-subdomain backend. The Caddy renderer's extra-subdomain
+                # vhosts already honor `target` (entry.get("target") or
+                # default_upstream); without the same here every emergency
+                # port pointed at default_upstream, so a client-portal port
+                # (vibe-connect's 5182, vibe-time-billing's portal listener)
+                # served the STAFF app instead of the surface its label
+                # promised.
+                "target": sd.get("target") or "",
             })
     else:
         port = m.get("emergencyPort")
@@ -267,7 +275,7 @@ for slug in all_app_slugs:
             "slug":       slug,
             "name":       slug.replace("-", "_") + c["name_suffix"],
             "port":       port,
-            "upstream":   upstream,
+            "upstream":   c.get("target") or upstream,
             "label":      m.get("displayName", slug) + c["label_suffix"],
             "note":       c["note"],
             "health":     "/api/v1/ping",

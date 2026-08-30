@@ -1,0 +1,192 @@
+{
+  "schemaVersion": 1,
+  "slug": "vibe-time-billing",
+  "displayName": "Vibe Practice Management",
+  "description": "Practice management for the firm: time tracking, billing and invoicing, retainers, proposals and engagement letters, WIP reporting, a client portal, and document intake.",
+  "_doc": "In-tree manifest for KisaesDevLab/Vibe-Time-Billing (github.com/KisaesDevLab/Vibe-Time-Billing). ONE GHCR mono-image runs three tiers plus a one-shot: `vibe-time-billing-api` (Express, :3001, /health, migrates itself at boot via ops/docker/entrypoint-api.sh), `vibe-time-billing-worker` (BullMQ jobs, same image, no HTTP surface), and `vibe-time-billing-web` (caddy:2-alpine serving the staff/portal/intake SPA dists that `vibe-time-billing-init` copies out of the image together with the app's own ops/docker/Caddyfile — the appliance vendors nothing; the config ships inside the image). REALMS: the app splits staff (web:80 catch-all) from the client portal (Host `portal.*` on :80, or the :8088 listener) with separate cookie names and JWT secrets; all browser traffic must flow through the web tier, so routing declares NO /api matcher — the single matcher is named `api` ONLY because the seed runner and health prober key on that name to reach the API container, and its path is the bare /health passthrough. ROOT-SERVED: the SPA dists are built with base '/' and no 40-base-path.sh hook, so the app cannot be path-mounted (rootServedOnly) — domain mode serves it at practice.<domain> + portal.<domain>; LAN/Tailscale access is the emergency ports (5178 staff, 5179 portal — 5179 maps to web:8088, which IS the portal realm listener, so the split survives without hostnames). UPDATE CAVEAT: update.sh's scoped stop/up covers web+api (routing-derived); the worker shares the api image and picks up the new one on the next enable — run Disable/Enable after an update if worker-side jobs must move immediately (same accepted limitation as vibe-1040's sidecar). NOT WIRED (owned by the appliance instead, per the no-app-owned-infra rule): the app's built-in Cloudflare-tunnel provisioning, backup sidecar mounts, and recovery-kit volume are all omitted; those admin pages will report their feature unavailable. OpenSign e-sign is upstream-standalone opt-in (OPENSIGN_URL unset = native signing). STORAGE: ships STORAGE_PROVIDER=mock so first enable succeeds for evaluation, but mock storage is THROWAWAY — real client documents require the firm's Backblaze B2 bucket (Settings → Storage) before production use.",
+
+  "image": {
+    "server":     "ghcr.io/kisaesdevlab/vibe-time-billing",
+    "defaultTag": "latest"
+  },
+
+  "subdomain":      "practice",
+  "rootServedOnly": true,
+  "emergencyPort":  5178,
+  "subdomains": [
+    {
+      "name":          "practice",
+      "audience":      "staff",
+      "emergencyPort": 5178,
+      "target":        "vibe-time-billing-web:80"
+    },
+    {
+      "name":          "portal",
+      "audience":      "client portal",
+      "emergencyPort": 5179,
+      "target":        "vibe-time-billing-web:8088",
+      "emergencyNote": "Staff emergency access only — portal magic-link and payment flows require HTTPS cookies and won't work over the plain-HTTP emergency port."
+    }
+  ],
+  "ports": { "server": 3001, "client": 80 },
+
+  "routing": {
+    "default_upstream": "vibe-time-billing-web:80",
+    "matchers": [
+      { "name": "api", "path": "/health", "upstream": "vibe-time-billing-api:3001" }
+    ]
+  },
+
+  "depends": ["postgres", "redis"],
+
+  "env": {
+    "required": [
+      { "name": "DATABASE_URL", "from": "database-url" },
+      { "name": "REDIS_URL",    "from": "redis-url" },
+      { "name": "APP_BASE_URL", "from": "subdomain-url" },
+      {
+        "name":   "STAFF_JWT_SECRET",
+        "from":   "generated:hex32",
+        "secret": true,
+        "doc":    "Signs staff sessions. Per-app and per-realm — the portal uses its own secret so rotating one realm never signs out the other."
+      },
+      {
+        "name":   "PORTAL_JWT_SECRET",
+        "from":   "generated:hex32",
+        "secret": true,
+        "doc":    "Signs client-portal sessions. Distinct from STAFF_JWT_SECRET by upstream design (realm isolation)."
+      },
+      {
+        "name":   "KMS_KEY",
+        "from":   "generated:base64-32bytes",
+        "secret": true,
+        "doc":    "32 raw bytes, base64. Envelope-encryption master key; the api refuses to boot without it. NOT ROTATABLE IN PLACE — losing it loses every wrapped data key. Generated once on first enable and preserved on every re-render; lives in /opt/vibe/env inside the appliance's sealed backup set."
+      },
+      {
+        "name":   "PROPOSAL_SIGNATURE_HMAC_SEED",
+        "from":   "generated:hex32",
+        "secret": true,
+        "doc":    "Seeds the HMAC on proposal-signature links minted by the worker. Generated once and preserved."
+      },
+      {
+        "name":   "ADMIN_PASSWORD",
+        "from":   "generated:hex32",
+        "secret": true,
+        "doc":    "Password for the seeded firm admin (see firstLogin). Consumed by the run-once seed only; change the password in-app afterwards — the seed will not reset it again."
+      }
+    ],
+    "optional": [
+      {
+        "name": "VIBE_APP_SUBDOMAIN",
+        "doc":  "Operator override for this app's subdomain label. Empty = the manifest default (practice). Consumed by the appliance routing (Caddy vhost + Cloudflare Tunnel CNAME/ingress); because this app is rootServedOnly it is served at its own subdomain in BOTH routing modes. Single DNS label — lowercase letters, digits, dashes, no dots.",
+        "ui": {
+          "tier":        1,
+          "category":    "Network",
+          "label":       "Subdomain",
+          "helpText":    "The <subdomain> in <subdomain>.<your-domain> for the staff app. Leave blank for the default (practice). Lowercase letters, digits, and dashes; no dots. Saving re-renders routing and re-provisions the Cloudflare Tunnel; the app briefly restarts.",
+          "input":       "text",
+          "appliance":   "per-app",
+          "validate":    "regex:^([a-z0-9][a-z0-9-]*)?$",
+          "postSaveJob": "routing-reconcile"
+        }
+      },
+      {
+        "name": "STORAGE_PROVIDER",
+        "doc":  "Object-storage backend for client documents: b2 (Backblaze B2 — production) or mock (in-process, THROWAWAY — evaluation only, documents do not survive). The appliance ships mock so first enable succeeds; switch to b2 with the fields below before storing real client documents.",
+        "ui": {
+          "tier":      1,
+          "category":  "Storage",
+          "label":     "Document storage backend",
+          "helpText":  "mock is evaluation-only — uploaded documents are NOT durable. For production, create a Backblaze B2 bucket (firm-owned), fill in the B2 fields below, and set this to b2. The app restarts on save.",
+          "input":     "text",
+          "appliance": "per-app",
+          "validate":  "regex:^(b2|mock)?$"
+        }
+      },
+      {
+        "name": "B2_ENDPOINT",
+        "doc":  "Backblaze B2 S3-compatible endpoint, e.g. https://s3.us-west-004.backblazeb2.com.",
+        "ui": { "tier": 1, "category": "Storage", "label": "B2 endpoint", "helpText": "From the B2 bucket's details page, e.g. https://s3.us-west-004.backblazeb2.com.", "input": "text", "appliance": "per-app" }
+      },
+      {
+        "name": "B2_REGION",
+        "doc":  "B2 region, e.g. us-west-004.",
+        "ui": { "tier": 1, "category": "Storage", "label": "B2 region", "helpText": "The region segment of the endpoint, e.g. us-west-004.", "input": "text", "appliance": "per-app" }
+      },
+      {
+        "name": "B2_BUCKET",
+        "doc":  "B2 bucket name (private bucket the firm owns).",
+        "ui": { "tier": 1, "category": "Storage", "label": "B2 bucket", "helpText": "A private bucket the firm owns. The app never shares these credentials with third parties.", "input": "text", "appliance": "per-app" }
+      },
+      {
+        "name": "B2_KEY_ID",
+        "doc":  "B2 application key id, scoped to the bucket.",
+        "ui": { "tier": 1, "category": "Storage", "label": "B2 key ID", "helpText": "Create an application key restricted to the bucket above.", "input": "text", "appliance": "per-app" }
+      },
+      {
+        "name":   "B2_APPLICATION_KEY",
+        "secret": true,
+        "doc":    "B2 application key secret.",
+        "ui": { "tier": 1, "category": "Storage", "label": "B2 application key", "helpText": "The secret half of the application key. Stored in the per-app env file (mode 600).", "input": "password", "appliance": "per-app" }
+      },
+      {
+        "name": "MAIL_SMTP_HOST",
+        "doc":  "SMTP relay host. Sign-in REQUIRES working email (magic links and emailed one-time codes), so configure this before the first login.",
+        "ui": { "tier": 1, "category": "Email & SMS", "label": "SMTP host", "helpText": "Sign-in emails (magic links, one-time codes), invoices, and client notifications all go through this relay. Required before first login.", "input": "text", "appliance": "per-app" }
+      },
+      {
+        "name": "MAIL_SMTP_PORT",
+        "doc":  "SMTP port (587 STARTTLS typical).",
+        "ui": { "tier": 1, "category": "Email & SMS", "label": "SMTP port", "helpText": "587 for STARTTLS (typical), 465 for implicit TLS, 25 for plain relays.", "input": "text", "appliance": "per-app", "validate": "regex:^([0-9]{1,5})?$" }
+      },
+      {
+        "name": "MAIL_SMTP_USER",
+        "doc":  "SMTP username.",
+        "ui": { "tier": 1, "category": "Email & SMS", "label": "SMTP username", "helpText": "Leave blank for an unauthenticated relay.", "input": "text", "appliance": "per-app" }
+      },
+      {
+        "name":   "MAIL_SMTP_PASS",
+        "secret": true,
+        "doc":    "SMTP password.",
+        "ui": { "tier": 1, "category": "Email & SMS", "label": "SMTP password", "helpText": "Stored in the per-app env file (mode 600).", "input": "password", "appliance": "per-app" }
+      },
+      {
+        "name": "MAIL_FROM",
+        "doc":  "From header for outbound mail, e.g. \"Smith & Co CPAs <billing@smithcpas.com>\".",
+        "ui": { "tier": 1, "category": "Email & SMS", "label": "Mail from address", "helpText": "Shown on sign-in, invoice, and portal emails. Use an address your SMTP relay is allowed to send as.", "input": "text", "appliance": "per-app" }
+      }
+    ]
+  },
+
+  "database": { "name": "vibe_time_billing_db", "user": "vibetimebilling" },
+  "redis":    { "db": 5 },
+
+  "firstLogin": {
+    "type":           "default-credentials-passive",
+    "username":       "admin@appliance.local",
+    "passwordEnvKey": "ADMIN_PASSWORD",
+    "url":            "/",
+    "note":           "The username is whatever ADMIN_EMAIL was at enable time (default admin@appliance.local — set a real address in /opt/vibe/env/vibe-time-billing.env BEFORE first enable). IMPORTANT: sign-in requires working EMAIL — password login is completed with an emailed one-time code, and magic-link login is email too — so configure the SMTP settings (Settings → this app → Email & SMS) before the first login or you cannot get in. Change the password in-app after signing in; the seed runs once and will not reset it. This app is served at the ROOT of its own subdomain in both routing modes (rootServedOnly), so in LAN/Tailscale mode use http://<server-ip>:5178/ for the staff app and http://<server-ip>:5179/ for the client portal."
+  },
+
+  "health": "/health",
+  "health_timeout_s": 180,
+
+  "migrations": {
+    "command": [
+      "node",
+      "--experimental-transform-types",
+      "--no-warnings=ExperimentalWarning",
+      "--import", "/app/ops/docker/esm-resolve-hook.mjs",
+      "packages/db/dist/scripts/migrate.js"
+    ]
+  },
+
+  "seed": {
+    "command": [
+      "sh", "-c",
+      "node --experimental-transform-types --no-warnings=ExperimentalWarning --import /app/ops/docker/esm-resolve-hook.mjs packages/db/dist/scripts/bootstrap-firm.js && node --experimental-transform-types --no-warnings=ExperimentalWarning --import /app/ops/docker/esm-resolve-hook.mjs apps/api/dist/apps/api/src/scripts/create-admin.js"
+    ],
+    "description": "Two upstream run-once scripts, chained: bootstrap-firm creates the minimal firm (one office, service lines, rate code, notification templates) from FIRM_NAME/ADMIN_EMAIL/ADMIN_NAME; create-admin then attaches the admin role and sets the ADMIN_PASSWORD password with email-OTP second factor. Both are idempotent upstream, and state.apps.vibe-time-billing.seeded gates the pair to a single run. All inputs come from the per-app env file — set FIRM_NAME and ADMIN_EMAIL there BEFORE first enable."
+  }
+}

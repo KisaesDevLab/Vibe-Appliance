@@ -322,6 +322,8 @@ services:
       - "5175:5175"   # vibe-tx-converter
       - "5176:5176"   # vibe-1099
       - "5177:5177"   # vibe-1040
+      - "5178:5178"   # vibe-time-billing (staff)
+      - "5179:5179"   # vibe-time-billing (client portal)
       - "5181:5181"   # vibe-connect (main)
       - "5182:5182"   # vibe-connect (public)
       - "5191:5191"   # vibe-tax-research

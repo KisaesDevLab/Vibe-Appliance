@@ -371,7 +371,7 @@ preflight_emergency_ports() {
     # this list matches the compose publishes exactly.
     log_check_warn "Emergency-access ports" \
       "Could not read the emergency-proxy port list from docker-compose.yml; falling back to the known set. If bootstrap later fails with 'port is already allocated', that's the cause."
-    ports="5171 5172 5174 5175 5176 5177 5181 5182 5191 5192 5193 5194 5197 5198 5199"
+    ports="5171 5172 5174 5175 5176 5177 5178 5179 5181 5182 5191 5192 5193 5194 5197 5198 5199"
   fi
   for p in $ports; do
     if ! preflight_port "$p" vibe-emergency-proxy; then

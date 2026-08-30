@@ -1,0 +1,154 @@
+# apps/vibe-time-billing.yml — Vibe Practice Management overlay.
+#
+# Used as a docker-compose overlay on top of the core docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f apps/vibe-time-billing.yml up -d
+#
+# Reads /opt/vibe/env/vibe-time-billing.env (rendered from
+# env-templates/per-app/vibe-time-billing.env.tmpl).
+#
+# Topology — ONE GHCR mono-image plus the stock caddy image:
+#
+#   vibe-time-billing-init    one-shot; copies the staff/portal/intake SPA
+#                             dists AND the app's own ops/docker/Caddyfile
+#                             out of the image into the shared static
+#                             volume. Re-runs on every `up`, so a fresh
+#                             image pull propagates automatically. The
+#                             appliance vendors nothing — config and
+#                             bundles both ship inside the app image.
+#   vibe-time-billing-api     Express API (:3001, /health). Its entrypoint
+#                             self-migrates at boot (idempotent, tracked
+#                             in schema_migrations); update.sh ALSO runs
+#                             the explicit migration step with its dump +
+#                             rollback net in front.
+#   vibe-time-billing-worker  BullMQ worker, same image, no HTTP surface.
+#                             UPDATE CAVEAT: update.sh's scoped stop/up
+#                             covers web+api (routing-derived); the worker
+#                             picks up a new image on the next enable —
+#                             Disable/Enable after an update if jobs must
+#                             move immediately (same accepted limitation
+#                             as vibe-1040's sidecar).
+#   vibe-time-billing-web     caddy:2-alpine running the app's OWN
+#                             Caddyfile from the static volume. It is the
+#                             realm switch: staff SPA + X-Vibe-Realm on
+#                             :80, client portal on :8088 (and on Host
+#                             portal.* of :80), public intake realm on
+#                             Host intake.*. All browser traffic MUST go
+#                             through this tier — the appliance's Caddy
+#                             proxies whole hosts to it and never routes
+#                             /api/* around it.
+#
+# The upstream repo's standalone compose also ships its OWN postgres,
+# redis, caddy-with-published-ports, cloudflared, backup and recovery-kit
+# mounts. None of that appears here: the appliance owns Postgres, Redis,
+# ingress, tunnel, and backups (CLAUDE.md rules 2 and 3), so this overlay
+# points the same image at the shared instances and publishes no ports.
+#
+# Private network: the app's Caddyfile says `reverse_proxy api:3001`
+# literally, so the api container gets an `api` alias on a private
+# network — same pattern as vibe-tb's nginx `api` alias — without
+# colliding with other apps whose configs also expect `api` to mean
+# THEIR backend.
+
+name: vibe
+
+services:
+  vibe-time-billing-init:
+    image: ghcr.io/kisaesdevlab/vibe-time-billing:${APP_TAG:-latest}
+    container_name: vibe-time-billing-init
+    entrypoint: ['/bin/sh', '-c']
+    command:
+      - |
+        set -eu
+        rm -rf /static-out/web /static-out/portal /static-out/intake
+        cp -r /app/apps/web/dist /static-out/web
+        cp -r /app/apps/portal/dist /static-out/portal
+        cp -r /app/apps/intake/dist /static-out/intake
+        cp /app/ops/docker/Caddyfile /static-out/Caddyfile
+        echo "vibe-time-billing-init: copied web + portal + intake dists and Caddyfile"
+    volumes:
+      - vibe-time-billing-static:/static-out
+    restart: 'no'
+
+  vibe-time-billing-api:
+    image: ghcr.io/kisaesdevlab/vibe-time-billing:${APP_TAG:-latest}
+    container_name: vibe-time-billing-api
+    restart: unless-stopped
+    # The image's documented production entrypoint: tini + migrate-then-serve.
+    entrypoint: ['/usr/bin/tini', '--', '/app/ops/docker/entrypoint-api.sh']
+    env_file:
+      - /opt/vibe/env/shared.env
+      # Tier 1 inline-editable settings; loaded between shared and per-app
+      # so per-app overrides win (compose merges in declared order).
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-time-billing.env
+    networks:
+      vibe_net: {}
+      vibe-time-billing-internal:
+        aliases: [api]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # Mirrors the upstream compose's own probe; curl ships in the image.
+      test: ['CMD-SHELL', 'curl -fsS http://localhost:3001/health || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 45s
+
+  vibe-time-billing-worker:
+    image: ghcr.io/kisaesdevlab/vibe-time-billing:${APP_TAG:-latest}
+    container_name: vibe-time-billing-worker
+    restart: unless-stopped
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-time-billing.env
+    networks:
+      vibe_net: {}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Upstream's worker invocation verbatim (see its compose for why the
+    # dist path is nested: tsc rootDir auto-rises under workspace aliases).
+    command:
+      - 'node'
+      - '--experimental-transform-types'
+      - '--no-warnings=ExperimentalWarning'
+      - '--import'
+      - '/app/ops/docker/esm-resolve-hook.mjs'
+      - 'apps/worker/dist/apps/worker/src/index.js'
+
+  vibe-time-billing-web:
+    # Same stock image the core stack already uses for its own Caddy —
+    # this is infra serving the app's baked assets, not app code.
+    image: caddy:2-alpine
+    container_name: vibe-time-billing-web
+    restart: unless-stopped
+    command: ['caddy', 'run', '--config', '/srv/Caddyfile', '--adapter', 'caddyfile']
+    # No env_file on purpose: the app's Caddyfile reads no env vars, and
+    # this container has no business holding the appliance's secrets.
+    volumes:
+      - vibe-time-billing-static:/srv:ro
+    networks:
+      vibe_net: {}
+      vibe-time-billing-internal: {}
+    depends_on:
+      vibe-time-billing-api:
+        condition: service_healthy
+      vibe-time-billing-init:
+        condition: service_completed_successfully
+
+networks:
+  vibe-time-billing-internal:
+    name: vibe-time-billing-internal
+    driver: bridge
+
+volumes:
+  vibe-time-billing-static:
+    name: vibe-time-billing-static
