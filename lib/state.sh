@@ -148,6 +148,56 @@ os.replace(tmp, path)
 PYEOF
 }
 
+# state_get_path <dotted.path>
+#   Prints the value at a dotted path in state.json (e.g.
+#   "host_services.avahi.status", "config.mode"). Prints nothing when the
+#   path is unset or the state file is missing/malformed — callers treat
+#   "no answer" as "unknown", never as a default value.
+state_get_path() {
+  python3 - "$VIBE_STATE_FILE" "$1" <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        s = json.load(f)
+except Exception:
+    sys.exit(0)
+keys = sys.argv[2].split(".")
+v = s
+for k in keys:
+    if isinstance(v, dict):
+        v = v.get(k)
+    else:
+        v = None
+        break
+if v is None:
+    sys.exit(0)
+print(v)
+PYEOF
+}
+
+# Detect whether the calling script is running inside a container vs on
+# the host. /.dockerenv is created by Docker for every container at
+# runtime — the canonical sentinel that's been in place since Docker 1.0.
+# The console spawns doctor.sh and lib/sentinel-module.sh from inside its
+# container; in that namespace `dpkg -s`, `command -v ufw`, `sysctl -n`
+# and `systemctl is-active` give wrong answers (the console's
+# Debian-bookworm base doesn't ship those tools, while the host's Ubuntu
+# 24.04 does). Affected checks branch on this and read the host's
+# state.host_services entries (written on the host during bootstrap and
+# by doctor.sh) instead of probing in-container.
+# VIBE_CONTAINER_SENTINEL is a test seam: the federation tests themselves
+# run inside Docker, so they point it at a path that does/doesn't exist
+# to exercise both branches.
+state_in_container() {
+  [[ -f "${VIBE_CONTAINER_SENTINEL:-/.dockerenv}" ]]
+}
+
+# state_get_host_service <slug> <field>
+#   Reads state.host_services.<slug>.<field> (status | at | detail),
+#   the attestation written by state_set_host_service on the host.
+#   Empty string if missing.
+state_get_host_service() { state_get_path "host_services.$1.$2"; }
+
 # state_get_config_kv <key>
 #   Prints state.config[key], or nothing when unset. Non-fatal on a missing
 #   or malformed state file: callers treat "no answer" as "not configured",

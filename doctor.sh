@@ -45,6 +45,8 @@ VIBE_DISK_HISTORY="${VIBE_DISK_HISTORY:-${VIBE_DIR}/data/.disk-history}"
 # shellcheck source=/dev/null
 . "${APPLIANCE_DIR}/lib/log.sh"
 # shellcheck source=/dev/null
+. "${APPLIANCE_DIR}/lib/state.sh"
+# shellcheck source=/dev/null
 . "${APPLIANCE_DIR}/lib/health-probe.sh"
 log_init
 
@@ -130,46 +132,11 @@ _check_fail() { _check_emit fail "$1" "${2:-}"; }
 
 # ---- helpers -----------------------------------------------------------
 
-_state_get() {
-  python3 - "$VIBE_STATE_FILE" "$1" <<'PYEOF'
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        s = json.load(f)
-except Exception:
-    sys.exit(0)
-keys = sys.argv[2].split(".")
-v = s
-for k in keys:
-    if isinstance(v, dict):
-        v = v.get(k)
-    else:
-        v = None
-        break
-if v is None:
-    sys.exit(0)
-print(v)
-PYEOF
-}
-
-# Detect whether doctor.sh is running inside a container vs on the host.
-# /.dockerenv is created by Docker for every container at runtime — the
-# canonical sentinel that's been in place since Docker 1.0. The console
-# spawns this script via `/bin/bash doctor.sh --json` from inside its
-# container; in that namespace `dpkg -s avahi-daemon`, `command -v ufw`,
-# and `systemctl is-active foo` give wrong answers (the console's
-# Debian-bookworm base doesn't ship those tools, while the host's Ubuntu
-# 24.04 does). Affected checks branch on this and read the host's
-# state.host_services entries (written by infra/avahi-up.sh and
-# lib/ufw-rules.sh during bootstrap) instead of probing in-container.
-_in_container() {
-  [[ -f /.dockerenv ]]
-}
-
-# Read state.host_services.<slug>.status. Empty string if missing.
-_host_service_status() { _state_get "host_services.$1.status"; }
-_host_service_at()     { _state_get "host_services.$1.at"; }
-_host_service_detail() { _state_get "host_services.$1.detail"; }
+# Container detection and the host_services readers live in lib/state.sh
+# (state_in_container, state_get_host_service) — shared with
+# lib/sentinel-module.sh, which needs the same branch for its host-prereq
+# checks. _state_get stays as doctor's local shorthand.
+_state_get() { state_get_path "$1"; }
 
 _enabled_slugs() {
   python3 - "$VIBE_STATE_FILE" <<'PYEOF'
@@ -231,7 +198,7 @@ check_host_os() {
   # console image's base OS (Debian bookworm) rather than the actual
   # host. Be honest about it instead — the operator who ran doctor from
   # the admin button shouldn't think they're running on Debian.
-  if _in_container; then
+  if state_in_container; then
     _check_warn "running inside console container — host OS not directly visible from here" \
       "Run from the host shell to see the real host OS:
   sudo /opt/vibe/appliance/doctor.sh"
@@ -423,7 +390,7 @@ check_console_health() {
   # reach Caddy via the published host port through that name. On the
   # host shell, plain 127.0.0.1 works.
   local target="http://127.0.0.1/health"
-  if _in_container; then
+  if state_in_container; then
     # Tailscale mode binds Caddy's published ports to 127.0.0.1 on the
     # HOST (bootstrap's tailscale bind), so host.docker.internal has no
     # listener — probing it from in here false-FAILs every healthy
@@ -707,10 +674,10 @@ check_avahi_status() {
   # infra/avahi-up.sh on the host. Without this branch, the check probes
   # the console container (no avahi installed, no systemd) and produces
   # a false WARN.
-  if _in_container; then
+  if state_in_container; then
     local s ts
-    s="$(_host_service_status avahi)"
-    ts="$(_host_service_at avahi)"
+    s="$(state_get_host_service avahi status)"
+    ts="$(state_get_host_service avahi at)"
     case "$s" in
       active)        _check_pass "active (per state.host_services as of ${ts:-unknown})" ;;
       inactive)      _check_fail "inactive — likely systemd-resolved port-5353 conflict" \
@@ -776,7 +743,7 @@ check_cockpit_reachability() {
   # container has `host.docker.internal:host-gateway` in its extra_hosts
   # (docker-compose.yml), so we can curl Cockpit's host port via that
   # hostname. This is the same channel server.js's probeCockpit() uses.
-  if _in_container; then
+  if state_in_container; then
     local code
     # See check_host_outbound for the `|| echo 000` trap (produces
     # "000000" on connection failure, which then misroutes through
@@ -920,7 +887,7 @@ check_cookie_policy() {
   # In-container: `ufw status` and /etc/ufw/after.rules aren't reachable, so
   # verification would fail closed and read as drift when nothing is wrong.
   # Report the opt-in and defer the verdict to a host-side run.
-  if _in_container; then
+  if state_in_container; then
     _check_warn "cookies opted out of the Secure flag by ${who:-unknown} at ${when:-unknown}; firewall not verifiable from in here" \
       "Diagnose on the host: sudo vibe cookies --status"
     return
@@ -998,10 +965,10 @@ check_ufw_rules() {
   # In-container path — `ufw` binary isn't in the console image and even
   # if it were, it can't read host iptables/nftables state. Defer to
   # state.host_services.ufw written by lib/ufw-rules.sh on the host.
-  if _in_container; then
+  if state_in_container; then
     local s ts
-    s="$(_host_service_status ufw)"
-    ts="$(_host_service_at ufw)"
+    s="$(state_get_host_service ufw status)"
+    ts="$(state_get_host_service ufw at)"
     case "$s" in
       active)        _check_pass "active with rules applied (per state.host_services as of ${ts:-unknown})" ;;
       inactive)      _check_warn "ufw installed but inactive — emergency ports 5171:5198 unprotected" \
