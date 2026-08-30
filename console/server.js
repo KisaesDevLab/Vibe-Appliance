@@ -1059,6 +1059,74 @@ app.disable('x-powered-by');
 // is not published to the host (vibe_net only), so the header can only
 // come from Caddy.
 app.set('trust proxy', 1);
+
+// ----- console-proxied internal apps (BK-10a) --------------------------
+// An appliance-runtime app with `userFacing: false` and no subdomains[]
+// has NO Caddy surface anywhere — lib/render-caddyfile.sh skips it in
+// every renderer, including the LAN catch-alls — because its UI carries
+// no auth of its own. The only way in is through this console's admin
+// auth: each such app is mounted at /admin/apps/<slug>/ and proxied to
+// its manifest's routing.default_upstream over vibe_net. Manifest-driven
+// (no slug branches): vibe-backup is today's only case; the next app of
+// this shape mounts itself by existing.
+//
+// Registered BEFORE express.json(): the proxy streams request bodies
+// verbatim, and a body parser ahead of it would consume the stream and
+// forward empty POSTs.
+function consoleProxiedApp(m) {
+  return !!m
+    && appRuntime(m) === 'appliance'
+    && m.userFacing === false
+    && !(m.subdomains || []).length
+    && !!(m.routing && m.routing.default_upstream);
+}
+const appProxyUrl = (m) => (consoleProxiedApp(m) ? `/admin/apps/${m.slug}/` : null);
+
+app.use('/admin/apps/:slug', requireAdmin, (req, res) => {
+  const m = MANIFESTS[req.params.slug];
+  if (!consoleProxiedApp(m)) {
+    res.status(404).type('text/plain').send('not a console-proxied app\n');
+    return;
+  }
+  // The mount root must carry a trailing slash or the app's relative
+  // URLs ("api/status") resolve against /admin/apps/ and miss.
+  if (req.url === '/' && !req.originalUrl.split('?')[0].endsWith('/')) {
+    res.redirect(308, `/admin/apps/${m.slug}/`);
+    return;
+  }
+  const [upHost, upPort] = m.routing.default_upstream.split(':');
+  const headers = { ...req.headers };
+  // Hop-by-hop headers are ours, not the upstream's; the console's own
+  // basic-auth credential does not leak into an app that must never
+  // learn it.
+  delete headers.authorization;
+  delete headers.connection;
+  delete headers.upgrade;
+  delete headers['keep-alive'];
+  delete headers['proxy-authorization'];
+  headers.host = m.routing.default_upstream;
+  const upstream = http.request(
+    { host: upHost, port: Number(upPort) || 80, method: req.method, path: req.url, headers },
+    (ur) => {
+      res.writeHead(ur.statusCode || 502, ur.headers);
+      ur.pipe(res);
+    },
+  );
+  upstream.setTimeout(120000, () => upstream.destroy(new Error('upstream timeout')));
+  upstream.on('error', (err) => {
+    if (!res.headersSent) {
+      res.status(502).json({
+        error: `${m.displayName} is not answering (${err.code || err.message}). ` +
+               'Is the app enabled and its container running? Diagnose: ' +
+               `sudo docker logs ${m.slug} --tail 50`,
+      });
+    } else {
+      res.destroy();
+    }
+  });
+  req.pipe(upstream);
+});
+
 app.use(express.json({ limit: '64kb' }));
 
 app.get('/health', (_req, res) => {
@@ -1841,19 +1909,29 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
               .filter((sd) => sd && sd.name && sd.name !== m.subdomain && sd.internal !== true)
               .map((sd) => ({ name: sd.name, audience: sd.audience || null }))),
         defaultTag: m.image && m.image.defaultTag,
-        url: appPublicUrl(m, state.config || {}, live),
+        // A console-proxied internal app (userFacing:false, no
+        // subdomains[]) has no Caddy surface: its URL is the console's
+        // own authenticated proxy mount, in every mode. Root-relative on
+        // purpose — the admin UI links it on whatever host the operator
+        // is already using.
+        url: appProxyUrl(m) || appPublicUrl(m, state.config || {}, live),
         // LAN-fallback URL (http://<host_ip>/<prefix>/ via Caddy) — what
         // the app card's "backup" row uses. Caddy-routed; works when
         // mDNS / vibe.local is the failure point.
-        lanFallbackUrl: appLanFallbackUrl(m, state.config || {}),
+        // For a console-proxied app the LAN/tailnet path-prefix URLs
+        // are 404s by design (render-caddyfile's _no_caddy_surface skip)
+        // — advertising them would send the operator to a dead route.
+        // The console proxy above already works from every network the
+        // console itself is reachable on.
+        lanFallbackUrl: consoleProxiedApp(m) ? null : appLanFallbackUrl(m, state.config || {}),
         // Tailnet URL — http://<tailnet-ip>/<prefix>/. Works whenever
         // daemon is Running + mode supports path-prefix routes.
         // Plain HTTP, but inside the encrypted WireGuard tunnel.
-        tailnetUrl:         appTailnetUrl(m, state.config || {}, live),
+        tailnetUrl:         consoleProxiedApp(m) ? null : appTailnetUrl(m, state.config || {}, live),
         // Tailnet HTTPS URL — only when Tailscale Serve has been
         // enabled in the tailnet admin AND `tailscale serve --https`
         // rules are configured on this node.
-        tailnetHostnameUrl: appTailnetHostnameUrl(m, state.config || {}, live),
+        tailnetHostnameUrl: consoleProxiedApp(m) ? null : appTailnetHostnameUrl(m, state.config || {}, live),
         // HAProxy emergency-port URL — Emergency Access panel only.
         // Bypasses Caddy entirely; for the "Caddy is down" failure
         // mode. Has known SPA blank-page limitations per

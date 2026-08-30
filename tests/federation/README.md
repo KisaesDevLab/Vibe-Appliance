@@ -63,12 +63,16 @@ the script fails for that renderer specifically:
 Boots the **real console** against the real manifests and asserts what
 `/api/v1/apps` actually returns for a Sentinel module — Phase D's read path end
 to end, rather than by reading the source. It checks that all nine modules and
-all twelve Vibe apps appear, that `runtime`, `resources`, `hostPrereqs`,
+all thirteen Vibe apps appear, that `runtime`, `resources`, `hostPrereqs`,
 `license`, `harnessGate`, `bootOrder` and `disableRequires` are surfaced, that a
 foreign unit gets no bogus container-inspect result, that a Vibe app is
 unchanged, that each Vibe app card carries its setup-guide URL (a real PDF
 behind admin auth — fetched with credentials it must start with `%PDF`,
-without them it must 401) while a foreign unit claims none, that
+without them it must 401) while a foreign unit claims none, that the
+console proxy for no-Caddy-surface apps (`/admin/apps/<slug>/`, BK-10a) is
+wired and honest (vibe-backup's URL is the proxy mount with no dead
+LAN/tailnet URLs beside it; the route 401s unauthenticated, 404s a normal
+app, and 502s with a diagnostic when the sidecar is down), that
 `/api/v1/admin/status` reports free memory for the resource gate, and that
 the console no longer logs nine env-block warnings per boot.
 

@@ -49,6 +49,15 @@ curl -fsS -u admin:probe-pass "http://127.0.0.1:39117/api/v1/admin/status" -o /t
 curl -fsS -u admin:probe-pass "http://127.0.0.1:39117/guides/vibe-tb.pdf" -o /tmp/guide.pdf 2>/dev/null || true
 curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:39117/guides/vibe-tb.pdf" > /tmp/guide.unauth 2>/dev/null || true
 
+# Console proxy for no-Caddy-surface apps (/admin/apps/<slug>/, BK-10a):
+# unauthenticated → 401; a normal app → 404 (only the userFacing:false +
+# no-subdomains shape is proxied); vibe-backup with no container running
+# in this harness → 502 with a diagnostic, proving the route is wired and
+# honest rather than silently absent.
+curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:39117/admin/apps/vibe-backup/" > /tmp/proxy.unauth 2>/dev/null || true
+curl -s -u admin:probe-pass -o /dev/null -w '%{http_code}' "http://127.0.0.1:39117/admin/apps/vibe-tb/" > /tmp/proxy.wrongapp 2>/dev/null || true
+curl -s -u admin:probe-pass -o /dev/null -w '%{http_code}' "http://127.0.0.1:39117/admin/apps/vibe-backup/api/health" > /tmp/proxy.noupstream 2>/dev/null || true
+
 python3 - <<'PY'
 import json, sys
 apps = json.load(open('/tmp/apps.json'))['apps']
@@ -69,7 +78,7 @@ foreign = [a for a in apps if a.get('runtime', 'appliance') != 'appliance']
 
 print('apps returned: %d  (%d appliance, %d sentinel)' % (len(apps), len(own), len(foreign)))
 check(len(foreign) == 9, 'all nine Sentinel modules present', 'expected 9 sentinel rows, got %d' % len(foreign))
-check(len(own) == 12, 'all twelve Vibe apps present', 'expected 12 vibe rows, got %d' % len(own))
+check(len(own) == 13, 'all thirteen Vibe apps present', 'expected 13 vibe rows, got %d' % len(own))
 
 core = by.get('sentinel-core')
 if not core:
@@ -109,6 +118,28 @@ if tb:
           'a Vibe app still gets its URL', 'vibe-tb url wrong: %r' % tb.get('url'))
     check(tb.get('guide') == '/guides/vibe-tb.pdf',
           'setup guide surfaced', 'vibe-tb guide wrong: %r' % tb.get('guide'))
+
+bk = by.get('vibe-backup')
+if not bk:
+    check(False, '', 'vibe-backup missing from the API')
+else:
+    check(bk.get('url') == '/admin/apps/vibe-backup/',
+          'no-Caddy-surface app URL is the console proxy mount',
+          'vibe-backup url wrong: %r' % bk.get('url'))
+    check(bk.get('lanFallbackUrl') is None and bk.get('tailnetUrl') is None,
+          'no dead LAN/tailnet URLs advertised for it',
+          'vibe-backup lan/tailnet should be null: %r / %r' % (bk.get('lanFallbackUrl'), bk.get('tailnetUrl')))
+    check(bk.get('guide') == '/guides/vibe-backup.pdf',
+          'vibe-backup setup guide surfaced', 'vibe-backup guide wrong: %r' % bk.get('guide'))
+
+for probe, want, label in (('/tmp/proxy.unauth', '401', 'proxy refuses unauthenticated (401)'),
+                           ('/tmp/proxy.wrongapp', '404', 'proxy 404s a normal app'),
+                           ('/tmp/proxy.noupstream', '502', 'proxy answers 502 when the sidecar is down')):
+    try:
+        code = open(probe).read().strip()
+        check(code == want, label, '%s: HTTP %s, wanted %s' % (label, code, want))
+    except Exception as exc:
+        check(False, '', '%s: probe unreadable: %s' % (label, exc))
 
 try:
     head = open('/tmp/guide.pdf', 'rb').read(5)

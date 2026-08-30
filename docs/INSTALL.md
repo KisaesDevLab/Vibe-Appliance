@@ -755,6 +755,15 @@ Run a backup manually before relying on the schedule. Then test a
 restore — to a scratch path, of one file — so you know the recovery
 path actually works.
 
+**Vibe Backup (the app).** The Apps tab also offers **Vibe Backup** —
+the suite's own backup-and-verified-restore system: nightly restic to a
+firm-owned Backblaze B2 bucket with deletion-proof Object Lock, a
+monthly automated restore drill, and a printed Recovery Kit. Enable it
+and follow its card's setup guide. It is the recommended path going
+forward, but its per-app coverage is still rolling out (each Vibe app
+ships its backup contract separately) — so keep the Duplicati job above
+configured as the whole-tree net until the release notes say otherwise.
+
 ---
 
 ## 9. Daily operation

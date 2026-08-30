@@ -187,7 +187,18 @@ test('public subdomains are unique and do not collide with infra hosts', () => {
     // two installers provisioning the same hostname is the real hazard.
     if (data.subdomain === undefined && runtimeOf(data) !== 'appliance') continue;
     assert.ok(data.subdomain, `${file}: an appliance app must declare a subdomain`);
-    claim(data.subdomain, data.slug, 'primary');
+    // The no-Caddy-surface shape (userFacing:false AND no subdomains[])
+    // never has its primary subdomain rendered by ANY renderer —
+    // lib/render-caddyfile.sh::_no_caddy_surface — so the name cannot
+    // collide with anything this appliance serves. vibe-backup declares
+    // "backup" for STANDALONE deployments while the appliance's own
+    // backup.<domain> belongs to Duplicati; both are true at once
+    // precisely because the appliance never emits a vhost for the app.
+    // The exemption is conditioned on the exact same shape the renderer
+    // gates on: give the app a subdomains[] entry or drop
+    // userFacing:false, and this check fires again.
+    const noCaddySurface = data.userFacing === false && !(data.subdomains || []).length;
+    if (!noCaddySurface) claim(data.subdomain, data.slug, 'primary');
     for (const sd of data.subdomains || []) {
       if (sd && sd.name) claim(sd.name, data.slug, 'subdomains[]');
     }

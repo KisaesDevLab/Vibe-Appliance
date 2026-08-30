@@ -1,0 +1,97 @@
+# apps/vibe-backup.yml — Vibe Backup overlay (BK-10a).
+#
+# Two services. The sidecar (KisaesDevLab/Vibe-Backup) is the suite's
+# backup-and-verified-restore system: nightly restic to a firm-owned B2
+# bucket with Object Lock, monthly restore drills, printed Recovery Kit.
+# The socket proxy is its ONLY path to Docker — the raw socket is never
+# mounted into the sidecar (docs/socket-proxy.md in the Vibe-Backup repo
+# holds the endpoint allowlist and threat assessment).
+#
+# NO CADDY SURFACE, ON PURPOSE. The sidecar's UI authenticates nobody.
+# The manifest's userFacing:false + no subdomains[] is the appliance's
+# "no Caddy surface" contract (lib/render-caddyfile.sh skips it in every
+# renderer, including the LAN catch-alls), and port 4000 is never
+# published to the host. The one way in is the console's authenticated
+# proxy at /admin/apps/vibe-backup/ (console/server.js).
+#
+# NO SHARED ENV FILES. Unlike other apps this one gets ONLY its own env
+# file: it needs no shared secrets (Postgres dumps exec INSIDE the
+# vibe-postgres container, where the credentials already live), and a
+# backup process should hold the minimum it needs.
+#
+# COVERAGE TODAY, honestly: Postgres cluster globals + state.json every
+# night, plus each app's databases and key material AS the app repos ship
+# their .vibe-backup module contracts (Vibe-Backup phase BK-2b, a
+# cross-repo fan-out that has not happened yet). /opt/vibe/env and the
+# Caddy cert store are root-600 and this container is non-root by
+# upstream policy (BK-1), so they are NOT captured yet — open question
+# with the Vibe-Backup repo (its QUESTIONS.md); keep Duplicati's
+# whole-tree backup configured until that closes. The sidecar itself
+# keeps running when the stack it protects is broken — that is why it
+# depends on nothing.
+
+name: vibe
+
+services:
+  vibe-backup:
+    image: ghcr.io/kisaesdevlab/vibe-backup:${APP_TAG:-latest}
+    container_name: vibe-backup
+    restart: unless-stopped
+    env_file:
+      - /opt/vibe/env/vibe-backup.env
+    volumes:
+      # state.json, secrets, staging, drill scratch. Losing it loses the
+      # activation gate and generation bookkeeping (recoverable from the
+      # printed kit, but noisy). enable-app.sh chowns this to the image's
+      # runtime uid (65532) like every other app data dir.
+      - /opt/vibe/data/apps/vibe-backup/state:/var/lib/vibe-backup
+      # Read-only view of the appliance tree for EXTRA_PATHS capture.
+      # A directory mount, never a file mount: state.json is replaced
+      # atomically (new inode) on every write, and a file bind-mount
+      # would freeze on the original inode — same trap documented for
+      # the Caddyfile in docker-compose.yml.
+      - /opt/vibe:/host/vibe:ro
+    networks:
+      - vibe_net             # console proxy + health probe reach it here
+      - vibe_backup_socket   # its route to the socket proxy
+    # A backup or drill interrupted mid-run is safe (restic snapshots are
+    # atomic; staging is redone), but give in-flight uploads a moment.
+    stop_grace_period: 30s
+    # No compose healthcheck: the image is FROM scratch — there is no
+    # shell or curl to exec. Health gating happens through the appliance
+    # convention instead: lib/health-probe.sh curls the manifest's
+    # /api/health from the console container over vibe_net.
+
+  # Filtered Docker API for the sidecar. linuxserver's socket-proxy (a
+  # maintained tecnativa fork; lscr.io is already this appliance's
+  # registry for Duplicati). The grants below are exactly the allowlist
+  # in Vibe-Backup docs/socket-proxy.md: discovery + inspect, exec-based
+  # dumps/hooks/canaries, archive capture, and the ephemeral drill
+  # database's create/start/stop/delete + image pull. Everything else
+  # (networks, volumes, swarm, system, build, events) stays denied.
+  vibe-backup-socket-proxy:
+    image: lscr.io/linuxserver/socket-proxy:latest
+    container_name: vibe-backup-socket-proxy
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /run
+    environment:
+      - CONTAINERS=1
+      - EXEC=1
+      - IMAGES=1
+      - POST=1
+      - ALLOW_START=1
+      - ALLOW_STOP=1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      # The private network ONLY. On vibe_net, every app container could
+      # reach docker.sock through this proxy — root-equivalent on the
+      # stack. Isolation is the point of the second network.
+      - vibe_backup_socket
+
+networks:
+  # Sidecar <-> socket proxy only. internal: no host egress from it.
+  vibe_backup_socket:
+    internal: true

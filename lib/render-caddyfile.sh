@@ -113,6 +113,19 @@ def _emergency_port(manifest):
     return None
 
 
+def _no_caddy_surface(manifest):
+    """`userFacing: false` AND no subdomains[] — an app with NO operator
+    surface Caddy should serve, anywhere. The public vhost renderers have
+    always skipped this shape; since vibe-backup it also excludes the
+    LAN-gated catch-alls: that sidecar's UI authenticates NOBODY (its one
+    way in is the console's authenticated proxy at /admin/apps/<slug>/),
+    so a LAN path mount would hand the office network an unauthenticated
+    backup-restore control panel. Cross-app callers were never routed
+    through Caddy for these apps anyway — they use container DNS on
+    vibe_net."""
+    return manifest.get("userFacing") is False and not (manifest.get("subdomains") or [])
+
+
 def deny_path_lines(manifest, indent, matcher_prefix=""):
     """Emit `handle` blocks that 404 the manifest's routing.deny_paths.
 
@@ -393,15 +406,16 @@ def render_domain_app_vhost(domain, tunnel_subdomain, enabled, tls_internal=Fals
     served by Caddy:443 but never registered with the tunnel ingress —
     reachable from LAN (split DNS to the host IP) or Tailscale only.
 
-    userFacing=false apps (e.g. vibe-glm-ocr) are also excluded from this
-    public vhost. They're internal services consumed server-to-server
-    over vibe_net by other Vibe apps — exposing them via Caddy would
-    publish unauthenticated inference / OCR / etc. endpoints to the
-    internet. Cross-app callers reach them by container DNS
-    (`http://vibe-glm-ocr:8090`) directly, not via Caddy, so dropping
-    the public path handler doesn't break the integration. The
-    LAN-gated :80 catch-all (rendered separately below in main()) still
-    includes these apps for on-host admin debugging.
+    userFacing=false apps (e.g. vibe-backup) are also excluded from this
+    public vhost. They're internal services with no auth of their own —
+    exposing them via Caddy would publish unauthenticated backup /
+    inference / etc. endpoints to the internet. Cross-app callers reach
+    them by container DNS (`http://vibe-backup:4000`) directly, not via
+    Caddy, so dropping the public path handler doesn't break the
+    integration. Since vibe-backup, the LAN-gated :80 catch-alls exclude
+    them too (see _no_caddy_surface): an unauthenticated restore panel
+    on the office LAN is not "admin debugging". Operators reach such an
+    app through the console's authenticated /admin/apps/<slug>/ proxy.
 
     tls_internal: see render_apex_vhost.
     """
@@ -1116,7 +1130,8 @@ def main():
         if routing_mode == "subdomain-per-app":
             app_path_blocks = ""
         else:
-            path_mountable = [(s, m) for s, m in enabled if not root_served_only(m)]
+            path_mountable = [(s, m) for s, m in enabled
+                              if not root_served_only(m) and not _no_caddy_surface(m)]
             app_path_blocks = "\n".join(
                 render_path_handler(slug, m) for slug, m in path_mountable
             ) if path_mountable else ""
@@ -1133,8 +1148,11 @@ def main():
         # HAProxy and UFW-gated to the same LAN/tailnet audience this
         # catch-all serves. A comment marks them so an operator reading
         # the rendered Caddyfile isn't left wondering.
-        path_mountable = [(s, m) for s, m in enabled if not root_served_only(m)]
+        path_mountable = [(s, m) for s, m in enabled
+                          if not root_served_only(m) and not _no_caddy_surface(m)]
         root_only = [(s, m) for s, m in enabled if root_served_only(m)]
+        no_surface = [(s, m) for s, m in enabled
+                      if _no_caddy_surface(m) and not root_served_only(m)]
         app_path_blocks = "\n".join(
             render_path_handler(slug, m) for slug, m in path_mountable
         ) if path_mountable else "\t# (no path-mountable apps enabled yet)"
@@ -1144,6 +1162,12 @@ def main():
             app_path_blocks += (
                 f"\n\t# {slug} — rootServedOnly: served at the root of "
                 f"{where}, not under a path prefix."
+            )
+        for slug, m in no_surface:
+            app_path_blocks += (
+                f"\n\t# {slug} — no Caddy surface (its UI has no auth of its "
+                f"own): reached only via the console's authenticated proxy "
+                f"at /admin/apps/{slug}/."
             )
         infra_path_blocks = "\n".join(
             render_infra_path_handler(s) for s in INFRA_SERVICES
