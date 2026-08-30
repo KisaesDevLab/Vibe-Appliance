@@ -190,18 +190,28 @@ _sm_check_host_prereqs() { # <slug> -> 0 ok, 1 unmet
   local manifest; manifest="$(_sm_manifest "$1")"
   local reqs; reqs="$(_sm_field "$manifest" 'chr(10).join(data.get("hostPrereqs") or [])')"
   [[ -n "$reqs" ]] || return 0
-  local unmet="" r key want have
+  local unmet="" r key want have pth s ts
   while IFS= read -r r; do
     r="${r%%[![:print:]]*}"
     [[ -n "$r" ]] || continue
     case "$r" in
       sysctl:*)
         key="${r#sysctl:}"; want="${key##*>=}"; key="${key%%>=*}"; key="${key%%=*}"
-        have="$(sysctl -n "$key" 2>/dev/null || echo 0)"
-        if [[ "$have" =~ ^[0-9]+$ ]] && (( have >= want )); then
+        # Read /proc/sys directly, not the sysctl binary. The console
+        # container (where the Enable button runs this) ships no procps,
+        # and `sysctl -n ... || echo 0` conflated "no probe" with "0" —
+        # it reported vm.max_map_count=0 on a host whose real value was
+        # 262144. vm.max_map_count is not namespaced, so /proc/sys is the
+        # host's real value from either side, with no tool dependency.
+        pth="/proc/sys/${key//.//}"
+        have=""
+        if [[ -r "$pth" ]]; then IFS= read -r have <"$pth" || true; fi
+        if [[ ! "$have" =~ ^[0-9]+$ ]]; then
+          unmet+=$'\n'"  $r  (currently: unknown — cannot read ${pth} from here)  verify on the host: sysctl -n ${key}"
+        elif (( have >= want )); then
           log_ok "prereq ok: $key=$have (needs >= $want)"
         else
-          unmet+=$'\n'"  $r  (currently: ${have:-unset})  fix: sudo sysctl -w ${key}=${want} && echo '${key}=${want}' | sudo tee -a /etc/sysctl.d/99-vibe-sentinel.conf"
+          unmet+=$'\n'"  $r  (currently: ${have})  fix: sudo sysctl -w ${key}=${want} && echo '${key}=${want}' | sudo tee -a /etc/sysctl.d/99-vibe-sentinel.conf"
         fi
         ;;
       kernel:*)
@@ -222,14 +232,38 @@ _sm_check_host_prereqs() { # <slug> -> 0 ok, 1 unmet
         ;;
       pkg:*)
         key="${r#pkg:}"
-        if command -v "$key" >/dev/null 2>&1 || dpkg -s "$key" >/dev/null 2>&1; then
+        # Host-only probe: the container has its own dpkg database
+        # (Debian bookworm), so asking it about the host's packages
+        # answers for the wrong OS. In-container, read the attestation
+        # preflight_sentinel_host_prereqs wrote on the host — and when
+        # there is none, say "cannot verify", never a fabricated verdict.
+        if state_in_container; then
+          s="$(state_get_host_service "pkg:${key}" status)"
+          ts="$(state_get_host_service "pkg:${key}" at)"
+          case "$s" in
+            installed) log_ok "prereq ok: $key installed (per state.host_services as of ${ts:-unknown})" ;;
+            missing)   unmet+=$'\n'"  $r  (missing per state.host_services as of ${ts:-unknown})  fix: sudo apt-get install -y $key  — then refresh the attestation: sudo bash /opt/vibe/appliance/doctor.sh" ;;
+            *)         unmet+=$'\n'"  $r  (cannot verify from the console container — no host_services entry)  fix: sudo bash /opt/vibe/appliance/doctor.sh on the host records it; a re-run of bootstrap does too" ;;
+          esac
+        elif command -v "$key" >/dev/null 2>&1 || dpkg -s "$key" >/dev/null 2>&1; then
           log_ok "prereq ok: $key installed"
         else
           unmet+=$'\n'"  $r  fix: sudo apt-get install -y $key"
         fi
         ;;
       timesync)
-        if timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes \
+        # Host-only probe: no systemd inside the container, so
+        # timedatectl/systemctl cannot answer there. Same attestation
+        # branch as pkg:.
+        if state_in_container; then
+          s="$(state_get_host_service timesync status)"
+          ts="$(state_get_host_service timesync at)"
+          case "$s" in
+            active)   log_ok "prereq ok: time synchronised (per state.host_services as of ${ts:-unknown})" ;;
+            inactive) unmet+=$'\n'"  timesync  (inactive per state.host_services as of ${ts:-unknown})  fix: sudo systemctl enable --now systemd-timesyncd  — then refresh the attestation: sudo bash /opt/vibe/appliance/doctor.sh" ;;
+            *)        unmet+=$'\n'"  timesync  (cannot verify from the console container — no host_services entry)  fix: sudo bash /opt/vibe/appliance/doctor.sh on the host records it; a re-run of bootstrap does too" ;;
+          esac
+        elif timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes \
            || systemctl is-active --quiet systemd-timesyncd 2>/dev/null \
            || systemctl is-active --quiet chrony 2>/dev/null; then
           log_ok "prereq ok: time synchronised"

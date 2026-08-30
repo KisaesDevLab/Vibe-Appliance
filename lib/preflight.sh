@@ -479,6 +479,76 @@ preflight_https_soft() {
   return 0
 }
 
+# ---- Sentinel host-prereq attestation ----------------------------------
+# Not a gate: records host truth for probes that cannot run inside the
+# console container. The dpkg database and systemd's timesync state
+# belong to the host OS — the console's Debian-bookworm namespace answers
+# for the wrong system — so lib/sentinel-module.sh's pre-flight (spawned
+# in-container by the Enable button) reads these state.host_services
+# entries instead of probing.
+#
+# Which prereqs to attest comes from the Sentinel manifests themselves
+# (hostPrereqs, per console/manifest.schema.json) — no hardcoded package
+# list. sysctl:* needs no attestation (/proc/sys is not namespaced, so
+# the container reads the host's real value) and kernel:* reads the
+# shared kernel; only pkg:* and timesync are host-only.
+#
+# Runs on the host as root: bootstrap phase 1, and doctor.sh refreshes it
+# so an operator who just installed a package is not stuck with a stale
+# verdict until the next full bootstrap. Each entry carries state.sh's
+# `at` timestamp, which the in-container reader prints with its verdict.
+# Always returns 0.
+preflight_sentinel_host_prereqs() {
+  local mdir="${APPLIANCE_DIR:-/opt/vibe/appliance}/console/manifests"
+  [[ -d "$mdir" ]] || return 0
+  local reqs
+  reqs="$(python3 - "$mdir" <<'PYEOF' 2>/dev/null
+import json, os, sys
+mdir = sys.argv[1]
+seen = []
+for f in sorted(os.listdir(mdir)):
+    if not f.endswith(".json"):
+        continue
+    try:
+        with open(os.path.join(mdir, f), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        continue
+    if data.get("runtime") != "sentinel":
+        continue
+    for r in data.get("hostPrereqs") or []:
+        if isinstance(r, str) and r not in seen:
+            seen.append(r)
+print("\n".join(seen))
+PYEOF
+)"
+  [[ -n "$reqs" ]] || return 0
+  local r key
+  while IFS= read -r r; do
+    [[ -n "$r" ]] || continue
+    case "$r" in
+      pkg:*)
+        key="${r#pkg:}"
+        if command -v "$key" >/dev/null 2>&1 || dpkg -s "$key" >/dev/null 2>&1; then
+          state_set_host_service "pkg:${key}" installed
+        else
+          state_set_host_service "pkg:${key}" missing
+        fi
+        ;;
+      timesync)
+        if timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes \
+           || systemctl is-active --quiet systemd-timesyncd 2>/dev/null \
+           || systemctl is-active --quiet chrony 2>/dev/null; then
+          state_set_host_service timesync active
+        else
+          state_set_host_service timesync inactive
+        fi
+        ;;
+    esac
+  done <<< "$reqs"
+  return 0
+}
+
 # ---- aggregator --------------------------------------------------------
 # Run every check. Return 0 if all PASSED (including WARN), non-zero with
 # the count of FAILED checks otherwise. Bootstrap exits on a non-zero
@@ -515,6 +585,11 @@ preflight_run_all() {
     preflight_https_soft api.anthropic.com  https://api.anthropic.com/
     preflight_https_soft deb.nodesource.com https://deb.nodesource.com/
   fi
+
+  # Phase D federation — attest the Sentinel host prereqs (pkg:*/timesync)
+  # into state.host_services while we're on the host, where dpkg and
+  # systemd answer truthfully. Not a gate; never adds to $errors.
+  preflight_sentinel_host_prereqs
 
   return "$errors"
 }

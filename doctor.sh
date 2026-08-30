@@ -2,9 +2,12 @@
 # doctor.sh — Vibe Appliance post-install diagnostic runner.
 #
 # Idempotency: doctor is read-only. Running it 100 times in a row
-#   never modifies host state. The single side effect is appending one
-#   line to /opt/vibe/data/.disk-history for the disk-trend check, and
-#   that file is bounded to ~30 days of entries.
+#   never modifies host state, with two bounded side effects: it appends
+#   one line to /opt/vibe/data/.disk-history for the disk-trend check
+#   (bounded to ~30 days of entries), and — on the host, as root, when
+#   state.json exists — it refreshes the Sentinel host-prereq attestation
+#   in state.host_services (preflight_sentinel_host_prereqs; records the
+#   current truth, so re-running converges).
 # Reverse: none needed.
 #
 # Two output modes:
@@ -46,6 +49,8 @@ VIBE_DISK_HISTORY="${VIBE_DISK_HISTORY:-${VIBE_DIR}/data/.disk-history}"
 . "${APPLIANCE_DIR}/lib/log.sh"
 # shellcheck source=/dev/null
 . "${APPLIANCE_DIR}/lib/state.sh"
+# shellcheck source=/dev/null
+. "${APPLIANCE_DIR}/lib/preflight.sh"
 # shellcheck source=/dev/null
 . "${APPLIANCE_DIR}/lib/health-probe.sh"
 log_init
@@ -1009,6 +1014,17 @@ check_ufw_rules() {
 # ---- main --------------------------------------------------------------
 
 _human_out "$(printf '\n%s===== Vibe Appliance — doctor =====%s\n' "${_C_BOLD:-}" "${_C_RESET:-}")"
+
+# Refresh the Sentinel host-prereq attestation (state.host_services
+# pkg:*/timesync entries) while doctor is on the host, where dpkg and
+# systemd answer truthfully. Without this, the only refresh after an
+# operator installs a missing package would be a full re-bootstrap.
+# Host + root only (state.json is root-owned); an in-container doctor is
+# the consumer of this data, not the producer. Gated on state.json
+# existing so doctor on an un-bootstrapped host stays write-free.
+if ! state_in_container && [[ "${EUID:-$(id -u)}" -eq 0 && -f "$VIBE_STATE_FILE" ]]; then
+  preflight_sentinel_host_prereqs || true
+fi
 
 check_host_os
 check_host_disk
