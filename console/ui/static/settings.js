@@ -1836,8 +1836,9 @@ const SETTINGS_JS_VERSION = '2026-07-30-tunnel-scope-and-rootserved-urls';
       body.appendChild(el('p', { class: 'help', style: 'color:var(--bad);' }, [
         '✗ Switch failed: ' + _friendlyError(err),
       ]));
-      // Re-render fresh so the operator can retry.
-      setTimeout(() => loadNetworkMode(section), 1500);
+      // Re-render fresh so the operator can retry — after long enough
+      // to actually read the error.
+      setTimeout(() => loadNetworkMode(section), 8000);
       return;
     }
 
@@ -1891,7 +1892,13 @@ const SETTINGS_JS_VERSION = '2026-07-30-tunnel-scope-and-rootserved-urls';
       el('summary', { class: 'help', style: 'cursor:pointer;color:var(--bad);' }, ['Show error']),
       el('pre', { class: 'maintenance__output' }, [data.error || JSON.stringify(data, null, 2)]),
     ]));
-    setTimeout(() => loadNetworkMode(section), 3000);
+    // NEVER auto-repaint over a DEGRADED/recovery screen — those manual
+    // recovery instructions are the operator's only copy, and erasing
+    // them after 3 seconds left a novice with a broken appliance and no
+    // visible next step. Plain failures repaint after a readable pause.
+    if (!data.degraded && !data.recovery) {
+      setTimeout(() => loadNetworkMode(section), 15000);
+    }
   }
 
   function renderCloudflareTunnelSection(host) {
@@ -5055,13 +5062,17 @@ const SETTINGS_JS_VERSION = '2026-07-30-tunnel-scope-and-rootserved-urls';
         html = `<strong>DEGRADED.</strong> Both the save and the rollback failed health-check. ` +
                `Snapshot at ${escapeHtml(data.snapshot || 'unknown')}. Manual recovery may be required — see /opt/vibe/logs/.`;
         break;
-      default:
+      default: {
         // 409s from the appliance's operation locks put their guidance
         // ("wait for the running action…") in `detail` — without it the
-        // operator gets a dead-end "operation in progress".
-        html = `<strong>Error:</strong> ${escapeHtml(data.reason || data.detail || data.error || 'unknown')}` +
-               (data.detail && data.error && data.detail !== data.error
+        // operator gets a dead-end "operation in progress". Summary
+        // first, guidance appended once (never doubled).
+        const mainLine = data.reason || data.error || data.detail || 'unknown';
+        html = `<strong>Error:</strong> ${escapeHtml(mainLine)}` +
+               (data.detail && data.detail !== mainLine
                  ? `<br>${escapeHtml(data.detail)}` : '');
+        break;
+      }
     }
     resultEl.innerHTML = html;
   }

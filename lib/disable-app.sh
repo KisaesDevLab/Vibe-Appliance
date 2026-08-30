@@ -146,6 +146,12 @@ _overlay_services() {
   compose_files;         _core_f=( "${COMPOSE_FILES[@]}" )
   all_svc="$(docker compose "${_all_f[@]}" config --services 2>/dev/null | sort -u)"
   core_svc="$(docker compose "${_core_f[@]}" config --services 2>/dev/null | sort -u)"
+  # Same guard as the enable-app.sh twin: if the CORE list came back
+  # empty (docker CLI OOM-killed, dockerd mid-restart), the subtraction
+  # would emit every merged service — and this list feeds a destructive
+  # `compose stop` that would take down shared Postgres/Caddy/Redis and
+  # the console itself. Empty output makes the caller die harmlessly.
+  [[ -n "$all_svc" && -n "$core_svc" ]] || return 0
   comm -23 <(printf '%s\n' "$all_svc") <(printf '%s\n' "$core_svc") | tr '\n' ' '
 }
 

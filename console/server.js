@@ -843,10 +843,18 @@ async function ddnsUpdateCycle(force = false) {
     results[host] = await ddnsUpdateOne(host, cfg.domain, cfg.password, ip);
   }
 
-  ddnsState.last_ip        = ip;
   ddnsState.last_update_ts = new Date().toISOString();
   ddnsState.last_results   = results;
-  ddnsState.last_error     = null;
+  const failedHosts = Object.entries(results).filter(([, r]) => !r.ok).map(([h]) => h);
+  if (failedHosts.length === 0) {
+    ddnsState.last_ip    = ip;
+    ddnsState.last_error = null;
+  } else {
+    // Do NOT record last_ip: the same-IP short-circuit would then skip
+    // every retry for as long as the ISP keeps this IP, leaving the
+    // failed records stale for weeks while the UI said ok.
+    ddnsState.last_error = `update failed for ${failedHosts.length} host(s): ${failedHosts.join(', ')}`;
+  }
 
   const okCount = Object.values(results).filter(r => r.ok).length;
   log('info', 'ddns: cycle complete', {
@@ -937,9 +945,34 @@ function verifyAdminPassword(supplied) {
 // basic auth. Used by requireAdmin (which adds the 401 challenge) and
 // by public-with-admin-preview routes (/tools/:id on a hidden tool)
 // where a 401 challenge would be wrong for ordinary visitors.
+// Failed-attempt throttle, checked BEFORE the password verify: after a
+// rotation, every wrong-password attempt runs a synchronous scrypt
+// (~50-100ms of event-loop CPU), so an unauthenticated client looping
+// junk Basic headers could both brute-force unbounded and freeze the
+// admin UI. 20 failures per source IP per minute, then refuse cheaply.
+const AUTH_FAILS = new Map(); // ip -> { count, resetAt }
+function authThrottled(ip) {
+  const now = Date.now();
+  const rec = AUTH_FAILS.get(ip);
+  if (!rec || now > rec.resetAt) return false;
+  return rec.count >= 20;
+}
+function recordAuthFailure(ip) {
+  const now = Date.now();
+  const rec = AUTH_FAILS.get(ip);
+  if (!rec || now > rec.resetAt) {
+    AUTH_FAILS.set(ip, { count: 1, resetAt: now + 60 * 1000 });
+  } else {
+    rec.count += 1;
+  }
+  if (AUTH_FAILS.size > 10000) AUTH_FAILS.clear(); // memory cap
+}
+
 function hasAdminCreds(req) {
   const header = req.headers.authorization || '';
   if (!header.toLowerCase().startsWith('basic ')) return false;
+  const ip = req.ip || 'unknown';
+  if (authThrottled(ip)) return false;
   let decoded;
   try {
     decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
@@ -951,6 +984,7 @@ function hasAdminCreds(req) {
   const user = decoded.slice(0, sep);
   const pass = decoded.slice(sep + 1);
   if (!constantTimeStringEquals(user, ADMIN_USER) || !verifyAdminPassword(pass)) {
+    recordAuthFailure(ip);
     log('warn', 'admin auth failed', { user });
     return false;
   }
@@ -1910,8 +1944,9 @@ app.post('/api/v1/update/check', requireAdmin, testRateLimit, async (_req, res) 
   // A check writes update_available flags into state.json while an
   // in-flight lifecycle script may be mid-rewrite of the same entries;
   // it is also instantly re-runnable, so refusing is cheap and honest.
-  if (refuseIfBusy(res, 'Wait for it to finish, then re-check.')) return;
-  await runShell(res, [UPDATE_SCRIPT, '--check'], 'update-check');
+  if (!acquireGlobalLock('update check', res)) return;
+  await runShell(res, [UPDATE_SCRIPT, '--check'], 'update-check', {},
+                 releaseGlobalLock);
 });
 
 // Reclaim disk by removing images not referenced by any container
@@ -3087,10 +3122,19 @@ const _DAEMON_TTL_MS = 10 * 1000;
 const _EMPTY_DAEMON = { backendState: null, hostname: null, ip: null, serve_configured: false };
 let _daemonCache = { value: { ..._EMPTY_DAEMON }, ts: 0 };
 
+let _daemonInflight = null;
 async function _liveTailscaleState() {
   if (Date.now() - _daemonCache.ts < _DAEMON_TTL_MS) {
     return _daemonCache.value;
   }
+  // Coalesce: the unauthenticated landing API can trigger this, and N
+  // concurrent cache misses would spawn N parallel docker probes on a
+  // 1vcpu droplet. Everyone awaits the one in flight.
+  if (_daemonInflight) return _daemonInflight;
+  _daemonInflight = _liveTailscaleStateUncached().finally(() => { _daemonInflight = null; });
+  return _daemonInflight;
+}
+async function _liveTailscaleStateUncached() {
   const probe = await tsHost('status', '--json');
   const out = { ..._EMPTY_DAEMON };
   if (probe.code === 0) {
@@ -3233,7 +3277,7 @@ const NETWORK_MODES_SET = new Set(NETWORK_MODES);
 // the auth key.
 const TAILSCALE_AUTHKEY_RE = /^tskey-(auth|client)-[A-Za-z0-9-]{10,200}$/;
 
-app.post('/api/v1/admin/tailscale/connect', requireAdmin, testRateLimit, async (req, res) => {
+app.post('/api/v1/admin/tailscale/connect', requireAdmin, testRateLimit, globalOp('Tailscale connect'), async (req, res) => {
   const body = req.body || {};
   const authKey = typeof body.authKey === 'string' ? body.authKey.trim() : '';
   // Empty body = "use the AUTHKEY already in appliance.env" (retry path).
@@ -3308,7 +3352,7 @@ app.post('/api/v1/admin/tailscale/connect', requireAdmin, testRateLimit, async (
 });
 
 // Disconnect from the tailnet. No body.
-app.post('/api/v1/admin/tailscale/disconnect', requireAdmin, testRateLimit, async (_req, res) => {
+app.post('/api/v1/admin/tailscale/disconnect', requireAdmin, testRateLimit, globalOp('Tailscale disconnect'), async (_req, res) => {
   log('info', 'tailscale logout (panel)', {});
   const result = await tsHost('logout');
   // tailscale logout exits non-zero when not logged in — treat as
@@ -3377,7 +3421,7 @@ app.post('/api/v1/admin/tailscale/update', requireAdmin, testRateLimit, async (_
 // Full uninstall: logout, reset serve, stop+disable daemon, apt-remove
 // package, remove apt source + keyring, clear appliance.env keys, flip
 // state.config.tailscale=false. Reversible by clicking Install again.
-app.post('/api/v1/admin/tailscale/uninstall', requireAdmin, testRateLimit, async (_req, res) => {
+app.post('/api/v1/admin/tailscale/uninstall', requireAdmin, testRateLimit, globalOp('Tailscale uninstall'), async (_req, res) => {
   // First the docker-image-driven logout + serve reset (the daemon is
   // still running at this point, so we use the host's tailscale via
   // the socket — same path as /disconnect).
@@ -3412,7 +3456,7 @@ app.post('/api/v1/admin/tailscale/uninstall', requireAdmin, testRateLimit, async
 // updates immediately at Tailscale's edge.
 const TAILSCALE_HOSTNAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
-app.post('/api/v1/admin/tailscale/hostname', requireAdmin, testRateLimit, async (req, res) => {
+app.post('/api/v1/admin/tailscale/hostname', requireAdmin, testRateLimit, globalOp('Tailscale hostname change'), async (req, res) => {
   const body = req.body || {};
   const hostname = typeof body.hostname === 'string' ? body.hostname.trim().toLowerCase() : '';
   if (!hostname || !TAILSCALE_HOSTNAME_RE.test(hostname)) {
@@ -3771,12 +3815,12 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, globa
       rerender.total = enabledSlugs.length;
       for (const slug of enabledSlugs) {
         const r = await new Promise((resolve) => {
-          const child = spawn('/bin/bash',
+          const child = trackChild(spawn('/bin/bash',
             [path.join(APPLIANCE_DIR, 'lib', 'enable-app.sh'), slug],
             {
               env: { ...process.env, APPLIANCE_DIR, VIBE_DIR, NO_COLOR: '1' },
               stdio: ['ignore', 'pipe', 'pipe'],
-            });
+            }));
           let stderr = '';
           child.stderr.on('data', d => { stderr += d.toString(); });
           child.on('exit', code => resolve({ code, stderr }));
@@ -3983,6 +4027,12 @@ app.post('/api/v1/update/:slug', requireAdmin, testRateLimit, async (req, res) =
   const slug = req.params.slug;
   if (!SLUG_RE.test(slug)) return res.status(400).json({ error: 'invalid slug' });
   if (!MANIFESTS[slug])    return res.status(404).json({ error: 'unknown app' });
+  if (appRuntime(MANIFESTS[slug]) !== 'appliance') {
+    return res.status(409).json({
+      error: 'not updatable here',
+      detail: `${slug} is a '${appRuntime(MANIFESTS[slug])}' unit — its own installer owns updates (harness-gated). This appliance only lists it.`,
+    });
+  }
   if (!acquireSlugLock(slug, 'update', res)) return;
   await runShell(res, [UPDATE_SCRIPT, slug], 'update', { slug },
                  () => releaseSlugLock(slug));
@@ -3992,6 +4042,12 @@ app.post('/api/v1/update/:slug/rollback', requireAdmin, testRateLimit, async (re
   const slug = req.params.slug;
   if (!SLUG_RE.test(slug)) return res.status(400).json({ error: 'invalid slug' });
   if (!MANIFESTS[slug])    return res.status(404).json({ error: 'unknown app' });
+  if (appRuntime(MANIFESTS[slug]) !== 'appliance') {
+    return res.status(409).json({
+      error: 'not updatable here',
+      detail: `${slug} is a '${appRuntime(MANIFESTS[slug])}' unit — its own installer owns updates and rollbacks.`,
+    });
+  }
   if (!acquireSlugLock(slug, 'rollback', res)) return;
   await runShell(res, [UPDATE_SCRIPT, slug, '--rollback'], 'rollback', { slug },
                  () => releaseSlugLock(slug));
@@ -5866,10 +5922,10 @@ async function containerRunning(name) {
 
 async function runShell(res, args, action, extra = {}, onDone) {
   log('info', 'spawn shell', { action, ...extra });
-  const child = spawn('/bin/bash', args, {
+  const child = trackChild(spawn('/bin/bash', args, {
     env: { ...process.env, APPLIANCE_DIR, VIBE_DIR, NO_COLOR: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  }));
   // Fired exactly once when the child is finished with, however it ends
   // ('error' without 'exit', or both). Callers use it to release locks;
   // the once-guard keeps a late 'exit' after an 'error' from releasing a
@@ -5925,14 +5981,27 @@ const SLUG_LOCKS = new Map(); // slug -> { action, since: epoch ms }
 // Caddyfile ships or a mid-update image gets pruned.
 let GLOBAL_LOCK = null; // { action, since } | null
 
+// Count of console-spawned script children currently alive. The lock
+// expiry below must never fire while a guarded script is still running —
+// that would re-admit the interleaving the lock exists to prevent.
+let ACTIVE_CHILDREN = 0;
+function trackChild(child) {
+  ACTIVE_CHILDREN += 1;
+  let done = false;
+  const finish = () => { if (!done) { done = true; ACTIVE_CHILDREN = Math.max(0, ACTIVE_CHILDREN - 1); } };
+  child.on('exit', finish);
+  child.on('error', finish);
+  return child;
+}
+
 // The one accessor every gate uses. Self-expires a lock held past 45
-// minutes: a leak (client disconnect mid-script, a killed console child)
-// must not require the novice operator to run a terminal command before
-// any button works again. 45 min comfortably exceeds every guarded
-// script's worst case.
+// minutes ONLY when no console-spawned script child is alive: a leak
+// (client disconnect mid-script, a crashed handler) must not require
+// the novice operator to run a terminal command before any button works
+// again — but a legitimately slow guarded script keeps its lock.
 function globalLockHeld() {
   if (!GLOBAL_LOCK) return null;
-  if (Date.now() - GLOBAL_LOCK.since > 45 * 60 * 1000) {
+  if (ACTIVE_CHILDREN === 0 && Date.now() - GLOBAL_LOCK.since > 45 * 60 * 1000) {
     log('warn', 'expiring stale global lock', { action: GLOBAL_LOCK.action });
     GLOBAL_LOCK = null;
     return null;
@@ -6095,7 +6164,7 @@ async function runToggle(req, res, script, action, extraEnv) {
 
   let stdout = '';
   let stderr = '';
-  const child = spawn('/bin/bash', [script, slug], {
+  const child = trackChild(spawn('/bin/bash', [script, slug], {
     env: {
       ...process.env,
       APPLIANCE_DIR,
@@ -6108,7 +6177,7 @@ async function runToggle(req, res, script, action, extraEnv) {
       // Inherit DOCKER_HOST etc. from compose; the socket is mounted.
     },
     stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  }));
   child.stdout.on('data', (d) => { stdout += d.toString(); });
   child.stderr.on('data', (d) => { stderr += d.toString(); });
 
@@ -6666,18 +6735,25 @@ function runUpdateCheckBackground() {
     log('info', 'background update check skipped — appliance busy');
     return;
   }
+  // Hold the global lock for the child's whole life — the check writes
+  // state.json flags an enable started seconds later would race.
+  GLOBAL_LOCK = { action: 'background update check', since: Date.now() };
   log('info', 'background update check starting');
-  const child = spawn('/bin/bash', [UPDATE_SCRIPT, '--check'], {
+  const child = trackChild(spawn('/bin/bash', [UPDATE_SCRIPT, '--check'], {
     env: { ...process.env, APPLIANCE_DIR, VIBE_DIR, NO_COLOR: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: false,
-  });
+  }));
   let stderr = '';
+  let released = false;
+  const releaseOnce = () => { if (!released) { released = true; releaseGlobalLock(); } };
   child.stderr.on('data', (d) => { stderr += d.toString(); });
   child.on('exit', (code) => {
+    releaseOnce();
     log('info', 'background update check finished', { code, stderr_bytes: stderr.length });
   });
   child.on('error', (err) => {
+    releaseOnce();
     log('warn', 'background update check failed to spawn', { err: err.message });
   });
 }

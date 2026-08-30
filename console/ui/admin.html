@@ -432,8 +432,10 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
         const [status, apps, infra, firstLogin, settingsValues, hostServices] = await Promise.all([
           loadStatus(),
           loadApps(),
-          fetch('/api/v1/infra',       { credentials: 'same-origin' }).then(r => r.json()),
-          fetch('/api/v1/first-login', { credentials: 'same-origin' }).then(r => r.json()),
+          fetch('/api/v1/infra',       { credentials: 'same-origin' })
+            .then(r => { if (!r.ok) throw _httpError('infra', r); return r.json(); }),
+          fetch('/api/v1/first-login', { credentials: 'same-origin' })
+            .then(r => { if (!r.ok) throw _httpError('first-login', r); return r.json(); }),
           // Phase 8.5 W-C — settings values, used by renderSetupBanners
           // to decide which first-run banners to show. Tolerates 404 /
           // 500 silently (banners just stay hidden).
@@ -1284,7 +1286,13 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
 
       try {
         const r = await fetch('/api/v1/doctor', { credentials: 'same-origin' });
-        const data = await r.json();
+        const data = await r.json().catch(() => ({}));
+        // A 500 here ("spawn failed") parses as JSON too — rendering it
+        // as a completed run showed "0 PASS 0 WARN 0 FAIL" when
+        // diagnostics never ran at all.
+        if (!r.ok) {
+          throw new Error(data.detail || data.error || ('HTTP ' + r.status));
+        }
         renderDoctor(data);
 
         // Phase 8.5 — server appends each run to /opt/vibe/logs/doctor.log.

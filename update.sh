@@ -357,6 +357,7 @@ for slug, e in (s.get('apps',{}) or {}).items():
     log_info "checking $slug"
     local has_update="false"
     local check_failed="false"
+    local saw_never_pulled="false"
     while IFS= read -r ev; do
       [[ -z "$ev" ]] && continue
       printf '%s\n' "$ev"
@@ -367,6 +368,9 @@ for slug, e in (s.get('apps',{}) or {}).items():
       if printf '%s' "$ev" | grep -q '"status":"check_failed"'; then
         check_failed="true"
       fi
+      if printf '%s' "$ev" | grep -q '"status":"never_pulled"'; then
+        saw_never_pulled="true"
+      fi
     done < <(_check_one "$slug")
     _state_app_set "$slug" update_available "$has_update"
     # If the check succeeded for every image AND no update is available,
@@ -374,7 +378,10 @@ for slug, e in (s.get('apps',{}) or {}).items():
     # status=failed marker is stale (operator clearly resolved it or the
     # transient registry hiccup self-cleared). Reset so the dashboard
     # reflects reality.
-    if [[ "$check_failed" == "false" && "$has_update" == "false" ]]; then
+    # never_pulled means there is NO local image — the clear's invariant
+    # ("registry matches what's running") is false, and clearing would
+    # green-badge an app with no images and no containers.
+    if [[ "$check_failed" == "false" && "$has_update" == "false" && "$saw_never_pulled" == "false" ]]; then
       _state_app_clear_failed_if_stale "$slug"
     fi
   done
@@ -397,7 +404,9 @@ cmd_update() {
   # image.server three steps in.
   local _runtime
   _runtime="$(_manifest_field "$manifest" 'data.get("runtime","appliance")')"
-  if [[ -n "$_runtime" && "$_runtime" != "appliance" ]]; then
+  # Fail closed: an unreadable manifest must not be presumed appliance.
+  [[ -n "$_runtime" ]] || die "cannot read runtime from $manifest — refusing to guess." "Diagnose: python3 -m json.tool $manifest"
+  if [[ "$_runtime" != "appliance" ]]; then
     die "$slug is a '${_runtime}' unit; this appliance does not update it." "Its own installer owns the upgrade, including the harness gate on Uptime Kuma, Vaultwarden, NetBird, Authentik and Wazuh:
     sudo bash /opt/vibe-sentinel-installer/upgrade/upgrade.sh <version> --dry-run"
   fi
@@ -622,7 +631,9 @@ cmd_rollback() {
   # image.server three steps in.
   local _runtime
   _runtime="$(_manifest_field "$manifest" 'data.get("runtime","appliance")')"
-  if [[ -n "$_runtime" && "$_runtime" != "appliance" ]]; then
+  # Fail closed: an unreadable manifest must not be presumed appliance.
+  [[ -n "$_runtime" ]] || die "cannot read runtime from $manifest — refusing to guess." "Diagnose: python3 -m json.tool $manifest"
+  if [[ "$_runtime" != "appliance" ]]; then
     die "$slug is a '${_runtime}' unit; this appliance does not update it." "Its own installer owns the upgrade, including the harness gate on Uptime Kuma, Vaultwarden, NetBird, Authentik and Wazuh:
     sudo bash /opt/vibe-sentinel-installer/upgrade/upgrade.sh <version> --dry-run"
   fi
@@ -637,6 +648,18 @@ cmd_rollback() {
   local services
   services="$(_app_services "$manifest")"
   [[ -n "$services" ]] || die "could not derive any compose services for $slug from its manifest routing — a bare compose stop would hit the ENTIRE stack (postgres, caddy, console)." "Fix routing.default_upstream / routing.matchers[].upstream in console/manifests/${slug}.json, then retry."
+
+  # Pre-flight (CLAUDE.md: every destructive operation has one): the
+  # rollback tag must exist locally for every manifest image BEFORE we
+  # stop anything — otherwise a rollback with no rollback target takes a
+  # healthy app down (and --with-db would have already dropped the DB).
+  local _rb_key _rb_img
+  while IFS='=' read -r _rb_key _rb_img; do
+    [[ -n "$_rb_img" ]] || continue
+    if ! docker image inspect "${_rb_img}:vibe-rollback-${slug}" >/dev/null 2>&1; then
+      die "no local rollback image ${_rb_img}:vibe-rollback-${slug} — nothing was changed; the app keeps running." "The tag is created by a successful update; there is nothing to roll back to. If images were pruned, re-pull the wanted version and tag it: sudo docker tag <image>:<tag> ${_rb_img}:vibe-rollback-${slug}"
+    fi
+  done < <(_manifest_images "$manifest")
 
   ( cd "$APPLIANCE_DIR" && \
     compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" stop $services ) \
@@ -741,6 +764,12 @@ _do_pull() {
 _tag_rollback() {
   local slug="$1" manifest="$2"
   local rollback_tag="vibe-rollback-${slug}"
+  # When the app is NOT healthy-running (a prior update failed and its
+  # rollback bring-up failed too), the containers may be on the NEW bad
+  # image — tagging that over an existing rollback tag would destroy the
+  # only path back to the last-good version. Keep an existing tag then.
+  local _tr_status
+  _tr_status="$(python3 -c "import json;a=json.load(open('${VIBE_STATE_FILE}')).get('apps',{}).get('${slug}',{});print(a.get('status',''))" 2>/dev/null || true)"
   # The currently-running image is at the manifest's defaultTag — not
   # hardcoded `:latest`, which breaks apps that pin to a version tag
   # (vibe-shield ships at v1.1.5; inspecting `:latest` for it returns
@@ -776,6 +805,12 @@ _tag_rollback() {
     local image_no_tag="${image%:*}"
     local container_name
     container_name="$(basename "$image_no_tag")"
+    if [[ "$_tr_status" != "running" ]] && \
+       docker image inspect "${image}:${rollback_tag}" >/dev/null 2>&1; then
+      log_warn "keeping existing ${image}:${rollback_tag} — the app is not healthy-running, so the current image is not a safe rollback target" slug="$slug"
+      ok="true"
+      continue
+    fi
     if [[ -n "$container_name" ]]; then
       current_id="$(docker inspect --format '{{.Image}}' "$container_name" 2>/dev/null || true)"
     fi
@@ -834,17 +869,28 @@ sys.exit(0 if m.get('migrations',{}).get('command') else 1)
 
 _run_migrations() {
   local slug="$1" manifest="$2" tag="$3"
-  local server_image migration_cmd
+  local server_image migration_cmd_json
   server_image="$(_manifest_field "$manifest" 'data["image"]["server"]')"
-  migration_cmd="$(_manifest_field "$manifest" '" ".join(data["migrations"]["command"])')"
+  # argv, never a flattened string: the manifest schema is a two-repo
+  # contract carrying arbitrary argv arrays, and word-splitting an
+  # element like "node dist/migrate.js up" mangles the command — and a
+  # mangled "migration failure" triggers the destructive DB-restore +
+  # rollback path. Same json.dumps + mapfile pattern as the seed runner.
+  migration_cmd_json="$(_manifest_field "$manifest" 'json.dumps(data["migrations"]["command"])')"
+  local -a migration_cmd
+  mapfile -t migration_cmd < <(python3 -c "
+import json, sys
+for x in json.loads(sys.argv[1]):
+    print(x)
+" "$migration_cmd_json")
+  [[ ${#migration_cmd[@]} -gt 0 ]] || { log_error "migrations.command is empty in $manifest"; return 1; }
 
-  # shellcheck disable=SC2086
   docker run --rm \
     --network vibe_net \
     --env-file "$VIBE_ENV_SHARED" \
     --env-file "${VIBE_ENV_DIR}/${slug}.env" \
     "${server_image}:${tag}" \
-    $migration_cmd >>"$VIBE_LOG_FILE" 2>&1
+    "${migration_cmd[@]}" >>"$VIBE_LOG_FILE" 2>&1
 }
 
 _wait_for_health() {
