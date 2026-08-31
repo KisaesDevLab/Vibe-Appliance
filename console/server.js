@@ -1871,6 +1871,11 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
         ingress: m.ingress || null,
         // Non-null when turning it off needs a recorded compensating control.
         disableRequires: m.disableRequires || null,
+        // The SAME product shipped by another installer (vibe-printer /
+        // sentinel-print run one image). The card renders "enable one,
+        // not both" and the UI confirms before enabling the second copy.
+        sameProductAs: (typeof m.sameProductAs === 'string' && SLUG_RE.test(m.sameProductAs))
+          ? m.sameProductAs : null,
         // Non-null when its upgrade is gated on a harness run. Surfaced only;
         // the gate lives in the owning installer, where there is no --force.
         harnessGate: m.harnessGate || null,

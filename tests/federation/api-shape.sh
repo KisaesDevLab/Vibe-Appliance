@@ -131,6 +131,13 @@ if tb:
     check(tb.get('guide') == '/guides/vibe-tb.pdf',
           'setup guide surfaced', 'vibe-tb guide wrong: %r' % tb.get('guide'))
 
+pr, sp = by.get('vibe-printer'), by.get('sentinel-print')
+check(pr and sp and pr.get('sameProductAs') == 'sentinel-print'
+      and sp.get('sameProductAs') == 'vibe-printer',
+      'sameProductAs surfaced symmetrically on both print cards',
+      'vibe-printer=%r sentinel-print=%r' % (
+          pr and pr.get('sameProductAs'), sp and sp.get('sameProductAs')))
+
 bk = by.get('vibe-backup')
 if not bk:
     check(False, '', 'vibe-backup missing from the API')

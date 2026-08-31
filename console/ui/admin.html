@@ -1083,6 +1083,17 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
             ${foreign && a.hostPrereqs && a.hostPrereqs.length
                ? '<dt>host needs</dt><dd class="mono">' +
                  a.hostPrereqs.map(escapeHtml).join('<br>') + '</dd>' : ''}
+            ${(() => {
+              // One product, two installers (e.g. vibe-printer and
+              // sentinel-print run the same image). A firm wants ONE of
+              // the pair talking to its printers — say so on both cards.
+              if (!a.sameProductAs) return '';
+              const twin = (_appsCache || []).find(x => x.slug === a.sameProductAs);
+              if (!twin) return '';
+              return '<dt>same product</dt><dd>One product, two installers — <strong>' + escapeHtml(twin.displayName) + '</strong> is this same gateway' +
+                (twin.enabled ? ' <span class="badge badge--warn">enabled there</span>' : '') +
+                '<div class="muted">Enable one, not both: two copies mean two job databases and two audit logs for the same printers.</div></dd>';
+            })()}
             ${foreign && a._cardLicence && a.license && a.license.name
                ? '<dt>licence</dt><dd>' + escapeHtml(a.license.name) +
                  (a.license.note ? ' <span class="muted">— ' + escapeHtml(a.license.note) + '</span>' : '') +
@@ -1204,6 +1215,21 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
       if (action === 'sentinel-setup')   { openSentinelSetup(slug); return; }
       if (action === 'clear-transcript') { await clearTranscript(slug, btn.dataset.actionId); return; }
       if (_inflight.has(slug)) return; // double-fire guard (e.g. double-click)
+
+      // Same product, other installer, already running there? Confirm
+      // before standing up a second copy of the same gateway.
+      if (action === 'enable') {
+        const me = (_appsCache || []).find(x => x.slug === slug);
+        const twin = me && me.sameProductAs
+          ? (_appsCache || []).find(x => x.slug === me.sameProductAs) : null;
+        if (twin && twin.enabled) {
+          const go = window.confirm(
+            me.displayName + ' is the same product as ' + twin.displayName +
+            ', which is already enabled. Running both means two print gateways with ' +
+            'separate job databases and audit logs for the same printers.\n\nEnable anyway?');
+          if (!go) return;
+        }
+      }
       btn.disabled = true;
       btn.textContent = ACTION_PROGRESS[action] || 'Working…';
 

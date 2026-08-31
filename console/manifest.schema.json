@@ -35,6 +35,11 @@
       "default": "appliance",
       "description": "Which orchestrator installs and owns this unit. `appliance` (the default, and what every manifest written before this field existed means) is installed by lib/enable-app.sh into the `vibe` compose project on vibe_net. `sentinel` is installed by vibe-sentinel-installer into its own `vibe-sentinel` compose project, with its own Postgres, Redis and ingress; the appliance reads the manifest so the console can present one catalog, but renders NOTHING for it - no Caddy vhost, no path handler, no emergency frontend, no tunnel ingress. See docs/MANIFEST_SCHEMA.md#runtime."
     },
+    "sameProductAs": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]+$",
+      "description": "Slug of another catalog unit that is the SAME product shipped by a different installer - vibe-printer and sentinel-print both run ghcr.io/kisaesdevlab/vibe-printer, one packaging of one gateway. Symmetric by contract: each twin names the other, and the pair must span different runtimes (a same-runtime twin is just a duplicate manifest; tests/manifests/validate-manifests.test.js enforces both). The console renders an 'enable one, not both' note on each card and asks for confirmation before enabling the second copy."
+    },
     "displayName": { "type": "string", "minLength": 1, "maxLength": 80 },
     "description": { "type": "string", "minLength": 1, "maxLength": 200 },
     "logo":        { "type": "string", "maxLength": 80 },

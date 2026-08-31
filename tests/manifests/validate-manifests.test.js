@@ -695,6 +695,27 @@ test('the console routes enable/disable by runtime, not by slug', () => {
     'found a slug-literal branch for a Sentinel module; use runtime instead');
 });
 
+test('sameProductAs links are symmetric, resolvable, and cross-installer', () => {
+  // One product, two installers (vibe-printer / sentinel-print run one
+  // image). The console renders "enable one, not both" from this field on
+  // BOTH cards, so a one-sided link would warn on one card and silently
+  // say nothing on the other; and a same-runtime twin is not a packaging
+  // variant, it is a duplicate manifest.
+  const bySlug = new Map();
+  for (const { data } of manifests) bySlug.set(data.slug, data);
+  for (const { file, data } of manifests) {
+    if (data.sameProductAs === undefined) continue;
+    const twin = bySlug.get(data.sameProductAs);
+    assert.ok(twin,
+      `${file}: sameProductAs "${data.sameProductAs}" is not in the catalog`);
+    assert.equal(twin.sameProductAs, data.slug,
+      `${file}: sameProductAs must be symmetric — ${twin.slug} does not name ${data.slug} back`);
+    assert.notEqual(runtimeOf(twin), runtimeOf(data),
+      `${file}: sameProductAs pairs the same product across DIFFERENT installers; ` +
+      'two manifests with one runtime are a duplicate, not a pair');
+  }
+});
+
 test('every foreign-runtime manifest carries what the console renders', () => {
   // The card shows a resource floor, a licence and where the unit is served.
   // A manifest missing them renders blank rows and, worse, skips the resource

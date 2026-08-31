@@ -11,6 +11,8 @@
     "defaultTag": "latest"
   },
 
+  "sameProductAs": "sentinel-print",
+
   "subdomain": "print",
   "subdomains": [
     {

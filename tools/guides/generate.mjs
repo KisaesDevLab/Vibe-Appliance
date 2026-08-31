@@ -262,6 +262,7 @@ function appGuide(m) {
 <tr><td style="width:38mm"><strong>App id (slug)</strong></td><td><code>${esc(m.slug)}</code></td></tr>
 ${deps ? `<tr><td><strong>Uses</strong></td><td>the appliance's shared ${esc(deps)} — nothing separate to install</td></tr>` : ''}
 ${m.database?.name ? `<tr><td><strong>Data lives in</strong></td><td>database <code>${esc(m.database.name)}</code> inside the appliance's Postgres — covered by your Duplicati backups and by the automatic pre-update dump</td></tr>` : ''}
+${m.sameProductAs ? `<tr><td><strong>Same product as</strong></td><td>the <code>${esc(m.sameProductAs)}</code> catalog entry — one product shipped by two installers. A firm wants <strong>one</strong> of the pair running, not both; if you run the other installer's copy, leave this one disabled.</td></tr>` : ''}
 </tbody></table>`],
 
     ['Before you enable it', `

@@ -276,6 +276,20 @@ Surfaced in the console catalog so an operator sees the terms before installing.
 check, and gating a security and compliance tool behind a network call is the
 wrong trade.
 
+### `sameProductAs`
+
+Slug of another catalog unit that is the **same product shipped by a different
+installer** — `vibe-printer` and `sentinel-print` both run
+`ghcr.io/kisaesdevlab/vibe-printer`, one packaging of one gateway. The console
+renders "one product, two installers — enable one, not both" on both cards and
+asks for confirmation before enabling the second copy while the first is
+running.
+
+Two invariants, enforced by `tests/manifests/validate-manifests.test.js`:
+the link is **symmetric** (each twin names the other, so neither card warns
+alone) and the pair spans **different runtimes** (a same-runtime twin is a
+duplicate manifest, not a packaging variant).
+
 ### Coexisting on one host
 
 `docs/addenda/sentinel-federation.md` records what actually collides when both

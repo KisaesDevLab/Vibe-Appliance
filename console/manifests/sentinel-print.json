@@ -4,6 +4,7 @@
   "displayName": "Vibe Print Gateway",
   "description": "Print routing and controlled egress: the only thing on the network allowed to talk to a printer.",
   "runtime": "sentinel",
+  "sameProductAs": "vibe-printer",
   "userFacing": false,
   "_doc": "Runs ghcr.io/kisaesdevlab/vibe-printer - the SAME image the Vibe Appliance installs, so a firm running both runs one packaging of one product. It is an API print gateway, not a print server: it dials OUT to devices on tcp/9100 and tcp/631 and publishes no IPP queues. The scanner inbox does not exist upstream yet, so SENT-PR-009 is not enforced by this module. Held/PIN release was WITHDRAWN (build plan v1.7, §11 R26) - every job prints on submission and nothing claims otherwise. NOT CUSTOMER-FACING: userFacing is false because the ONLY manifest-level gate on the public landing page and on the Settings > Customer landing tab is `userFacing !== false`. Without it an operator could toggle Wazuh, CrowdSec or Vaultwarden onto a firm's client-facing page - and the URL the console would print for it 404s anyway, since this appliance renders no route for a foreign runtime. These are staff and infrastructure surfaces reached through Sentinel's own ingress.",
   "bootOrder": 70,
