@@ -2267,6 +2267,42 @@ app.post('/api/v1/sentinel/install', requireAdmin, testRateLimit, (req, res) => 
   res.status(202).json({ queued: true, action_id: id, action: 'sentinel-install', slug });
 });
 
+// Connect THIS box to a firm's Sentinel running on ANOTHER host: join
+// the NetBird mesh (identity + encryption; Sentinel's services bind the
+// mesh interface only, deliberately not the LAN), then enroll a Wazuh
+// agent over it. Values come from the Sentinel box (printed by its
+// lite/generate-lite.sh, or its NetBird/Wazuh dashboards). Executed by
+// lib/sentinel-enroll.sh via the host runner; secrets travel in the
+// payload file, never in logs.
+app.post('/api/v1/sentinel/enroll', requireAdmin, testRateLimit, (req, res) => {
+  const b = req.body || {};
+  const errors = [];
+  const management_url = typeof b.management_url === 'string' ? b.management_url.trim().replace(/\/$/, '') : '';
+  if (!/^https:\/\/[A-Za-z0-9.-]+(:\d+)?$/.test(management_url)) {
+    errors.push('management_url must be an https:// URL (the firm\'s NetBird management, e.g. https://nb.firm.com)');
+  }
+  const setup_key = typeof b.setup_key === 'string' ? b.setup_key.trim() : '';
+  if (!/^[A-Za-z0-9-]{8,100}$/.test(setup_key)) {
+    errors.push('setup_key does not look like a NetBird setup key (one-time, from the Sentinel box)');
+  }
+  const wazuh_manager = typeof b.wazuh_manager === 'string' ? b.wazuh_manager.trim() : '';
+  if (!/^[A-Za-z0-9.-]{1,253}$/.test(wazuh_manager)) {
+    errors.push('wazuh_manager must be the Sentinel host\'s mesh hostname or mesh IP');
+  }
+  const wazuh_password = typeof b.wazuh_password === 'string' ? b.wazuh_password : '';
+  if (/[\n\t]/.test(wazuh_password) || wazuh_password.length > 200) {
+    errors.push('wazuh_password contains characters it cannot');
+  }
+  const role = ['workstation', 'docker-host', 'db-host'].includes(b.role) ? b.role : 'docker-host';
+  if (errors.length) return res.status(400).json({ error: 'validation', errors });
+
+  const existing = _haPending('sentinel-core', 'sentinel-enroll');
+  if (existing) return res.status(202).json({ queued: true, action_id: existing, deduped: true });
+  const id = enqueueHostAction('sentinel-enroll', 'sentinel-core', {},
+    { management_url, setup_key, wazuh_manager, wazuh_password, role });
+  res.status(202).json({ queued: true, action_id: id, action: 'sentinel-enroll' });
+});
+
 // Phase 8.5 hardening — rate-limit the toggle and update endpoints.
 // Each call spawns a docker compose pull / restart that hits GHCR or
 // dockerhub; without a limit, a hostile or runaway client can burn
@@ -4692,6 +4728,7 @@ const HOST_SERVICE_LABELS = {
   ufw:   'UFW firewall (gates emergency ports 5171:5198)',
   'system-updates': 'System updates (host Ubuntu packages)',
   'host-runner': 'Host-action runner (runs Sentinel installs the console requests)',
+  'sentinel-enrollment': 'Sentinel enrollment (this box reporting to the firm\'s Sentinel)',
 };
 
 // Which statuses count as healthy, per slug. avahi/ufw predate this map
@@ -4701,6 +4738,10 @@ const HOST_SERVICE_OK = {
   ufw:   ['active'],
   'system-updates': ['up-to-date'],
   'host-runner': ['active'],
+  // A box that has never enrolled (single-box firm, or the Sentinel host
+  // itself) reports status 'unknown', which the panel renders as the
+  // neutral "not yet recorded" badge — absent is not broken.
+  'sentinel-enrollment': ['enrolled'],
 };
 
 app.get('/api/v1/host-services', requireAdmin, (_req, res) => {
@@ -4708,7 +4749,7 @@ app.get('/api/v1/host-services', requireAdmin, (_req, res) => {
   const recorded = state.host_services || {};
   const config = state.config || {};
   const out = [];
-  for (const slug of ['avahi', 'ufw', 'system-updates', 'host-runner']) {
+  for (const slug of ['avahi', 'ufw', 'system-updates', 'host-runner', 'sentinel-enrollment']) {
     const entry = recorded[slug] || {};
     const status = entry.status || 'unknown';
     const ok = (HOST_SERVICE_OK[slug] || ['active']).includes(status);

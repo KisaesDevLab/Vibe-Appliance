@@ -69,6 +69,9 @@ curl -s -u admin:probe-pass -o /tmp/sentinel.status \
 curl -s -u admin:probe-pass -X POST -H 'Content-Type: application/json' -d '{}' \
   -o /tmp/sentinel.install -w '%{http_code}' \
   "http://127.0.0.1:39117/api/v1/sentinel/install" > /tmp/sentinel.install.code 2>/dev/null || true
+curl -s -u admin:probe-pass -X POST -H 'Content-Type: application/json' -d '{}' \
+  -o /tmp/sentinel.enroll -w '%{http_code}' \
+  "http://127.0.0.1:39117/api/v1/sentinel/enroll" > /tmp/sentinel.enroll.code 2>/dev/null || true
 
 python3 - <<'PY'
 import json, sys
@@ -185,6 +188,14 @@ try:
           'install answered HTTP %s body %r' % (code, inst))
 except Exception as exc:
     check(False, '', 'sentinel install probe failed: %s' % exc)
+try:
+    code = open('/tmp/sentinel.enroll.code').read().strip()
+    enr = json.load(open('/tmp/sentinel.enroll'))
+    check(code == '400' and any('management_url' in e for e in enr.get('errors', [])),
+          'sentinel enroll validates its form (400 names missing fields)',
+          'enroll answered HTTP %s body %r' % (code, enr))
+except Exception as exc:
+    check(False, '', 'sentinel enroll probe failed: %s' % exc)
 
 try:
     head = open('/tmp/guide.pdf', 'rb').read(5)

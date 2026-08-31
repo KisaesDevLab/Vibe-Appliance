@@ -108,6 +108,19 @@ rc=$?
 [[ "$rc" -eq 0 ]] && ok "drain terminates with a stray stage file present" || bad "runner rc=$rc"
 rm -f "$HA/queue/.stage-1725000000004-dddddddd"
 
+# ---- 4b. sentinel-enroll without its payload is refused ----------------
+echo "[4b] enroll request with no payload fails closed"
+ID4B="1725000000007-abcdef00"
+req "$ID4B" sentinel-enroll sentinel-core
+run_runner
+ec="$(done_field "$ID4B" exit_code)"
+[[ "$ec" == "96" ]] && ok "no-payload enroll reports exit 96" || bad "exit_code: '$ec', wanted 96"
+if grep -q "no enrollment payload" "$VIBE_DIR/logs/host-actions/$ID4B.log" 2>/dev/null; then
+  ok "log names the missing payload"
+else
+  bad "log missing the payload explanation"
+fi
+
 # ---- 5. multiple requests drain oldest-first ---------------------------
 echo "[5] multiple requests drain"
 ID5A="1725000000005-eeeeeeee"; ID5B="1725000000006-ffffffff"

@@ -60,8 +60,9 @@
          /api/v1/sentinel/install, and the host-action runner executes
          the installer unattended with the resulting firm config. -->
     <style>
-      #ss-form label { display:block; margin:0.35rem 0; }
-      #ss-form input:not([type=checkbox]), #ss-form select { margin-left:0.4rem; }
+      #ss-form label, #sc-form label { display:block; margin:0.35rem 0; }
+      #ss-form input:not([type=checkbox]), #ss-form select,
+      #sc-form input, #sc-form select { margin-left:0.4rem; }
       #ss-modules label { display:block; margin:0.2rem 0; }
       #ss-modules input[type=text] { width: 90%; }
     </style>
@@ -136,8 +137,48 @@
         own ingress. This console lists them, reports what they need, and starts and stops them.
       </p>
       <p class="muted section-note" id="sentinel-licence" hidden></p>
+      <div class="cta-row">
+        <button class="btn btn--ghost" id="sentinel-connect-btn" type="button"
+          title="For firms with several boxes: join this box to the mesh and enroll its monitoring agent with the Sentinel host">
+          Connect this box to the firm's Sentinel…</button>
+        <span class="muted" style="align-self:center">Sentinel on a different server? Enroll this box so it reports there.
+          See the <a href="/guides/multi-box.pdf" target="_blank" rel="noopener">multi-box guide (PDF)</a>.</span>
+      </div>
+      <pre class="app-card__output" id="sentinel-connect-out" hidden></pre>
       <div class="apps-list" id="sentinel-list"></div>
     </section>
+
+    <!-- Enroll THIS box with a Sentinel running on another host: NetBird
+         mesh first (identity + encryption — Sentinel's services bind the
+         mesh only, deliberately not the LAN), then the Wazuh agent over
+         it. lib/sentinel-enroll.sh runs it via the host runner. -->
+    <dialog id="sentinel-connect" style="max-width:40rem;width:92%;border:1px solid #0f172a33;border-radius:10px;padding:1.2rem 1.4rem;">
+      <form method="dialog" id="sc-form">
+        <h3 style="margin-top:0">Connect this box to the firm's Sentinel</h3>
+        <p class="muted small">All four values come from the <strong>Sentinel box</strong>: run
+          <span class="mono">sudo bash /opt/vibe-sentinel-installer/lite/generate-lite.sh --platform linux --role docker-host</span>
+          there and copy them from its output (they're also visible in Sentinel's NetBird and Wazuh dashboards).
+          The setup key is <strong>one-time and expires</strong> — generate it when you're ready to use it.
+          Even on the same office network this goes over the mesh: Sentinel's services deliberately
+          listen only there (it is the identity and encryption layer, and same-LAN peers connect
+          directly, so it costs nothing).</p>
+        <div id="sc-errors" class="error-banner" hidden></div>
+        <label>NetBird management URL <input id="sc-management_url" required placeholder="https://nb.firm.com"></label>
+        <label>One-time setup key <input id="sc-setup_key" required></label>
+        <label>Wazuh manager (mesh hostname or mesh IP of the Sentinel box) <input id="sc-wazuh_manager" required></label>
+        <label>Agent enrollment password <input id="sc-wazuh_password" type="password"></label>
+        <label>This box's role
+          <select id="sc-role">
+            <option value="docker-host" selected>docker-host (an appliance/app server)</option>
+            <option value="db-host">db-host (a dedicated database server)</option>
+            <option value="workstation">workstation</option>
+          </select></label>
+        <div class="cta-row">
+          <button class="btn" value="default" type="submit">Connect now</button>
+          <button class="btn btn--ghost" value="cancel" formnovalidate>Cancel</button>
+        </div>
+      </form>
+    </dialog>
 
     <section>
       <h2>Infra services</h2>
@@ -1466,6 +1507,61 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
       showOut('Sentinel install queued — this takes 15–30 minutes. Keep this page open; the transcript streams below.');
       pollHostAction(_setupSlug, data.action_id, showOut);
       await refresh();
+    });
+
+    // ---------- Connect this box to a remote Sentinel ----------
+    document.getElementById('sentinel-connect-btn').addEventListener('click', () => {
+      document.getElementById('sc-errors').hidden = true;
+      document.getElementById('sentinel-connect').showModal();
+    });
+
+    document.getElementById('sc-form').addEventListener('submit', async (ev) => {
+      if (ev.submitter && ev.submitter.value === 'cancel') return;
+      ev.preventDefault();
+      const val = (id) => document.getElementById('sc-' + id).value.trim();
+      let r, data;
+      try {
+        r = await fetch('/api/v1/sentinel/enroll', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            management_url: val('management_url'), setup_key: val('setup_key'),
+            wazuh_manager: val('wazuh_manager'),
+            wazuh_password: document.getElementById('sc-wazuh_password').value,
+            role: val('role'),
+          }),
+        });
+        data = await r.json();
+      } catch (err) { data = { error: 'request failed: ' + err.message }; }
+      if (!r || !r.ok) {
+        const el = document.getElementById('sc-errors');
+        el.hidden = false;
+        el.textContent = (data.errors ? data.errors.join('\n') : (data.detail || data.error || 'request failed'));
+        return;
+      }
+      document.getElementById('sentinel-connect').close();
+      const out = document.getElementById('sentinel-connect-out');
+      const show = (t) => { out.hidden = false; out.textContent = t; };
+      show('enrollment queued — waiting for the host runner…');
+      const started = Date.now();
+      const timer = setInterval(async () => {
+        let s;
+        try {
+          const pr = await fetch('/api/v1/host-actions/' + encodeURIComponent(data.action_id), { credentials: 'same-origin' });
+          s = await pr.json();
+        } catch (_) { return; }
+        let head = s.state === 'queued' ? 'queued — waiting for the host runner…'
+                 : s.state === 'running' ? 'connecting this box (mesh first, then the agent)…'
+                 : s.state === 'done' ? ((s.result && s.result.exit_code === 0)
+                     ? 'CONNECTED — this box now reports to the firm\'s Sentinel.'
+                     : 'enrollment failed (exit ' + (s.result ? s.result.exit_code : '?') + ') — the transcript below says which step and how to fix it.')
+                 : 'action state unknown';
+        if (s.state === 'queued' && s.runner && s.runner !== 'active') {
+          head += '\nWARNING: the host runner reports "' + s.runner + '" — see Host services for the one-line fix.';
+        }
+        show(head + (s.log ? '\n\n' + s.log : ''));
+        if (s.state === 'done' || Date.now() - started > 30 * 60 * 1000) clearInterval(timer);
+      }, 2500);
     });
 
     refresh();

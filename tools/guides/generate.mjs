@@ -369,4 +369,20 @@ fs.writeFileSync(
 );
 built.push('restore-runbook');
 
+// The multi-box guide — hand-authored: several boxes running apps, a
+// separate box running Sentinel, and how the machines connect (mesh
+// first, then the agent; the console's Connect flow; workstation
+// bundles; why same-LAN still uses the mesh).
+const multiBoxBody = fs.readFileSync(path.join(HERE, 'multi-box.html'), 'utf8');
+fs.writeFileSync(
+  path.join(BUILD_DIR, 'multi-box.html'),
+  page(
+    'Vibe Appliance — Multi-Box Firms',
+    'Several servers, one Sentinel: connecting every box and workstation to the firm’s monitoring.',
+    'facts from the vibe-sentinel-installer docs and lib/sentinel-enroll.sh',
+    multiBoxBody,
+  ),
+);
+built.push('multi-box');
+
 console.log(`built ${built.length} guide(s): ${built.join(', ')}`);

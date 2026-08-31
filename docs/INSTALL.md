@@ -818,6 +818,18 @@ app from the admin **Apps** tab is the whole flow. The app appears
 at `https://vibe.firm.com/<app>/` (e.g. `/tb/`) immediately. No DNS
 work, no Caddy edit, no Cloudflare re-provision.
 
+**We run several servers, with Vibe Sentinel on its own box. How do the
+others connect to it?**
+Each additional appliance box connects from its own admin console: Apps →
+Security & Compliance → **Connect this box to the firm's Sentinel…** (paste
+the four values printed by `lite/generate-lite.sh` on the Sentinel box; the
+box joins the mesh first, then enrolls its monitoring agent, with the
+transcript streaming into the page). Workstations use the per-platform
+Sentinel Lite bundles from the same generator. The **multi-box guide (PDF)**
+— linked beside that button and served at `/guides/multi-box.pdf` — covers
+the whole topology, including why the mesh is used even when every box sits
+on the same office network.
+
 **Can I move the appliance to a bigger server later?**
 Yes. `tar czf vibe.tgz /opt/vibe/data /opt/vibe/env`, copy to the new
 server, run the same install command, untar over `/opt/vibe/`,

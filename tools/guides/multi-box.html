@@ -1,0 +1,118 @@
+<!-- Body fragment for the multi-box firm guide. Wrapped in the shared
+     page chrome by tools/guides/generate.mjs. Facts sourced from the
+     vibe-sentinel-installer README (Sentinel Lite bundles, mesh-first
+     ordering), lib/sentinel-enroll.sh, and the sameProductAs pairing. -->
+
+<section>
+<h2>1. The shape of a multi-box firm</h2>
+<p>Some firms outgrow one server: an appliance box (or several) running the
+accounting apps, and a separate box running <strong>Vibe Sentinel</strong> —
+the security-monitoring and compliance stack, which wants its own hardware
+(4&nbsp;cores / 8&nbsp;GB free for its core alone). This guide covers the part
+that trips people up: <em>connecting</em> the other machines to Sentinel so it
+actually watches them.</p>
+<p>Two layers connect every machine, always in this order:</p>
+<ol>
+<li><strong>The mesh (NetBird).</strong> A private WireGuard network between the
+firm's machines. Every Sentinel service listens <em>only</em> on the mesh
+interface.</li>
+<li><strong>The monitoring agent (Wazuh).</strong> Installed on each machine,
+reporting to the Sentinel box over the mesh.</li>
+</ol>
+</section>
+
+<section>
+<h2>2. "But my boxes are on the same network — do I need the mesh?"</h2>
+<p>Yes — and not because of routing. Three reasons, and one reassurance:</p>
+<ul>
+<li><strong>Sentinel doesn't listen on your LAN, on purpose.</strong> Its
+services bind the mesh interface only. An office LAN has printers, phones,
+guest Wi-Fi, and whatever a visitor plugged in; "on the LAN" is not an
+identity.</li>
+<li><strong>The mesh is the identity layer.</strong> A mesh peer enrolled with a
+one-time key is a known machine with its own cryptographic identity — that is
+what the monitoring evidence hangs off.</li>
+<li><strong>It's the encryption layer, and it travels.</strong> Agent traffic is
+encrypted end-to-end (WireGuard), and the same enrollment keeps working when a
+laptop goes home for the weekend.</li>
+<li><strong>The reassurance:</strong> two mesh peers on the same LAN connect
+<em>directly</em> to each other — no relay, no round-trip through the internet.
+On one network the mesh costs approximately nothing and you keep all three
+properties above.</li>
+</ul>
+<p class="small muted">A firm that already runs an equivalent overlay
+(Tailscale, for example) can leave Sentinel's mesh module off — that is a
+Security Six control, so the installer records the compensating control you
+name. That's the sanctioned path; binding Sentinel's services to the bare LAN
+is not.</p>
+</section>
+
+<section>
+<h2>3. Connect another appliance box (from its own console)</h2>
+<p>On each additional appliance/app box, the admin console does this for you:</p>
+<ol>
+<li><strong>On the Sentinel box</strong>, generate enrollment credentials:
+<pre><code>sudo bash /opt/vibe-sentinel-installer/lite/generate-lite.sh --platform linux --role docker-host</code></pre>
+The output includes the four values the next step asks for: the NetBird
+management URL, a <strong>one-time setup key</strong> (single-use, expires in
+48&nbsp;hours — generate it when you're ready), the Wazuh manager's mesh
+hostname, and the agent-enrollment password.</li>
+<li><strong>On the app box's console</strong>: Apps → the Security &amp;
+Compliance section → <strong>Connect this box to the firm's Sentinel…</strong>
+Paste the four values, pick the role (<code>docker-host</code> for an
+appliance), click Connect. The box joins the mesh first, health-checks it,
+then installs and enrolls the agent — the transcript streams into the page,
+and every failure names the step and the fix. Re-running is safe; it
+converges.</li>
+<li><strong>Verify:</strong> the box's Host services panel shows
+<em>Sentinel enrollment — enrolled</em>, and the machine appears in the Wazuh
+dashboard on the Sentinel box within a couple of minutes.</li>
+</ol>
+</section>
+
+<section>
+<h2>4. Connect workstations and other machines</h2>
+<p>Staff computers use the same generator with per-platform bundles:</p>
+<pre><code>sudo bash /opt/vibe-sentinel-installer/lite/generate-lite.sh --platform all --role workstation</code></pre>
+<p>That produces Windows, macOS, and Linux bundles under
+<code>/var/lib/vibe-sentinel/lite/&lt;timestamp&gt;/</code>, each carrying the
+mesh client with its one-time key, the preconfigured agent, the audit rules
+for its platform, and a posture collector — run the bundle on the machine and
+it enrolls itself, mesh first, refusing to continue if the mesh doesn't come
+up. Bundles contain credentials: move them on encrypted media or over the
+mesh, never by email, and delete them once the batch is enrolled. One key per
+machine.</p>
+</section>
+
+<section>
+<h2>5. What else connects across boxes</h2>
+<ul>
+<li><strong>Uptime monitoring:</strong> Sentinel's <em>pulse</em> module
+(Uptime Kuma) can probe each appliance box's <code>/health</code> endpoints
+across the mesh — add the monitors in Sentinel's own UI.</li>
+<li><strong>One print gateway, firm-wide:</strong> Vibe Print and Sentinel's
+print module are the <em>same product</em> (the cards say so). In a multi-box
+firm, run Sentinel's copy and leave the appliance boxes' copies disabled — the
+apps reach it over the mesh, and one gateway means one job history and one
+audit log.</li>
+<li><strong>The catalogs link up:</strong> each appliance console lists the
+Sentinel modules and links to the Sentinel host's UI once it answers on the
+firm domain — one place to see the estate from any box.</li>
+</ul>
+</section>
+
+<section>
+<h2>6. If something goes wrong</h2>
+<ul>
+<li><strong>Mesh joined but the agent won't confirm:</strong> almost always the
+wrong manager hostname, a wrong enrollment password, or 1514/1515 closed on
+the Sentinel host's mesh interface. The Connect transcript's last step says
+which; fix and re-run — it converges.</li>
+<li><strong>"Setup key rejected":</strong> keys are one-time and short-lived by
+design. Generate a fresh one on the Sentinel box and try again.</li>
+<li><strong>A box stops reporting:</strong> check its Host services panel
+(Sentinel enrollment row), then <code>sudo netbird status</code> and
+<code>sudo systemctl status wazuh-agent</code> on that box. The Sentinel side
+alerts on silent agents — that is its job.</li>
+</ul>
+</section>

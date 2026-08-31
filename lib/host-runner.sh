@@ -78,7 +78,7 @@ slug   = str(r.get("slug", ""))
 args   = r.get("args") or {}
 if not re.fullmatch(r"[0-9]{10,16}-[a-f0-9]{8}", rid):
     print("invalid id", file=sys.stderr); sys.exit(1)
-if action not in ("sentinel-enable", "sentinel-disable", "sentinel-health", "sentinel-install"):
+if action not in ("sentinel-enable", "sentinel-disable", "sentinel-health", "sentinel-install", "sentinel-enroll"):
     print(f"unknown action {action!r}", file=sys.stderr); sys.exit(1)
 if not re.fullmatch(r"[a-z][a-z0-9-]+", slug):
     print("invalid slug", file=sys.stderr); sys.exit(1)
@@ -211,6 +211,22 @@ _ha_run_one() { # <queue-file>
         fi
       fi
       rm -f "$payload"
+      ;;
+    sentinel-enroll)
+      # Connect THIS box to a firm's Sentinel running elsewhere: NetBird
+      # mesh first, then a Wazuh agent over it. The payload (management
+      # URL, one-time setup key, manager host, enrollment password) was
+      # written by the console's Connect form; lib/sentinel-enroll.sh
+      # validates it and never logs the secrets. slug is fixed by the
+      # console to 'sentinel-core' and unused beyond identification.
+      local epayload="$HA_DIR/payloads/$rid.json"
+      if [[ ! -f "$epayload" ]]; then
+        echo "no enrollment payload for this request" >>"$logf"; rc=96
+      else
+        timeout 900 /bin/bash "$APPLIANCE_DIR/lib/sentinel-enroll.sh" \
+          --config "$epayload" </dev/null >>"$logf" 2>&1 || rc=$?
+      fi
+      rm -f "$epayload"
       ;;
   esac
 
