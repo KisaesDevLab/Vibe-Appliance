@@ -75,7 +75,8 @@ LAN/tailnet URLs beside it; the route 401s unauthenticated, 404s a normal
 app, and 502s with a diagnostic when the sidecar is down), that Sentinel
 lifecycle actions queue to the host runner (enable answers 202 with a
 pollable action id; the poll reports queued plus the runner-health hint; the
-first-install endpoint 400s an empty form naming its missing fields), that
+first-install and enroll endpoints 400 an empty form naming its missing
+fields), that
 `/api/v1/admin/status` reports free memory for the resource gate, and that
 the console no longer logs nine env-block warnings per boot.
 
