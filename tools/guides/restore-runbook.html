@@ -1,0 +1,76 @@
+<!-- Body fragment for the restore runbook. Wrapped in the shared page
+     chrome by tools/guides/generate.mjs. Content is an adaptation of the
+     Vibe-Backup repo's docs/restore-runbook.md — that file is the source
+     of truth; when the two drift, this one owes an update. -->
+
+<div class="callout--warn callout">
+<p><strong>Print this document now and keep it with the printed Recovery Kit.</strong>
+The tier that matters most (T2) is for the day the appliance is dead, encrypted,
+or stolen — the day you cannot open the console this PDF is served from. A
+restore runbook that only exists on the machine being restored is not a runbook.</p>
+</div>
+
+<section>
+<h2>How to use this</h2>
+<p>Three tiers. Work top-down; use the smallest tier that fixes the problem.
+T0 and T1 happen in the Vibe Backup app (admin console → <strong>Apps</strong> →
+<strong>Vibe Backup</strong> → its card link); T2 needs only the printed kit and
+a fresh machine.</p>
+</section>
+
+<section>
+<h2>T0 — A file</h2>
+<p>Vibe Backup → <strong>Restore</strong> → choose the backup date → enter or
+browse the file path → download, or restore in place. No confirmation ceremony;
+this touches nothing else.</p>
+</section>
+
+<section>
+<h2>T1 — One module</h2>
+<p>Vibe Backup → <strong>Restore</strong> → choose the date → module restore.
+You will type the module's name to confirm, because this
+<strong>replaces the module's current data</strong> with the snapshot.</p>
+<p>What happens automatically: the snapshot is integrity-verified (nothing
+restores if the key material and data came from different moments), the
+module's databases are rolled back, its post-restore hook runs, and you get a
+checklist of external re-connections (Stripe, Plaid, and so on).</p>
+<div class="callout">
+<p>If the console warns that <strong>restored key material differs from the
+module's current environment</strong>: update the module's env to the
+snapshot's values (shown in the warning) and restart the module — otherwise
+the restored data cannot decrypt.</p>
+</div>
+</section>
+
+<section>
+<h2>T2 — Everything (appliance dead, encrypted, stolen, flooded)</h2>
+<p><strong>Do not troubleshoot the dead box.</strong> You need exactly two
+things:</p>
+<ol>
+<li>The <strong>printed Recovery Kit</strong> from the safe.</li>
+<li>Any machine with a <strong>fresh Ubuntu</strong> install and internet.</li>
+</ol>
+<p>Run:</p>
+<pre><code>curl -fsSL https://get.kisaes.com/restore | sudo bash</code></pre>
+<p>Scan the kit's QR code when prompted (or type the bucket, restore key, and
+passphrase). Pick the backup date. Everything else is automatic: Docker and
+restic install, the snapshot restores, its integrity is verified
+<strong>before</strong> anything is used, the database comes up on the exact
+image version the backup was taken from, and every database is restored into
+it. Budget: under an hour, most of it download time.</p>
+<p>The script ends with the re-connection checklist and pointers for re-running
+the Vibe installer against the restored state.</p>
+<div class="callout--warn callout">
+<p><strong>If integrity verification fails, the script refuses to continue.</strong>
+Pick an earlier snapshot. Do not force it — a snapshot that fails pairing
+verification can restore data that looks fine and cannot be decrypted.</p>
+</div>
+</section>
+
+<section>
+<h2>When to call support</h2>
+<p>Support's disaster-recovery line exists for: appliance unrecoverable,
+confirmed data loss, or ransomware — <em>after</em> the T2 path has been
+tried. "The restore worked and now I need to reconnect QuickBooks" is the
+checklist, not a disaster.</p>
+</section>

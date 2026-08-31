@@ -351,4 +351,21 @@ fs.writeFileSync(
 );
 built.push('appliance');
 
+// The restore runbook — also hand-authored (adapted from the Vibe-Backup
+// repo's docs/restore-runbook.md, the source of truth). Shipped as its
+// own PDF because its T2 tier is read on the day the appliance is dead:
+// the document itself tells the operator to PRINT it and keep it with
+// the Recovery Kit.
+const runbookBody = fs.readFileSync(path.join(HERE, 'restore-runbook.html'), 'utf8');
+fs.writeFileSync(
+  path.join(BUILD_DIR, 'restore-runbook.html'),
+  page(
+    'Vibe Appliance — Restore Runbook',
+    'Get back a file, a module, or the whole appliance. Print this; keep it with the Recovery Kit.',
+    'adapted from Vibe-Backup docs/restore-runbook.md',
+    runbookBody,
+  ),
+);
+built.push('restore-runbook');
+
 console.log(`built ${built.length} guide(s): ${built.join(', ')}`);

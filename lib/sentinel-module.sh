@@ -401,6 +401,27 @@ sentinel_module_enable() { # <slug>
     die "pre-flight failed for $slug. Nothing was installed and state was NOT modified beyond recording the reason."
   fi
 
+  # Everything past pre-flight is HOST-ONLY: the installer checkout
+  # (/opt/vibe-sentinel-installer), git, and Sentinel's own state
+  # (/etc/vibe-sentinel) all live outside the console container's
+  # filesystem and image. Running on regardless produced "git is not
+  # installed — sudo apt-get install -y git" against a host that has
+  # git; installing git in the container wouldn't help either, since the
+  # clone would land on an ephemeral filesystem the host never sees.
+  # Pre-flight DOES run in-container by design (the resource read and
+  # the state.host_services attestations are correct from here); the
+  # action itself gets handed to the operator as an exact command.
+  if state_in_container; then
+    _sm_state_set "$slug" status host-action-required error "pre-flight passed; run the enable from the host shell (see the output for the exact command)"
+    log_error "Pre-flight PASSED — but the enable itself must run on the HOST:"
+    log_error "         the Sentinel installer checkout and /etc/vibe-sentinel live there,"
+    log_error "         outside this console container. From the host shell:"
+    log_error ""
+    log_error "           sudo VIBE_SENTINEL_ACTION=enable bash /opt/vibe/appliance/lib/sentinel-module.sh $slug"
+    log_error ""
+    die "the console container cannot run Sentinel lifecycle actions; run the command above on the host."
+  fi
+
   _sm_ensure_installer
 
   if ! _sm_installed; then
@@ -443,6 +464,19 @@ sentinel_module_disable() { # <slug> [reason] [approver]
     die "refusing to disable $slug without a compensating control"
   fi
 
+  # Host-only from here, same as enable — and doubly important for
+  # disable: in-container, /etc/vibe-sentinel is invisible, so the
+  # not-installed branch below would falsely "succeed" and mark a
+  # running module disabled in state without touching it.
+  if state_in_container; then
+    log_error "Disabling runs on the HOST (the installer checkout and /etc/vibe-sentinel"
+    log_error "         live there, outside this console container). From the host shell:"
+    log_error ""
+    log_error "           sudo VIBE_SENTINEL_ACTION=disable ${reason:+VIBE_SENTINEL_REASON='<reason>' }${approver:+VIBE_SENTINEL_APPROVER='<approver>' }bash /opt/vibe/appliance/lib/sentinel-module.sh $slug"
+    log_error ""
+    die "the console container cannot run Sentinel lifecycle actions; run the command above on the host."
+  fi
+
   _sm_ensure_installer
   _sm_installed || {
     # Still flip the state: a module stuck enabled=true (the installer
@@ -469,6 +503,13 @@ sentinel_module_disable() { # <slug> [reason] [approver]
 sentinel_module_health() { # <slug>
   local slug="${1:-}"
   _sm_require_sentinel "$slug"
+  # In-container, /etc/vibe-sentinel is invisible — the _sm_installed
+  # check below would answer "not installed" for a host where Sentinel
+  # runs fine. Say "cannot verify" instead of a fabricated verdict.
+  if state_in_container; then
+    echo "cannot verify from the console container — run on the host: sudo VIBE_SENTINEL_ACTION=health bash /opt/vibe/appliance/lib/sentinel-module.sh $slug"
+    return 1
+  fi
   _sm_installed || { echo "Sentinel is not installed on this host."; return 1; }
   [[ -f "$SENTINEL_INSTALLER_DIR/modules/module.sh" ]] || { echo "Sentinel installer checkout missing."; return 1; }
   _sm_delegate health "$(_sm_module_id "$slug")"
