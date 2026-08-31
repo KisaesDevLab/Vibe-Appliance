@@ -745,6 +745,34 @@ check_system_updates() {
   esac
 }
 
+check_host_runner() {
+  _check_begin "Host-action runner"
+  # The bridge behind the console's Sentinel buttons: requests queue
+  # under /opt/vibe/host-actions and a root path unit runs them on the
+  # host. Dead runner = actions queue forever with no error anywhere
+  # else, so doctor owns saying it plainly.
+  if state_in_container; then
+    local s ts
+    s="$(state_get_host_service host-runner status)"
+    ts="$(state_get_host_service host-runner at)"
+    case "$s" in
+      active)   _check_pass "armed (per state.host_services as of ${ts:-unknown})" ;;
+      inactive) _check_fail "not armed — console-requested Sentinel actions will queue but never run" \
+                  "Fix: sudo bash /opt/vibe/appliance/infra/host-runner-install.sh" ;;
+      "")       _check_warn "no host_services entry — this install predates the runner; install it (or re-run bootstrap)" \
+                  "Fix: sudo bash /opt/vibe/appliance/infra/host-runner-install.sh" ;;
+      *)        _check_warn "unexpected status: $s" ;;
+    esac
+    return
+  fi
+  if systemctl is-active vibe-host-runner.path >/dev/null 2>&1; then
+    _check_pass "vibe-host-runner.path armed"
+  else
+    _check_fail "vibe-host-runner.path not active — console-requested Sentinel actions will queue but never run" \
+      "Fix: sudo bash /opt/vibe/appliance/infra/host-runner-install.sh"
+  fi
+}
+
 check_recent_errors() {
   _check_begin "Recent errors in /opt/vibe/logs"
   local cutoff_min=60
@@ -1059,6 +1087,15 @@ _human_out "$(printf '\n%s===== Vibe Appliance — doctor =====%s\n' "${_C_BOLD:
 if ! state_in_container && [[ "${EUID:-$(id -u)}" -eq 0 && -f "$VIBE_STATE_FILE" ]]; then
   preflight_sentinel_host_prereqs || true
   preflight_host_updates || true
+  # Host-action runner attestation: the console's Sentinel buttons depend
+  # on it, and 'queued forever' is the failure mode when it's dead.
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active vibe-host-runner.path >/dev/null 2>&1; then
+      state_set_host_service host-runner active || true
+    else
+      state_set_host_service host-runner inactive "vibe-host-runner.path is not active" || true
+    fi
+  fi
 fi
 
 check_host_os
@@ -1081,6 +1118,7 @@ check_cockpit_reachability      # Workstream A
 check_emergency_proxy           # Workstream D
 check_ufw_rules                 # Workstream D
 check_system_updates            # host OS update picture (attestation)
+check_host_runner               # console → host bridge for Sentinel actions
 check_settings_audit_db         # Workstream C
 check_cookie_policy             # security-gate drift
 check_claude_code               # Workstream B

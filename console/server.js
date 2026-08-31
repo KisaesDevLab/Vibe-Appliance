@@ -41,10 +41,11 @@ const MANIFESTS_DIR  = path.join(__dirname, 'manifests');
 const GUIDES_DIR     = path.join(__dirname, 'guides');
 const ENABLE_SCRIPT  = path.join(APPLIANCE_DIR, 'lib', 'enable-app.sh');
 const DISABLE_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'disable-app.sh');
-// Lifecycle for units another orchestrator owns. Same argv shape as the two
-// above (`bash <script> <slug>`) so runToggle needs no second code path; the
-// action and the compensating-control fields travel in the environment.
-const SENTINEL_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'sentinel-module.sh');
+// Lifecycle for units another orchestrator owns (Sentinel modules) is NOT
+// spawned in this container any more: git, the installer checkout and
+// /etc/vibe-sentinel live on the host. Those actions go through the
+// host-action queue (see the host-actions section before the enable
+// route), executed by lib/host-runner.sh on the host.
 
 // Which orchestrator installs a unit. Absent means this appliance, which is
 // what every manifest written before the field existed means.
@@ -2009,6 +2010,258 @@ app.get('/api/v1/admin/customer-visibility', requireAdmin, (_req, res) => {
   res.json({ apps: items });
 });
 
+// ----- host-action queue (console → host bridge) -----------------------
+// Sentinel lifecycle work happens on the HOST: git, the installer
+// checkout at /opt/vibe-sentinel-installer, and /etc/vibe-sentinel are
+// all outside this container. Spawning lib/sentinel-module.sh in here
+// (the old path) died on container facts ("git is not installed") — so
+// Sentinel actions are now queued as request files under
+// /opt/vibe/host-actions/, executed on the host by lib/host-runner.sh
+// (a root systemd path unit installed by infra/host-runner-install.sh),
+// and streamed back through a log file this console tails. The runner
+// re-validates everything; the action vocabulary is its fixed allowlist.
+const HOST_ACTIONS_DIR     = path.join(VIBE_DIR, 'host-actions');
+const HOST_ACTIONS_LOG_DIR = path.join(VIBE_DIR, 'logs', 'host-actions');
+const HA_ID_RE = /^[0-9]{10,16}-[a-f0-9]{8}$/;
+
+function _haDirs() {
+  for (const d of ['queue', 'running', 'done', 'payloads']) {
+    fs.mkdirSync(path.join(HOST_ACTIONS_DIR, d), { recursive: true, mode: 0o700 });
+  }
+  fs.mkdirSync(HOST_ACTIONS_LOG_DIR, { recursive: true });
+}
+
+// Re-click dedupe: if the same action for the same slug is already
+// queued or running, hand back its id instead of stacking a duplicate.
+function _haPending(slug, action) {
+  for (const dir of ['queue', 'running']) {
+    let files = [];
+    try { files = fs.readdirSync(path.join(HOST_ACTIONS_DIR, dir)); } catch { continue; }
+    for (const f of files) {
+      if (!f.endsWith('.json')) continue;
+      try {
+        const r = JSON.parse(fs.readFileSync(path.join(HOST_ACTIONS_DIR, dir, f), 'utf8'));
+        if (r.slug === slug && r.action === action) return r.id;
+      } catch { /* half-written or foreign file — skip */ }
+    }
+  }
+  return null;
+}
+
+function enqueueHostAction(action, slug, args, payload) {
+  _haDirs();
+  const id = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  if (payload !== undefined) {
+    fs.writeFileSync(path.join(HOST_ACTIONS_DIR, 'payloads', `${id}.json`),
+      JSON.stringify(payload, null, 2), { mode: 0o600 });
+  }
+  // Stage OUTSIDE queue/, then rename in: the runner treats any *.json
+  // in queue/ as a complete request, so it must never see a half-write.
+  const q = path.join(HOST_ACTIONS_DIR, 'queue', `${id}.json`);
+  const stage = path.join(HOST_ACTIONS_DIR, `.stage-${id}`);
+  fs.writeFileSync(stage, JSON.stringify(
+    { id, action, slug, args: args || {}, requested_at: new Date().toISOString() },
+    null, 2), { mode: 0o600 });
+  fs.renameSync(stage, q);
+  log('info', 'host action queued', { id, action, slug });
+  return id;
+}
+
+function queueSentinelAction(req, res, action, args) {
+  const slug = req.params.slug;
+  if (!SLUG_RE.test(slug)) return res.status(400).json({ error: 'invalid slug' });
+  if (!MANIFESTS[slug])    return res.status(404).json({ error: 'unknown app' });
+  const existing = _haPending(slug, action);
+  const id = existing || enqueueHostAction(action, slug, args);
+  res.status(202).json({ queued: true, action_id: id, action, slug, deduped: !!existing });
+}
+
+// Poll target for the admin UI: where the action is, its result when
+// finished, and the log so far (tailed — install transcripts get long).
+app.get('/api/v1/host-actions/:id', requireAdmin, (req, res) => {
+  const id = req.params.id;
+  if (!HA_ID_RE.test(id)) return res.status(400).json({ error: 'invalid action id' });
+  let stateName = 'unknown';
+  let result = null;
+  const doneP = path.join(HOST_ACTIONS_DIR, 'done', `${id}.json`);
+  if (fs.existsSync(doneP)) {
+    stateName = 'done';
+    try { result = JSON.parse(fs.readFileSync(doneP, 'utf8')); } catch { /* render log anyway */ }
+  } else if (fs.existsSync(path.join(HOST_ACTIONS_DIR, 'running', `${id}.json`))) {
+    stateName = 'running';
+  } else if (fs.existsSync(path.join(HOST_ACTIONS_DIR, 'queue', `${id}.json`))) {
+    stateName = 'queued';
+  }
+  let logText = '';
+  try { logText = tailFile(path.join(HOST_ACTIONS_LOG_DIR, `${id}.log`), 64 * 1024); } catch { /* not started */ }
+  // A request stuck in 'queued' usually means the runner units aren't
+  // installed/armed on the host — surface the attestation so the UI can
+  // say so instead of spinning forever.
+  let runner = null;
+  if (stateName === 'queued' || stateName === 'unknown') {
+    runner = (((readState().host_services || {})['host-runner']) || {}).status || 'unknown';
+  }
+  res.json({ id, state: stateName, result, log: logText, runner });
+});
+
+// A sentinel-install transcript contains the installer's ONE-TIME
+// break-glass credential (its unattended mode prints it to the
+// transcript by design). The UI shows it once with instructions, then
+// the operator clears it here. Overwrite, not delete: the id keeps
+// resolving so a stale poll can't recreate confusion.
+app.delete('/api/v1/host-actions/:id/log', requireAdmin, (req, res) => {
+  const id = req.params.id;
+  if (!HA_ID_RE.test(id)) return res.status(400).json({ error: 'invalid action id' });
+  try {
+    fs.writeFileSync(path.join(HOST_ACTIONS_LOG_DIR, `${id}.log`),
+      '(transcript cleared by the operator)\n');
+    res.json({ cleared: true });
+  } catch (err) {
+    res.status(500).json({ error: `could not clear transcript: ${err.message}` });
+  }
+});
+
+// Sentinel first install, from the console — the whole reason the
+// host-action bridge exists. The form collects the same answers the
+// installer's own TTY wizard asks and this endpoint emits the EXACT
+// config JSON shape wizard/wizard.sh writes (that shape is the
+// installer's documented --unattended --config contract). The installer
+// remains the owner of everything that happens with it.
+app.post('/api/v1/sentinel/install', requireAdmin, testRateLimit, (req, res) => {
+  const b = req.body || {};
+  const slug = (typeof b.slug === 'string' && SLUG_RE.test(b.slug)) ? b.slug : 'sentinel-core';
+  const m = MANIFESTS[slug];
+  if (!m || appRuntime(m) === 'appliance') {
+    return res.status(400).json({ error: 'slug is not a Sentinel module' });
+  }
+
+  const errors = [];
+  const str = (k, max, required) => {
+    const v = typeof b[k] === 'string' ? b[k].trim() : '';
+    if (required && !v) errors.push(`${k} is required`);
+    if (v.length > max) errors.push(`${k} is too long (max ${max})`);
+    return v;
+  };
+  const int = (k, dflt, lo, hi) => {
+    const v = b[k] === undefined || b[k] === '' ? dflt : Number(b[k]);
+    if (!Number.isInteger(v) || v < lo || v > hi) { errors.push(`${k} must be a whole number ${lo}-${hi}`); return dflt; }
+    return v;
+  };
+  const choice = (k, allowed, dflt) => {
+    const v = typeof b[k] === 'string' && b[k] ? b[k] : dflt;
+    if (!allowed.includes(v)) { errors.push(`${k} must be one of: ${allowed.join(', ')}`); return dflt; }
+    return v;
+  };
+
+  const firm_name  = str('firm_name', 200, true);
+  const firm_state = str('firm_state', 2, true).toUpperCase();
+  if (firm_state && !/^[A-Z]{2}$/.test(firm_state)) errors.push('firm_state must be a 2-letter state code');
+  const qi_name  = str('qi_name', 200, true);
+  const qi_email = str('qi_email', 200, true);
+  if (qi_email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(qi_email)) errors.push('qi_email does not look like an email address');
+  const consumer_count = int('consumer_count', 1000, 1, 10000000);
+  const agent_count    = int('agent_count', 10, 1, 100000);
+  const timezone  = str('timezone', 64, false) || 'UTC';
+  const domain    = str('domain', 253, true);
+  const cf_token  = str('cf_token', 300, true);
+  const smtp_host = str('smtp_host', 253, true);
+  const smtp_port = str('smtp_port', 5, false) || '587';
+  if (!/^\d{1,5}$/.test(smtp_port)) errors.push('smtp_port must be a port number');
+  const smtp_user = str('smtp_user', 200, false);
+  const smtp_pass = str('smtp_pass', 200, false);
+  const smtp_from = str('smtp_from', 200, true);
+  const staff_countries = (str('staff_countries', 100, false) || 'US')
+    .split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
+  const business_hours = str('business_hours', 20, false) || '08:00-18:00';
+  const backup_window  = str('backup_window', 20, false) || '01:00-03:00';
+  const maint_window   = str('maint_window', 30, false) || 'Sun 22:00-24:00';
+  const onsite_subnets = (str('onsite_subnets', 300, false) || '192.168.1.0/24')
+    .split(',').map((s) => s.trim()).filter(Boolean);
+  for (const cidr of onsite_subnets) {
+    if (!/^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(cidr)) errors.push(`"${cidr}" is not a CIDR subnet (e.g. 192.168.1.0/24)`);
+  }
+  const archive_years = int('archive_years', 3, 1, 30);
+  const ai_mode   = choice('ai_mode', ['local', 'cloud_optin'], 'local');
+  const vw_mode   = choice('vw_mode', ['tunnel', 'mesh_only'], 'tunnel');
+  const portcheck = choice('portcheck', ['self-worker', 'kisaes-prober-optin'], 'self-worker');
+
+  // Module selection: ids validated against the catalog's own sentinel
+  // manifests. core and ai are always included, mirroring the wizard.
+  const knownModules = Object.values(MANIFESTS)
+    .filter((mm) => appRuntime(mm) !== 'appliance')
+    .map((mm) => mm.slug.replace(/^sentinel-/, ''));
+  let selected = Array.isArray(b.modules) ? b.modules.filter((x) => typeof x === 'string') : null;
+  if (selected) {
+    for (const mod of selected) {
+      if (!knownModules.includes(mod)) errors.push(`unknown module "${mod}"`);
+    }
+  } else {
+    // Wizard defaults: everything on except the heavy scanner.
+    selected = knownModules.filter((mod) => mod !== 'scan' && mod !== 'core' && mod !== 'ai');
+  }
+  const modulesSelected = ['core', ...selected.filter((x) => x !== 'core' && x !== 'ai'), 'ai'];
+  // Compensating controls for Security Six modules the operator left
+  // out — same requirement the wizard and the disable path enforce.
+  const comp = (b.comp_controls && typeof b.comp_controls === 'object' && !Array.isArray(b.comp_controls)) ? b.comp_controls : {};
+  const comp_controls = {};
+  for (const [k, v] of Object.entries(comp)) {
+    if (knownModules.includes(k) && typeof v === 'string' && v.trim()) comp_controls[k] = v.trim().slice(0, 500);
+  }
+  for (const mm of Object.values(MANIFESTS)) {
+    if (appRuntime(mm) === 'appliance' || mm.disableRequires !== 'compensating-control') continue;
+    const mod = mm.slug.replace(/^sentinel-/, '');
+    if (!modulesSelected.includes(mod) && !comp_controls[mod]) {
+      errors.push(`${mm.displayName} is a Security Six control — record the compensating control the firm uses instead, or include the module`);
+    }
+  }
+
+  if (errors.length) return res.status(400).json({ error: 'validation', errors });
+
+  const now = new Date().toISOString();
+  const config = {
+    schema_version: 1,
+    generated_at: now,
+    firm: {
+      legal_name: firm_name,
+      state: firm_state,
+      qi_name,
+      qi_email,
+      consumer_count_estimate: consumer_count,
+      agent_count_estimate: agent_count,
+      timezone,
+      domain,
+      staff_countries,
+      business_hours,
+      backup_window,
+      maintenance_window: maint_window,
+      onsite_subnets,
+      onsite_subnets_csv: onsite_subnets.join(','),
+    },
+    cloudflare: { api_token: cf_token },
+    smtp: { host: smtp_host, port: smtp_port, username: smtp_user, password: smtp_pass, from: smtp_from },
+    modules: {
+      selected: modulesSelected,
+      compensating_controls: comp_controls,
+      ai:   { mode: ai_mode },
+      keys: { vaultwarden_mode: vw_mode, events_days_retain: 1095 },
+      mesh: {
+        relay_enabled: false,
+        relay_note: 'Direct-only by default. Enable only after a failed NAT test with QI consent (Decision 17); enabling is a logged, QI-approved change recorded in the risk assessment.',
+      },
+    },
+    external_port_check: { method: portcheck, consented_at: now },
+    retention: { hot_days: 30, warm_days: 365, archive_years },
+    backup: { restic_repository: '/var/lib/vibe-sentinel/restic-repo' },
+    network: { mesh_bind_ip: '127.0.0.1' },
+    preflight: { falco_privileged_fallback: false },
+  };
+
+  const existing = _haPending(slug, 'sentinel-install');
+  if (existing) return res.status(202).json({ queued: true, action_id: existing, deduped: true });
+  const id = enqueueHostAction('sentinel-install', slug, {}, config);
+  res.status(202).json({ queued: true, action_id: id, action: 'sentinel-install', slug });
+});
+
 // Phase 8.5 hardening — rate-limit the toggle and update endpoints.
 // Each call spawns a docker compose pull / restart that hits GHCR or
 // dockerhub; without a limit, a hostile or runaway client can burn
@@ -2017,8 +2270,7 @@ app.get('/api/v1/admin/customer-visibility', requireAdmin, (_req, res) => {
 app.post('/api/v1/enable/:slug', requireAdmin, testRateLimit, async (req, res) => {
   const m = MANIFESTS[req.params.slug];
   if (m && appRuntime(m) !== 'appliance') {
-    return runToggle(req, res, SENTINEL_SCRIPT, 'enable',
-                     { VIBE_SENTINEL_ACTION: 'enable' });
+    return queueSentinelAction(req, res, 'sentinel-enable', {});
   }
   await runToggle(req, res, ENABLE_SCRIPT, 'enable');
 });
@@ -2045,11 +2297,7 @@ app.post('/api/v1/disable/:slug', requireAdmin, testRateLimit, async (req, res) 
     if (reason.length > 500 || approver.length > 200) {
       return res.status(400).json({ error: 'reason or approver too long' });
     }
-    return runToggle(req, res, SENTINEL_SCRIPT, 'disable', {
-      VIBE_SENTINEL_ACTION: 'disable',
-      VIBE_SENTINEL_REASON: reason,
-      VIBE_SENTINEL_APPROVER: approver,
-    });
+    return queueSentinelAction(req, res, 'sentinel-disable', { reason, approver });
   }
   await runToggle(req, res, DISABLE_SCRIPT, 'disable');
 });
@@ -4422,12 +4670,23 @@ const HOST_SERVICE_FIXES = {
       command: 'sudo reboot',
     },
   },
+  'host-runner': {
+    'inactive': {
+      summary: 'The host-action runner is not armed — Sentinel enable/install requests from this console will queue but never run:',
+      command: 'sudo bash /opt/vibe/appliance/infra/host-runner-install.sh',
+    },
+    'unknown': {
+      summary: 'No runner status recorded — this appliance predates the host-action runner. Install it (or re-run bootstrap):',
+      command: 'sudo bash /opt/vibe/appliance/infra/host-runner-install.sh',
+    },
+  },
 };
 
 const HOST_SERVICE_LABELS = {
   avahi: 'Avahi (mDNS — <hostname>.local resolution)',
   ufw:   'UFW firewall (gates emergency ports 5171:5198)',
   'system-updates': 'System updates (host Ubuntu packages)',
+  'host-runner': 'Host-action runner (runs Sentinel installs the console requests)',
 };
 
 // Which statuses count as healthy, per slug. avahi/ufw predate this map
@@ -4436,6 +4695,7 @@ const HOST_SERVICE_OK = {
   avahi: ['active'],
   ufw:   ['active'],
   'system-updates': ['up-to-date'],
+  'host-runner': ['active'],
 };
 
 app.get('/api/v1/host-services', requireAdmin, (_req, res) => {
@@ -4443,7 +4703,7 @@ app.get('/api/v1/host-services', requireAdmin, (_req, res) => {
   const recorded = state.host_services || {};
   const config = state.config || {};
   const out = [];
-  for (const slug of ['avahi', 'ufw', 'system-updates']) {
+  for (const slug of ['avahi', 'ufw', 'system-updates', 'host-runner']) {
     const entry = recorded[slug] || {};
     const status = entry.status || 'unknown';
     const ok = (HOST_SERVICE_OK[slug] || ['active']).includes(status);

@@ -656,15 +656,18 @@ function resolve(data, pathExpr) {
 
 test('the console routes enable/disable by runtime, not by slug', () => {
   // The whole federation rests on this: a `runtime: "sentinel"` unit must
-  // reach lib/sentinel-module.sh, and everything else lib/enable-app.sh. A
-  // slug-based branch would be exactly the `if (slug === "vibe-tb")` the
-  // manifest contract exists to prevent, and would silently break the day a
-  // tenth Sentinel module appears.
+  // reach the host-action queue (queueSentinelAction → lib/host-runner.sh on
+  // the host → lib/sentinel-module.sh), and everything else
+  // lib/enable-app.sh in-process. A slug-based branch would be exactly the
+  // `if (slug === "vibe-tb")` the manifest contract exists to prevent, and
+  // would silently break the day a tenth Sentinel module appears.
   const src = fs.readFileSync(
     path.join(__dirname, '..', '..', 'console', 'server.js'), 'utf8');
 
-  assert.match(src, /const SENTINEL_SCRIPT\s*=/,
-    'console/server.js declares no SENTINEL_SCRIPT');
+  assert.match(src, /function queueSentinelAction\(/,
+    'console/server.js declares no queueSentinelAction (the host-action bridge)');
+  assert.match(src, /function enqueueHostAction\(/,
+    'console/server.js declares no enqueueHostAction');
   assert.match(src, /function appRuntime\(/,
     'console/server.js has no appRuntime helper');
 
@@ -678,15 +681,16 @@ test('the console routes enable/disable by runtime, not by slug', () => {
     const body = src.slice(start, start + 2000);
     assert.ok(body.includes("appRuntime(m) !== 'appliance'"),
       `/api/v1/${route} does not branch on runtime`);
-    assert.ok(body.includes('SENTINEL_SCRIPT'),
-      `/api/v1/${route} does not route a foreign runtime to SENTINEL_SCRIPT`);
+    assert.ok(body.includes('queueSentinelAction'),
+      `/api/v1/${route} does not route a foreign runtime to the host-action queue`);
     const branchAt = body.indexOf("appRuntime(m) !== 'appliance'");
-    const sentinelAt = body.indexOf('SENTINEL_SCRIPT');
+    const sentinelAt = body.indexOf('queueSentinelAction');
     assert.ok(sentinelAt > branchAt,
-      `/api/v1/${route} reaches SENTINEL_SCRIPT outside the runtime branch`);
+      `/api/v1/${route} reaches queueSentinelAction outside the runtime branch`);
   }
 
-  // No slug-literal branch anywhere near the toggles.
+  // No slug-literal branch anywhere near the toggles. (The install form's
+  // 'sentinel-core' default is a fallback value, not a branch condition.)
   assert.doesNotMatch(src, /slug\s*===\s*['"]sentinel-/,
     'found a slug-literal branch for a Sentinel module; use runtime instead');
 });

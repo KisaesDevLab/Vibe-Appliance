@@ -55,6 +55,78 @@
       <div class="apps-list" id="apps-list"></div>
     </section>
 
+    <!-- Sentinel first-install form. Collects the same answers the
+         installer's own terminal wizard asks, POSTs them to
+         /api/v1/sentinel/install, and the host-action runner executes
+         the installer unattended with the resulting firm config. -->
+    <style>
+      #ss-form label { display:block; margin:0.35rem 0; }
+      #ss-form input:not([type=checkbox]), #ss-form select { margin-left:0.4rem; }
+      #ss-modules label { display:block; margin:0.2rem 0; }
+      #ss-modules input[type=text] { width: 90%; }
+    </style>
+    <dialog id="sentinel-setup" style="max-width:44rem;width:92%;border:1px solid #0f172a33;border-radius:10px;padding:1.2rem 1.4rem;">
+      <form method="dialog" id="ss-form">
+        <h3 style="margin-top:0">Set up Vibe Sentinel on this server</h3>
+        <p class="muted small">One-time setup, then the Apps tab manages the modules.
+          Answers below become the installer's firm configuration; the install runs
+          unattended on the server and usually takes 15–30 minutes. Email settings are
+          verified with a <strong>real test message</strong> during install, so have your
+          SMTP details right.</p>
+        <div id="ss-errors" class="error-banner" hidden></div>
+        <fieldset style="border:0;padding:0;margin:0 0 0.6rem">
+          <legend style="font-weight:600">The firm</legend>
+          <label>Firm legal name <input id="ss-firm_name" required></label>
+          <label>Home state (2 letters) <input id="ss-firm_state" required maxlength="2" style="width:4rem" placeholder="MO"></label>
+          <label>Qualified Individual (QI) name <input id="ss-qi_name" required></label>
+          <label>QI email <input id="ss-qi_email" type="email" required></label>
+          <label>Consumers whose data the firm holds (estimate) <input id="ss-consumer_count" type="number" value="1000" min="1"></label>
+          <label>Endpoints that will run an agent <input id="ss-agent_count" type="number" value="10" min="1"></label>
+        </fieldset>
+        <fieldset style="border:0;padding:0;margin:0 0 0.6rem">
+          <legend style="font-weight:600">Network</legend>
+          <label>Firm domain on Cloudflare <input id="ss-domain" required placeholder="example-cpa.com"></label>
+          <label>Cloudflare API token <input id="ss-cf_token" type="password" required></label>
+          <label>Office subnets (comma-separated CIDRs) <input id="ss-onsite_subnets" value="192.168.1.0/24"></label>
+        </fieldset>
+        <fieldset style="border:0;padding:0;margin:0 0 0.6rem">
+          <legend style="font-weight:600">Alert email (SMTP)</legend>
+          <label>SMTP host <input id="ss-smtp_host" required></label>
+          <label>Port <input id="ss-smtp_port" value="587" style="width:5rem"></label>
+          <label>Username (blank for open relay) <input id="ss-smtp_user"></label>
+          <label>Password <input id="ss-smtp_pass" type="password"></label>
+          <label>From address <input id="ss-smtp_from" required></label>
+        </fieldset>
+        <fieldset style="border:0;padding:0;margin:0 0 0.6rem">
+          <legend style="font-weight:600">Modules</legend>
+          <div id="ss-modules" class="muted small">(loading module list…)</div>
+        </fieldset>
+        <details style="margin:0 0 0.8rem">
+          <summary class="muted">Advanced (defaults are fine)</summary>
+          <label>Staff countries (ISO codes) <input id="ss-staff_countries" value="US"></label>
+          <label>Business hours <input id="ss-business_hours" value="08:00-18:00"></label>
+          <label>Backup window <input id="ss-backup_window" value="01:00-03:00"></label>
+          <label>Maintenance window <input id="ss-maint_window" value="Sun 22:00-24:00"></label>
+          <label>Cold-archive retention (years) <input id="ss-archive_years" type="number" value="3" min="1" max="30"></label>
+          <label>External port check
+            <select id="ss-portcheck">
+              <option value="self-worker" selected>Cloudflare Worker in the firm's own account</option>
+              <option value="kisaes-prober-optin">Kisaes-hosted prober (consent is logged)</option>
+            </select></label>
+          <label>Password-manager publishing
+            <select id="ss-vw_mode">
+              <option value="tunnel" selected>Via Cloudflare Tunnel (phones work; normal posture)</option>
+              <option value="mesh_only">Mesh-only (every device runs the mesh client)</option>
+            </select></label>
+          <label><input id="ss-ai_cloud" type="checkbox"> Allow optional cloud AI summarization (alert metadata only; each call logged as a §7216 disclosure)</label>
+        </details>
+        <div class="cta-row">
+          <button class="btn" id="ss-submit" value="default" type="submit">Install Sentinel now</button>
+          <button class="btn btn--ghost" value="cancel" formnovalidate>Cancel</button>
+        </div>
+      </form>
+    </dialog>
+
     <section id="sentinel-section" hidden>
       <h2>Security &amp; Compliance (Vibe Sentinel)</h2>
       <p class="muted" id="sentinel-summary">—</p>
@@ -805,6 +877,7 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
     }
 
     function renderApps(apps) {
+      _appsCache = apps;
       const list = document.getElementById('apps-list');
       const summary = document.getElementById('apps-summary');
       if (!apps.length) {
@@ -877,6 +950,14 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
     // first refresh lands, in which case the resource line is simply omitted
     // rather than guessed at.
     let _hostCapacity = null;
+
+    // Latest /api/v1/apps payload — the Sentinel setup form builds its
+    // module checkboxes from it (manifest-driven; no hardcoded list).
+    let _appsCache = [];
+    // Slug → host-action id whose transcript still holds the one-time
+    // break-glass credential; renders a clear button until the operator
+    // confirms they saved it.
+    const _transcriptPending = new Map();
 
     // Per-slug lifecycle-action state. _inflight keeps the 15s poll's
     // re-render from resurrecting a clickable Enable while the script is
@@ -1086,9 +1167,15 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
             ${!foreign && a.enabled && a.update_history && a.update_history.length
               ? '<button class="btn btn--ghost" data-action="rollback" data-slug="' + escapeHtml(a.slug) + '">Roll back</button>'
               : ''}
+            ${foreign && !a.enabled
+              ? '<button class="btn btn--ghost" data-action="sentinel-setup" data-slug="' + escapeHtml(a.slug) + '" title="First-time Sentinel install on this server — collects the firm profile once and runs the installer unattended">Set up Sentinel…</button>'
+              : ''}
             ${foreign && a.enabled
               ? '<span class="muted" style="align-self:center">Updates run through the Sentinel installer\'s own harness-gated upgrade.</span>'
               : ''}`}
+            ${_transcriptPending.has(a.slug)
+              ? '<button class="btn" data-action="clear-transcript" data-slug="' + escapeHtml(a.slug) + '" data-action-id="' + escapeHtml(_transcriptPending.get(a.slug)) + '">I saved the credential — clear transcript</button>'
+              : ''}
           </div>
           ${a.update_history && a.update_history.length ? `
             <details class="app-card__history">
@@ -1114,6 +1201,8 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
     async function toggle(btn) {
       const slug   = btn.dataset.slug;
       const action = btn.dataset.action;
+      if (action === 'sentinel-setup')   { openSentinelSetup(slug); return; }
+      if (action === 'clear-transcript') { await clearTranscript(slug, btn.dataset.actionId); return; }
       if (_inflight.has(slug)) return; // double-fire guard (e.g. double-click)
       btn.disabled = true;
       btn.textContent = ACTION_PROGRESS[action] || 'Working…';
@@ -1159,6 +1248,7 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
         out.textContent = text;
         _lastOutput.set(slug, text);
       };
+      let polling = false;
       try {
         const r = await fetch(apiPath, {
           method: 'POST',
@@ -1166,7 +1256,14 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
           ...(body ? { headers: { 'Content-Type': 'application/json' }, body } : {}),
         });
         const data = await r.json();
-        if (!r.ok) {
+        if (r.ok && data.queued && data.action_id) {
+          // Sentinel actions run on the HOST via the host-action runner;
+          // the server answered 202 with an id to poll. The poller owns
+          // _inflight and the refresh from here.
+          polling = true;
+          showOut('queued — waiting for the host runner…');
+          pollHostAction(slug, data.action_id, showOut);
+        } else if (!r.ok) {
           // 409 (already running) and 4xx rejections carry error/detail,
           // not exit_code/stderr — render whichever fields exist.
           showOut(
@@ -1179,10 +1276,171 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
       } catch (err) {
         showOut('request failed: ' + err.message);
       } finally {
-        _inflight.delete(slug);
-        await refresh();
+        if (!polling) {
+          _inflight.delete(slug);
+          await refresh();
+        }
       }
     }
+
+    // ---------- host-action polling (Sentinel lifecycle) ----------
+    // The runner streams the action's output into a log file; poll it
+    // into the card's output panel until the done record appears.
+    function makeShowOut(slug) {
+      return (text) => {
+        _lastOutput.set(slug, text);
+        const card = document.getElementById('app-' + slug);
+        const out = card && card.querySelector('.app-card__output');
+        if (out) { out.hidden = false; out.textContent = text; }
+      };
+    }
+
+    function pollHostAction(slug, id, showOut) {
+      const started = Date.now();
+      const timer = setInterval(async () => {
+        let s;
+        try {
+          const r = await fetch('/api/v1/host-actions/' + encodeURIComponent(id), { credentials: 'same-origin' });
+          s = await r.json();
+        } catch (err) {
+          showOut('status poll failed: ' + err.message + ' — retrying…');
+          return;
+        }
+        let head;
+        if (s.state === 'queued') {
+          head = 'queued — waiting for the host runner…';
+          if (s.runner && s.runner !== 'active') {
+            head += '\nWARNING: the host-action runner on the server reports "' + s.runner +
+                    '". If this never starts, open Host services below for the one-line fix, or re-run bootstrap on the server.';
+          }
+        } else if (s.state === 'running') {
+          head = 'running on the server…';
+        } else if (s.state === 'done') {
+          head = 'finished (exit ' + (s.result ? s.result.exit_code : '?') + ')';
+        } else {
+          head = 'action state unknown — the request may have been rejected; see Host services.';
+        }
+        showOut(head + (s.log ? '\n\n' + s.log : ''));
+        if (s.state === 'done') {
+          clearInterval(timer);
+          _inflight.delete(slug);
+          const ok = s.result && s.result.exit_code === 0;
+          if (s.result && s.result.note === 'transcript-contains-credential') {
+            _transcriptPending.set(slug, id);
+          }
+          await refresh();
+          if (!ok && (s.log || '').includes('Sentinel is not installed')) {
+            // First-time path: this server has no Sentinel yet — walk the
+            // operator straight into the setup form instead of dead-ending.
+            openSentinelSetup(slug);
+          }
+        } else if (Date.now() - started > 2 * 3600 * 1000) {
+          clearInterval(timer);
+          _inflight.delete(slug);
+          showOut(head + '\n\nStopped watching after 2 hours. The action may still be running on the server; its transcript is /opt/vibe/logs/host-actions/' + id + '.log');
+          await refresh();
+        }
+      }, 2500);
+    }
+
+    async function clearTranscript(slug, id) {
+      if (!id) return;
+      try {
+        await fetch('/api/v1/host-actions/' + encodeURIComponent(id) + '/log', {
+          method: 'DELETE', credentials: 'same-origin',
+        });
+      } catch (_) { /* transient; the button stays for a retry */ return; }
+      _transcriptPending.delete(slug);
+      _lastOutput.set(slug, '(transcript cleared — the break-glass credential now lives only in the firm password manager)');
+      await refresh();
+    }
+
+    // ---------- Sentinel first-install form ----------
+    let _setupSlug = 'sentinel-core';
+
+    function openSentinelSetup(slug) {
+      _setupSlug = slug || 'sentinel-core';
+      const dlg = document.getElementById('sentinel-setup');
+      // Module checkboxes from the live catalog — manifest-driven, with
+      // the installer wizard's defaults (everything on except the heavy
+      // scanner). Unchecking a Security Six module requires naming the
+      // compensating control, same as the wizard and the disable path.
+      const mods = (_appsCache || []).filter(a =>
+        (a.runtime || 'appliance') !== 'appliance' && a.slug !== 'sentinel-core');
+      const box = document.getElementById('ss-modules');
+      box.innerHTML = mods.map(a => {
+        const id = a.slug.replace(/^sentinel-/, '');
+        const six = a.disableRequires === 'compensating-control';
+        const checked = id === 'scan' ? '' : 'checked';
+        return '<label><input type="checkbox" data-module="' + escapeHtml(id) + '" data-six="' + (six ? '1' : '0') + '" ' + checked + '> ' +
+               escapeHtml(a.displayName) + (six ? ' <span class="muted">(Security Six)</span>' : '') + '</label>' +
+               '<input type="text" data-cc-for="' + escapeHtml(id) + '" placeholder="Compensating control the firm uses instead (required when unchecked)" hidden>';
+      }).join('') || '<span class="muted">module list unavailable — core will be installed</span>';
+      box.querySelectorAll('input[type=checkbox]').forEach(cb => {
+        cb.addEventListener('change', () => {
+          const cc = box.querySelector('[data-cc-for="' + cb.dataset.module + '"]');
+          if (cc) cc.hidden = cb.checked || cb.dataset.six !== '1';
+        });
+      });
+      document.getElementById('ss-errors').hidden = true;
+      dlg.showModal();
+    }
+
+    document.getElementById('ss-form').addEventListener('submit', async (ev) => {
+      const dlg = document.getElementById('sentinel-setup');
+      if (ev.submitter && ev.submitter.value === 'cancel') return; // dialog closes itself
+      ev.preventDefault();
+      const val = (id) => document.getElementById('ss-' + id).value.trim();
+      const modules = [];
+      const comp_controls = {};
+      document.querySelectorAll('#ss-modules input[type=checkbox]').forEach(cb => {
+        if (cb.checked) modules.push(cb.dataset.module);
+        else if (cb.dataset.six === '1') {
+          const cc = document.querySelector('#ss-modules [data-cc-for="' + cb.dataset.module + '"]');
+          if (cc && cc.value.trim()) comp_controls[cb.dataset.module] = cc.value.trim();
+        }
+      });
+      const body = {
+        slug: _setupSlug,
+        firm_name: val('firm_name'), firm_state: val('firm_state'),
+        qi_name: val('qi_name'), qi_email: val('qi_email'),
+        consumer_count: Number(val('consumer_count')), agent_count: Number(val('agent_count')),
+        timezone: (Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'),
+        domain: val('domain'), cf_token: val('cf_token'),
+        onsite_subnets: val('onsite_subnets'),
+        smtp_host: val('smtp_host'), smtp_port: val('smtp_port'),
+        smtp_user: val('smtp_user'), smtp_pass: val('smtp_pass'), smtp_from: val('smtp_from'),
+        staff_countries: val('staff_countries'), business_hours: val('business_hours'),
+        backup_window: val('backup_window'), maint_window: val('maint_window'),
+        archive_years: Number(val('archive_years')),
+        portcheck: val('portcheck'), vw_mode: val('vw_mode'),
+        ai_mode: document.getElementById('ss-ai_cloud').checked ? 'cloud_optin' : 'local',
+        modules, comp_controls,
+      };
+      let r, data;
+      try {
+        r = await fetch('/api/v1/sentinel/install', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        data = await r.json();
+      } catch (err) {
+        data = { error: 'request failed: ' + err.message };
+      }
+      if (!r || !r.ok) {
+        const el = document.getElementById('ss-errors');
+        el.hidden = false;
+        el.textContent = (data.errors ? data.errors.join('\n') : (data.detail || data.error || 'request failed'));
+        return;
+      }
+      dlg.close();
+      const showOut = makeShowOut(_setupSlug);
+      _inflight.set(_setupSlug, 'install');
+      showOut('Sentinel install queued — this takes 15–30 minutes. Keep this page open; the transcript streams below.');
+      pollHostAction(_setupSlug, data.action_id, showOut);
+      await refresh();
+    });
 
     refresh();
     _pollHandle = setInterval(refresh, 15000);

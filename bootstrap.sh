@@ -943,6 +943,16 @@ phase_infra() {
       "fix:sudo bash /opt/vibe/appliance/infra/unattended-upgrades-setup.sh"
   fi
 
+  # Host-action runner: the bridge that lets console buttons run
+  # allowlisted host-side scripts (Sentinel module enable/disable and
+  # the unattended first install). Also before the cockpit gate — it is
+  # core UX, not admin tooling.
+  log_step "installing the host-action runner"
+  if ! ( cd "$APPLIANCE_DIR" && /bin/bash infra/host-runner-install.sh ); then
+    log_warn "host-runner install failed; Sentinel actions from the console will queue but never run" \
+      "fix:sudo bash /opt/vibe/appliance/infra/host-runner-install.sh"
+  fi
+
   if [[ "$CONFIG_COCKPIT" != "true" ]]; then
     log_info "skipping cockpit install (--no-cockpit)"
     return 0

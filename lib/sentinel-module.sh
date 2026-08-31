@@ -412,14 +412,16 @@ sentinel_module_enable() { # <slug>
   # the state.host_services attestations are correct from here); the
   # action itself gets handed to the operator as an exact command.
   if state_in_container; then
-    _sm_state_set "$slug" status host-action-required error "pre-flight passed; run the enable from the host shell (see the output for the exact command)"
+    _sm_state_set "$slug" status host-action-required error "pre-flight passed; this action must run on the host (the console normally queues it to the host-action runner)"
     log_error "Pre-flight PASSED — but the enable itself must run on the HOST:"
     log_error "         the Sentinel installer checkout and /etc/vibe-sentinel live there,"
-    log_error "         outside this console container. From the host shell:"
-    log_error ""
+    log_error "         outside this console container. The console normally queues this"
+    log_error "         to the host-action runner (lib/host-runner.sh) — seeing this text"
+    log_error "         means that bridge is missing here. Install it:"
+    log_error "           sudo bash /opt/vibe/appliance/infra/host-runner-install.sh"
+    log_error "         or run the action directly from the host shell:"
     log_error "           sudo VIBE_SENTINEL_ACTION=enable bash /opt/vibe/appliance/lib/sentinel-module.sh $slug"
-    log_error ""
-    die "the console container cannot run Sentinel lifecycle actions; run the command above on the host."
+    die "the console container cannot run Sentinel lifecycle actions itself."
   fi
 
   _sm_ensure_installer

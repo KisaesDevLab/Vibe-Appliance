@@ -72,7 +72,10 @@ without them it must 401) while a foreign unit claims none, that the
 console proxy for no-Caddy-surface apps (`/admin/apps/<slug>/`, BK-10a) is
 wired and honest (vibe-backup's URL is the proxy mount with no dead
 LAN/tailnet URLs beside it; the route 401s unauthenticated, 404s a normal
-app, and 502s with a diagnostic when the sidecar is down), that
+app, and 502s with a diagnostic when the sidecar is down), that Sentinel
+lifecycle actions queue to the host runner (enable answers 202 with a
+pollable action id; the poll reports queued plus the runner-health hint; the
+first-install endpoint 400s an empty form naming its missing fields), that
 `/api/v1/admin/status` reports free memory for the resource gate, and that
 the console no longer logs nine env-block warnings per boot.
 
@@ -124,6 +127,23 @@ docker run --rm -v "$PWD:/w/appliance:ro" ubuntu:24.04 bash -c \
 ```
 
 **Verified 2026-08-30:** all 33 assertions pass.
+
+## host-runner.sh
+
+Exercises `lib/host-runner.sh` — the console → host bridge behind the Sentinel
+buttons — without a network, using the `sentinel-health` action against the
+real `sentinel-module.sh`. Asserts the full queue → validate → execute →
+done-record → log pipeline, that an unknown action is rejected without
+executing (exit 97, with a note the console renders), that a request whose
+filename doesn't match its inner id is dropped (the overwrite-another-result
+vector), that a half-staged non-`.json` file can't wedge the drain, and that
+multiple requests drain oldest-first.
+
+```bash
+docker run --rm -v "$PWD:/w/appliance:ro" ubuntu:24.04 bash -c \
+  'apt-get update -qq && apt-get install -y -qq python3 \
+   && bash /w/appliance/tests/federation/host-runner.sh'
+```
 
 ## host-updates.sh
 

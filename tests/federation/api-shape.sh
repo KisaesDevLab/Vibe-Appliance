@@ -58,6 +58,18 @@ curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:39117/admin/apps/vibe-b
 curl -s -u admin:probe-pass -o /dev/null -w '%{http_code}' "http://127.0.0.1:39117/admin/apps/vibe-tb/" > /tmp/proxy.wrongapp 2>/dev/null || true
 curl -s -u admin:probe-pass -o /dev/null -w '%{http_code}' "http://127.0.0.1:39117/admin/apps/vibe-backup/api/health" > /tmp/proxy.noupstream 2>/dev/null || true
 
+# Sentinel lifecycle goes through the host-action queue: an enable POST
+# answers 202 with an action id, that id polls as 'queued' (this harness
+# has no runner), and the first-install endpoint validates its form.
+curl -s -u admin:probe-pass -X POST -o /tmp/sentinel.enable -w '%{http_code}' \
+  "http://127.0.0.1:39117/api/v1/enable/sentinel-core" > /tmp/sentinel.enable.code 2>/dev/null || true
+AID="$(python3 -c "import json;print(json.load(open('/tmp/sentinel.enable')).get('action_id',''))" 2>/dev/null || true)"
+curl -s -u admin:probe-pass -o /tmp/sentinel.status \
+  "http://127.0.0.1:39117/api/v1/host-actions/${AID:-none}" 2>/dev/null || true
+curl -s -u admin:probe-pass -X POST -H 'Content-Type: application/json' -d '{}' \
+  -o /tmp/sentinel.install -w '%{http_code}' \
+  "http://127.0.0.1:39117/api/v1/sentinel/install" > /tmp/sentinel.install.code 2>/dev/null || true
+
 python3 - <<'PY'
 import json, sys
 apps = json.load(open('/tmp/apps.json'))['apps']
@@ -140,6 +152,32 @@ for probe, want, label in (('/tmp/proxy.unauth', '401', 'proxy refuses unauthent
         check(code == want, label, '%s: HTTP %s, wanted %s' % (label, code, want))
     except Exception as exc:
         check(False, '', '%s: probe unreadable: %s' % (label, exc))
+
+import re as _re
+try:
+    code = open('/tmp/sentinel.enable.code').read().strip()
+    enq = json.load(open('/tmp/sentinel.enable'))
+    check(code == '202' and enq.get('queued') is True
+          and _re.fullmatch(r'[0-9]{10,16}-[a-f0-9]{8}', enq.get('action_id', '') or ''),
+          'sentinel enable queues a host action (202 + id)',
+          'enable answered HTTP %s body %r' % (code, enq))
+    st = json.load(open('/tmp/sentinel.status'))
+    check(st.get('state') == 'queued',
+          'queued action polls as queued (no runner in this harness)',
+          'host-action state: %r' % st.get('state'))
+    check('runner' in st,
+          'poll reports runner health for the stuck-queue hint',
+          'no runner field in %r' % st)
+except Exception as exc:
+    check(False, '', 'sentinel queue probes failed: %s' % exc)
+try:
+    code = open('/tmp/sentinel.install.code').read().strip()
+    inst = json.load(open('/tmp/sentinel.install'))
+    check(code == '400' and any('firm_name' in e for e in inst.get('errors', [])),
+          'sentinel install validates the firm form (400 names missing fields)',
+          'install answered HTTP %s body %r' % (code, inst))
+except Exception as exc:
+    check(False, '', 'sentinel install probe failed: %s' % exc)
 
 try:
     head = open('/tmp/guide.pdf', 'rb').read(5)

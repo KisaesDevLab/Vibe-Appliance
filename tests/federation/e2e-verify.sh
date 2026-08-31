@@ -262,9 +262,11 @@ if "compensating-control" not in body:
     bad.append('the disable route does not check disableRequires')
 if "status(400)" not in body:
     bad.append('the disable route does not 400 without a control')
-# It must refuse BEFORE spawning.
-if body.index('status(400)') > body.index('runToggle(req, res, SENTINEL_SCRIPT'):
-    bad.append('the 400 comes after the spawn')
+# It must refuse BEFORE queueing to the host runner.
+if 'queueSentinelAction' not in body:
+    bad.append('the disable route does not queue to the host runner')
+elif body.index('status(400)') > body.index("queueSentinelAction(req, res, 'sentinel-disable'"):
+    bad.append('the 400 comes after the enqueue')
 # And length-bounded, or a 500 KB "reason" lands in state.
 if 'length > 500' not in body:
     bad.append('reason/approver are not length-bounded')
