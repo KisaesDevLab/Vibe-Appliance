@@ -1,0 +1,131 @@
+# apps/vibe-recap.yml — Vibe Recap overlay for the Vibe Appliance.
+# Copy of Vibe-Recap/.appliance/compose.vibe-recap.yml; the app repo is the source of truth.
+#
+# Five services from three GHCR images:
+#   vibe-recap-migrate → one-shot `migrate` (idempotent). MIGRATIONS_AUTO is false on the
+#                        appliance, so the api never migrates at boot; this runs at enable and
+#                        update.sh runs the same command behind its dump + rollback.
+#   vibe-recap-api     → Fastify api (3000). container_name = basename(image), the
+#                        routing-derived service enable-app brings up. Registers the
+#                        `recap_script` task class with vibe-ai-router at startup.
+#   vibe-recap-web     → unprivileged nginx serving the React UI (8080). Caddy's default upstream.
+#   vibe-recap-worker  → Python pipeline. NOT on vibe_net: it sits on a private internal
+#                        network and reaches Postgres, Redis, the router and the local model
+#                        server only through vibe-recap-relay, so it has no internet route
+#                        (Vibe-Recap CLAUDE.md non-negotiable 4). It talks HTTP to nothing
+#                        Caddy could probe; its health is the queue it drains.
+#   vibe-recap-relay   → socat, four listeners, aliased on the internal network as
+#                        postgres / redis / vibe-ai-router / vibellm so the shared env file
+#                        needs no per-service rewriting.
+#
+# SHARED UID. Every service runs as 1000:1000 (the uid baked into the api and worker images)
+# and api + worker share /data (encrypted blobs, master key, form profiles); manifest
+# dataOwner = 1000:1000 chowns the host side to match. The web tier and the relay carry the
+# same pin so the appliance's invariant test stays satisfied; neither touches /data.
+
+name: vibe
+
+services:
+  vibe-recap-migrate:
+    image: ghcr.io/kisaesdevlab/vibe-recap-api:${APP_TAG:-latest}
+    container_name: vibe-recap-migrate
+    user: "1000:1000"
+    restart: "no"
+    init: true
+    command: ["migrate"]
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-recap.env
+    networks:
+      - vibe_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  vibe-recap-relay:
+    image: alpine/socat:latest
+    container_name: vibe-recap-relay
+    user: "1000:1000"
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        socat TCP-LISTEN:5432,fork,reuseaddr TCP:postgres:5432 &
+        socat TCP-LISTEN:6379,fork,reuseaddr TCP:redis:6379 &
+        socat TCP-LISTEN:8220,fork,reuseaddr TCP:vibe-ai-router:8220 &
+        exec socat TCP-LISTEN:11434,fork,reuseaddr TCP:${LOCAL_MODEL_HOST:-vibellm}:11434
+    networks:
+      vibe_net: {}
+      vibe_recap_internal:
+        aliases: [postgres, redis, vibe-ai-router, vibellm]
+
+  vibe-recap-worker:
+    image: ghcr.io/kisaesdevlab/vibe-recap-worker:${APP_TAG:-latest}
+    container_name: vibe-recap-worker
+    user: "1000:1000"
+    restart: unless-stopped
+    init: true
+    shm_size: 1g
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-recap.env
+    environment:
+      FORM_PROFILES_DIR: /data/form-profiles
+    volumes:
+      - /opt/vibe/data/apps/vibe-recap:/data
+    networks:
+      - vibe_recap_internal
+    depends_on:
+      vibe-recap-relay:
+        condition: service_started
+      vibe-recap-migrate:
+        condition: service_completed_successfully
+
+  vibe-recap-web:
+    image: ghcr.io/kisaesdevlab/vibe-recap-web:${APP_TAG:-latest}
+    container_name: vibe-recap-web
+    user: "1000:1000"
+    restart: unless-stopped
+    init: true
+    networks:
+      - vibe_net
+
+  vibe-recap-api:
+    image: ghcr.io/kisaesdevlab/vibe-recap-api:${APP_TAG:-latest}
+    container_name: vibe-recap-api
+    user: "1000:1000"
+    restart: unless-stopped
+    init: true
+    env_file:
+      - /opt/vibe/env/shared.env
+      - /opt/vibe/env/appliance.env
+      - /opt/vibe/env/vibe-recap.env
+    volumes:
+      - /opt/vibe/data/apps/vibe-recap:/data
+    networks:
+      - vibe_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vibe-recap-migrate:
+        condition: service_completed_successfully
+      # Pull the worker (and through it the relay) and the web tier into the `up` set;
+      # enable-app starts the routing-derived service only.
+      vibe-recap-worker:
+        condition: service_started
+      vibe-recap-web:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/api/v1/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+
+# Flow style on purpose: the appliance's invariant test counts every two-space-indented
+# key as a service when it checks user pins.
+networks: { vibe_recap_internal: { name: vibe_recap_internal, internal: true } }

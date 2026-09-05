@@ -1,0 +1,120 @@
+{
+  "schemaVersion": 1,
+  "slug": "vibe-recap",
+  "displayName": "Vibe Recap",
+  "description": "Turns a finished Form 1040 package into a narrated plain-English video summary for the client, verified line by line against the return, approved by the preparer, delivered by download.",
+  "logo": "vibe-recap.svg",
+  "_doc": "In-tree manifest for KisaesDevLab/Vibe-Recap. THREE containers plus a migration one-shot, from three GHCR images: `vibe-recap-api` (Fastify, 3000; also the migration and seed one-shots), `vibe-recap-web` (nginx serving the React UI, 80), `vibe-recap-worker` (Python: extraction, script, verifier, Kokoro narration, Playwright slides, ffmpeg). NETWORK POSTURE: the worker never joins vibe_net. It lives on a private internal network behind `vibe-recap-relay`, a socat container that forwards exactly four ports (postgres 5432, redis 6379, vibe-ai-router 8220, vibellm 11434) and carries those names as aliases so the shared env file works unchanged; the worker therefore has no internet route on the appliance either. ROUTER: script generation goes through vibe-ai-router by default (task class `recap_script`, registered by the api at startup and starting local_only until the firm admin widens it). Unlike Vibe-1040 the router is not fatal - with an empty token the app falls back to the appliance's local model server through OLLAMA_URL - but the token is minted at enable like every other app, hence requiredApps. OCR of scanned pages needs an Ollama-native endpoint (`/api/chat` with images); if vibellm only speaks /v1 the job fails cleanly at `ocr` and the preparer asks for a text-layer PDF. MIGRATIONS: the api honours MIGRATIONS_AUTO; the appliance sets it false and runs `migrate` as the one-shot in the overlay (idempotent) and at update time. FIRST LOGIN: `seed-admin` creates the first admin from SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD, is a no-op once any user exists, and the app's /setup page disables itself as soon as a user exists.",
+  "image": {
+    "server": "ghcr.io/kisaesdevlab/vibe-recap-api",
+    "client": "ghcr.io/kisaesdevlab/vibe-recap-web",
+    "defaultTag": "latest",
+    "extras": [
+      { "name": "worker", "image": "ghcr.io/kisaesdevlab/vibe-recap-worker" }
+    ]
+  },
+  "subdomain": "recap",
+  "emergencyPort": 5183,
+  "ports": {
+    "server": 3000,
+    "client": 8080
+  },
+  "rootServedOnly": true,
+  "routing": {
+    "default_upstream": "vibe-recap-web:8080",
+    "matchers": [
+      { "name": "api", "path": "/api/*", "upstream": "vibe-recap-api:3000" },
+      { "name": "healthz", "path": "/healthz", "upstream": "vibe-recap-api:3000" },
+      { "name": "readyz", "path": "/readyz", "upstream": "vibe-recap-api:3000" }
+    ]
+  },
+  "depends": ["postgres", "redis"],
+  "requiredApps": ["vibe-ai-router"],
+  "dataOwner": "1000:1000",
+  "resources": { "cores": 4, "ramMb": 6144 },
+  "license": { "name": "PolyForm Small Business 1.0.0" },
+  "env": {
+    "required": [
+      { "name": "DATABASE_URL", "from": "database-url" },
+      { "name": "REDIS_URL", "from": "redis-url" },
+      { "name": "ALLOWED_ORIGIN", "from": "subdomain-url", "doc": "Comma-separated list accepted. State-changing browser requests must carry one of these origins." },
+      { "name": "DATA_DIR", "from": "static:/data", "doc": "Encrypted blob store, master key, form profiles, orphans. Bind-mounted from /opt/vibe/data/apps/vibe-recap and shared by api and worker (both uid 1000, hence dataOwner)." },
+      { "name": "VIBE_AI_ROUTER_URL", "from": "static:http://vibe-ai-router:8220", "doc": "The router's /v1 gateway on vibe_net; the worker reaches it through vibe-recap-relay under the same name. Never through Caddy." },
+      { "name": "VIBE_AI_TOKEN", "secret": true, "doc": "App token minted against the vibe-ai-router admin API during enable and preserved across re-renders. Empty token = scripts are generated on the local model server instead." },
+      { "name": "OLLAMA_URL", "from": "static:http://vibellm:11434", "doc": "Ollama-native endpoint used for the local-provider fallback and for OCR of scanned pages. On the appliance this is the local model server, reached by the worker through the relay." },
+      { "name": "MIGRATIONS_AUTO", "from": "static:false", "doc": "The appliance runs migrations explicitly (overlay one-shot at enable, update.sh at update)." },
+      { "name": "LICENSE_ENFORCE", "from": "static:false", "doc": "Kisaes licensing check stays informational until the licensing server is live (Vibe-Recap QUESTIONS.md Q35)." },
+      { "name": "SEED_ADMIN_PASSWORD", "from": "generated:hex32", "secret": true, "doc": "First-login password for the admin the seed step creates. Surfaced in the First-login card and CREDENTIALS.txt; preserved across re-renders." },
+      { "name": "COOKIE_SECURE", "from": "static:true" },
+      { "name": "TRUST_PROXY", "from": "static:true" }
+    ],
+    "optional": [
+      {
+        "name": "VIBE_APP_SUBDOMAIN",
+        "doc": "Operator override for this app's subdomain label. Empty = the manifest default (recap). Single DNS label.",
+        "ui": { "tier": 1, "category": "Network", "label": "Subdomain", "helpText": "The <subdomain> in <subdomain>.<your-domain> for this app. Leave blank for the default. Lowercase letters, digits, and dashes; no dots.", "input": "text", "appliance": "per-app", "validate": "regex:^([a-z0-9][a-z0-9-]*)?$", "postSaveJob": "routing-reconcile" }
+      },
+      {
+        "name": "SEED_ADMIN_EMAIL",
+        "value": "admin@appliance.local",
+        "doc": "Login for the first admin created by the seed step. Set it BEFORE first enable; the seed is a no-op once any user exists.",
+        "ui": { "tier": 1, "category": "Application", "label": "First admin email", "helpText": "The email you sign in with the first time. Set it before you enable the app.", "input": "text", "appliance": "per-app", "validate": "email" }
+      },
+      {
+        "name": "OLLAMA_MODEL",
+        "value": "qwen3:8b",
+        "doc": "Model used when scripts are generated locally (Settings > General > provider = Bundled Ollama, or no router token).",
+        "ui": { "tier": 1, "category": "AI", "label": "Local script model", "helpText": "Ollama model name on the local model server for the local-provider fallback. The router provider ignores this.", "input": "text", "appliance": "per-app" }
+      },
+      {
+        "name": "OLLAMA_OCR_MODEL",
+        "value": "glm-ocr",
+        "doc": "Ollama-native vision model used to OCR scanned pages when a return has no text layer.",
+        "ui": { "tier": 1, "category": "AI", "label": "OCR model", "helpText": "Needs an Ollama-native endpoint. If your local model server only speaks the OpenAI API, scanned packages fail cleanly at the OCR step.", "input": "text", "appliance": "per-app" }
+      },
+      {
+        "name": "OLLAMA_TIMEOUT_S",
+        "value": "600",
+        "doc": "Seconds one script attempt may take (router or local). CPU-only boxes need minutes.",
+        "ui": { "tier": 1, "category": "AI", "label": "Script model timeout (s)", "helpText": "One attempt at writing the narration script. 600 is safe on CPU-only hardware.", "input": "number", "appliance": "per-app", "validate": "number-range:60:3600" }
+      },
+      {
+        "name": "WORKER_CONCURRENCY",
+        "value": "1",
+        "doc": "Recap jobs processed at once. Keep 1 unless the host has spare cores and RAM (each job renders a video).",
+        "ui": { "tier": 1, "category": "Application", "label": "Concurrent recap jobs", "helpText": "1 is right for a 6-core box. Takes effect when the worker restarts.", "input": "number", "appliance": "per-app", "validate": "number-range:1:4" }
+      },
+      {
+        "name": "MASTER_KEY_PASSPHRASE",
+        "secret": true,
+        "doc": "Optional passphrase wrapping /data/keys/master.key. If set, it must be present at every start. Leave empty on the appliance; /opt/vibe/env is inside the sealed backup set already."
+      },
+      {
+        "name": "TZ",
+        "from": "appliance:TZ",
+        "doc": "IANA time zone; inherits the appliance-wide TZ unless overridden.",
+        "ui": { "tier": 1, "category": "Time & Logging", "label": "Time zone (override)", "helpText": "Inherited from appliance.", "input": "time-zone", "appliance": "both", "validate": "iana-timezone" }
+      }
+    ]
+  },
+  "database": { "name": "vibe_recap_db", "user": "viberecap" },
+  "requiredExtensions": ["pg_trgm"],
+  "redis": { "db": 9 },
+  "firstLogin": {
+    "type": "default-credentials-passive",
+    "username": "admin@appliance.local",
+    "passwordEnvKey": "SEED_ADMIN_PASSWORD",
+    "url": "/login",
+    "note": "The username is whatever SEED_ADMIN_EMAIL was at enable time. Change the password under your account after signing in; the seed never resets it. Served at the root of its own subdomain in both routing modes (rootServedOnly); in LAN/Tailscale mode use http://<server-ip>:5183/."
+  },
+  "migrations": {
+    "command": ["migrate"],
+    "autoEnvVar": "MIGRATIONS_AUTO"
+  },
+  "seed": {
+    "command": ["seed-admin"],
+    "description": "Creates the first admin from SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD. No demo data. No-op once any user exists."
+  },
+  "health": "/api/v1/health",
+  "health_timeout_s": 120
+}
