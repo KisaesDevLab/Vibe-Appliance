@@ -115,7 +115,7 @@ STUB
   chmod 644 "$tmp"
 
   python3 - "$manifests_dir" "$VIBE_STATE_FILE" "$tmp" <<'PYEOF'
-import json, os, sys
+import json, os, re, sys
 from pathlib import Path
 
 (manifests_dir, state_path, out_path) = sys.argv[1:4]
@@ -286,6 +286,11 @@ for slug in all_app_slugs:
             # this the fallback URL printed in CREDENTIALS.txt and the
             # Emergency Access panel lands on the app's own 404.
             "root_redirect": (m.get("routing", {}) or {}).get("root_redirect") or "",
+            # manifest.routing.matchers — the path-based splits the app
+            # declares. render-caddyfile.sh has always honored these; this
+            # renderer read only `default_upstream`, so every emergency
+            # frontend sent /api/* to the app's STATIC web tier.
+            "matchers": (m.get("routing", {}) or {}).get("matchers") or [],
         })
 
 # Phase 8.5 v1.2 — fallback ports for infra services. Same pattern as
@@ -418,11 +423,51 @@ else:
             lines.append(
                 f"  http-request redirect location {fe['root_redirect']} code 308 "
                 "if { path / }")
+        # Path-based splits from manifest.routing.matchers. Without these
+        # the app's static web tier answered /api/* itself: an SPA
+        # try_files fallback returns index.html with 200 for a GET and 405
+        # for a POST, so `POST /api/auth/login` could never reach the API
+        # and sign-in was impossible on every emergency port — the ONLY
+        # LAN/Tailscale path for a rootServedOnly app.
+        matcher_backends = []          # [(suffix, upstream)] in first-seen order
+        upstream_to_suffix = {}        # dedupe: /api, /healthz, /readyz share one
+        for mt in fe.get("matchers") or []:
+            if not isinstance(mt, dict):
+                continue
+            m_path = (mt.get("path") or "").strip()
+            m_up   = (mt.get("upstream") or "").strip()
+            m_name = (mt.get("name") or "").strip()
+            if not m_path or not m_up or not m_name:
+                continue
+            # A matcher pointing at the frontend's own upstream needs no split.
+            if m_up == fe["upstream"]:
+                continue
+            safe = re.sub(r"[^A-Za-z0-9_]", "_", m_name)
+            suffix = upstream_to_suffix.get(m_up)
+            if suffix is None:
+                suffix = safe
+                upstream_to_suffix[m_up] = suffix
+                matcher_backends.append((suffix, m_up))
+            acl_name = f"acl_{fe['name']}_{safe}"
+            if m_path.endswith("/*"):
+                # Caddy's `/api/*` matches /api and everything beneath it.
+                # Two acl lines sharing a name OR together in HAProxy.
+                prefix = m_path[:-2]
+                lines.append(f"  acl {acl_name} path_beg {prefix}/")
+                lines.append(f"  acl {acl_name} path {prefix}")
+            else:
+                lines.append(f"  acl {acl_name} path {m_path}")
+            lines.append(f"  use_backend be_{fe['name']}_{suffix} if {acl_name}")
         lines.append(f"  default_backend be_{fe['name']}")
         lines.append(f"backend be_{fe['name']}")
         lines.append(f"  option httpchk GET /")
         lines.append(f"  http-check expect status 100-499")
         lines.append(f"  server {fe['name']} {fe['upstream']} check inter 30s fall 3 rise 1 resolvers docker init-addr last,libc,none")
+        for suffix, m_up in matcher_backends:
+            lines.append(f"backend be_{fe['name']}_{suffix}")
+            lines.append(f"  option httpchk GET /")
+            lines.append(f"  http-check expect status 100-499")
+            lines.append(f"  server {fe['name']}_{suffix} {m_up} check inter 30s fall 3 rise 1 resolvers docker init-addr last,libc,none")
 
 # encoding pinned explicitly: several emitted comment lines contain
 # non-ASCII (em-dashes, an arrow), and manifest displayName / note values
