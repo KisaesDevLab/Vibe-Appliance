@@ -372,10 +372,21 @@ services:
       - vibe_net
     depends_on: []
     healthcheck:
-      # `haproxy -c -f` exits 0 when the config parses; useful liveness
-      # probe without reaching out for socat or other extras. The image
-      # is busybox-ish but ships sh.
-      test: ["CMD-SHELL", "haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg >/dev/null 2>&1 || exit 1"]
+      # Probes the stats frontend (:5199, no auth) — proves the running
+      # HAProxy is alive and actually serving. Runs in ~45ms.
+      #
+      # Do NOT revert this to `haproxy -c -f`. Config-check mode resolves
+      # every `server` address through libc (the lines carry
+      # `init-addr last,libc,none`), so each *disabled* app's unresolvable
+      # container name costs a full DNS timeout. With ~13 apps offline the
+      # check takes >25s and can never pass inside any sane timeout, so the
+      # proxy reported unhealthy while it was serving traffic normally —
+      # and the cost grows with every app added to the manifests.
+      #
+      # A broken on-disk config is already caught by lib/render-haproxy.sh,
+      # which validates with `haproxy -c -f` in a throwaway container before
+      # installing the file and sending SIGHUP. It does not belong here.
+      test: ["CMD-SHELL", "wget -q -O /dev/null -T 3 http://127.0.0.1:5199/ || exit 1"]
       interval: 60s
       timeout: 5s
       retries: 2
