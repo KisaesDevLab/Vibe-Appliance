@@ -290,7 +290,18 @@ for slug in all_app_slugs:
             # declares. render-caddyfile.sh has always honored these; this
             # renderer read only `default_upstream`, so every emergency
             # frontend sent /api/* to the app's STATIC web tier.
-            "matchers": (m.get("routing", {}) or {}).get("matchers") or [],
+            #
+            # PRIMARY SURFACE ONLY. A matcher's `upstream` is wired for the
+            # manifest's default_upstream; on a subdomains[] entry that
+            # overrides `target` it names the wrong container port. Applying
+            # vibe-connect's `/socket.io/* -> vibe-connect-client:80` to the
+            # client-portal frontend (target :8080) would send client
+            # WebSocket traffic to the STAFF surface. render-caddyfile.sh
+            # ignores matcher upstreams on secondary subdomain vhosts for
+            # exactly this reason (see its extra-subdomain vhost block);
+            # emergency frontends follow the same rule.
+            "matchers": ((m.get("routing", {}) or {}).get("matchers") or [])
+                        if (c.get("target") or upstream) == upstream else [],
         })
 
 # Phase 8.5 v1.2 — fallback ports for infra services. Same pattern as

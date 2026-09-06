@@ -439,6 +439,63 @@ test('render-haproxy emits the root redirect on the emergency frontend', () => {
     'no root_redirect declared, none emitted');
 });
 
+test('routing.matchers split paths on the primary surface, never on a secondary one', () => {
+  const fx = mkFixtures();
+
+  // vibe-tb: one surface, and its matcher names a genuinely different
+  // container. This is the case the split exists for.
+  const tbPath = path.join(fx.manifests, 'vibe-tb.json');
+  const tb = JSON.parse(fs.readFileSync(tbPath, 'utf8'));
+  tb.emergencyPort = 5172;
+  fs.writeFileSync(tbPath, JSON.stringify(tb));
+
+  // vibe-connect: two surfaces on two container ports. The matcher's
+  // upstream is the manifest default — the STAFF port — while the client
+  // portal overrides `target`.
+  const cPath = path.join(fx.manifests, 'vibe-connect.json');
+  const c = JSON.parse(fs.readFileSync(cPath, 'utf8'));
+  c.routing.matchers = [{ name: 'websocket', path: '/socket.io/*',
+                          upstream: 'vibe-connect-client:80', streaming: true }];
+  c.subdomains = [
+    { name: 'connect', audience: 'staff',  emergencyPort: 5181, target: 'vibe-connect-client:80' },
+    { name: 'client',  audience: 'client', emergencyPort: 5182, target: 'vibe-connect-client:8080' },
+  ];
+  fs.writeFileSync(cPath, JSON.stringify(c));
+
+  const py = extractPyeof(path.join(REPO, 'lib', 'render-haproxy.sh'), 'frontend fe_');
+  const pyFile = path.join(fx.dir, 'haproxy-matchers.py');
+  fs.writeFileSync(pyFile, py + '\n');
+  const out = path.join(fx.dir, 'haproxy-matchers.cfg');
+  execFileSync('python3', [pyFile, fx.manifests, fx.stateFile, out]);
+  const cfg = fs.readFileSync(out, 'utf8');
+
+  // Primary surface: the split is emitted, and /api reaches the API tier.
+  // Without it an SPA try_files fallback answers POST /api/... with 405.
+  const tbFe = cfg.split('frontend fe_vibe_tb\n')[1].split('\nfrontend ')[0];
+  assert.match(tbFe, /acl acl_vibe_tb_api path_beg \/api\//,        'prefix acl for /api/*');
+  assert.match(tbFe, /^ {2}acl acl_vibe_tb_api path \/api$/m,       'bare /api matches too');
+  assert.match(tbFe, /use_backend be_vibe_tb_api if acl_vibe_tb_api/, 'split hands off');
+  assert.match(tbFe, /server vibe_tb_api vibe-tb-server:3001 /,     'and lands on the API container');
+
+  // Secondary surface: no split at all. The matcher upstream names the
+  // staff port (:80); honouring it here would send client-portal WebSocket
+  // traffic to the STAFF container. render-caddyfile.sh ignores matcher
+  // upstreams on secondary subdomain vhosts for exactly this reason.
+  const clientFe = cfg.split('frontend fe_vibe_connect_client\n')[1].split('\nfrontend ')[0];
+  assert.doesNotMatch(clientFe, /^ {2}acl /m,        'no acl on the client portal');
+  assert.doesNotMatch(clientFe, /use_backend /,      'no path split on the client portal');
+  assert.match(clientFe, /default_backend be_vibe_connect_client$/m, 'one backend, its own');
+  assert.match(clientFe, /server vibe_connect_client vibe-connect-client:8080 /,
+    'client portal keeps its own target');
+  assert.doesNotMatch(cfg, /be_vibe_connect_client_websocket/,
+    'no cross-surface backend is emitted anywhere');
+
+  // The staff surface declares the same upstream the matcher names, so the
+  // split is redundant there and must not be emitted either.
+  const staffFe = cfg.split('frontend fe_vibe_connect_connect\n')[1].split('\nfrontend ')[0];
+  assert.doesNotMatch(staffFe, /^ {2}acl /m, 'matcher pointing at the frontend upstream is a no-op');
+});
+
 // --- runtime federation: another orchestrator's units are not ours --------
 
 // A Sentinel module: no image, no ports, no routing, health by script, its own
