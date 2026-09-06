@@ -315,3 +315,44 @@ _host_lan_ip() {
   ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
   printf '%s' "${ip:-}"
 }
+
+# The address to hand a BROWSER — prefer state.config.host_ip, fall back to
+# probing this machine's interfaces.
+#
+# _host_lan_ip probes whatever is EXECUTING it. That is the host during
+# bootstrap, but the console spawns lib/enable-app.sh from inside its own
+# container (console/server.js, which mounts /opt/vibe and the docker
+# socket), and there the probe returns the CONTAINER's vibe_net address:
+# every step of _host_lan_ip agrees on it, so no amount of bridge-filtering
+# helps. ALLOWED_ORIGIN for a rootServedOnly app came out as
+# `http://172.18.0.15:5183` — the console's own IP — and Vibe Recap answered
+# every sign-in with "Origin not allowed", because the browser's real origin
+# was the host's LAN IP.
+#
+# state.config.host_ip is written by bootstrap ON THE HOST and refreshed by
+# the console, so it reads correctly from both sides of the boundary.
+#
+# NOT for callers that must probe this machine: bootstrap's phase that SETS
+# state.config.host_ip would define itself, and doctor.sh reports on the
+# host it runs on. Those keep calling _host_lan_ip.
+_host_ip_effective() {
+  local state_file ip
+  state_file="${VIBE_STATE_FILE:-${VIBE_DIR:-/opt/vibe}/state.json}"
+  ip=""
+  if [[ -f "$state_file" ]] && command -v python3 >/dev/null 2>&1; then
+    ip="$(python3 - "$state_file" <<'PYEOF' 2>/dev/null || true
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1])).get("config") or {}
+except Exception:
+    cfg = {}
+sys.stdout.write(str(cfg.get("host_ip") or "").strip())
+PYEOF
+)"
+  fi
+  if [[ -n "$ip" ]]; then
+    printf '%s' "$ip"
+    return 0
+  fi
+  _host_lan_ip
+}

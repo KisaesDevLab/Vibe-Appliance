@@ -1184,7 +1184,7 @@ PYEOF
     # that host:port IS the browser's origin. Anything else would put a
     # mismatched value in ALLOWED_ORIGIN and break CORS / cookies for the
     # one path that does work.
-    ip="$(_host_lan_ip)"
+    ip="$(_host_ip_effective)"
     local _emg_port
     _emg_port="$(_manifest_field "$manifest" 'data.get("emergencyPort") or next((s.get("emergencyPort") for s in (data.get("subdomains") or []) if s.get("emergencyPort")), "")')"
     if [[ -n "$_emg_port" ]]; then
@@ -1197,7 +1197,7 @@ PYEOF
     staff_app_url="$allowed_origin"
     client_portal_url=""
   else
-    ip="$(_host_lan_ip)"
+    ip="$(_host_ip_effective)"
     allowed_origin="http://${ip:-localhost}"
     # LAN / Tailscale → Caddy path-prefix /<prefix>/. The web image's
     # /docker-entrypoint.d/40-base-path.sh reads VITE_BASE_PATH and
