@@ -467,10 +467,12 @@ secrets_write_credentials() {
 
   # Best-effort detection of LAN + Tailscale IPs for the emergency-access
   # section. Both fall back to a placeholder when unavailable.
-  # _host_lan_ip skips docker bridges so CREDENTIALS.txt doesn't print
-  # a 172.x address the operator's browser can't reach.
+  # _host_ip_effective prefers state.config.host_ip so CREDENTIALS.txt
+  # doesn't print a 172.x address the operator's browser can't reach —
+  # lib/enable-app.sh calls this from inside the console container, where
+  # probing the interfaces returns the container's own vibe_net IP.
   local lan_ip ts_ip
-  lan_ip="$(_host_lan_ip)"
+  lan_ip="$(_host_ip_effective)"
   [[ -z "$lan_ip" ]] && lan_ip="<your-server-ip>"
   if command -v tailscale >/dev/null 2>&1; then
     ts_ip="$(tailscale ip -4 2>/dev/null | head -1)"
