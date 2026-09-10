@@ -65,6 +65,11 @@
         "doc": "32 raw bytes, base64. Signs staff session cookies. Per-app rather than the appliance-wide JWT_SECRET because this app's zod schema requires exactly 32 decoded bytes and rotating it should sign out this app only."
       },
       {
+        "name": "SESSION_SECURE",
+        "from": "install-mode-tls",
+        "doc": "Marks the staff session cookie `Secure`. Rendered from the appliance's install-mode TLS decision: true in domain mode, false in LAN mode, and false in Tailscale mode as well because this app is rootServedOnly and so has no tailnet HTTPS surface - its only address there is the plain-HTTP emergency port :5177. Static true strands sign-in in both of those modes: the browser accepts the Set-Cookie, never returns it, and the second-factor request 401s in a loop that shows no error. Before the app read this variable it derived the flag from NODE_ENV, which this appliance always sets to production, so LAN sign-in could not succeed at all."
+      },
+      {
         "name": "STORAGE_ENCRYPTION_KEY",
         "from": "generated:base64-32bytes",
         "secret": true,
