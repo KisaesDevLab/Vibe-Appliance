@@ -55,6 +55,33 @@
       <div class="apps-list" id="apps-list"></div>
     </section>
 
+    <!-- Single sign-on (Vibe Auth). Manifest-driven: the server lists
+         every app whose manifest carries `sso.capable`, and the broker
+         is whichever manifest `provides: ["identity"]`. Every button
+         here spawns one action of lib/identity.sh; the output pane
+         renders its stdout/stderr like the app cards do. Rendered by
+         /static/identity.js. -->
+    <section id="identity-section">
+      <h2>Single sign-on (Vibe Auth)</h2>
+      <p class="muted" id="identity-summary">—</p>
+      <p class="muted section-note">
+        Vibe Auth is the appliance's identity broker: staff sign in once and every registered app
+        accepts that session. Each app keeps a <span class="mono">vibe-breakglass</span> local account
+        so you can still get in if the broker is down — store its password in the firm password manager
+        before switching any app to <span class="mono">oidc_only</span>.
+      </p>
+      <div id="identity-error" class="error-banner" hidden></div>
+      <div id="identity-broker" style="margin-top:1rem"></div>
+      <div class="cta-row">
+        <button class="btn btn--ghost" id="identity-refresh" type="button">Refresh</button>
+        <button class="btn btn--ghost" id="identity-rebase" type="button" disabled
+          title="Recompute every registered app's issuer URL after the host name, IP, domain or routing mode changed">
+          Re-derive issuers (after host/IP change)</button>
+      </div>
+      <pre class="app-card__output" id="identity-rebase-out" hidden></pre>
+      <div class="apps-list" id="identity-list"></div>
+    </section>
+
     <!-- Sentinel first-install form. Collects the same answers the
          installer's own terminal wizard asks, POSTs them to
          /api/v1/sentinel/install, and the host-action runner executes
@@ -1834,5 +1861,6 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
     loadLogList();
     setInterval(loadLogList, 30000);
   </script>
+  <script src="/static/identity.js"></script>
 </body>
 </html>

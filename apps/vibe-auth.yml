@@ -1,0 +1,102 @@
+# apps/vibe-auth.yml — Vibe Auth overlay (broker + bundled authentik).
+#
+#   docker compose -f docker-compose.yml -f apps/vibe-auth.yml up -d
+#
+# Reads /opt/vibe/env/vibe-auth.env (rendered from
+# env-templates/per-app/vibe-auth.env.tmpl). authentik and the broker share
+# the per-app database `vibe_auth` on the appliance Postgres (D7); the
+# broker's own tables are prefixed vibe_broker_*. No Redis (authentik
+# ≥2025 dropped it). No published ports — Caddy routes /auth/* to the
+# authentik server (routing.mounts) and /vibe-auth/* to the broker.
+#
+# Memory (§2.7): server 1 GB, worker 768 MB, broker 256 MB.
+
+name: vibe
+
+x-authentik: &authentik
+  image: ghcr.io/goauthentik/server:2026.8.2@sha256:ff8489a5af4f4fe415ffd180a8e3c10b120bc2592d13d79dac050d977f7b9ecd
+  restart: unless-stopped
+  env_file:
+    - /opt/vibe/env/vibe-auth.env
+  volumes:
+    - /opt/vibe/data/apps/vibe-auth/media:/media
+    - /opt/vibe/data/apps/vibe-auth/templates:/templates
+    - /opt/vibe/data/apps/vibe-auth/blueprints:/blueprints/vibe:ro
+  networks:
+    vibe_net: {}
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  vibe-auth-authentik-server:
+    <<: *authentik
+    container_name: vibe-auth-authentik-server
+    command: server
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      interval: 30s
+      timeout: 30s
+      start_period: 120s
+      retries: 5
+    deploy:
+      resources:
+        limits: { memory: 1g }
+        reservations: { memory: 512m }
+
+  vibe-auth-authentik-worker:
+    <<: *authentik
+    container_name: vibe-auth-authentik-worker
+    command: worker
+    volumes:
+      - /opt/vibe/data/apps/vibe-auth/media:/media
+      - /opt/vibe/data/apps/vibe-auth/templates:/templates
+      - /opt/vibe/data/apps/vibe-auth/certs:/certs
+      - /opt/vibe/data/apps/vibe-auth/blueprints:/blueprints/vibe:ro
+    deploy:
+      resources:
+        limits: { memory: 768m }
+        reservations: { memory: 384m }
+
+  vibe-auth:
+    image: ghcr.io/kisaesdevlab/vibe-auth:${APP_TAG:-latest}
+    container_name: vibe-auth
+    restart: unless-stopped
+    init: true
+    env_file:
+      - /opt/vibe/env/vibe-auth.env
+    volumes:
+      - /opt/vibe/data/apps/vibe-auth/data:/data
+    labels:
+      vibe.backup.contract: /app/backup.contract.yaml
+      com.kisaes.vibe.product: vibe-auth
+    networks:
+      vibe_net: {}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      vibe-auth-authentik-server:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 90s
+      retries: 20
+    deploy:
+      resources:
+        limits: { memory: 256m }
+        reservations: { memory: 128m }
+
+  # Copies the pinned blueprints out of the broker image into the bind mount
+  # authentik reads, so blueprints and broker always match versions.
+  vibe-auth-blueprints:
+    image: ghcr.io/kisaesdevlab/vibe-auth:${APP_TAG:-latest}
+    container_name: vibe-auth-blueprints
+    restart: "no"
+    user: "0:0"
+    entrypoint: ["sh", "-c", "cp -f /app/blueprints/*.yaml /out/ && chmod 644 /out/*.yaml && echo blueprints synced"]
+    volumes:
+      - /opt/vibe/data/apps/vibe-auth/blueprints:/out
+    networks:
+      vibe_net: {}
