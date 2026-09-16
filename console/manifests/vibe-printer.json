@@ -4,140 +4,151 @@
   "displayName": "Vibe Print",
   "description": "LAN print routing gateway: other Vibe apps POST a job, it renders and routes to thermal, label, and office printers.",
   "logo": "vibe-printer.svg",
-  "_doc": "In-tree manifest for KisaesDevLab/Vibe-Printer (github.com/KisaesDevLab/Vibe-Printer), current release v0.1.0. ONE container from one GHCR image: FastAPI on 8080 with a bundled React admin SPA mounted at /admin and the print API at /v1. STATELESS OF THE SHARED STACK - it keeps its own SQLite under /data and touches neither the shared Postgres nor the shared Redis, so it declares no `database`, no `redis`, and an empty `depends`. AUTH IS A SINGLE SHARED BEARER SECRET (VIBE_PRINT_SECRET), not a user model: there is no username, the admin UI asks for the secret, and calling apps send it as a bearer token. It is `userFacing: false` because clients never touch it - the subdomains[] entry is what still earns it a staff vhost in domain mode (same pattern as vibe-ai-router). ROOT SERVES NOTHING (the SPA is at /admin, the API at /v1), which is what routing.root_redirect is for. NOT WIRED YET: no other Vibe app's env template points at this gateway, so today it is installed and usable from its own admin UI but nothing in the suite prints through it automatically.",
-
+  "_doc": "In-tree manifest for KisaesDevLab/Vibe-Printer (github.com/KisaesDevLab/Vibe-Printer), current release v0.1.0; upstream mirrors this file at .appliance/manifest.json - keep them in step. ONE container from one GHCR image: FastAPI on 8080 with a bundled React admin SPA mounted at /admin and the print API at /v1. STATELESS OF THE SHARED STACK - it keeps its own SQLite under /data and touches neither the shared Postgres nor the shared Redis, so it declares no `database`, no `redis`, and an empty `depends`. AUTH IS A SINGLE SHARED BEARER SECRET (VIBE_PRINT_SECRET), not a user model: there is no username, the admin UI asks for the secret, and calling apps send it as a bearer token. It is `userFacing: false` because clients never touch it - the subdomains[] entry is what still earns it a staff vhost in domain mode (same pattern as vibe-ai-router). ROOT SERVES NOTHING (the SPA is at /admin, the API at /v1), which is what routing.root_redirect is for. NOT WIRED YET: no other Vibe app's env template points at this gateway, so today it is installed and usable from its own admin UI but nothing in the suite prints through it automatically. MANAGED INGRESS: VIBE_PRINT_MANAGED_INGRESS=true (static, required) tells the app this appliance owns TLS/hostname/tunnel - its bundled cloudflared never auto-starts, the tunnel start endpoint answers 409, and the Remote Access tab hides its tunnel controls. Upstream honours X-Forwarded-Proto only from VIBE_PRINT_TRUSTED_PROXIES peers, and 308-redirects / to /admin/ itself as well.",
   "image": {
-    "server":     "ghcr.io/kisaesdevlab/vibe-printer",
+    "server": "ghcr.io/kisaesdevlab/vibe-printer",
     "defaultTag": "latest"
   },
-
   "sameProductAs": "sentinel-print",
-
   "subdomain": "print",
   "subdomains": [
     {
-      "name":          "print",
-      "audience":      "staff",
+      "name": "print",
+      "audience": "staff",
       "emergencyPort": 5194,
       "emergencyNote": "The ONLY way in on LAN/Tailscale (rootServedOnly: no path mount). It is also the RIGHT way in on a LAN: the printers this gateway talks to are on that same network."
     }
   ],
   "emergencyPort": 5194,
-  "userFacing":    false,
-  "ports":         { "server": 8080 },
-
+  "userFacing": false,
+  "ports": {
+    "server": 8080
+  },
   "rootServedOnly": true,
-
   "routing": {
     "default_upstream": "vibe-printer:8080",
-    "root_redirect":    "/admin/",
-    "deny_paths":       ["/metrics"]
+    "root_redirect": "/admin/",
+    "deny_paths": [
+      "/metrics"
+    ]
   },
-
   "env": {
     "required": [
-      { "name": "VIBE_PRINT_SECRET", "from": "generated:hex32", "secret": true,
-        "doc": "The shared bearer secret. It is the ONLY credential this app has: it gates the admin UI and every /v1 call, there is no user model behind it, and the service refuses to boot when it is empty. Generated once on first enable and preserved across re-renders - rotating it invalidates every caller and every signed-in admin session at once, so treat it as a deliberate act, not a maintenance step." },
-      { "name": "VIBE_PRINT_DATA_DIR", "from": "static:/data",
-        "doc": "SQLite database, uploaded assets, and backup snapshots. Bind-mounted from /opt/vibe/data/apps/vibe-printer/data - this app keeps ALL of its state here, so that directory is the whole backup surface." },
-      { "name": "VIBE_PRINT_TRUSTED_PROXIES", "from": "static:[\"127.0.0.1\",\"172.16.0.0/12\"]",
-        "doc": "Peers whose forwarded-for headers are believed when resolving a caller's real IP. Set to loopback plus the RFC1918 block Docker allocates from, because on this appliance the only things in front of the app are Caddy and the emergency HAProxy, both on the internal bridge network. Rate limiting and the audit trail key off the resolved IP, so a wider value here would let a caller spoof both." }
+      {
+        "name": "VIBE_PRINT_SECRET",
+        "from": "generated:hex32",
+        "secret": true,
+        "doc": "The shared bearer secret. It is the ONLY credential this app has: it gates the admin UI and every /v1 call, there is no user model behind it, and the service refuses to boot when it is empty. Generated once on first enable and preserved across re-renders - rotating it invalidates every caller and every signed-in admin session at once, so treat it as a deliberate act, not a maintenance step."
+      },
+      {
+        "name": "VIBE_PRINT_DATA_DIR",
+        "from": "static:/data",
+        "doc": "SQLite database, uploaded assets, and backup snapshots. Bind-mounted from /opt/vibe/data/apps/vibe-printer/data - this app keeps ALL of its state here, so that directory is the whole backup surface."
+      },
+      {
+        "name": "VIBE_PRINT_TRUSTED_PROXIES",
+        "from": "static:[\"127.0.0.1\",\"172.16.0.0/12\"]",
+        "doc": "Peers whose forwarded-for headers are believed when resolving a caller's real IP. Set to loopback plus the RFC1918 block Docker allocates from, because on this appliance the only things in front of the app are Caddy and the emergency HAProxy, both on the internal bridge network. Rate limiting and the audit trail key off the resolved IP, so a wider value here would let a caller spoof both."
+      },
+      {
+        "name": "VIBE_PRINT_MANAGED_INGRESS",
+        "from": "static:true",
+        "doc": "This appliance owns public ingress (shared Caddy + its own Cloudflare Tunnel). With this set the app's bundled cloudflared never auto-starts, POST /v1/admin/remote/tunnel/start answers 409 `conflict`, no tunnel token is ever stored, and the admin UI's Remote Access tab hides the tunnel controls. Without it an operator could start a second tunnel that publishes this gateway on a hostname the appliance cannot re-render or tear down."
+      }
     ],
     "optional": [
       {
         "name": "VIBE_APP_SUBDOMAIN",
-        "doc":  "Operator override for this app's subdomain label. Empty = the manifest default. Consumed by the appliance routing (Caddy vhost + Cloudflare Tunnel CNAME/ingress). Single DNS label - lowercase letters, digits, dashes, no dots.",
+        "doc": "Operator override for this app's subdomain label. Empty = the manifest default. Consumed by the appliance routing (Caddy vhost + Cloudflare Tunnel CNAME/ingress). Single DNS label - lowercase letters, digits, dashes, no dots.",
         "ui": {
-          "tier":        1,
-          "category":    "Network",
-          "label":       "Subdomain",
-          "helpText":    "The <subdomain> in <subdomain>.<your-domain> for this app. Leave blank to use the built-in default. Lowercase letters, digits, and dashes; no dots. Saving re-renders routing and re-provisions the Cloudflare Tunnel; the app briefly restarts.",
-          "input":       "text",
-          "appliance":   "per-app",
-          "validate":    "regex:^([a-z0-9][a-z0-9-]*)?$",
+          "tier": 1,
+          "category": "Network",
+          "label": "Subdomain",
+          "helpText": "The <subdomain> in <subdomain>.<your-domain> for this app. Leave blank to use the built-in default. Lowercase letters, digits, and dashes; no dots. Saving re-renders routing and re-provisions the Cloudflare Tunnel; the app briefly restarts.",
+          "input": "text",
+          "appliance": "per-app",
+          "validate": "regex:^([a-z0-9][a-z0-9-]*)?$",
           "postSaveJob": "routing-reconcile"
         }
       },
       {
-        "name":  "VIBE_PRINT_STORE_PAYLOADS",
+        "name": "VIBE_PRINT_STORE_PAYLOADS",
         "value": "false",
-        "doc":   "Whether a job's rendered payload is kept after printing. The appliance ships it OFF: these payloads are receipts and client documents, so the appliance default keeps only a content hash once the job is done. Turn it on temporarily when you need to reprint or debug a specific job.",
+        "doc": "Whether a job's rendered payload is kept after printing. The appliance ships it OFF: these payloads are receipts and client documents, so the appliance default keeps only a content hash once the job is done. Turn it on temporarily when you need to reprint or debug a specific job.",
         "ui": {
-          "tier":      1,
-          "category":  "Compliance",
-          "label":     "Keep printed payloads",
-          "helpText":  "Off keeps only a content hash after a job prints - safer, and the appliance default. On keeps the full rendered payload so you can inspect or reprint it.",
-          "input":     "toggle",
+          "tier": 1,
+          "category": "Compliance",
+          "label": "Keep printed payloads",
+          "helpText": "Off keeps only a content hash after a job prints - safer, and the appliance default. On keeps the full rendered payload so you can inspect or reprint it.",
+          "input": "toggle",
           "appliance": "per-app",
-          "validate":  "boolean"
+          "validate": "boolean"
         }
       },
       {
-        "name":  "VIBE_PRINT_JOB_RETENTION_DAYS",
+        "name": "VIBE_PRINT_JOB_RETENTION_DAYS",
         "value": "30",
-        "doc":   "Days a completed print job row survives before the retention sweep prunes it.",
+        "doc": "Days a completed print job row survives before the retention sweep prunes it.",
         "ui": {
-          "tier":      1,
-          "category":  "Compliance",
-          "label":     "Job retention (days)",
-          "helpText":  "How long finished print jobs stay in the Jobs tab before they are pruned.",
-          "input":     "number",
+          "tier": 1,
+          "category": "Compliance",
+          "label": "Job retention (days)",
+          "helpText": "How long finished print jobs stay in the Jobs tab before they are pruned.",
+          "input": "number",
           "appliance": "per-app",
-          "validate":  "number-range:1:3650"
+          "validate": "number-range:1:3650"
         }
       },
       {
-        "name":  "VIBE_PRINT_AUDIT_RETENTION_DAYS",
+        "name": "VIBE_PRINT_AUDIT_RETENTION_DAYS",
         "value": "365",
-        "doc":   "Days the hash-chained audit log is kept. Pruning breaks the chain before the cut, which is expected; the verify endpoint checks from the oldest surviving entry forward.",
+        "doc": "Days the hash-chained audit log is kept. Pruning breaks the chain before the cut, which is expected; the verify endpoint checks from the oldest surviving entry forward.",
         "ui": {
-          "tier":      1,
-          "category":  "Compliance",
-          "label":     "Audit retention (days)",
-          "helpText":  "How long the tamper-evident audit log is kept. Default 365. Check your own retention policy before shortening this.",
-          "input":     "number",
+          "tier": 1,
+          "category": "Compliance",
+          "label": "Audit retention (days)",
+          "helpText": "How long the tamper-evident audit log is kept. Default 365. Check your own retention policy before shortening this.",
+          "input": "number",
           "appliance": "per-app",
-          "validate":  "number-range:1:3650"
+          "validate": "number-range:1:3650"
         }
       },
       {
-        "name":  "VIBE_PRINT_RATE_LIMIT_PER_MINUTE",
+        "name": "VIBE_PRINT_RATE_LIMIT_PER_MINUTE",
         "value": "120",
-        "doc":   "Requests per minute per resolved caller IP. Raise it only if a legitimate caller is being throttled - the resolved IP depends on VIBE_PRINT_TRUSTED_PROXIES being correct.",
+        "doc": "Requests per minute per resolved caller IP. Raise it only if a legitimate caller is being throttled - the resolved IP depends on VIBE_PRINT_TRUSTED_PROXIES being correct.",
         "ui": {
-          "tier":      1,
-          "category":  "Application",
-          "label":     "Rate limit (requests/minute)",
-          "helpText":  "Per-caller request ceiling. Default 120. A busy point-of-sale integration may need more.",
-          "input":     "number",
+          "tier": 1,
+          "category": "Application",
+          "label": "Rate limit (requests/minute)",
+          "helpText": "Per-caller request ceiling. Default 120. A busy point-of-sale integration may need more.",
+          "input": "number",
           "appliance": "per-app",
-          "validate":  "number-range:1:10000"
+          "validate": "number-range:1:10000"
         }
       },
       {
         "name": "VIBE_PRINT_TIMEZONE",
         "from": "appliance:TZ",
-        "doc":  "IANA time-zone name (e.g. America/Chicago) used for timestamps printed on receipts. Inherits the appliance-wide TZ unless overridden.",
+        "doc": "IANA time-zone name (e.g. America/Chicago) used for timestamps printed on receipts. Inherits the appliance-wide TZ unless overridden.",
         "ui": {
-          "tier":      1,
-          "category":  "Time & Logging",
-          "label":     "Time zone (override)",
-          "helpText":  "Inherited from appliance. Override only if the printers serve a location in a different zone than the host.",
-          "input":     "time-zone",
+          "tier": 1,
+          "category": "Time & Logging",
+          "label": "Time zone (override)",
+          "helpText": "Inherited from appliance. Override only if the printers serve a location in a different zone than the host.",
+          "input": "time-zone",
           "appliance": "both",
-          "validate":  "iana-timezone"
+          "validate": "iana-timezone"
         }
       }
     ]
   },
-
   "firstLogin": {
     "type": "default-credentials-passive",
     "passwordEnvKey": "VIBE_PRINT_SECRET",
     "url": "/admin/",
     "note": "There is no username - this app authenticates with one shared secret. Paste the value above into the admin UI when it asks, and send it as `Authorization: Bearer <secret>` from anything calling /v1. Because it is a single shared credential rather than per-person logins, treat it as a service credential: give it to systems, not to staff who each need their own account. The bare root of this app serves nothing, so every URL the appliance advertises for it redirects to /admin/. In LAN/Tailscale mode use http://<server-ip>:5194/ - which is also the natural address here, since the printers are on that same network."
   },
-
   "health": "/readyz",
   "health_timeout_s": 120
 }

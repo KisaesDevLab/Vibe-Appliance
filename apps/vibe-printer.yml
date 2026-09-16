@@ -23,14 +23,14 @@
 # would also put its :8080 on the host, unauthenticated by anything but
 # the shared secret, and is not something the appliance will do for you.
 #
-# THE IN-APP TUNNEL IS NOT FOR THIS DEPLOYMENT. The image bundles
+# THE IN-APP TUNNEL IS DISABLED FOR THIS DEPLOYMENT. The image bundles
 # cloudflared and its Remote Access tab can start a tunnel of its own.
 # On the appliance, ingress belongs to the shared Caddy plus the
-# appliance's own Cloudflare Tunnel — starting a second one publishes
-# this gateway on a hostname the appliance does not know about and
-# cannot take down. There is no env var upstream to disable that tab;
-# the instruction not to use it lives in the env template and the
-# first-login note.
+# appliance's own Cloudflare Tunnel — a second one would publish this
+# gateway on a hostname the appliance does not know about and cannot
+# take down. The env template sets VIBE_PRINT_MANAGED_INGRESS=true,
+# which upstream honours: the tunnel never auto-starts, its start
+# endpoint answers 409, and the tab hides the tunnel controls.
 #
 # USB PRINTERS are commented out below on purpose. A device mapping for
 # a path that does not exist stops the container from starting at all,
