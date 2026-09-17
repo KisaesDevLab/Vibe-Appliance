@@ -2277,8 +2277,10 @@ Append to this list as phases complete. Format:
 
 - Same host run (2026-09-17): every setup / sign-in link ended in
   ERR_SSL_PROTOCOL_ERROR. Both sides forced https on the belief that
-  Caddy serves :443 with an internal CA in every mode (Vibe-Auth
-  COMPAT.md LAN row); LAN mode is plain http on :80. `identity.sh` now
+  https://<ip> works in LAN mode (Vibe-Auth COMPAT.md LAN row). Caddy
+  does bind `:443` with `tls internal` there, but the internal CA issues
+  no certificate for a bare IP, so the handshake fails and every product
+  runs on http://<ip> with SESSION_SECURE=false. `identity.sh` now
   passes the rendered origin through unchanged and sends the origin's
   scheme on `/rebase`; broker 1.0.2 (Vibe-Auth `config.ts`) derives its
   scheme from `VIBE_AUTH_APPLIANCE_ORIGIN` the same way. Until 1.0.2 is

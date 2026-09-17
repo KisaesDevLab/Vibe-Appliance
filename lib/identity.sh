@@ -64,11 +64,13 @@ _id_va_base() {
 
 # Browser-facing origin of vibe-auth, scheme included, exactly as the
 # template rendered it into VIBE_AUTH_APPLIANCE_ORIGIN (there is no
-# ALLOWED_ORIGIN in vibe-auth.env). LAN mode is plain http on :80 — this
-# used to rewrite http→https on the belief Caddy served :443 with an
-# internal CA in every mode, and the first LAN enable produced setup
-# links that ended in ERR_SSL_PROTOCOL_ERROR. Broker ≥1.0.2 derives its
-# own scheme from the same origin, so the two agree.
+# ALLOWED_ORIGIN in vibe-auth.env). In LAN mode the origin is http://<ip>:
+# Caddy does bind :443 with `tls internal`, but its internal CA never
+# issues a certificate for a bare IP, so https://<ip> fails the TLS
+# handshake (ERR_SSL_PROTOCOL_ERROR) and every product runs on http with
+# SESSION_SECURE=false. This used to rewrite http→https and the first LAN
+# enable produced setup links nothing could open. Broker ≥1.0.2 derives
+# its own scheme from the same origin, so the two agree.
 _id_va_origin() {
   local o; o="$(_extract_env_value "$VA_ENV" VIBE_AUTH_APPLIANCE_ORIGIN)"
   [[ -n "$o" ]] || die "VIBE_AUTH_APPLIANCE_ORIGIN missing in ${VA_ENV}. Fix: sudo vibe enable vibe-auth (re-renders the env file), then retry."
