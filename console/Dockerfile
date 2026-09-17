@@ -46,28 +46,23 @@ RUN apt-get update -qq \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=deps /app/node_modules /app/node_modules
-COPY package.json server.js manifest.schema.json ./
-COPY ui/ ./ui/
 
-# Per-app manifests. server.js loads /app/manifests/*.json at startup
-# and exposes them via /api/v1/apps; without this COPY the admin
-# panel shows zero apps even when the repo has them. Files under
-# manifests/_pending/ stay un-loaded because the loader scans the
-# top-level only.
-COPY manifests/ ./manifests/
+# Copy the whole console tree. Everything server.js needs at module-load
+# time (top-level *.js such as identity.js, lib/, manifests/, guides/,
+# ui/) ships by default; what must stay out is listed in .dockerignore
+# (node_modules, lockfile, local sqlite, manifests/_pending). This used
+# to be a per-file COPY list, and every new top-level module had to be
+# added by hand: identity.js was not (commit ed117ab), the image built
+# clean, and the container crash-looped with MODULE_NOT_FOUND until
+# bootstrap gave up. Inclusion-by-default inverts that failure mode.
+COPY . ./
 
-# Printable setup guides (PDF), one per app plus the appliance's own,
-# built by tools/guides/build-guides.sh and committed. server.js scans
-# /app/guides at startup and each app card links its own guide; without
-# this COPY the links silently disappear (the scan warns and degrades).
-COPY guides/ ./guides/
-
-# Server-side helper modules (cf-helpers.js, etc.). server.js does
-# `require('./lib/cf-helpers')` at module-load time, so missing this
-# directory crashes the console container on startup with
-# MODULE_NOT_FOUND. Bootstrap Phase 7 dumps the resulting crash logs
-# and aborts — operators cannot reach /admin to fix it.
-COPY lib/ ./lib/
+# Mechanical guard, because the prose warning above did not stop the
+# last one. Resolves every relative require in server.js, lib/ and
+# scripts/ (no code is executed, no port bound) and checks the scanned
+# directories are present. A miss fails `docker build` here rather than
+# shipping an image that dies at startup.
+RUN node scripts/check-requires.js
 
 EXPOSE 3000
 

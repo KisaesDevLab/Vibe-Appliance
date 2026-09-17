@@ -1,0 +1,38 @@
+# console/.dockerignore — what `COPY . ./` in console/Dockerfile leaves out.
+#
+# The Dockerfile copies the whole console/ tree so a new top-level module
+# (identity.js, next-thing.js) ships by default. Exclusions are the
+# reviewed part. Add a line here only for things that must never reach
+# the image; never "fix" a missing file by touching the Dockerfile.
+
+# Installed by the deps stage from package.json; a host copy would
+# shadow it with the wrong platform's better-sqlite3 binary.
+node_modules/
+
+# No lockfile by convention (see .gitignore); keep the image identical
+# to the tracked tree even when a developer has one locally.
+package-lock.json
+
+# Build tooling and this file itself.
+Dockerfile
+.dockerignore
+
+# Local sqlite / build artefacts (never tracked, sometimes present).
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+dist/
+
+# Manifests parked under _pending/ are deliberately not loaded; the
+# loader scans the top level only, so keep them out of the image too.
+manifests/_pending/
+
+# Editor / OS noise.
+.DS_Store
+Thumbs.db
+*.swp
+*~
+*.bak
+*.orig
+*.tmp

@@ -1,0 +1,97 @@
+# .github/workflows/console.yml — console unit tests + image smoke test.
+#
+# Two gates, both required before merge:
+#
+#   test   — runs the whole tests/ suite the way console/package.json
+#            does (`node --test ../tests/**/*.test.js`). Needs bash and
+#            python3 on the runner, which ubuntu-latest has.
+#
+#   image  — builds console/Dockerfile and then actually starts the
+#            container and waits for /health to answer 200. `docker build`
+#            exiting 0 is not enough: commit ed117ab built clean and the
+#            container still crash-looped on MODULE_NOT_FOUND, which
+#            aborted bootstrap on every fresh host. On timeout the job
+#            fails and dumps the container logs.
+#
+# The console talks to the docker socket and /opt/vibe lazily (per
+# request), so a bare `docker run` with a scratch VIBE_DIR is enough for
+# /health. Nothing here needs secrets.
+
+name: console
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'console/**'
+      - 'tests/**'
+      - 'lib/**'
+      - 'caddy/**'
+      - '.github/workflows/console.yml'
+  pull_request:
+    paths:
+      - 'console/**'
+      - 'tests/**'
+      - 'lib/**'
+      - 'caddy/**'
+      - '.github/workflows/console.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install console dependencies
+        working-directory: console
+        run: npm install --no-audit --no-fund
+      - name: Require-resolution guard
+        run: node console/scripts/check-requires.js
+      - name: Run test suite
+        working-directory: console
+        run: npm test
+
+  image:
+    name: image starts and reports healthy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build console image
+        run: docker build -t vibe-appliance/console:ci console
+      - name: Start container
+        run: |
+          mkdir -p "$RUNNER_TEMP/vibe"
+          docker run -d --name vibe-console-ci \
+            -e VIBE_DIR="$RUNNER_TEMP/vibe" \
+            -e APPLIANCE_DIR="$GITHUB_WORKSPACE" \
+            -e CONSOLE_ADMIN_PASSWORD=ci-only-not-a-secret \
+            -v "$RUNNER_TEMP/vibe:$RUNNER_TEMP/vibe" \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:ro" \
+            -p 3000:3000 \
+            vibe-appliance/console:ci
+      - name: Wait for /health == 200
+        run: |
+          for i in $(seq 1 30); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/health || true)"
+            if [ "$code" = "200" ]; then
+              echo "healthy after ${i}s"; exit 0
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' vibe-console-ci)" != "true" ]; then
+              echo "container exited before becoming healthy"; exit 1
+            fi
+            sleep 1
+          done
+          echo "timed out waiting for /health"; exit 1
+      - name: Container logs
+        if: failure()
+        run: docker logs vibe-console-ci || true
+      - name: Cleanup
+        if: always()
+        run: docker rm -f vibe-console-ci || true
