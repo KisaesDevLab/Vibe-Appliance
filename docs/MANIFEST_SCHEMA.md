@@ -409,6 +409,23 @@ redirects.
 Prefer fixing the app to serve something useful at its root; this exists
 so an app that cannot is still openable.
 
+### `routing.stripPrefix`
+
+```jsonc
+"routing": {
+  "default_upstream": "vibe-auth:8080",
+  "stripPrefix": false
+}
+```
+
+Default `true`: in path-mounted modes Caddy strips `/<prefix>` so the
+app sees `/api/...` and serves itself at its own root. Set `false` for
+an app that mounts itself **under** the prefix (it reads the prefix from
+an env var and serves `/<prefix>/...`), so the upstream receives the path
+unchanged. vibe-auth is the case: the broker serves `/vibe-auth/setup`
+and `/vibe-auth/admin` from `VIBE_AUTH_BASE_PATH`. Ignored in
+subdomain-per-app mode (root-served, no prefix).
+
 ### `routing.mounts`
 
 ```jsonc

@@ -2261,3 +2261,16 @@ Append to this list as phases complete. Format:
   every overlay and immediately found two more of the same class, both
   fixed: `vibe-backup` never started its Docker socket proxy, and
   `vibe-time-billing` never started its BullMQ worker.
+
+- Same host run (2026-09-17): `http://<host>/vibe-auth/` answered Caddy's
+  "Not found". Two causes. (1) The enable had timed out before the Caddy
+  re-render step, so no route existed yet. (2) Even with the route, the
+  renderer strips `/vibe-auth` before proxying and the broker only serves
+  `/vibe-auth/setup` and `/vibe-auth/admin` under `VIBE_AUTH_BASE_PATH`
+  (Vibe-Auth's own `deploy/caddy.port.Caddyfile` proxies without
+  stripping). Added `routing.stripPrefix` (schema, default true;
+  vibe-auth sets false) and honoured it in `render_path_handler`;
+  `tests/routing/strip-prefix.test.js` renders LAN and single-host
+  against the shipped manifests. **Schema contract change** — one more
+  field to propagate to `vibe-sentinel-installer/.schema/` alongside
+  `provides`/`requires`/`sso`/`routing.mounts`.

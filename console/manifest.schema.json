@@ -224,6 +224,11 @@
           "maxLength": 200,
           "description": "Path to 308-redirect the bare `/` to, for an app that serves nothing at its own root. Emitted only on ROOT-SERVED surfaces — the per-app Caddy vhost (subdomain-per-app mode, and rootServedOnly apps in single-host mode) and the app's emergency-proxy frontend — because those are the only places the appliance sends an operator to a bare `/`. Path-mounted apps are unaffected: their prefix handler already lands inside the app. Vibe-Printer is the motivating case: its API is at /v1 and its admin SPA is mounted at /admin, so `/` is a bare 404 and every URL the console advertises for it would be broken. Prefer fixing the app to serve something useful at its root; this exists so an app that cannot is still openable."
         },
+        "stripPrefix": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether Caddy strips `/<prefix>` before proxying to `default_upstream` and `matchers` in path-mounted modes (LAN, Tailscale, single-host domain). Default true: the app sees `/api/...` and serves itself at its own root. Set false for an app that serves itself UNDER the prefix (reads it from an env var such as VIBE_AUTH_BASE_PATH and mounts every route beneath it), so the upstream receives `/<prefix>/...` unchanged. vibe-auth is the motivating case: its setup wizard and admin console live at /vibe-auth/setup and /vibe-auth/admin inside the broker, and stripping left them unreachable. Ignored in subdomain-per-app mode, where the app is root-served and there is no prefix."
+        },
         "deny_paths": {
           "type": "array",
           "minItems": 1,

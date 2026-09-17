@@ -915,7 +915,13 @@ def render_path_handler(slug, manifest):
     lines.append(f"\tredir @{bare_id} /{prefix}/ permanent")
     # Main route — strip_prefix happens inside so upstream sees /api etc.
     lines.append(f"\thandle /{prefix}/* {{")
-    lines.append(f"\t\turi strip_prefix /{prefix}")
+    # routing.stripPrefix: false keeps the prefix for an app that mounts
+    # itself under it (vibe-auth serves /vibe-auth/setup, /vibe-auth/admin
+    # from VIBE_AUTH_BASE_PATH; stripping made both unreachable).
+    if routing.get("stripPrefix", True) is not False:
+        lines.append(f"\t\turi strip_prefix /{prefix}")
+    else:
+        lines.append(f"\t\t# {slug}: routing.stripPrefix=false, upstream serves itself under /{prefix}")
     # Denied paths (post-strip, so they match what the app would see).
     lines.extend(deny_path_lines(manifest, "\t\t", matcher_prefix=_matcher_id(slug, "")))
     for m in matchers:

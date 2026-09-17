@@ -1,88 +1,169 @@
 {
-  "_doc": "Vibe Auth — single sign-on for the Vibe product family (bundled authentik + broker). Vendored from KisaesDevLab/Vibe-Auth deploy/. Installed ONLY when the firm selects it (console toggle or `vibe enable vibe-auth`); products stay on local sign-in until flipped (D11). Routing: the broker is path-mounted at /vibe-auth/ like every other app; authentik is a `routing.mounts` entry at /auth (served with AUTHENTIK_WEB__PATH=/auth/, so no prefix stripping) — this replaces the original :8443 port design (COMPAT.md amendment 4, QUESTIONS Q7).",
+  "_doc": "Vibe Auth — single sign-on for the Vibe product family (bundled authentik + broker). Vendored from KisaesDevLab/Vibe-Auth deploy/. Installed ONLY when the firm selects it (console toggle or `vibe enable vibe-auth`); products stay on local sign-in until flipped (D11). Routing: the broker is path-mounted at /vibe-auth/ like every other app; authentik is a `routing.mounts` entry at /auth (served with AUTHENTIK_WEB__PATH=/auth/, so no prefix stripping) — this replaces the original :8443 port design (COMPAT.md amendment 4, QUESTIONS Q7). routing.stripPrefix=false: the broker serves every route under VIBE_AUTH_BASE_PATH (/vibe-auth/setup, /vibe-auth/admin, /vibe-auth/health), so Caddy must pass the prefix through; only /health and /version have bare aliases.",
   "schemaVersion": 1,
   "slug": "vibe-auth",
   "displayName": "Vibe Auth",
   "description": "Single sign-on for firm staff across Vibe products (bundled authentik, MFA enforced, Entra ID / Google federation).",
   "logo": "vibe-auth.svg",
-
   "image": {
-    "server":     "ghcr.io/kisaesdevlab/vibe-auth",
+    "server": "ghcr.io/kisaesdevlab/vibe-auth",
     "defaultTag": "latest",
     "extras": [
-      { "name": "authentik", "image": "ghcr.io/goauthentik/server:2026.8.2" }
+      {
+        "name": "authentik",
+        "image": "ghcr.io/goauthentik/server:2026.8.2"
+      }
     ]
   },
-
-  "subdomain":     "auth",
-  "pathPrefix":    "vibe-auth",
+  "subdomain": "auth",
+  "pathPrefix": "vibe-auth",
   "emergencyPort": 5180,
   "emergencyNote": "Emergency access reaches the broker's console only; single sign-on itself needs the Caddy route (/auth/) and cannot run over the emergency port.",
-  "ports":         { "server": 8080 },
-
+  "ports": {
+    "server": 8080
+  },
   "routing": {
     "default_upstream": "vibe-auth:8080",
+    "stripPrefix": false,
     "mounts": [
-      { "path": "/auth", "upstream": "vibe-auth-authentik-server:9000" }
+      {
+        "path": "/auth",
+        "upstream": "vibe-auth-authentik-server:9000"
+      }
     ]
   },
-
-  "provides": ["identity"],
-  "depends":  ["postgres"],
-
-  "resources": { "cores": 1, "ramMb": 2048 },
-
+  "provides": [
+    "identity"
+  ],
+  "depends": [
+    "postgres"
+  ],
+  "resources": {
+    "cores": 1,
+    "ramMb": 2048
+  },
   "env": {
     "required": [
-      { "name": "VIBE_AUTH_DATABASE_URL",        "from": "database-url" },
-      { "name": "VIBE_AUTH_APPLIANCE_ORIGIN",    "from": "subdomain-url" },
-      { "name": "VIBE_AUTH_AUTHENTIK_SECRET_KEY", "from": "generated:hex32", "secret": true },
-      { "name": "VIBE_AUTH_AUTHENTIK_TOKEN",     "from": "generated:hex32", "secret": true },
-      { "name": "VIBE_AUTH_CONSOLE_TOKEN",       "from": "generated:hex32", "secret": true },
-      { "name": "VIBE_AUTH_SECRET_KEY",          "from": "generated:hex32", "secret": true }
+      {
+        "name": "VIBE_AUTH_DATABASE_URL",
+        "from": "database-url"
+      },
+      {
+        "name": "VIBE_AUTH_APPLIANCE_ORIGIN",
+        "from": "subdomain-url"
+      },
+      {
+        "name": "VIBE_AUTH_AUTHENTIK_SECRET_KEY",
+        "from": "generated:hex32",
+        "secret": true
+      },
+      {
+        "name": "VIBE_AUTH_AUTHENTIK_TOKEN",
+        "from": "generated:hex32",
+        "secret": true
+      },
+      {
+        "name": "VIBE_AUTH_CONSOLE_TOKEN",
+        "from": "generated:hex32",
+        "secret": true
+      },
+      {
+        "name": "VIBE_AUTH_SECRET_KEY",
+        "from": "generated:hex32",
+        "secret": true
+      }
     ],
     "optional": [
       {
         "name": "VIBE_AUTH_BRAND_NAME",
-        "doc":  "Firm name shown on the sign-in page and as the SSO button label in products. The setup wizard sets it too.",
-        "ui": { "tier": 1, "category": "Identity", "label": "Sign-in page title", "input": "text", "appliance": "per-app", "validate": "non-empty" }
+        "doc": "Firm name shown on the sign-in page and as the SSO button label in products. The setup wizard sets it too.",
+        "ui": {
+          "tier": 1,
+          "category": "Identity",
+          "label": "Sign-in page title",
+          "input": "text",
+          "appliance": "per-app",
+          "validate": "non-empty"
+        }
       },
       {
         "name": "VIBE_AUTH_MFA_REQUIRED",
-        "doc":  "true (default) enforces MFA for every sign-in. The Vibe Auth admin console can switch it off with a logged acknowledgement (D23).",
-        "ui": { "tier": 2, "category": "Identity", "label": "MFA enforced", "input": "toggle", "appliance": "per-app" }
+        "doc": "true (default) enforces MFA for every sign-in. The Vibe Auth admin console can switch it off with a logged acknowledgement (D23).",
+        "ui": {
+          "tier": 2,
+          "category": "Identity",
+          "label": "MFA enforced",
+          "input": "toggle",
+          "appliance": "per-app"
+        }
       },
       {
-        "name":   "VIBE_AUTH_SMTP_HOST",
-        "from":   "appliance:EMAIL_SMTP_HOST",
-        "doc":    "SMTP host for password-recovery emails. Inherited from the appliance Email settings.",
-        "ui": { "tier": 1, "category": "Email & SMS", "label": "SMTP host (recovery mail)", "input": "text", "appliance": "both", "validate": "non-empty" }
+        "name": "VIBE_AUTH_SMTP_HOST",
+        "from": "appliance:EMAIL_SMTP_HOST",
+        "doc": "SMTP host for password-recovery emails. Inherited from the appliance Email settings.",
+        "ui": {
+          "tier": 1,
+          "category": "Email & SMS",
+          "label": "SMTP host (recovery mail)",
+          "input": "text",
+          "appliance": "both",
+          "validate": "non-empty"
+        }
       },
-      { "name": "VIBE_AUTH_SMTP_PORT", "from": "appliance:EMAIL_SMTP_PORT" },
-      { "name": "VIBE_AUTH_SMTP_USER", "from": "appliance:EMAIL_SMTP_USER" },
-      { "name": "VIBE_AUTH_SMTP_PASS", "from": "appliance:EMAIL_SMTP_PASS", "secret": true },
-      { "name": "VIBE_AUTH_SMTP_FROM", "from": "appliance:EMAIL_FROM" },
       {
-        "name":   "VIBE_AUTH_SENTINEL_URL",
-        "doc":    "Sentinel audit-ingest endpoint (POST). Empty = audit events stay in Postgres + /data/audit.jsonl only.",
-        "ui": { "tier": 1, "category": "Compliance", "label": "Sentinel audit webhook URL", "input": "text", "appliance": "per-app", "validate": "url" }
+        "name": "VIBE_AUTH_SMTP_PORT",
+        "from": "appliance:EMAIL_SMTP_PORT"
       },
-      { "name": "VIBE_AUTH_SENTINEL_TOKEN", "secret": true, "doc": "x-sentinel-token for the audit webhook." }
+      {
+        "name": "VIBE_AUTH_SMTP_USER",
+        "from": "appliance:EMAIL_SMTP_USER"
+      },
+      {
+        "name": "VIBE_AUTH_SMTP_PASS",
+        "from": "appliance:EMAIL_SMTP_PASS",
+        "secret": true
+      },
+      {
+        "name": "VIBE_AUTH_SMTP_FROM",
+        "from": "appliance:EMAIL_FROM"
+      },
+      {
+        "name": "VIBE_AUTH_SENTINEL_URL",
+        "doc": "Sentinel audit-ingest endpoint (POST). Empty = audit events stay in Postgres + /data/audit.jsonl only.",
+        "ui": {
+          "tier": 1,
+          "category": "Compliance",
+          "label": "Sentinel audit webhook URL",
+          "input": "text",
+          "appliance": "per-app",
+          "validate": "url"
+        }
+      },
+      {
+        "name": "VIBE_AUTH_SENTINEL_TOKEN",
+        "secret": true,
+        "doc": "x-sentinel-token for the audit webhook."
+      }
     ]
   },
-
-  "database": { "name": "vibe_auth", "user": "vibe_auth" },
-
-  "firstLogin": {
-    "type":     "setup-wizard",
-    "username": "(chosen in the wizard)",
-    "url":      "/vibe-auth/setup",
-    "note":     "First visit runs a setup wizard gated by a one-time token. The console's Identity panel shows the link and token (also printed to the broker log: docker logs vibe-auth). The wizard creates the firm's first identity administrator; no default password exists (D13)."
+  "database": {
+    "name": "vibe_auth",
+    "user": "vibe_auth"
   },
-
+  "firstLogin": {
+    "type": "setup-wizard",
+    "username": "(chosen in the wizard)",
+    "url": "/vibe-auth/setup",
+    "note": "First visit runs a setup wizard gated by a one-time token. The console's Identity panel shows the link and token (also printed to the broker log: docker logs vibe-auth). The wizard creates the firm's first identity administrator; no default password exists (D13)."
+  },
   "health": "/health",
   "health_timeout_s": 300,
   "health_extra": [
-    { "name": "authentik", "upstream": "vibe-auth-authentik-server:9000", "path": "/auth/-/health/ready/", "doc": "authentik server readiness (migrations applied)." }
+    {
+      "name": "authentik",
+      "upstream": "vibe-auth-authentik-server:9000",
+      "path": "/auth/-/health/ready/",
+      "doc": "authentik server readiness (migrations applied)."
+    }
   ]
 }
