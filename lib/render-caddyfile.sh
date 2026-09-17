@@ -282,6 +282,18 @@ def render_vhost(slug, manifest, domain, subdomain, tls_internal=False):
     if matchers:
         lines.append("")
 
+    # routing.mounts inside the app's own vhost (subdomain-per-app mode):
+    # `auth.<domain>/auth/*` → authentik, everything else → the broker.
+    mounts = render_mount_handlers(slug, manifest, "    ")
+    if mounts:
+        lines.extend(mounts)
+        lines.append("")
+
+    gate = edge_gate_lines(slug, manifest, "    ")
+    if gate:
+        lines.extend(gate)
+        lines.append("")
+
     # Default handler — root path goes to the SPA upstream.
     lines.append("    handle {")
     lines.append(f"        reverse_proxy {default_upstream}")
@@ -922,11 +934,91 @@ def render_path_handler(slug, manifest):
         else:
             lines.append(f"\t\t\treverse_proxy {m['upstream']}")
         lines.append("\t\t}")
+    lines.extend(edge_gate_lines(slug, manifest, "\t\t"))
     lines.append("\t\thandle {")
     lines.append(f"\t\t\treverse_proxy {default_upstream}")
     lines.append("\t\t}")
     lines.append("\t}")
+    # routing.mounts — host-level paths proxied WITHOUT prefix stripping
+    # (authentik at /auth/ for vibe-auth). Emitted after the app's own
+    # prefix handler; Caddy `handle` blocks are first-match-wins and the
+    # paths are disjoint from /<prefix>/ by the schema's uniqueness rule.
+    lines.extend(render_mount_handlers(slug, manifest, "\t"))
     return "\n".join(lines) + "\n"
+
+
+# Set by main() once the enabled set is known: True when an enabled app
+# `provides: ["identity"]` (vibe-auth). Consulted by edge_gate_lines so an
+# `sso.edgeGate: true` product is only gated while the gate can answer.
+IDENTITY_PROVIDER_ENABLED = False
+
+
+def edge_gate_lines(slug, manifest, indent):
+    """Vibe Auth D10 — opt-in Caddy forward_auth in front of a product via
+    authentik's embedded outpost (served under /auth/ with
+    AUTHENTIK_WEB__PATH=/auth/). sso.publicPaths (webhooks, health, API-key
+    routes) bypass the gate. Emitted only when the product asks for it AND
+    an identity provider is enabled; otherwise the product's own middleware
+    is the only gate, which is the D10 default."""
+    sso = manifest.get("sso") or {}
+    if not sso.get("edgeGate") or not IDENTITY_PROVIDER_ENABLED:
+        return []
+    out = []
+    pub = [p for p in (sso.get("publicPaths") or []) if isinstance(p, str) and p]
+    # Caddy sorts `forward_auth` ahead of every `handle` in a block, so a
+    # public-path `handle` placed next to it never bypasses the gate — the
+    # request is challenged first. The bypass has to live on the
+    # forward_auth directive itself as a `not path` matcher; the public
+    # paths then fall through to the app's normal handlers untouched.
+    gate_matcher = ""
+    if pub:
+        gid = _matcher_id(slug, "gated")
+        out.append(f"{indent}@{gid} not path {' '.join(pub)}")
+        gate_matcher = f"@{gid} "
+    out.append(f"{indent}# vibe-auth edge gate (sso.edgeGate): authentik forward_auth")
+    out.append(f"{indent}forward_auth {gate_matcher}vibe-auth-authentik-server:9000 {{")
+    out.append(f"{indent}\turi /auth/outpost.goauthentik.io/auth/caddy")
+    out.append(f"{indent}\tcopy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Uid")
+    out.append(f"{indent}}}")
+    return out
+
+
+def render_mount_handlers(slug, manifest, indent):
+    """`handle <path>/*` blocks for routing.mounts (no strip_prefix), plus a
+    bare-path redirect so `<host>/auth` lands on `<host>/auth/`."""
+    routing = manifest.get("routing", {}) or {}
+    out = []
+    for i, m in enumerate(routing.get("mounts") or []):
+        path = m["path"].rstrip("/")
+        mid = _matcher_id(slug, f"mount{i}")
+        out.append(f"{indent}# {slug} mount {path} (no prefix strip)")
+        out.append(f"{indent}@{mid} path {path}")
+        out.append(f"{indent}redir @{mid} {path}/ permanent")
+        out.append(f"{indent}handle {path}/* {{")
+        if m.get("streaming"):
+            out.append(f"{indent}\treverse_proxy {m['upstream']} {{")
+            out.append(f"{indent}\t\tflush_interval -1")
+            out.append(f"{indent}\t\ttransport http {{")
+            out.append(f"{indent}\t\t\tread_timeout 3600s")
+            out.append(f"{indent}\t\t}}")
+            out.append(f"{indent}\t}}")
+        else:
+            out.append(f"{indent}\treverse_proxy {m['upstream']}")
+        out.append(f"{indent}}}")
+    return out
+
+
+def _mount_paths_unique(enabled):
+    """Refuse to render two enabled apps that claim the same mount path —
+    the second handle would silently never match."""
+    seen = {}
+    for slug, m in enabled:
+        for mnt in ((m.get("routing", {}) or {}).get("mounts") or []):
+            p = mnt["path"].rstrip("/")
+            if p in seen and seen[p] != slug:
+                print(f"ERROR: routing.mounts path {p} is claimed by both {seen[p]} and {slug}", file=sys.stderr)
+                sys.exit(3)
+            seen[p] = slug
 
 
 def _read_appliance_env(env_path):
@@ -1044,6 +1136,9 @@ def main():
         global_snippet = global_snippet.rstrip("\n") + "\n\tauto_https disable_redirects\n"
 
     enabled = list_enabled_apps(state, manifests_dir)
+    _mount_paths_unique(enabled)
+    global IDENTITY_PROVIDER_ENABLED
+    IDENTITY_PROVIDER_ENABLED = any("identity" in (m.get("provides") or []) for _s, m in enabled)
 
     if mode == "domain" and domain:
         # Two routing styles, selected by DOMAIN_ROUTING_MODE:

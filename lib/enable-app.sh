@@ -310,6 +310,31 @@ print((json.load(open('${manifest}')).get('runtime') or 'appliance'))
   # only merges keys — it never removes them.
   _state_app_clear_keys "$slug" error update_error swap_dirty db_dirty
 
+  # 8b. Vibe Auth (single sign-on). Two directions, both non-fatal — SSO
+  # is additive and a product must come up on local sign-in regardless:
+  #   - enabling vibe-auth itself → register every enabled sso.capable
+  #     product (writes its VIBE_OIDC_* block, recreates it, provisions
+  #     its break-glass admin; NEVER touches VIBE_AUTH_MODE — D11);
+  #   - enabling an sso.capable product while vibe-auth is up → register
+  #     just that product.
+  # lib/identity.sh is the single owner of that logic; it is also what the
+  # console's Identity panel spawns, so "enable" and "Fix" converge.
+  if [[ -x "${APPLIANCE_DIR}/lib/identity.sh" || -f "${APPLIANCE_DIR}/lib/identity.sh" ]]; then
+    local _va_state
+    _va_state="$(python3 -c "import json;print('1' if (json.load(open('${VIBE_STATE_FILE}')).get('apps',{}).get('vibe-auth',{}).get('enabled')) else '0')" 2>/dev/null || echo 0)"
+    local _sso_capable
+    _sso_capable="$(_manifest_field "$manifest" 'str(bool((data.get("sso") or {}).get("capable"))).lower()' 2>/dev/null || echo false)"
+    if [[ "$slug" == "vibe-auth" ]]; then
+      log_step "registering enabled SSO-capable products with vibe-auth"
+      bash "${APPLIANCE_DIR}/lib/identity.sh" register-all 2>&1 | tee -a "$VIBE_LOG_FILE" >&2 \
+        || log_warn "some products could not be registered with vibe-auth; use the console Identity panel → Fix, or: sudo vibe identity register <slug>"
+    elif [[ "$_sso_capable" == "true" && "$_va_state" == "1" ]]; then
+      log_step "registering $slug with vibe-auth"
+      bash "${APPLIANCE_DIR}/lib/identity.sh" register "$slug" 2>&1 | tee -a "$VIBE_LOG_FILE" >&2 \
+        || log_warn "$slug is running on local sign-in; vibe-auth registration failed. Fix: console Identity panel → Fix, or: sudo vibe identity register $slug"
+    fi
+  fi
+
   # Refresh /opt/vibe/CREDENTIALS.txt so apps whose first-login secrets
   # are generated at enable time (e.g. vibe-ai-router's
   # ROUTER_ADMIN_PASSWORD) land in the operator's archived credentials
@@ -1458,6 +1483,12 @@ print(json.dumps(dict(zip(a[0::2], a[1::2]))))
   tmp="$(mktemp "${out}.XXXXXX")"
   chmod 600 "$tmp"
 
+  # Generic routing markers (@ROUTING_MODE@ = lan|domain|tailscale,
+  # @DOMAIN_ROUTING_MODE@ = single-host|subdomain-per-app) so an app that
+  # must know how it is reached (vibe-auth derives issuer URLs from them)
+  # does not need a bespoke stanza here. Passed via the environment so the
+  # positional argv below stays untouched.
+  VIBE_RENDER_ROUTING_MODE="$mode" VIBE_RENDER_DOMAIN_ROUTING_MODE="$routing_mode" \
   python3 - "$tmpl" "$tmp" \
       "$allowed_origin" "$database_url" "$redis_url" \
       "${ENCRYPTION_KEY:-}" "${JWT_SECRET:-}" \
@@ -1512,6 +1543,9 @@ body = body.replace("@VIBE_AI_MODE@",        vibe_ai_mode)
 body = body.replace("@VIBE_AI_TOKEN@",       vibe_ai_token)
 body = body.replace("@STAFF_APP_URL@",      staff_app_url)
 body = body.replace("@CLIENT_PORTAL_URL@",  client_portal_url)
+import os as _os
+body = body.replace("@ROUTING_MODE@",        _os.environ.get("VIBE_RENDER_ROUTING_MODE", "lan"))
+body = body.replace("@DOMAIN_ROUTING_MODE@", _os.environ.get("VIBE_RENDER_DOMAIN_ROUTING_MODE", "single-host"))
 # Manifest-declared generated secrets (env[].from = "generated:<shape>").
 # Applied last so a hand-written marker above always wins for a name both
 # describe - the bespoke blocks carry per-app caveats the generic pass

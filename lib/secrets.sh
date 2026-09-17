@@ -603,6 +603,37 @@ PYEOF
     app_login_lines="  (no enabled app declares default credentials — check the admin console's First-login panel)"
   fi
 
+  # Vibe Auth break-glass admins (D12): lib/identity.sh stores each
+  # product's vibe-breakglass password in vibe-auth.env as
+  # VIBE_BREAKGLASS_PASSWORD_<SLUG>. Archive them here so the operator's
+  # printed copy covers emergency access when SSO is down.
+  local breakglass_lines=""
+  if [[ -f "${VIBE_ENV_DIR}/vibe-auth.env" ]]; then
+    breakglass_lines="$(python3 - "${VIBE_ENV_DIR}/vibe-auth.env" <<'PYEOF' 2>/dev/null || true
+import sys
+rows = []
+for raw in open(sys.argv[1]):
+    line = raw.strip()
+    if line.startswith("VIBE_BREAKGLASS_PASSWORD_") and "=" in line:
+        k, v = line.split("=", 1)
+        if v:
+            slug = k[len("VIBE_BREAKGLASS_PASSWORD_"):].lower().replace("_", "-")
+            rows.append((slug, v))
+for slug, pw in rows:
+    print(f"  {slug}")
+    print(f"    Username:  vibe-breakglass")
+    print(f"    Password:  {pw}")
+    print()
+PYEOF
+)"
+  fi
+  if [[ -n "$breakglass_lines" ]]; then
+    app_login_lines="${app_login_lines}
+
+  --- Vibe Auth break-glass local admins (use only when single sign-on is down) ---
+${breakglass_lines}"
+  fi
+
   cat >"$tmp" <<EOF
 ================================================================
  Vibe Appliance — credentials

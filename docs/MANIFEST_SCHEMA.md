@@ -409,6 +409,66 @@ redirects.
 Prefer fixing the app to serve something useful at its root; this exists
 so an app that cannot is still openable.
 
+### `routing.mounts`
+
+```jsonc
+"routing": {
+  "default_upstream": "vibe-auth:8080",
+  "mounts": [
+    { "path": "/auth", "upstream": "vibe-auth-authentik-server:9000" }
+  ]
+}
+```
+
+An absolute path the app owns at the **host** level, proxied **without**
+prefix stripping — for an upstream that serves itself under that path
+(authentik with `AUTHENTIK_WEB__PATH=/auth/`). Emitted as a top-level
+`handle /auth/*` in every path-mounted mode (LAN, Tailscale, single-host
+domain) and as a handle inside the app's own vhost in subdomain-per-app
+mode, so `<host>/auth/...` works identically everywhere. Paths must be
+unique across enabled apps; the renderer refuses a collision.
+
+---
+
+## `provides` / `requires` (Vibe Auth)
+
+```jsonc
+"provides": ["identity"]          // vibe-auth only
+"requires": ["identity"]          // any product that embeds @kisaesdevlab/vibe-auth
+```
+
+`requires` is **soft**: it only orders install/boot so the provider comes
+up first. A product installs and runs on local sign-in when no provider
+is enabled (Vibe Auth D11). Contrast `requiredApps`, which refuses the
+enable.
+
+## `sso` (Vibe Auth integration contract)
+
+```jsonc
+"sso": {
+  "capable":          true,
+  "redirectPaths":    ["/auth/oidc/callback"],
+  "logoutPaths":      ["/auth/oidc/backchannel"],
+  "publicPaths":      ["/api/v1/health", "/api/v1/ping", "/mcp/*"],
+  "edgeGate":         false,
+  "internalUrl":      "http://vibe-tb-server:3001",
+  "breakglassService": "vibe-tb-server",
+  "breakglassCommand": ["npx", "vibe-auth", "breakglass", "ensure", "--json"]
+}
+```
+
+When `vibe-auth` is enabled, `lib/identity.sh register <slug>` (run by
+`enable-app.sh` and by the console's Identity panel) registers the product
+with the broker, writes the returned `VIBE_OIDC_*` block into
+`/opt/vibe/env/<slug>.env`, recreates the product and provisions its
+`vibe-breakglass` local admin (password stored once as
+`VIBE_BREAKGLASS_PASSWORD_<SLUG>` in `vibe-auth.env` and printed to
+CREDENTIALS.txt). `VIBE_AUTH_MODE` is **never** written by registration —
+the firm flips `local → both → oidc_only` from the Identity panel
+(`identity.sh mode`), which refuses `oidc_only` until a break-glass
+password exists. `edgeGate` adds Caddy `forward_auth` in front of the whole
+app (D10, off by default); `publicPaths` bypass it.
+
 ---
 
 ## `env`

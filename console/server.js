@@ -2343,6 +2343,18 @@ app.post('/api/v1/disable/:slug', requireAdmin, testRateLimit, async (req, res) 
   await runToggle(req, res, DISABLE_SCRIPT, 'disable');
 });
 
+// Vibe Auth SSO routes (/api/v1/identity*) — see console/identity.js.
+// Same spawn shape as runToggle: `/bin/bash lib/identity.sh <action>
+// <slug> [arg]` with an argv array, tracked children, per-slug locks.
+require('./identity')(app, {
+  requireAdmin, testRateLimit, MANIFESTS, APPLIANCE_DIR, VIBE_DIR, SLUG_RE, log, trim,
+  acquireSlugLock, releaseSlugLock, globalOp,
+  spawnScript: (argv) => trackChild(spawn('/bin/bash', argv, {
+    env: { ...process.env, APPLIANCE_DIR, VIBE_DIR, NO_COLOR: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })),
+});
+
 // Flip apps.<slug>.visibleToCustomers in state.json. Pure state mutation
 // — no Caddy reload, no container touch. Same admin + rate-limit gates
 // as enable/disable so a misbehaving client can't burn the JSON write

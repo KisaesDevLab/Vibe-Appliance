@@ -1057,13 +1057,24 @@ for slug in enabled:
     if (m.get("runtime") or "appliance") != "appliance":
         continue
     own.append(slug)
+# Capability edges (Vibe Auth): an app that `requires: ["identity"]` boots
+# after every enabled app that `provides: ["identity"]`. Soft — the
+# consumer still boots when no provider is enabled (D11).
+providers = {}
+manifests = {}
 for slug in own:
     try:
         with open(os.path.join(manifests_dir, slug + ".json")) as f:
-            m = json.load(f)
-        deps[slug] = [d for d in (m.get("requiredApps") or []) if d in own]
+            manifests[slug] = json.load(f)
     except Exception:
-        deps[slug] = []
+        manifests[slug] = {}
+    for cap in (manifests[slug].get("provides") or []):
+        providers.setdefault(cap, []).append(slug)
+for slug in own:
+    m = manifests.get(slug) or {}
+    hard = [d for d in (m.get("requiredApps") or []) if d in own]
+    soft = [p for cap in (m.get("requires") or []) for p in providers.get(cap, []) if p != slug]
+    deps[slug] = sorted(set(hard + soft))
 enabled = own
 emitted, remaining = [], sorted(enabled)
 while remaining:

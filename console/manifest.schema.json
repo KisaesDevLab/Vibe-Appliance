@@ -244,6 +244,71 @@
               "streaming": { "type": "boolean" }
             }
           }
+        },
+        "mounts": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Absolute paths this app owns at the HOST level, proxied WITHOUT prefix stripping — for an upstream that serves itself under that path (authentik with AUTHENTIK_WEB__PATH=/auth/). Emitted as a top-level `handle <path>/*` in every path-mounted mode (LAN, Tailscale, single-host domain) and inside the app's own vhost in subdomain-per-app mode. Unlike `matchers` (which live under the app's /<prefix>/ handler and see the stripped path) a mount is reachable at `<host><path>/...` directly. Paths must be unique across enabled apps.",
+          "items": {
+            "type": "object",
+            "required": ["path", "upstream"],
+            "additionalProperties": false,
+            "properties": {
+              "path":      { "type": "string", "pattern": "^/[a-z0-9][a-z0-9-]*$", "maxLength": 40 },
+              "upstream":  { "type": "string", "pattern": "^[a-z0-9.-]+:[0-9]+$" },
+              "streaming": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+
+    "provides": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["identity"] },
+      "uniqueItems": true,
+      "description": "Capabilities this app offers to other apps. `identity` = the Vibe Auth single sign-on broker (console/manifests/vibe-auth.json). Consumers name the capability in `requires`; bootstrap.sh orders enabled apps so providers start before consumers, exactly like requiredApps but soft (see `requires`)."
+    },
+    "requires": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["identity"] },
+      "uniqueItems": true,
+      "description": "Capabilities this app CAN use when a provider is enabled. Affects install/boot order only — the app installs and runs fine without the provider present (Vibe Auth D11: a product stays on local sign-in until the firm flips it). Contrast requiredApps, which refuses the enable."
+    },
+    "sso": {
+      "type": "object",
+      "required": ["capable"],
+      "additionalProperties": false,
+      "description": "Vibe Auth integration contract for a product that embeds @kisaes/vibe-auth. When vibe-auth is enabled, lib/identity.sh registers the product with the broker (POST /registrations), writes the returned VIBE_OIDC_* block into /opt/vibe/env/<slug>.env, recreates the product and provisions its break-glass local admin. VIBE_AUTH_MODE is never written by registration (D11); the firm changes it from the console Identity panel or the product's own Settings → Authentication page.",
+      "properties": {
+        "capable":       { "type": "boolean" },
+        "redirectPaths": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^/.+$" }, "default": ["/auth/oidc/callback"] },
+        "logoutPaths":   { "type": "array", "items": { "type": "string", "pattern": "^/.+$" }, "default": ["/auth/oidc/backchannel"] },
+        "publicPaths": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^/.*$" },
+          "description": "Machine endpoints (webhooks, health, API-key routes) that bypass the optional Caddy edge gate (D10). Ignored unless edgeGate is true."
+        },
+        "edgeGate": {
+          "type": "boolean",
+          "default": false,
+          "description": "Opt-in Caddy forward_auth in front of the whole app via authentik's embedded outpost (D10). Off by default: the app's own middleware already enforces sign-in; the gate adds defence in depth for apps with weak local auth."
+        },
+        "breakglassService": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "description": "Container to `docker exec` the break-glass CLI in. Defaults to <slug>-server."
+        },
+        "internalUrl": {
+          "type": "string",
+          "pattern": "^https?://[a-z0-9.-]+(:[0-9]+)?(/.*)?$",
+          "description": "Container-internal base URL of the tier that serves the product's /auth/* routes (e.g. http://vibe-tb-server:3001, no path prefix because Caddy strips it). authentik POSTs back-channel logout tokens here over vibe_net, never via the public edge. Defaults to http://<routing.default_upstream>."
+        },
+        "breakglassCommand": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" },
+          "description": "Argv run inside breakglassService to (idempotently) ensure the vibe-breakglass local admin and print {username,password} JSON. Defaults to [\"npx\",\"vibe-auth\",\"breakglass\",\"ensure\",\"--json\"]. Distroless images point this at their own node entrypoint."
         }
       }
     },
@@ -536,7 +601,7 @@
           "description": "1 = inline-editable form field; 2 = read-only with copy-paste rotation hint; 3 = not surfaced (default)."
         },
         "category": {
-          "enum": ["Network", "Email & SMS", "Backup", "AI", "Time & Logging", "System", "Application", "Compliance"],
+          "enum": ["Network", "Email & SMS", "Backup", "AI", "Time & Logging", "System", "Application", "Compliance", "Identity"],
           "description": "Settings page tab. Required for tier 1."
         },
         "label":     { "type": "string", "minLength": 1, "maxLength": 80 },

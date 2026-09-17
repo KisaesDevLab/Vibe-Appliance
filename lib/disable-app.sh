@@ -78,6 +78,21 @@ print((json.load(open('${manifest}')).get('runtime') or 'appliance'))
 
   log_step "disabling app" slug="$slug" services="$services"
 
+  # 0. Vibe Auth (single sign-on), non-fatal. Disabling vibe-auth itself
+  # forces every registered product back to local sign-in first (§2.3
+  # item 6) so nobody is locked out of an oidc_only product; disabling a
+  # product drops its broker registration (its env keeps the VIBE_OIDC_*
+  # block for a later re-enable, which re-registers idempotently).
+  if [[ -f "${APPLIANCE_DIR}/lib/identity.sh" ]]; then
+    if [[ "$slug" == "vibe-auth" ]]; then
+      log_step "returning registered products to local sign-in before stopping vibe-auth"
+      bash "${APPLIANCE_DIR}/lib/identity.sh" disable-all 2>&1 | tee -a "$VIBE_LOG_FILE" >&2 \
+        || log_warn "could not return every product to local sign-in; check each product's Identity panel"
+    else
+      bash "${APPLIANCE_DIR}/lib/identity.sh" unregister "$slug" >>"$VIBE_LOG_FILE" 2>&1 || true
+    fi
+  fi
+
   # 1. Flip enabled=false BEFORE re-rendering Caddyfile. The renderer
   # reads state.json's enabled-apps list; if we re-rendered while
   # enabled=true, the disabled app's vhost would still be in the

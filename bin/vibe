@@ -25,6 +25,9 @@ COMMANDS
   doctor [--json]              Run diagnostics and print PASS/WARN/FAIL.
   enable  <slug>               Bring an app online.
   disable <slug>               Take an app offline (data preserved).
+  identity <action> [slug]     Vibe Auth single sign-on: status|register|rotate|
+                               disable|mode <slug> [local|both|oidc_only],
+                               setup-token, rebase, register-all, disable-all.
   update  --check [slug]       Check for available image updates.
   update  <slug>               Update an app (pre-update DB backup +
                                rollback on failure).
@@ -65,6 +68,12 @@ case "$cmd" in
     ;;
   disable)
     exec /bin/bash "${APPLIANCE_DIR}/lib/disable-app.sh" "$@"
+    ;;
+  identity)
+    # Vibe Auth single sign-on lifecycle for products — see lib/identity.sh:
+    #   vibe identity status|register|rotate|disable|mode <slug> [mode]
+    #   vibe identity setup-token | rebase | register-all | disable-all
+    exec /bin/bash "${APPLIANCE_DIR}/lib/identity.sh" "$@"
     ;;
   update)
     exec /bin/bash "${APPLIANCE_DIR}/update.sh" "$@"
