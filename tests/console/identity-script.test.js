@@ -65,10 +65,16 @@ test('base path: /vibe-auth/ normalises to /vibe-auth; / normalises to empty', (
   assert.equal(run(ENV_ROOT, '_id_va_base'), '');
 });
 
-test('public base is https + origin + base path in both modes', () => {
-  assert.equal(run(ENV_SUBPATH, '_id_va_public_base'), 'https://192.168.68.50/vibe-auth',
-    'LAN origin is http:// in the env; sign-in URLs are always https');
+test('public base is the origin (scheme as rendered) + base path in both modes', () => {
+  // LAN mode is plain http on :80 — rewriting to https produced setup links
+  // that ended in ERR_SSL_PROTOCOL_ERROR on the first real LAN enable.
+  assert.equal(run(ENV_SUBPATH, '_id_va_public_base'), 'http://192.168.68.50/vibe-auth');
   assert.equal(run(ENV_ROOT, '_id_va_public_base'), 'https://auth.firm.com');
+});
+
+test('scheme for /rebase follows the origin: http in LAN, https in domain modes', () => {
+  assert.equal(run(ENV_SUBPATH, '_id_va_scheme'), 'http');
+  assert.equal(run(ENV_ROOT, '_id_va_scheme'), 'https');
 });
 
 test('setup-token: the console gets a full URL the operator can click', () => {
@@ -78,7 +84,7 @@ _id_va_healthy() { return 0; }
 _id_api() { printf '%s' '{"token":"abc123","state":{"done":false}}'; }
 id_setup_token`;
   const sub = JSON.parse(run(ENV_SUBPATH, stubs));
-  assert.equal(sub.url, 'https://192.168.68.50/vibe-auth/setup?token=abc123');
+  assert.equal(sub.url, 'http://192.168.68.50/vibe-auth/setup?token=abc123');
   assert.equal(sub.token, 'abc123');
   assert.equal(sub.done, false);
   const root = JSON.parse(run(ENV_ROOT, stubs));
@@ -91,7 +97,7 @@ _id_va_enabled() { return 0; }
 _id_va_healthy() { return 0; }
 _id_api() { printf '%s' '{"token":null,"state":{"done":true}}'; }
 id_setup_token`));
-  assert.equal(out.url, 'https://192.168.68.50/vibe-auth/admin');
+  assert.equal(out.url, 'http://192.168.68.50/vibe-auth/admin');
   assert.equal(out.token, null);
   assert.equal(out.done, true);
 });

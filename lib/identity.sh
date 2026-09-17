@@ -62,13 +62,23 @@ _id_va_base() {
   return 0
 }
 
-# Browser-facing origin of vibe-auth, always https (Caddy serves :443 in
-# every mode; LAN uses its internal CA). The template writes this as
-# VIBE_AUTH_APPLIANCE_ORIGIN — there is no ALLOWED_ORIGIN in vibe-auth.env.
+# Browser-facing origin of vibe-auth, scheme included, exactly as the
+# template rendered it into VIBE_AUTH_APPLIANCE_ORIGIN (there is no
+# ALLOWED_ORIGIN in vibe-auth.env). LAN mode is plain http on :80 — this
+# used to rewrite http→https on the belief Caddy served :443 with an
+# internal CA in every mode, and the first LAN enable produced setup
+# links that ended in ERR_SSL_PROTOCOL_ERROR. Broker ≥1.0.2 derives its
+# own scheme from the same origin, so the two agree.
 _id_va_origin() {
   local o; o="$(_extract_env_value "$VA_ENV" VIBE_AUTH_APPLIANCE_ORIGIN)"
   [[ -n "$o" ]] || die "VIBE_AUTH_APPLIANCE_ORIGIN missing in ${VA_ENV}. Fix: sudo vibe enable vibe-auth (re-renders the env file), then retry."
-  printf '%s' "${o/#http:/https:}"
+  printf '%s' "$o"
+}
+
+# Scheme of that origin ("http" or "https"), for the broker's /rebase body.
+_id_va_scheme() {
+  local o; o="$(_id_va_origin)"
+  case "$o" in http://*) printf 'http' ;; *) printf 'https' ;; esac
 }
 
 # Broker base URL as the browser reaches it: origin + base path. Fails
@@ -364,7 +374,8 @@ id_rebase() {
   done
   local host body resp
   host="$(_id_va_rebase_host)"
-  body="$(python3 -c 'import json,sys; print(json.dumps({"host": sys.argv[1], "scheme": "https", "products": json.loads(sys.argv[2])}))' "$host" "$products")"
+  local scheme; scheme="$(_id_va_scheme)"
+  body="$(python3 -c 'import json,sys; print(json.dumps({"host": sys.argv[1], "scheme": sys.argv[2], "products": json.loads(sys.argv[3])}))' "$host" "$scheme" "$products")"
   resp="$(_id_api POST /rebase "$body")" || die "rebase failed"
   # Apply each product's new env block and recreate it.
   while IFS= read -r slug; do
