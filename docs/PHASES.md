@@ -2301,3 +2301,13 @@ Append to this list as phases complete. Format:
   (verified locally: late-started backend goes 503→200, SIGHUP reload
   hitless). Existing hosts: `git pull` then
   `sudo bash /opt/vibe/appliance/lib/render-haproxy.sh`.
+
+- Same host run (2026-09-17): the authentik admin UI showed "The base
+  URL has not been configured. Configure it in the system settings."
+  authentik 2026.8 added a Base URL system setting (scheme + host, no
+  path; required from 2026.11), seedable with `AUTHENTIK_WEB__BASE_URL`.
+  `vibe-auth.env.tmpl` now seeds it from `@ALLOWED_ORIGIN@` (the same
+  origin the broker derives scheme/host from); broker 1.0.3 also writes
+  it through the settings API at bootstrap and rebase so an IP change
+  keeps it current. Existing hosts: `sudo vibe enable vibe-auth`
+  re-renders the env and recreates authentik.
