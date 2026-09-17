@@ -33,8 +33,9 @@
     "logoutPaths":   ["/auth/oidc/backchannel"],
     "publicPaths":   ["/api/v1/health", "/api/v1/ping", "/api/v1/features", "/api/v1/public/*", "/api/v1/integrations/qbo/callback", "/mcp/*", "/api/v1/auth/*", "/api/v1/password-reset/*"],
     "edgeGate":      false,
+    "internalUrl":   "http://vibe-tb-server:3001",
     "breakglassService": "vibe-tb-server",
-    "breakglassCommand": ["node", "node_modules/@kisaesdevlab/vibe-auth/dist/cli.js", "breakglass", "ensure", "--json"]
+    "breakglassCommand": ["node", "server/node_modules/@kisaesdevlab/vibe-auth/dist/cli.js", "breakglass", "ensure", "--json"]
   },
 
   "env": {

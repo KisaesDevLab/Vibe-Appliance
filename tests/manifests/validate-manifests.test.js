@@ -294,6 +294,47 @@ test('health_extra entries are well-formed and name a service the overlay declar
   }
 });
 
+test('an sso-capable manifest carries everything lib/identity.sh needs', () => {
+  // lib/identity.sh registers the product from this block: the /auth/*
+  // matcher is what lets the broker's back-channel logout and the browser's
+  // OIDC callback reach the API tier (render-caddyfile.sh builds routes ONLY
+  // from routing.matchers — nothing is derived from sso.redirectPaths), and
+  // breakglassCommand is docker-exec'd in breakglassService with the image's
+  // own WORKDIR and no shell, so it must be an argv array whose "ensure"
+  // element identity.sh can swap for "rotate". A product that declares
+  // sso.capable without these registers "successfully" and then cannot
+  // complete a login or provision its break-glass admin.
+  const root = path.join(__dirname, '..', '..');
+  for (const { file, data } of applianceManifests()) {
+    const sso = data.sso;
+    if (!sso || sso.capable !== true) continue;
+    assert.ok(Array.isArray(data.requires) && data.requires.includes('identity'),
+      `${file}: sso.capable requires "identity" in requires[]`);
+    const matchers = (data.routing && data.routing.matchers) || [];
+    const auth = matchers.find((m) => m.path === '/auth/*');
+    assert.ok(auth, `${file}: sso.capable needs a routing matcher for /auth/* (the API tier)`);
+    if (sso.internalUrl !== undefined) {
+      assert.match(sso.internalUrl, /^https?:\/\/[a-z0-9.-]+:\d+$/,
+        `${file}: sso.internalUrl "${sso.internalUrl}" is not http://<service>:<port>`);
+      assert.strictEqual(sso.internalUrl.replace(/^https?:\/\//, ''), auth.upstream,
+        `${file}: sso.internalUrl must name the same upstream as the /auth/* matcher`);
+    }
+    const overlay = fs.readFileSync(path.join(root, 'apps', `${data.slug}.yml`), 'utf8');
+    const service = sso.breakglassService || `${data.slug}-server`;
+    assert.match(overlay, new RegExp(`^\\s{2}${service}:\\s*$`, 'm'),
+      `${file}: sso.breakglassService "${service}" is not a service in apps/${data.slug}.yml`);
+    const cmd = sso.breakglassCommand;
+    if (cmd !== undefined) {
+      assert.ok(Array.isArray(cmd) && cmd.length >= 3 && cmd.every((c) => typeof c === 'string'),
+        `${file}: sso.breakglassCommand must be an argv array`);
+      assert.ok(cmd.includes('ensure'),
+        `${file}: sso.breakglassCommand needs a literal "ensure" element (identity.sh rewrites it to "rotate")`);
+      assert.ok(cmd.includes('--json'), `${file}: sso.breakglassCommand must produce JSON (--json)`);
+      assert.notStrictEqual(cmd[0], 'sh', `${file}: sso.breakglassCommand must not go through a shell (argv substitution)`);
+    }
+  }
+});
+
 test('routing.deny_paths entries are absolute paths', () => {
   for (const { file, data } of manifests) {
     const denied = (data.routing || {}).deny_paths;
