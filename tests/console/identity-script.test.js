@@ -72,6 +72,17 @@ test('public base is the origin (scheme as rendered) + base path in both modes',
   assert.equal(run(ENV_ROOT, '_id_va_public_base'), 'https://auth.firm.com');
 });
 
+test('product base URL for registration keeps the product origin scheme (http in LAN)', () => {
+  // Registered redirect URIs are built from this by the broker; an https
+  // rewrite here made every LAN sign-in fail on redirect_uri mismatch.
+  const lan = `printf 'ALLOWED_ORIGIN=http://192.168.68.50\nVITE_BASE_PATH=/tb/\n' > "$VIBE_ENV_DIR/vibe-tb.env"; _id_product_base_url vibe-tb`;
+  assert.equal(run(ENV_SUBPATH, lan), 'http://192.168.68.50/tb');
+  const dom = `printf 'ALLOWED_ORIGIN=https://vibe.firm.com\nVITE_BASE_PATH=/tb/\n' > "$VIBE_ENV_DIR/vibe-tb.env"; _id_product_base_url vibe-tb`;
+  assert.equal(run(ENV_ROOT, dom), 'https://vibe.firm.com/tb');
+  const root = `printf 'ALLOWED_ORIGIN=https://tb.firm.com\nVITE_BASE_PATH=/\n' > "$VIBE_ENV_DIR/vibe-tb.env"; _id_product_base_url vibe-tb`;
+  assert.equal(run(ENV_ROOT, root), 'https://tb.firm.com');
+});
+
 test('scheme for /rebase follows the origin: http in LAN, https in domain modes', () => {
   assert.equal(run(ENV_SUBPATH, '_id_va_scheme'), 'http');
   assert.equal(run(ENV_ROOT, '_id_va_scheme'), 'https');

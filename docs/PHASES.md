@@ -2311,3 +2311,12 @@ Append to this list as phases complete. Format:
   it through the settings API at bootstrap and rebase so an IP change
   keeps it current. Existing hosts: `sudo vibe enable vibe-auth`
   re-renders the env and recreates authentik.
+- Same host run (2026-09-17): first SSO sign-in from Trial Balance
+  (image sha-51331d9, the first with the vibe-auth client) failed. A
+  second http→https rewrite in `identity.sh` (`_id_product_base_url`)
+  registered `https://<ip>/tb/...` redirect URIs with the broker for a
+  product the browser reaches over http, so the OIDC redirect could not
+  match. Removed; test added. Existing hosts re-register:
+  `sudo vibe identity register vibe-tb` (or the panel's Fix). The
+  browser's Cross-Origin-Opener-Policy console message on http is only
+  a warning.

@@ -147,7 +147,9 @@ _id_product_base_url() {
   local slug="$1" env="${VIBE_ENV_DIR}/$1.env" origin base
   origin="$(_extract_env_value "$env" ALLOWED_ORIGIN)"
   [[ -n "$origin" ]] || die "ALLOWED_ORIGIN missing in ${env}; enable ${slug} first"
-  origin="${origin/#http:/https:}"
+  # Scheme as rendered: http://<ip> in LAN. Rewriting to https here made the
+  # broker register https redirect URIs for a product the browser reaches
+  # over http, so every LAN sign-in failed on redirect_uri mismatch.
   base="$(_extract_env_value "$env" VITE_BASE_PATH)"
   base="${base%/}"
   [[ "$base" == "/" ]] && base=""
