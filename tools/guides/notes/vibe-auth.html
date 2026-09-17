@@ -1,0 +1,77 @@
+<!-- Extra section for the vibe-auth guide. Facts sourced from
+     lib/identity.sh, console/identity.js, console/ui/static/identity.js,
+     apps/vibe-auth.yml and docs/MANIFEST_SCHEMA.md (sso contract). -->
+<p><strong>What changes when you enable it — and what does not.</strong> Vibe Auth is the
+appliance's identity broker: staff sign in once, with MFA, and every Vibe app you connect
+to it accepts that session. Enabling it changes <em>nothing</em> about how anyone signs in
+today. Each app keeps working on its own local accounts until you connect it and then
+choose its sign-in mode, one app at a time.</p>
+
+<h3>Order of work</h3>
+<ol>
+<li><strong>Enable Vibe Auth</strong> from its card. First start takes longer than other apps
+(up to five minutes) because the bundled identity server applies its configuration before
+the health check turns green. Do not click Enable again while the badge says
+<em>enabling…</em>; the card tells you if it actually failed.</li>
+<li><strong>Run the setup wizard</strong> (previous section) from the admin console's
+<strong>Single sign-on (Vibe Auth)</strong> panel. Enrol MFA for the first administrator
+when the wizard asks. The Vibe Auth admin console is then at <code>…/auth/if/admin/</code>
+on the appliance address.</li>
+<li><strong>Create the firm's staff</strong> in the Vibe Auth admin console, or connect
+the firm's Microsoft Entra ID / Google Workspace so staff sign in with the accounts they
+already have. Put each person in the group that matches their role
+(for example <code>vibe-partner</code>, <code>vibe-staff</code>); apps map those groups to
+their own roles.</li>
+<li><strong>Connect each app.</strong> In the <strong>Single sign-on</strong> panel every
+SSO-capable app has a card. Click <strong>Register</strong>. The appliance registers the app
+with the broker, restarts it, and creates a local emergency account in it named
+<code>vibe-breakglass</code>. Nothing else changes yet — the app still uses local sign-in.</li>
+<li><strong>Switch the sign-in mode</strong> on that card, in this order:
+<table>
+<thead><tr><th style="width:26mm">Mode</th><th>Who can sign in</th><th>When to use it</th></tr></thead>
+<tbody>
+<tr><td><code>local</code></td><td>Local accounts only (today's behaviour).</td><td>Default after registering.</td></tr>
+<tr><td><code>both</code></td><td>Local accounts <em>and</em> the SSO button.</td><td>Roll-out. Have every staff member sign in once through SSO before moving on.</td></tr>
+<tr><td><code>oidc_only</code></td><td>SSO only, plus <code>vibe-breakglass</code>.</td><td>Steady state. Local passwords stop working for everyone else.</td></tr>
+</tbody></table>
+</li>
+</ol>
+
+<div class="callout--warn callout">
+<p><strong>Before you choose <code>oidc_only</code> for any app, save its break-glass
+password.</strong> It is in <code>/opt/vibe/CREDENTIALS.txt</code> on the server (line
+<code>VIBE_BREAKGLASS_PASSWORD_&lt;APP&gt;</code>) and in the app's Register output. Put it in
+the firm's password manager. It is the only way into that app if Vibe Auth is down, and the
+console refuses <code>oidc_only</code> until a break-glass account exists.</p>
+</div>
+
+<h3>Apps enabled later</h3>
+<p>An SSO-capable app you enable after Vibe Auth is running registers itself automatically
+during its own enable. It still starts in <code>local</code> mode; switch it when you are ready.
+If a card shows <em>not registered</em> even though Vibe Auth is healthy, click
+<strong>Fix registration</strong> — it is safe to repeat.</p>
+
+<h3>Things that happen rarely</h3>
+<ul>
+<li><strong>The server's name, IP, domain or routing mode changed.</strong> Click
+<strong>Re-derive issuers</strong> at the top of the Single sign-on panel. Until you do,
+SSO sign-ins fail with a redirect error while local sign-in keeps working.</li>
+<li><strong>Rotate secret</strong> on an app card issues that app a new client secret and
+restarts it. Use it if the app's configuration file was ever shared or copied.</li>
+<li><strong>Disable SSO</strong> on an app card returns just that app to local sign-in.
+<strong>Disabling Vibe Auth itself</strong> first returns <em>every</em> connected app to
+local sign-in, so nobody is locked out, then stops the broker. Re-enabling later
+reconnects them; their modes start back at <code>local</code>.</li>
+<li><strong>Someone left the firm.</strong> Disable them in the Vibe Auth admin console
+and end their sessions there; connected apps drop their session at the next request.
+Also remove any local accounts they had in apps still running in <code>local</code> or
+<code>both</code> mode.</li>
+<li><strong>Password recovery mail</strong> uses the appliance's Email settings
+(Settings → Email &amp; SMS). Without SMTP, an administrator resets passwords in the Vibe
+Auth admin console instead.</li>
+</ul>
+
+<h3>Emergency access</h3>
+<p>The emergency port reaches the broker's status page only. Single sign-on itself needs the
+normal web front end (the <code>/auth/</code> route), so if the front end is down, sign in to
+each app with its <code>vibe-breakglass</code> account until the doctor has the front end back.</p>

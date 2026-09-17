@@ -185,6 +185,24 @@ function firstLoginSection(m) {
     return `<p>This app has no separate login of its own — if it asks for credentials, they are
       shown in the admin console under <strong>First-login info</strong>.</p>`;
   }
+  if ((fl.type || '') === 'setup-wizard') {
+    // No default account exists: the first visit is a one-time-token
+    // wizard that creates the first administrator (vibe-auth D13).
+    return `<p>This app has <strong>no default account and no default password</strong>. Its
+      first visit runs a setup wizard, protected by a one-time token, and that wizard creates
+      the first administrator.</p>
+<ol>
+<li>After the card shows <strong>running</strong>, look in the admin console for the
+<strong>setup URL</strong> and <strong>one-time token</strong> (the note below says which panel
+shows them). The token is shown once and is
+never stored anywhere else.</li>
+<li>Open the setup URL${fl.url ? ` (<code>…${esc(fl.url)}</code> on the app's address)` : ''} and paste the token.</li>
+<li>Create the first administrator (you choose the username). Store the password in the firm's password manager.</li>
+<li>Finish the wizard. The setup URL stops working once it completes; the same section in the
+admin console then reports setup as done.</li>
+</ol>
+${fl.note ? `<p class="small muted">${esc(fl.note)}</p>` : ''}`;
+  }
   let html = `<p>Open the app URL. `;
   if (fl.username) {
     html += `Sign in with username <code>${esc(fl.username)}</code>. The one-time default
@@ -269,6 +287,7 @@ ${m.sameProductAs ? `<tr><td><strong>Same product as</strong></td><td>the <code>
 <ul>
 <li>The appliance itself must be installed and healthy — see the <strong>Vibe Appliance setup guide</strong> first if you haven't done that yet.</li>
 <li>Each running app uses memory. Two or three apps fit a 2&nbsp;GB server; for all of them plan on 4&nbsp;GB or more.</li>
+${Number.isInteger(m.resources?.ramMb) && m.resources.ramMb >= 1024 ? `<li><strong>This app needs about ${esc(Math.round(m.resources.ramMb / 1024 * 10) / 10)}&nbsp;GB of memory on its own.</strong> The console refuses to enable it when the server does not have that much free; plan on a 4&nbsp;GB server or larger.</li>` : ''}
 <li>If the card shows an <em>image not published</em> badge, the app's build isn't available yet — the Enable button stays off until it is.</li>
 </ul>`],
 
