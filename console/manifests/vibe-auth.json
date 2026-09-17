@@ -80,7 +80,7 @@
     "note":     "First visit runs a setup wizard gated by a one-time token. The console's Identity panel shows the link and token (also printed to the broker log: docker logs vibe-auth). The wizard creates the firm's first identity administrator; no default password exists (D13)."
   },
 
-  "health": "/vibe-auth/health",
+  "health": "/health",
   "health_timeout_s": 300,
   "health_extra": [
     { "name": "authentik", "upstream": "vibe-auth-authentik-server:9000", "path": "/auth/-/health/ready/", "doc": "authentik server readiness (migrations applied)." }

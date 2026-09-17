@@ -45,11 +45,38 @@ fi
 
 VA_SLUG="vibe-auth"
 VA_ENV="${VIBE_ENV_DIR}/${VA_SLUG}.env"
-VA_INTERNAL="http://vibe-auth:8080/vibe-auth"
+VA_UPSTREAM="http://vibe-auth:8080"
 
 # ---------------------------------------------------------------- helpers
 
 _id_manifest() { printf '%s' "${APPLIANCE_DIR}/console/manifests/$1.json"; }
+
+# The broker mounts its console API under VIBE_AUTH_BASE_PATH (rendered
+# from @VITE_BASE_PATH@): "/vibe-auth" in every path-mounted mode, "" when
+# the app is root-served (subdomain-per-app). Read it from the env file
+# rather than hardcoding it, or every API call 404s in that mode.
+_id_va_base() {
+  local b; b="$(_extract_env_value "$VA_ENV" VIBE_AUTH_BASE_PATH)"
+  b="${b#/}"; b="${b%/}"
+  [[ -n "$b" ]] && printf '/%s' "$b"
+  return 0
+}
+
+# Browser-facing origin of vibe-auth, always https (Caddy serves :443 in
+# every mode; LAN uses its internal CA). The template writes this as
+# VIBE_AUTH_APPLIANCE_ORIGIN — there is no ALLOWED_ORIGIN in vibe-auth.env.
+_id_va_origin() {
+  local o; o="$(_extract_env_value "$VA_ENV" VIBE_AUTH_APPLIANCE_ORIGIN)"
+  [[ -n "$o" ]] || die "VIBE_AUTH_APPLIANCE_ORIGIN missing in ${VA_ENV}. Fix: sudo vibe enable vibe-auth (re-renders the env file), then retry."
+  printf '%s' "${o/#http:/https:}"
+}
+
+# Broker base URL as the browser reaches it: origin + base path. Fails
+# (rather than printing a host-less path) when the origin is missing.
+_id_va_public_base() {
+  local o; o="$(_id_va_origin)" || return 1
+  printf '%s%s' "$o" "$(_id_va_base)"
+}
 
 _id_sso_field() {
   # _id_sso_field <slug> <python expr over data["sso"]> [default]
@@ -75,7 +102,8 @@ _id_va_enabled() {
 }
 
 _id_va_healthy() {
-  probe_health_200 "${VA_INTERNAL}/health" 2>/dev/null
+  # /health is served unprefixed in every base-path configuration.
+  probe_health_200 "${VA_UPSTREAM}/health" 2>/dev/null
 }
 
 _id_console_token() {
@@ -85,13 +113,17 @@ _id_console_token() {
 }
 
 # _id_api <METHOD> <path> [json-body]  → response body on stdout; exit 1 on HTTP >= 400
+# The console token travels on stdin (first line), never in argv, so it is
+# not visible in `ps` on the host while the call runs. `read` in a POSIX
+# sh consumes exactly one line from a pipe; curl then reads the rest as
+# the request body.
 _id_api() {
   local method="$1" path="$2" body="${3:-}"
   local token; token="$(_id_console_token)"
   local out code
-  out="$(printf '%s' "$body" | docker exec -i vibe-console sh -c \
-    'curl -s -o /tmp/id.out -w "%{http_code}" -X "$0" -H "Authorization: Bearer $1" -H "Content-Type: application/json" --data-binary @- "$2"; echo; cat /tmp/id.out' \
-    "$method" "$token" "${VA_INTERNAL}${path}")" || return 1
+  out="$(printf '%s\n%s' "$token" "$body" | docker exec -i vibe-console sh -c \
+    'IFS= read -r t; curl -s -o /tmp/id.out -w "%{http_code}" -X "$0" -H "Authorization: Bearer $t" -H "Content-Type: application/json" --data-binary @- "$1"; echo; cat /tmp/id.out' \
+    "$method" "${VA_UPSTREAM}$(_id_va_base)${path}")" || return 1
   code="${out%%$'\n'*}"; body="${out#*$'\n'}"
   printf '%s' "$body"
   [[ "$code" =~ ^2 ]] || { log_error "vibe-auth API ${method} ${path} → HTTP ${code}: ${body:0:300}"; return 1; }
@@ -307,9 +339,20 @@ id_setup_token() {
   _id_va_enabled || { echo '{"token":null,"done":false,"url":null,"error":"vibe-auth not enabled"}'; return 0; }
   _id_va_healthy || { echo '{"token":null,"done":false,"url":null,"error":"vibe-auth not healthy yet"}'; return 0; }
   resp="$(_id_api GET /setup/token '')" || { echo '{"token":null,"done":false,"url":null,"error":"broker unreachable"}'; return 0; }
-  origin="$(_extract_env_value "$VA_ENV" ALLOWED_ORIGIN)"; origin="${origin/#http:/https:}"
-  base="$(_extract_env_value "$VA_ENV" VITE_BASE_PATH)"; base="${base%/}"; [[ "$base" == "/" ]] && base=""
-  python3 -c 'import json,sys; d=json.load(sys.stdin); t=d.get("token"); s=d.get("state") or {}; o=sys.argv[1]; print(json.dumps({"token":t,"done":bool(s.get("done")),"url":(o+"/setup?token="+t) if t else (o+"/admin")}))' "${origin}${base}" <<< "$resp"
+  base="$(_id_va_public_base)" || { echo '{"token":null,"done":false,"url":null,"error":"VIBE_AUTH_APPLIANCE_ORIGIN missing in vibe-auth.env; re-run: sudo vibe enable vibe-auth"}'; return 0; }
+  python3 -c 'import json,sys; d=json.load(sys.stdin); t=d.get("token"); s=d.get("state") or {}; o=sys.argv[1]; print(json.dumps({"token":t,"done":bool(s.get("done")),"url":(o+"/setup?token="+t) if t else (o+"/admin")}))' "$base" <<< "$resp"
+}
+
+# Host the broker should derive issuers from. Mirrors the broker's own
+# applyApplianceHints(): in subdomain-per-app mode the origin is
+# https://auth.<domain> and the broker wants the bare <domain>.
+_id_va_rebase_host() {
+  local origin mode host
+  origin="$(_id_va_origin)"
+  mode="$(_extract_env_value "$VA_ENV" VIBE_AUTH_APPLIANCE_MODE)"
+  host="${origin#*://}"; host="${host%%/*}"
+  [[ "$mode" == *subdomain-per-app ]] && host="${host#auth.}"
+  printf '%s' "$host"
 }
 
 id_rebase() {
@@ -319,9 +362,9 @@ id_rebase() {
     [[ -n "$(_extract_env_value "${VIBE_ENV_DIR}/${slug}.env" VIBE_OIDC_CLIENT_ID)" ]] || continue
     products="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d[sys.argv[2]]=sys.argv[3]; print(json.dumps(d))' "$products" "$slug" "$(_id_product_base_url "$slug")")"
   done
-  local origin body resp
-  origin="$(_extract_env_value "$VA_ENV" ALLOWED_ORIGIN)"; origin="${origin/#http:/https:}"
-  body="$(python3 -c 'import json,sys; print(json.dumps({"host": sys.argv[1].split("://",1)[1], "scheme": "https", "products": json.loads(sys.argv[2])}))' "$origin" "$products")"
+  local host body resp
+  host="$(_id_va_rebase_host)"
+  body="$(python3 -c 'import json,sys; print(json.dumps({"host": sys.argv[1], "scheme": "https", "products": json.loads(sys.argv[2])}))' "$host" "$products")"
   resp="$(_id_api POST /rebase "$body")" || die "rebase failed"
   # Apply each product's new env block and recreate it.
   while IFS= read -r slug; do

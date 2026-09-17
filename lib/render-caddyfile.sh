@@ -965,14 +965,18 @@ def edge_gate_lines(slug, manifest, indent):
         return []
     out = []
     pub = [p for p in (sso.get("publicPaths") or []) if isinstance(p, str) and p]
+    # Caddy sorts `forward_auth` ahead of every `handle` in a block, so a
+    # public-path `handle` placed next to it never bypasses the gate — the
+    # request is challenged first. The bypass has to live on the
+    # forward_auth directive itself as a `not path` matcher; the public
+    # paths then fall through to the app's normal handlers untouched.
+    gate_matcher = ""
     if pub:
-        pid = _matcher_id(slug, "public")
-        out.append(f"{indent}@{pid} path {' '.join(pub)}")
-        out.append(f"{indent}handle @{pid} {{")
-        out.append(f"{indent}\treverse_proxy {manifest['routing']['default_upstream']}")
-        out.append(f"{indent}}}")
+        gid = _matcher_id(slug, "gated")
+        out.append(f"{indent}@{gid} not path {' '.join(pub)}")
+        gate_matcher = f"@{gid} "
     out.append(f"{indent}# vibe-auth edge gate (sso.edgeGate): authentik forward_auth")
-    out.append(f"{indent}forward_auth vibe-auth-authentik-server:9000 {{")
+    out.append(f"{indent}forward_auth {gate_matcher}vibe-auth-authentik-server:9000 {{")
     out.append(f"{indent}\turi /auth/outpost.goauthentik.io/auth/caddy")
     out.append(f"{indent}\tcopy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Uid")
     out.append(f"{indent}}}")

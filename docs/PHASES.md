@@ -2142,3 +2142,73 @@ Append to this list as phases complete. Format:
   6. **GHCR pull for Vibe-1040.** Its repo was private at v0.0.1; the images
      inherit repository visibility, so a droplet may need a token with
      `read:packages` before the console's badge turns green.
+
+- Vibe Auth integration (branch `vibe-auth-integration`, commit ed117ab,
+  2026-09-16) — reviewed and patched 2026-09-17 by Claude (Fable 5.1) on the
+  Windows dev host. **Not yet run on a real host.** The "Phase 6" in that
+  commit's title is the Vibe-Auth build plan's phase numbering
+  (`../Vibe-Auth/STATE.md`), not this file's.
+
+  What the branch adds: `apps/vibe-auth.yml` (broker
+  `ghcr.io/kisaesdevlab/vibe-auth` + pinned authentik 2026.8.2, no Redis),
+  `lib/identity.sh` behind `vibe identity …`, `routing.mounts` and the
+  opt-in edge gate in the Caddy renderer, `provides`/`requires`/`sso` in
+  the manifest schema, and the console's Identity panel. Products stay on
+  local sign-in until the firm flips them (D11); vibe-auth is only
+  installed when selected.
+
+  Verified on the dev host 2026-09-17: the published broker image (1.0.1,
+  public, amd64) runs as uid 1000 and carries the blueprints, backup
+  contract and `wget` the overlay expects; started against Postgres with
+  the exact variable set `vibe-auth.env.tmpl` renders, it serves
+  `/vibe-auth/version` and answers `/health` 503 until authentik is up;
+  the overlay merges with the core compose file; rendered Caddyfiles for
+  LAN, single-host and subdomain-per-app pass `caddy validate`, and
+  `caddy adapt` confirms the edge gate's `not path` bypass orders ahead of
+  the app handlers. Console suite 176/177 with the new identity-script and edge-gate tests (the one failure is the
+  pre-existing Windows-only `subdomain-per-app` case, also on `main`).
+
+  Deviations fixed in the 2026-09-17 patch:
+  - `identity.sh` read `ALLOWED_ORIGIN` / `VITE_BASE_PATH` from
+    `vibe-auth.env`, which only has `VIBE_AUTH_APPLIANCE_ORIGIN` /
+    `VIBE_AUTH_BASE_PATH`: the setup link had no host and `rebase` crashed.
+    It now derives origin, base path and rebase host from the keys the
+    template actually writes, and API/health URLs follow the base path
+    (root-served in subdomain-per-app mode).
+  - Manifest `health` was `/vibe-auth/health`; the broker serves that only
+    when path-mounted, so the enable timed out after 300 s in
+    subdomain-per-app mode. Now `/health`, which is served in every mode.
+  - The edge gate's public-path bypass was a sibling `handle`, which Caddy
+    sorts after `forward_auth`; it never bypassed anything. Now a
+    `not path` matcher on the directive. Dormant until a manifest sets
+    `sso.edgeGate: true`.
+  - The broker console token was passed to `docker exec` in argv (visible
+    in `ps`); it now travels on stdin.
+
+  **Owed before this is trusted** — a 4 GB Ubuntu 24.04 host, not the
+  `s-1vcpu-2gb` droplet: vibe-auth reserves ~1.5 GB and limits at 2 GB
+  (manifest `resources.ramMb: 2048`; the console refuses the toggle on a
+  2 GB host, the CLI does not).
+  1. **Enable, setup wizard, admin console** in LAN and single-host modes;
+     confirm the Identity panel shows a clickable setup URL and the
+     one-time token, and that `vibe identity setup-token` reports `done`
+     afterwards.
+  2. **First-boot race.** Broker 1.0.1 waits for the vibe blueprints before
+     bootstrapping; confirm enable-time `register-all` succeeds on a cold
+     host or, if authentik is still applying blueprints, that the Fix
+     button converges.
+  3. **A product sign-in end to end.** Blocked until a Trial Balance image
+     with `@kisaesdevlab/vibe-auth` is published: `trial-balance-app`'s
+     `vibe-auth-integration` branch is unpushed and depends on
+     `file:../../Vibe-Auth/packages/client`, which is outside the Docker
+     build context. Switch it to the registry package (1.0.1 is on GitHub
+     Packages), push, and rebuild before `console/manifests/vibe-tb.json`'s
+     `sso` block is meaningful. Then: register, `both`, `oidc_only`
+     (refused until break-glass exists), back-channel logout, `disable`
+     returns to local, and `disable vibe-auth` returns every product first.
+  4. **Idempotency and recovery.** `vibe enable vibe-auth` twice; Ctrl-C
+     mid-enable and re-run; kill `vibe-auth-authentik-worker` mid-register.
+  5. **Schema contract.** `console/manifest.schema.json` gained
+     `provides`, `requires`, `sso`, `routing.mounts` and the `Identity`
+     category; propagate to `vibe-sentinel-installer/.schema/` per
+     `docs/addenda/sentinel-federation.md` before merging to `main`.
