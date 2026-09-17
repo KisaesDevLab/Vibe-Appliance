@@ -29,10 +29,21 @@ x-authentik: &authentik
       condition: service_healthy
 
 services:
+  # `compose up -d vibe-auth` (what enable-app.sh runs) starts ONLY the
+  # broker's depends_on closure. Every service here must therefore hang
+  # off vibe-auth, directly or transitively — the first real-host enable
+  # started server + broker only, the worker (which applies blueprints)
+  # and the blueprint copy never ran, and the broker's /health waited
+  # 300 s for blueprints nobody applied.
   vibe-auth-authentik-server:
     <<: *authentik
     container_name: vibe-auth-authentik-server
     command: server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      vibe-auth-blueprints:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "ak", "healthcheck"]
       interval: 30s
@@ -48,6 +59,11 @@ services:
     <<: *authentik
     container_name: vibe-auth-authentik-worker
     command: worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      vibe-auth-blueprints:
+        condition: service_completed_successfully
     volumes:
       - /opt/vibe/data/apps/vibe-auth/media:/media
       - /opt/vibe/data/apps/vibe-auth/templates:/templates
@@ -75,7 +91,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      vibe-auth-blueprints:
+        condition: service_completed_successfully
       vibe-auth-authentik-server:
+        condition: service_started
+      vibe-auth-authentik-worker:
         condition: service_started
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]

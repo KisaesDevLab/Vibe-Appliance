@@ -54,6 +54,13 @@ services:
     networks:
       - vibe_net             # console proxy + health probe reach it here
       - vibe_backup_socket   # its route to the socket proxy
+    # enable-app.sh runs `compose up -d vibe-backup`, which starts only this
+    # service's depends_on closure. Without this edge the socket proxy the
+    # sidecar's DOCKER_HOST points at never starts (tests/compose/
+    # overlay-closure.test.js enforces the rule for every overlay).
+    depends_on:
+      vibe-backup-socket-proxy:
+        condition: service_started
     # A backup or drill interrupted mid-run is safe (restic snapshots are
     # atomic; staging is redone), but give in-flight uploads a moment.
     stop_grace_period: 30s

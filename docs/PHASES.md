@@ -2249,3 +2249,15 @@ Append to this list as phases complete. Format:
   and any `*POSTGRESQL__PASSWORD` (in that precedence);
   `tests/enable/extract-db-password.test.js` covers each shape and asserts
   every template for a manifest with a `database` block carries one.
+
+- Same host run, next failure (2026-09-17): `compose up -d vibe-auth`
+  started only the broker and the authentik server. `enable-app.sh`
+  starts the routed services' depends_on closure and nothing else, and
+  the authentik worker (which applies blueprints) and the one-shot
+  blueprint copy were outside it, so the broker's `/health` waited 300 s
+  for blueprints nobody applied. `apps/vibe-auth.yml` now hangs worker
+  and blueprints off the broker (and server/worker off the blueprint
+  copy). `tests/compose/overlay-closure.test.js` enforces the rule for
+  every overlay and immediately found two more of the same class, both
+  fixed: `vibe-backup` never started its Docker socket proxy, and
+  `vibe-time-billing` never started its BullMQ worker.

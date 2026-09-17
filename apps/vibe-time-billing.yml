@@ -143,6 +143,12 @@ services:
         condition: service_healthy
       vibe-time-billing-init:
         condition: service_completed_successfully
+      # The worker has no HTTP surface so routing never names it; enable
+      # starts only the routed services' depends_on closure, so it must
+      # hang off web here or BullMQ jobs never run
+      # (tests/compose/overlay-closure.test.js).
+      vibe-time-billing-worker:
+        condition: service_started
 
 networks:
   vibe-time-billing-internal:
