@@ -139,9 +139,14 @@ except (FileNotFoundError, json.JSONDecodeError):
 # "connection reset by peer" with no helpful indication of what's
 # wrong. By always emitting a frontend, disabled apps get the friendly
 # 503 ("App not running — enable from admin console") that the panel
-# was designed to show. HAProxy's `init-addr last,libc,none` lets the
-# server stay DOWN at start-up if the upstream container doesn't exist
-# yet, so this is safe.
+# was designed to show. HAProxy's `init-addr none` lets the server
+# stay DOWN at start-up if the upstream container doesn't exist yet, so
+# this is safe. NOT `last,libc,none`: the libc step is a blocking
+# getaddrinfo per server before HAProxy listens on anything, and with
+# ~30 catalog hostnames that don't exist (plus a tailnet search domain)
+# the first LAN box took minutes to come up after every restart — every
+# emergency port refused, doctor red — while `none` listens in a second
+# and the `resolvers docker` block picks each upstream up at runtime.
 all_app_slugs = []
 for fname in sorted(Path(manifests_dir).iterdir() if Path(manifests_dir).is_dir() else []):
     if not fname.name.endswith(".json") or fname.name.startswith("_"):
@@ -365,12 +370,12 @@ lines.append("")
 # time by default. During phase_caddy (Phase 6) the upstream containers
 # don't exist yet (phase_core_up brings them up in Phase 7) and config
 # validation fails with "could not resolve address vibe-duplicati". The
-# resolvers block + per-server `init-addr last,libc,none` lets HAProxy
+# resolvers block + per-server `init-addr none` lets HAProxy
 # start with the backend marked DOWN if DNS isn't yet answering, then
 # re-resolve at runtime against Docker's embedded DNS (127.0.0.11)
 # inside the vibe_net network.
 lines.append("# Docker's embedded DNS for re-resolution at runtime. Combined with")
-lines.append("# `init-addr last,libc,none` on each server, lets HAProxy start before")
+lines.append("# `init-addr none` on each server, lets HAProxy start before")
 lines.append("# upstream containers exist (Phase 6 validation, Phase 7 startup race).")
 lines.append("resolvers docker")
 lines.append("  nameserver dns 127.0.0.11:53")
@@ -473,12 +478,12 @@ else:
         lines.append(f"backend be_{fe['name']}")
         lines.append(f"  option httpchk GET /")
         lines.append(f"  http-check expect status 100-499")
-        lines.append(f"  server {fe['name']} {fe['upstream']} check inter 30s fall 3 rise 1 resolvers docker init-addr last,libc,none")
+        lines.append(f"  server {fe['name']} {fe['upstream']} check inter 30s fall 3 rise 1 resolvers docker init-addr none")
         for suffix, m_up in matcher_backends:
             lines.append(f"backend be_{fe['name']}_{suffix}")
             lines.append(f"  option httpchk GET /")
             lines.append(f"  http-check expect status 100-499")
-            lines.append(f"  server {fe['name']}_{suffix} {m_up} check inter 30s fall 3 rise 1 resolvers docker init-addr last,libc,none")
+            lines.append(f"  server {fe['name']}_{suffix} {m_up} check inter 30s fall 3 rise 1 resolvers docker init-addr none")
 
 # encoding pinned explicitly: several emitted comment lines contain
 # non-ASCII (em-dashes, an arrow), and manifest displayName / note values

@@ -2287,3 +2287,17 @@ Append to this list as phases complete. Format:
   tagged and published, `ghcr.io/kisaesdevlab/vibe-auth:latest` (1.0.1)
   still prints https links in its own log and wizard; the console's
   setup-token link is already correct.
+
+- Same host run (2026-09-17): doctor reported the emergency proxy
+  UNHEALTHY for ~4 min after every enable, and the two enabled apps
+  (vibe-1040, vibe-ai-router — both `rootServedOnly`, so LAN access is
+  their emergency ports 5177/5193 only) were unreachable meanwhile.
+  Cause: `render-haproxy.sh` emitted `init-addr last,libc,none` on every
+  server, and the config names every catalog app whether enabled or not;
+  the libc step is a blocking lookup per server before HAProxy listens,
+  and ~30 nonexistent hostnames behind a tailnet search domain took
+  minutes. Now `init-addr none`: listens in ~1 s, stays 503 until the
+  upstream exists, and `resolvers docker` picks it up at runtime
+  (verified locally: late-started backend goes 503→200, SIGHUP reload
+  hitless). Existing hosts: `git pull` then
+  `sudo bash /opt/vibe/appliance/lib/render-haproxy.sh`.
