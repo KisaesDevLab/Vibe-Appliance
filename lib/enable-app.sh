@@ -1596,22 +1596,43 @@ PYEOF
 
 # Extract the password embedded in DATABASE_URL of a per-app env file.
 # Returns empty if not present.
+# Read the per-app DB password back out of a rendered env file, so a
+# re-render preserves it and db-bootstrap grants the role the same
+# password the app was given. Templates name it differently per app:
+# most ship a bare DATABASE_URL=, Vibe-TB also ships DB_PASSWORD=, and
+# Vibe Auth ships only VIBE_AUTH_DATABASE_URL= plus
+# AUTHENTIK_POSTGRESQL__PASSWORD= (that one shipped and every enable
+# died with "could not extract per-app DB password"). Precedence:
+# DATABASE_URL, DB_PASSWORD, any *DATABASE_URL, any *POSTGRESQL__PASSWORD.
+# Prints nothing when none is present.
 _extract_db_password() {
   local file="$1"
   [[ -f "$file" ]] || return 0
   python3 - "$file" <<'PYEOF'
 import re, sys
+URL_RE = re.compile(r"^[A-Z0-9_]*DATABASE_URL=postgres(?:ql)?://[^:/@]+:([^@]+)@")
+found = {}
 try:
     with open(sys.argv[1]) as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith("DATABASE_URL="):
-                m = re.match(r"DATABASE_URL=postgresql://[^:]+:([^@]+)@", line)
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            if key == "DATABASE_URL" or key.endswith("_DATABASE_URL"):
+                m = URL_RE.match(line)
                 if m:
-                    print(m.group(1))
-                    break
+                    found.setdefault("exact_url" if key == "DATABASE_URL" else "any_url", m.group(1))
+            elif key == "DB_PASSWORD" and val:
+                found.setdefault("db_password", val)
+            elif key.endswith("POSTGRESQL__PASSWORD") and val:
+                found.setdefault("any_password", val)
 except FileNotFoundError:
     pass
+for k in ("exact_url", "db_password", "any_url", "any_password"):
+    if k in found:
+        print(found[k])
+        break
 PYEOF
 }
 

@@ -2212,3 +2212,40 @@ Append to this list as phases complete. Format:
      `provides`, `requires`, `sso`, `routing.mounts` and the `Identity`
      category; propagate to `vibe-sentinel-installer/.schema/` per
      `docs/addenda/sentinel-federation.md` before merging to `main`.
+
+- Console image crash-loop after the Vibe Auth merge — fixed 2026-09-17
+  by Claude (Fable 5.1). `ed117ab` added `console/identity.js` and
+  required it from `server.js` but never added it to the Dockerfile's
+  per-file `COPY` list, so every fresh bootstrap died in the core-stack
+  health gate with `MODULE_NOT_FOUND`. Fix and hardening:
+  - `console/Dockerfile` now does `COPY . ./` with a reviewed
+    `console/.dockerignore` (option a: new files ship by default,
+    exclusions are explicit) **and** runs `scripts/check-requires.js`,
+    which `require.resolve`s every relative require in server.js, lib/
+    and scripts/ and checks manifests/, guides/ and ui/ are present. A
+    miss fails `docker build` instead of shipping a broken image.
+  - `.github/workflows/console.yml`: `test` job runs the whole suite;
+    `image` job builds the console, `docker run`s it and polls `/health`
+    until 200 or 30 s, dumping container logs on failure. The build
+    exiting 0 was never enough — that is exactly how this shipped.
+  - Audit: every `__dirname`-relative path the console resolves (ui,
+    manifests, guides, lib, node_modules, identity.js) is inside the
+    image; no other service in this repo builds from listed source
+    files. Verified locally: image builds, guard passes, container
+    healthy in 2 s with all 24 manifests loaded.
+  - Guide: `console/guides/vibe-auth.pdf` added. `generate.mjs` gained a
+    `firstLogin.type: setup-wizard` branch and a per-app memory line
+    from `resources.ramMb` (both manifest-driven); the SSO roll-out
+    caveats live in `tools/guides/notes/vibe-auth.html`. Only the new
+    PDF was rendered — a full `build-guides.sh` run re-dates all 17
+    others. Note `vibe-recap` has a manifest but no committed PDF yet.
+
+- First real-host enable of vibe-auth (2026-09-17, LAN box) died at
+  `could not extract per-app DB password from /opt/vibe/env/vibe-auth.env`.
+  `_extract_db_password` in `lib/enable-app.sh` only read a bare
+  `DATABASE_URL=` line; the vibe-auth template ships
+  `VIBE_AUTH_DATABASE_URL=` and `AUTHENTIK_POSTGRESQL__PASSWORD=`. The
+  extractor now accepts DATABASE_URL, DB_PASSWORD, any `*_DATABASE_URL`
+  and any `*POSTGRESQL__PASSWORD` (in that precedence);
+  `tests/enable/extract-db-password.test.js` covers each shape and asserts
+  every template for a manifest with a `database` block carries one.
