@@ -2320,6 +2320,20 @@ Append to this list as phases complete. Format:
   `sudo vibe identity register vibe-tb` (or the panel's Fix). The
   browser's Cross-Origin-Opener-Policy console message on http is only
   a warning.
+- 2026-09-17: Vibe 1099 joins SSO (Phase 8 step 5, Vibe-1099 PR #6).
+  `console/manifests/vibe-1099.json` gains `requires: ["identity"]`, the
+  `sso` block and the `/auth/*` → `vibe1099-app:8210` matcher; the
+  break-glass CLI is `node --import tsx …/cli.js breakglass ensure --json`
+  inside `vibe1099-app` (tsx image, adapter path set by its Dockerfile).
+  The env template gets `ALLOWED_ORIGIN=@ALLOWED_ORIGIN@` — the product
+  only had `APP_BASE_URL=@ALLOWED_ORIGIN@`, and `_id_product_base_url`
+  dies without the bare key — plus `VIBE_OIDC_REQUIRE_MFA_AMR=true`
+  (SSO sessions bypass the app's TOTP). Four SSO policy knobs (MFA at
+  the IdP, JIT provisioning, fallback role, group→role map) are Tier-1
+  per-app settings so operators never need the env file; mode /
+  register / rotate / break-glass stay on the Identity panel. Needs a
+  Vibe-1099 image containing PR #6; on older images registration writes
+  the env block harmlessly and the app keeps local sign-in.
 - 2026-09-17: the Single sign-on panel is dynamic. Two gaps: it listed
   every `sso.capable` manifest whether or not the app was enabled (a
   Register button that could only fail with "not enabled"), and an app

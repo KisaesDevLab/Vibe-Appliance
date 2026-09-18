@@ -4,40 +4,112 @@
   "displayName": "Vibe 1099",
   "description": "1099 preparation, recipient delivery, and IRS IRIS A2A e-filing.",
   "logo": "vibe-1099.svg",
-  "_doc": "Imported from KisaesDevLab/Vibe-1099 appliance/manifest.yaml (Addendum A). Upstream ships no .appliance/manifest.json yet, so this in-tree copy is authoritative until it does (Phase 5 convention). ROOT-SERVED ONLY (flag set 2026-07-28, v0.1.0 images): vibe1099-web ships stock nginx entrypoints (no 40-base-path.sh) and its bundle asks for /assets/* at absolute root, so a /1099/ path mount serves a blank page — the env template warned about this since import; the flag is what enforces it. Root-served vhost at 1099.<domain> in BOTH domain routing modes; :5176 is the access path in LAN/Tailscale. Drop the flag if upstream adds base-path support (same condition as vibe-ai-router).",
-
+  "_doc": "Imported from KisaesDevLab/Vibe-1099 appliance/manifest.yaml (Addendum A). Upstream ships no .appliance/manifest.json yet, so this in-tree copy is authoritative until it does (Phase 5 convention). ROOT-SERVED ONLY (flag set 2026-07-28, v0.1.0 images): vibe1099-web ships stock nginx entrypoints (no 40-base-path.sh) and its bundle asks for /assets/* at absolute root, so a /1099/ path mount serves a blank page — the env template warned about this since import; the flag is what enforces it. Root-served vhost at 1099.<domain> in BOTH domain routing modes; :5176 is the access path in LAN/Tailscale. Drop the flag if upstream adds base-path support (same condition as vibe-ai-router). SSO (Vibe-1099 PR #6, Phase 8 step 5): the api tier serves /auth/*; the back-channel logout arrives container-to-container at sso.internalUrl; the break-glass CLI runs inside vibe1099-app (VIBE_AUTH_ADAPTER is set by its Dockerfile). Mode/register/rotate live on the Identity panel; the per-app auth policy knobs below (MFA, JIT, default role, role map) are Tier-1 settings on the Apps tab. Mirror of Vibe-1099/.appliance/manifest.json.",
   "image": {
-    "server":     "ghcr.io/kisaesdevlab/vibe1099-app",
-    "client":     "ghcr.io/kisaesdevlab/vibe1099-web",
+    "server": "ghcr.io/kisaesdevlab/vibe1099-app",
+    "client": "ghcr.io/kisaesdevlab/vibe1099-web",
     "defaultTag": "latest",
     "extras": [
-      { "name": "render", "image": "ghcr.io/kisaesdevlab/vibe1099-render" }
+      {
+        "name": "render",
+        "image": "ghcr.io/kisaesdevlab/vibe1099-render"
+      }
     ]
   },
-
-  "subdomain":      "1099",
-  "emergencyPort":  5176,
+  "subdomain": "1099",
+  "emergencyPort": 5176,
   "rootServedOnly": true,
-  "ports":          { "server": 8210, "client": 8211 },
-
+  "ports": {
+    "server": 8210,
+    "client": 8211
+  },
   "routing": {
     "default_upstream": "vibe1099-web:8211",
     "matchers": [
-      { "name": "api", "path": "/api/*", "upstream": "vibe1099-app:8210" }
+      {
+        "name": "api",
+        "path": "/api/*",
+        "upstream": "vibe1099-app:8210"
+      },
+      {
+        "name": "auth",
+        "path": "/auth/*",
+        "upstream": "vibe1099-app:8210"
+      }
     ]
   },
-
-  "depends": ["postgres", "redis"],
-
+  "sso": {
+    "capable": true,
+    "redirectPaths": [
+      "/auth/oidc/callback"
+    ],
+    "logoutPaths": [
+      "/auth/oidc/backchannel"
+    ],
+    "publicPaths": [
+      "/api/health",
+      "/api/about",
+      "/api/status",
+      "/api/portal/*",
+      "/api/w9-public/*",
+      "/api/client-portal/*",
+      "/api/webhooks/taxbandits",
+      "/api/auth/login",
+      "/api/auth/password-reset/*",
+      "/f/*",
+      "/w9/*",
+      "/client",
+      "/client/*",
+      "/login/local"
+    ],
+    "edgeGate": false,
+    "internalUrl": "http://vibe1099-app:8210",
+    "breakglassService": "vibe1099-app",
+    "breakglassCommand": [
+      "node",
+      "--import",
+      "tsx",
+      "apps/api/node_modules/@kisaesdevlab/vibe-auth/dist/cli.js",
+      "breakglass",
+      "ensure",
+      "--json"
+    ]
+  },
+  "depends": [
+    "postgres",
+    "redis"
+  ],
+  "requires": [
+    "identity"
+  ],
   "env": {
     "required": [
-      { "name": "MASTER_KEY",      "from": "generated:base64-32bytes" },
-      { "name": "DATABASE_URL",    "from": "database-url" },
-      { "name": "REDIS_URL",       "from": "redis-url" },
-      { "name": "APP_BASE_URL",    "from": "subdomain-url" },
-      { "name": "PORTAL_BASE_URL", "from": "subdomain-url" },
-      { "name": "VIBE1099_ADMIN_PASSWORD", "from": "generated:hex32", "secret": true,
-        "doc": "First-login password for the staff app, generated on enable and preserved across re-renders. Surfaced in the console's First-login card and /opt/vibe/CREDENTIALS.txt via firstLogin.passwordEnvKey. Applied by the seed (pnpm bootstrap:firm) — which needs a Vibe-1099 release containing upstream PR #5; on older images the seed fails soft and retries at the next enable." }
+      {
+        "name": "MASTER_KEY",
+        "from": "generated:base64-32bytes"
+      },
+      {
+        "name": "DATABASE_URL",
+        "from": "database-url"
+      },
+      {
+        "name": "REDIS_URL",
+        "from": "redis-url"
+      },
+      {
+        "name": "APP_BASE_URL",
+        "from": "subdomain-url"
+      },
+      {
+        "name": "PORTAL_BASE_URL",
+        "from": "subdomain-url"
+      },
+      {
+        "name": "VIBE1099_ADMIN_PASSWORD",
+        "from": "generated:hex32",
+        "secret": true,
+        "doc": "First-login password for the staff app, generated on enable and preserved across re-renders. Surfaced in the console's First-login card and /opt/vibe/CREDENTIALS.txt via firstLogin.passwordEnvKey. Applied by the seed (pnpm bootstrap:firm) — which needs a Vibe-1099 release containing upstream PR #5; on older images the seed fails soft and retries at the next enable."
+      }
     ],
     "optional": [
       {
@@ -45,61 +117,156 @@
         "value": "admin@appliance.local",
         "doc": "Login for the staff app's first admin. Set BEFORE first enable if you want a real address — the bootstrap creates the admin once (state.apps.<slug>.seeded gates it); afterwards add users from inside the app instead.",
         "ui": {
-          "tier":      1,
-          "category":  "Application",
-          "label":     "Admin email",
-          "helpText":  "The email you sign in with at Vibe 1099. Set it before you enable the app — after that the first-run bootstrap has already created the admin and won't run again.",
-          "input":     "text",
+          "tier": 1,
+          "category": "Application",
+          "label": "Admin email",
+          "helpText": "The email you sign in with at Vibe 1099. Set it before you enable the app — after that the first-run bootstrap has already created the admin and won't run again.",
+          "input": "text",
           "appliance": "per-app",
-          "validate":  "email"
+          "validate": "email"
         }
       },
       {
         "name": "VIBE_APP_SUBDOMAIN",
-        "doc":  "Operator override for this app's subdomain label. Empty = the manifest default (\"1099\"). Consumed by the appliance routing (Caddy vhost + Cloudflare Tunnel CNAME/ingress) when DOMAIN_ROUTING_MODE=subdomain-per-app; ignored in single-host mode. Single DNS label — lowercase letters, digits, dashes, no dots.",
+        "doc": "Operator override for this app's subdomain label. Empty = the manifest default (\"1099\"). Consumed by the appliance routing (Caddy vhost + Cloudflare Tunnel CNAME/ingress) when DOMAIN_ROUTING_MODE=subdomain-per-app; ignored in single-host mode. Single DNS label — lowercase letters, digits, dashes, no dots.",
         "ui": {
-          "tier":        1,
-          "category":    "Network",
-          "label":       "Subdomain",
-          "helpText":    "The <subdomain> in <subdomain>.<your-domain> when routing is 'subdomain per app'. Blank = default (\"1099\"). Vibe 1099's web SPA is built for a root base, so it REQUIRES subdomain-per-app routing (single-host path-mounting 404s its assets). Saving re-renders routing and re-provisions the tunnel; the app briefly restarts.",
-          "input":       "text",
-          "appliance":   "per-app",
-          "validate":    "regex:^([a-z0-9][a-z0-9-]*)?$",
+          "tier": 1,
+          "category": "Network",
+          "label": "Subdomain",
+          "helpText": "The <subdomain> in <subdomain>.<your-domain> when routing is 'subdomain per app'. Blank = default (\"1099\"). Vibe 1099's web SPA is built for a root base, so it REQUIRES subdomain-per-app routing (single-host path-mounting 404s its assets). Saving re-renders routing and re-provisions the tunnel; the app briefly restarts.",
+          "input": "text",
+          "appliance": "per-app",
+          "validate": "regex:^([a-z0-9][a-z0-9-]*)?$",
           "postSaveJob": "routing-reconcile"
         }
       },
       {
         "name": "STAFF_IP_ALLOWLIST",
-        "doc":  "Comma-separated IPs/CIDRs allowed to reach staff APIs. Belt-and-braces for the split-exposure model: staff endpoints refuse tunnel-origin traffic even if a route leaks. Empty = no IP restriction (rely on auth). See the app's docs/appliance-integration.md.",
+        "doc": "Comma-separated IPs/CIDRs allowed to reach staff APIs. Belt-and-braces for the split-exposure model: staff endpoints refuse tunnel-origin traffic even if a route leaks. Empty = no IP restriction (rely on auth). See the app's docs/appliance-integration.md.",
         "ui": {
-          "tier":      1,
-          "category":  "Network",
-          "label":     "Staff API IP allowlist",
-          "helpText":  "Comma-separated IPs or CIDRs (e.g. 203.0.113.0/24, 198.51.100.7). Staff APIs reject any source not on this list — recommended when the recipient portal is public via the tunnel so a leaked staff route still can't be reached from the internet. Leave blank to disable IP gating.",
-          "input":     "text",
+          "tier": 1,
+          "category": "Network",
+          "label": "Staff API IP allowlist",
+          "helpText": "Comma-separated IPs or CIDRs (e.g. 203.0.113.0/24, 198.51.100.7). Staff APIs reject any source not on this list — recommended when the recipient portal is public via the tunnel so a leaked staff route still can't be reached from the internet. Leave blank to disable IP gating.",
+          "input": "text",
           "appliance": "per-app"
         }
       },
       {
         "name": "TAXBANDITS_ENABLED",
         "value": "0",
-        "doc":   "Enable the TaxBandits e-file provider path (1099 batch e-filing). Requires provider credentials; leave 0 until the firm is onboarded (TCC/ATS).",
+        "doc": "Enable the TaxBandits e-file provider path (1099 batch e-filing). Requires provider credentials; leave 0 until the firm is onboarded (TCC/ATS).",
         "ui": {
-          "tier":      1,
-          "category":  "Application",
-          "label":     "TaxBandits e-file",
-          "helpText":  "Turn on to route 1099 e-filing through TaxBandits. Requires firm onboarding + provider credentials (see the app's docs/firm-onboarding.md). Default off.",
-          "input":     "toggle",
+          "tier": 1,
+          "category": "Application",
+          "label": "TaxBandits e-file",
+          "helpText": "Turn on to route 1099 e-filing through TaxBandits. Requires firm onboarding + provider credentials (see the app's docs/firm-onboarding.md). Default off.",
+          "input": "toggle",
           "appliance": "per-app",
-          "validate":  "boolean"
+          "validate": "boolean"
+        }
+      },
+      {
+        "name": "VIBE_OIDC_REQUIRE_MFA_AMR",
+        "value": "true",
+        "doc": "Refuse a single sign-on login whose ID token carries no MFA `amr` claim. An SSO session bypasses the app's own TOTP, so the identity provider's MFA stands in; keep this on unless the firm has deliberately not enrolled staff in MFA at Vibe Auth. Not written by registration (identity.sh writes only the broker's VIBE_OIDC_* block), so the value set here survives Register / Fix / rebase.",
+        "ui": {
+          "tier": 1,
+          "category": "Application",
+          "label": "SSO requires MFA at the identity provider",
+          "helpText": "On: a Vibe Auth sign-in is accepted only when the identity provider reports multi-factor authentication. Off: password-only SSO logins are accepted. Local (password) sign-in to Vibe 1099 is unaffected and keeps its own TOTP.",
+          "input": "toggle",
+          "appliance": "per-app",
+          "validate": "enum",
+          "options": [
+            {
+              "value": "true",
+              "label": "Required"
+            },
+            {
+              "value": "false",
+              "label": "Not required"
+            }
+          ]
+        }
+      },
+      {
+        "name": "VIBE_OIDC_ALLOW_JIT",
+        "value": "true",
+        "doc": "Just-in-time provisioning: create a Vibe 1099 staff user on first SSO sign-in (role from the Vibe group map, joins the firm). Off = only users already present in Vibe 1099 (matched by verified email) can sign in with SSO.",
+        "ui": {
+          "tier": 1,
+          "category": "Application",
+          "label": "Create staff accounts on first SSO sign-in",
+          "helpText": "On: anyone the identity provider admits gets a Vibe 1099 account automatically, with the role mapped from their Vibe group. Off: staff must be added in Vibe 1099 (Settings → Users) with the same email before SSO lets them in.",
+          "input": "toggle",
+          "appliance": "per-app",
+          "validate": "enum",
+          "options": [
+            {
+              "value": "true",
+              "label": "Enabled"
+            },
+            {
+              "value": "false",
+              "label": "Disabled"
+            }
+          ]
+        }
+      },
+      {
+        "name": "VIBE_OIDC_DEFAULT_ROLE",
+        "doc": "Role for an SSO user whose Vibe groups map to nothing. Empty = no role → the login is refused (safest). Vibe 1099 roles: admin, reviewer, preparer.",
+        "ui": {
+          "tier": 1,
+          "category": "Application",
+          "label": "SSO fallback role",
+          "helpText": "Applied when a signed-in user is in none of the mapped Vibe groups. \"None\" refuses such logins — recommended.",
+          "input": "dropdown",
+          "appliance": "per-app",
+          "validate": "enum",
+          "options": [
+            {
+              "value": "",
+              "label": "None (refuse the login)"
+            },
+            {
+              "value": "preparer",
+              "label": "Preparer"
+            },
+            {
+              "value": "reviewer",
+              "label": "Reviewer"
+            },
+            {
+              "value": "admin",
+              "label": "Admin"
+            }
+          ]
+        }
+      },
+      {
+        "name": "VIBE_OIDC_ROLE_MAP",
+        "doc": "JSON object, Vibe group → Vibe 1099 role. Empty = the app's default: vibe-admin / vibe-it / vibe-partner → admin, vibe-manager → reviewer, vibe-staff → preparer. A value saved on the app's own Settings → Authentication page overrides this.",
+        "ui": {
+          "tier": 1,
+          "category": "Application",
+          "label": "SSO group → role map (JSON)",
+          "helpText": "Example: {\"vibe-partner\":\"admin\",\"vibe-manager\":\"reviewer\",\"vibe-staff\":\"preparer\"}. Leave blank for the built-in map. Roles: admin, reviewer, preparer.",
+          "input": "textarea",
+          "appliance": "per-app",
+          "validate": "regex:^(\\s*|\\s*\\{[\\s\\S]*\\}\\s*)$"
         }
       }
     ]
   },
-
-  "database": { "name": "vibe_1099_db", "user": "vibe1099" },
-  "redis":    { "db": 7 },
-
+  "database": {
+    "name": "vibe_1099_db",
+    "user": "vibe1099"
+  },
+  "redis": {
+    "db": 7
+  },
   "firstLogin": {
     "type": "default-credentials-passive",
     "username": "admin@appliance.local",
@@ -107,11 +274,12 @@
     "url": "/",
     "note": "The username is whatever VIBE1099_ADMIN_EMAIL was at enable time. Created by the production bootstrap (pnpm bootstrap:firm) — NOT the demo seed, which injects demo data and must never run in production. Requires a Vibe-1099 release containing upstream PR #5; on older images the seed fails soft (warning in the enable log), no login exists yet, and the next enable retries it. Change the password inside the app after first sign-in; the appliance won't reset it (the bootstrap runs once). Firm onboarding (TCC/ATS, EIN, address): the app's docs/firm-onboarding.md."
   },
-
   "seed": {
-    "command": ["pnpm", "bootstrap:firm"],
+    "command": [
+      "pnpm",
+      "bootstrap:firm"
+    ],
     "description": "Production first-run bootstrap: creates the real firm (FIRM_NAME) and the admin login (VIBE1099_ADMIN_EMAIL / VIBE1099_ADMIN_PASSWORD). No demo data — this is NOT `pnpm seed`. Idempotent; re-running only re-applies the admin password. Runs in the vibe1099-app container (the api matcher's upstream). Needs a release containing KisaesDevLab/Vibe-1099 PR #5; on older images pnpm exits non-zero (missing script) and enable-app logs a warning without failing the enable."
   },
-
   "health": "/api/status"
 }
