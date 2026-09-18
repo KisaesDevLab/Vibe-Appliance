@@ -2334,3 +2334,20 @@ Append to this list as phases complete. Format:
   register / rotate / break-glass stay on the Identity panel. Needs a
   Vibe-1099 image containing PR #6; on older images registration writes
   the env block harmlessly and the app keeps local sign-in.
+- 2026-09-17: the Single sign-on panel is dynamic. Two gaps: it listed
+  every `sso.capable` manifest whether or not the app was enabled (a
+  Register button that could only fail with "not enabled"), and an app
+  that gained SSO in a release ahead of the appliance's vendored manifest
+  never appeared. Now `identity.sh status` reports `enabled` /
+  `declared` / `detected`: every ENABLED app with no sso block is probed
+  at `GET /auth/status` on its api tier (the endpoint every
+  @kisaesdevlab/vibe-auth product serves, via the same vibe-console curl
+  the health probe uses), and capability = declared OR detected.
+  `register` accepts a detected app with the package defaults (a warning
+  names what the next appliance update adds: public paths, the app's
+  break-glass command). The console passes `readState` so enabled-ness
+  is known up front; the panel groups enabled apps (configurable) above
+  "Available once enabled", badges runtime-detected ones, reloads on the
+  Apps list's new `vibe:apps-changed` event and on a 60 s tick.
+  Registration/rotate/disable/mode routes no longer 400 on "manifest not
+  sso.capable" — the script is authoritative and its refusal is relayed.

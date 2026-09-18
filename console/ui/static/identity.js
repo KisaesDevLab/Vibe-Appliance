@@ -92,7 +92,24 @@
       '</div>';
   }
 
+  // An SSO-capable app that is not enabled yet: nothing can be configured
+  // until it runs (registration needs its env file and its api). It is
+  // listed so the operator sees what will appear here, and the card turns
+  // live on its own once the Apps list enables it.
+  function pendingCardHtml(a) {
+    return '' +
+      '<article class="app-card app-card--muted" id="identity-app-' + esc(a.slug) + '">' +
+        '<header class="app-card__head">' +
+          '<h3 class="app-card__title">' + esc(a.displayName) + '</h3>' +
+          '<div class="app-card__badges"><span class="badge badge--muted">not enabled</span></div>' +
+        '</header>' +
+        '<p class="muted small" style="margin:0.4rem 0 0">Supports single sign-on. Enable it in the Apps list and it ' +
+          'becomes configurable here' + (a.declared ? '' : ' (detected from its running api)') + '.</p>' +
+      '</article>';
+  }
+
   function appCardHtml(a, broker) {
+    if (a.enabled === false) return pendingCardHtml(a);
     const busy = _inflight.get(a.slug);
     const brokerReady = !!(broker && broker.enabled && broker.healthy);
     const regPill = a.error
@@ -106,6 +123,13 @@
     const bgPill = a.breakglass
       ? '<span class="badge badge--good" title="A break-glass local account exists for this app">break-glass ready</span>'
       : '<span class="badge badge--warn" title="No break-glass password stored — oidc_only is refused until Register / Fix creates one">no break-glass</span>';
+    // Runtime-detected: the app answers /auth/status but the appliance's
+    // vendored manifest predates its SSO support. Registration works with
+    // the package defaults; the app-specific bits (public paths, the
+    // break-glass command) arrive with the next appliance update.
+    const detectedPill = (a.detected && !a.declared)
+      ? '<span class="badge badge--warn" title="This app answers /auth/status, but this appliance build has no SSO manifest for it yet. Register uses the package defaults; update the appliance for the app\'s full SSO settings and break-glass command.">detected at runtime</span>'
+      : '';
 
     const regLabel = busy === 'register' ? 'Working…' : (a.registered ? 'Fix registration' : 'Register');
     const disableAll = !!busy;
@@ -118,7 +142,7 @@
       '<article class="app-card" id="identity-app-' + esc(a.slug) + '">' +
         '<header class="app-card__head">' +
           '<h3 class="app-card__title">' + esc(a.displayName) + '</h3>' +
-          '<div class="app-card__badges">' + regPill + modePill + bgPill +
+          '<div class="app-card__badges">' + regPill + modePill + bgPill + detectedPill +
             (a.edgeGate ? '<span class="badge" title="Caddy gates this app at the edge">edge-gated</span>' : '') +
           '</div>' +
         '</header>' +
@@ -155,17 +179,26 @@
     const d = _data;
     if (!d) return;
     const apps = d.apps || [];
-    const reg = apps.filter(a => a.registered).length;
+    // enabled === null means the server could not read state; treat as live.
+    const live = apps.filter(a => a.enabled !== false);
+    const pending = apps.filter(a => a.enabled === false);
+    const reg = live.filter(a => a.registered).length;
     const v = d.vibeAuth || {};
+    const more = pending.length ? ' ' + pending.length + ' more will appear once enabled.' : '';
     els.summary.textContent = !v.installed
       ? 'Single sign-on is not available in this build.'
       : !v.enabled
-        ? 'Vibe Auth is not installed. ' + apps.length + ' app(s) can use it once it is.'
-        : reg + ' of ' + apps.length + ' SSO-capable app(s) registered with Vibe Auth.';
+        ? 'Vibe Auth is not installed. ' + live.length + ' enabled app(s) can use it once it is.' + more
+        : reg + ' of ' + live.length + ' enabled SSO-capable app(s) registered with Vibe Auth.' + more;
     els.broker.innerHTML = brokerHtml(v);
-    els.list.innerHTML = apps.length
-      ? apps.map(a => appCardHtml(a, v)).join('')
-      : '<p class="muted">No installed app declares SSO support yet.</p>';
+    els.list.innerHTML = live.length || pending.length
+      ? live.map(a => appCardHtml(a, v)).join('') +
+        (pending.length
+          ? '<h3 class="muted" style="grid-column:1/-1;margin:0.8rem 0 0">Available once enabled</h3>' +
+            pending.map(pendingCardHtml).join('')
+          : '')
+      : '<p class="muted">No app on this appliance supports single sign-on yet. Apps appear here automatically ' +
+        'when their manifest declares SSO or their running api answers <span class="mono">/auth/status</span>.</p>';
     els.rebase.disabled = !(v.installed && v.enabled);
   }
 
@@ -324,7 +357,12 @@
   });
   els.refresh.addEventListener('click', load);
   els.rebase.addEventListener('click', rebase);
-  // Poll on panel open (page load) and when the tab becomes visible again.
+  // Reload on panel open (page load), when the tab becomes visible again,
+  // whenever the Apps list finishes an enable/disable/update (admin.html
+  // dispatches vibe:apps-changed), and on a slow tick so an app that gains
+  // SSO in an update shows up without a manual Refresh.
   document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
+  document.addEventListener('vibe:apps-changed', () => { if (!_inflight.size) load(); });
+  setInterval(() => { if (!document.hidden && !_inflight.size) load(); }, 60_000);
   load();
 })();

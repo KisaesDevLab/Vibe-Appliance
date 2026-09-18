@@ -2348,7 +2348,7 @@ app.post('/api/v1/disable/:slug', requireAdmin, testRateLimit, async (req, res) 
 // <slug> [arg]` with an argv array, tracked children, per-slug locks.
 require('./identity')(app, {
   requireAdmin, testRateLimit, MANIFESTS, APPLIANCE_DIR, VIBE_DIR, SLUG_RE, log, trim,
-  acquireSlugLock, releaseSlugLock, globalOp,
+  acquireSlugLock, releaseSlugLock, globalOp, readState,
   spawnScript: (argv) => trackChild(spawn('/bin/bash', argv, {
     env: { ...process.env, APPLIANCE_DIR, VIBE_DIR, NO_COLOR: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],

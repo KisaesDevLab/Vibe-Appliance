@@ -55,18 +55,22 @@
       <div class="apps-list" id="apps-list"></div>
     </section>
 
-    <!-- Single sign-on (Vibe Auth). Manifest-driven: the server lists
-         every app whose manifest carries `sso.capable`, and the broker
-         is whichever manifest `provides: ["identity"]`. Every button
-         here spawns one action of lib/identity.sh; the output pane
-         renders its stdout/stderr like the app cards do. Rendered by
-         /static/identity.js. -->
+    <!-- Single sign-on (Vibe Auth). Dynamic: the server lists every app
+         whose manifest carries `sso.capable` plus every ENABLED app whose
+         running api answers /auth/status (SSO gained ahead of the vendored
+         manifest); the broker is whichever manifest `provides:
+         ["identity"]`. Enabled apps are configurable, not-yet-enabled ones
+         are listed as pending, and the panel reloads when the Apps list
+         changes. Every button here spawns one action of lib/identity.sh;
+         the output pane renders its stdout/stderr like the app cards do.
+         Rendered by /static/identity.js. -->
     <section id="identity-section">
       <h2>Single sign-on (Vibe Auth)</h2>
       <p class="muted" id="identity-summary">—</p>
       <p class="muted section-note">
         Vibe Auth is the appliance's identity broker: staff sign in once and every registered app
-        accepts that session. Each app keeps a <span class="mono">vibe-breakglass</span> local account
+        accepts that session. Apps appear below on their own as they are enabled or gain SSO support.
+        Each app keeps a <span class="mono">vibe-breakglass</span> local account
         so you can still get in if the broker is down — store its password in the firm password manager
         before switching any app to <span class="mono">oidc_only</span>.
       </p>
@@ -1373,6 +1377,9 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
         if (!polling) {
           _inflight.delete(slug);
           await refresh();
+          // Other panels keyed on which apps run (Single sign-on) re-read now
+          // rather than on their next tick.
+          document.dispatchEvent(new CustomEvent('vibe:apps-changed', { detail: { slug, action } }));
         }
       }
     }
