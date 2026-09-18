@@ -217,7 +217,9 @@ module.exports = function registerIdentityRoutes(app, deps) {
     // The script's view wins where it reports; the manifest fills the rest.
     merged.declared = declared || parsed.declared === true;
     merged.detected = parsed.detected === true;
-    merged.ssoCapable = merged.declared || merged.detected;
+    // A registered app stays capable (and listed) while its api is down:
+    // detection alone would drop an app registered through it.
+    merged.ssoCapable = merged.declared || merged.detected || merged.registered === true;
     if (merged.enabled == null && typeof parsed.enabled === 'boolean') merged.enabled = parsed.enabled;
     return merged;
   }
@@ -225,7 +227,7 @@ module.exports = function registerIdentityRoutes(app, deps) {
   // Run every identity provider, every app whose manifest declares SSO,
   // and every ENABLED app that might have gained SSO at runtime through
   // `status`, then ask the broker for its setup state. Apps that are
-  // neither declared nor detected are dropped from the answer.
+  // neither declared, registered nor detected are dropped from the answer.
   async function collectIdentity() {
     const all = Object.values(MANIFESTS);
     const enabled = enabledMap();
@@ -242,7 +244,7 @@ module.exports = function registerIdentityRoutes(app, deps) {
       (m) => statusFor(m, enabled ? enabled[m.slug] : null));
     const providerStatuses = statuses.filter(s => s.providesIdentity);
     const apps = statuses
-      .filter(s => !s.providesIdentity && (s.declared || s.detected))
+      .filter(s => !s.providesIdentity && (s.declared || s.detected || s.registered === true))
       // Enabled apps first (they are the ones to configure), then by name.
       .sort((a, b) => (Number(b.enabled === true) - Number(a.enabled === true))
         || String(a.displayName).localeCompare(String(b.displayName)));

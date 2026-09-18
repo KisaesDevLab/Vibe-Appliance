@@ -1430,6 +1430,9 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
             _transcriptPending.set(slug, id);
           }
           await refresh();
+          // Same signal the direct enable/disable path sends: panels keyed
+          // on which apps run (Single sign-on) re-read now.
+          document.dispatchEvent(new CustomEvent('vibe:apps-changed', { detail: { slug, action: 'host-action' } }));
           if (!ok && (s.log || '').includes('Sentinel is not installed')) {
             // First-time path: this server has no Sentinel yet — walk the
             // operator straight into the setup form instead of dead-ending.

@@ -2351,3 +2351,32 @@ Append to this list as phases complete. Format:
   Apps list's new `vibe:apps-changed` event and on a 60 s tick.
   Registration/rotate/disable/mode routes no longer 400 on "manifest not
   sso.capable" — the script is authoritative and its refusal is relayed.
+- 2026-09-18: review fixes for the SSO panel and the Vibe 1099 SSO merge.
+  (1) Security: `identity.sh disable` stripped every `VIBE_OIDC_*` line,
+  including the operator policy keys (MFA at the IdP, JIT, fallback role,
+  role map). The package default for `VIBE_OIDC_REQUIRE_MFA_AMR` is false,
+  so Disable + Register let SSO logins skip MFA. Manifest-declared keys
+  are operator-owned now: `disable` keeps them and the broker's
+  registration block can never overwrite them. (2) Re-render: the env
+  merge kept old values only for keys the template lacks, so every Tier-1
+  per-app setting the template also sets reverted on each enable,
+  bootstrap or routing change (Vibe 1099 MFA, Vibe Time & Billing SMTP
+  and storage, Vibe Recap models, Vibe AI Router local model). Tier-1
+  per-app/both keys now keep the existing value; the merge is its own
+  function (`_merge_env_render`) with tests. Trade-off: a changed template
+  default for such a key reaches fresh installs only. (3) Settings save
+  now enforces each field's `ui.validate` rule server-side
+  (`console/lib/settings-validate.js`) and refuses line breaks in any
+  value; `settings-save.sh` refuses them too, and the page joins a
+  multi-line textarea onto one line. The registry descriptor now carries
+  `dynamic`, which it never did, so the live Anthropic model list merges
+  into the dropdown for the first time. (4) Identity: a registered app
+  counts as SSO-capable (listed, reached by disable-all and rebase) even
+  when runtime detection fails because its api is down; disable, mode,
+  rotate and rotate-breakglass refuse an app that is neither capable nor
+  registered; a trailing slash on `sso.internalUrl` no longer doubles in
+  the probe URL. (5) Panel: background reloads skip while a sign-in mode
+  is picked but not applied; the host-action path also dispatches
+  `vibe:apps-changed`; the pending card has a style. Not changed: the
+  enable path still auto-registers only manifest-declared apps; an app
+  known only through runtime detection needs Register on the panel.

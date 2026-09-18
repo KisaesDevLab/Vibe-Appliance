@@ -1051,6 +1051,72 @@ _image_uid_gid() {
   printf '%s:%s' "$uid" "$gid"
 }
 
+# _merge_env_render <existing-env> <new-render> <manifest>
+# Rewrites <new-render> in place. See the rules below.
+# Merge with the existing file:
+#   - keys the new render lacks are carried forward (ANTHROPIC_API_KEY
+#     and similar optional settings);
+#   - keys the manifest surfaces as Tier-1 per-app Settings (ui.tier 1,
+#     ui.appliance per-app | both) keep the EXISTING value even when the
+#     template also sets them. The template value is only the first-render
+#     default; the operator owns the key after that. Without this, every
+#     re-render (enable, bootstrap, routing change) reset those settings
+#     to the template default: Vibe 1099's VIBE_OIDC_REQUIRE_MFA_AMR,
+#     Vibe Time & Billing's SMTP and storage settings, Vibe Recap's
+#     model settings. Trade-off: a changed template default for such a
+#     key reaches only fresh installs.
+_merge_env_render() {
+  local src="$1" tmp="$2" manifest="$3"
+  [[ -f "$src" ]] || return 0
+  python3 - "$src" "$tmp" "$manifest" <<'PYEOF'
+import json, sys
+def operator_keys(path):
+    try:
+        env = (json.load(open(path)).get("env") or {})
+    except Exception:
+        return set()
+    out = set()
+    for section in ("required", "optional"):
+        for e in (env.get(section) or []):
+            ui = (e or {}).get("ui") or {}
+            if ui.get("tier") == 1 and ui.get("appliance", "per-app") in ("per-app", "both") and e.get("name"):
+                out.add(e["name"])
+    return out
+def parse(path):
+    rows = {}
+    with open(path) as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#") or "=" not in s: continue
+            k, v = s.split("=", 1)
+            rows[k] = v
+    return rows
+
+old = parse(sys.argv[1])
+new = parse(sys.argv[2])
+owned = operator_keys(sys.argv[3]) if len(sys.argv) > 3 else set()
+merged_lines = []
+for line in open(sys.argv[2]).read().splitlines():
+    s = line.strip()
+    if s and not s.startswith("#") and "=" in s:
+        k = s.split("=", 1)[0]
+        if k in owned and k in old:
+            line = f"{k}={old[k]}"
+    merged_lines.append(line)
+new_keys = set(new.keys())
+extras = []
+for k, v in old.items():
+    if k not in new_keys:
+        extras.append(f"{k}={v}")
+if extras:
+    merged_lines.append("")
+    merged_lines.append("# --- preserved from previous render ---")
+    merged_lines += extras
+with open(sys.argv[2], "w") as f:
+    f.write("\n".join(merged_lines) + "\n")
+PYEOF
+}
+
 _render_app_env() {
   # $5 (src) is the EXISTING env file to preserve values from; defaults
   # to $out for the real enable path, where they are the same file. The
@@ -1556,38 +1622,8 @@ with open(dst, "w") as f:
     f.write(body)
 PYEOF
 
-  # Merge: keep operator-set keys from the existing file that don't
-  # appear in the new render. Specifically useful for ANTHROPIC_API_KEY
-  # and similar optional settings.
-  if [[ -f "$src" ]]; then
-    python3 - "$src" "$tmp" <<'PYEOF'
-import sys
-def parse(path):
-    rows = {}
-    with open(path) as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith("#") or "=" not in s: continue
-            k, v = s.split("=", 1)
-            rows[k] = v
-    return rows
-
-old = parse(sys.argv[1])
-new = parse(sys.argv[2])
-merged_lines = open(sys.argv[2]).read().splitlines()
-new_keys = set(new.keys())
-extras = []
-for k, v in old.items():
-    if k not in new_keys:
-        extras.append(f"{k}={v}")
-if extras:
-    merged_lines.append("")
-    merged_lines.append("# --- preserved from previous render ---")
-    merged_lines += extras
-with open(sys.argv[2], "w") as f:
-    f.write("\n".join(merged_lines) + "\n")
-PYEOF
-  fi
+  # Carry operator values forward (see _merge_env_render).
+  _merge_env_render "$src" "$tmp" "$manifest"
 
   mv "$tmp" "$out"
   chmod 600 "$out"

@@ -296,6 +296,14 @@ table.containers td.col-name { font-family: var(--mono); }
   flex-direction: column;
 }
 
+/* A card listed for information only (Single sign-on: an SSO-capable
+   app that is not enabled yet). No actions; visually recessed. */
+.app-card--muted {
+  background: var(--surface-2);
+  border-style: dashed;
+  opacity: 0.85;
+}
+
 .app-card__head {
   display: flex;
   align-items: baseline;

@@ -26,6 +26,7 @@ const Database    = require('better-sqlite3');
 // endpoints like cf-helpers) because the PUBLIC landing payload above
 // those endpoints uses it too, and a const require is not hoisted.
 const landingOrderLib = require('./lib/landing-order');
+const { validateSettingValue } = require('./lib/settings-validate');
 
 // ----- config -----------------------------------------------------------
 
@@ -4825,6 +4826,10 @@ function _fieldDescriptor(envEntry, providingSlug) {
     helpText:            ui.helpText || envEntry.doc || '',
     input:               ui.input || 'text',
     options:             ui.options || null,
+    // Live option source (e.g. 'anthropic-models'). Omitted before, so the
+    // page's live-model merge never ran; the save validator also needs it
+    // to skip the static-options check for these fields.
+    dynamic:             ui.dynamic || null,
     validate:            ui.validate || null,
     testEndpoint:        ui.testEndpoint || null,
     showIf:              ui.showIf || null,
@@ -5102,6 +5107,15 @@ app.post('/api/v1/settings/save', requireAdmin, testRateLimit, globalOp('setting
       : (c.scope.split(':')[1] + '::' + c.key);
     if (!SETTINGS_REGISTRY.allKeys.has(lookupKey)) {
       return res.status(400).json({ error: 'unknown setting at this scope: ' + c.scope + '/' + c.key });
+    }
+    // Enforce the manifest's ui.validate rule, and refuse line breaks in
+    // any value (lib/settings-save.sh writes KEY=<value> on one line).
+    // A revert deletes the key, so there is no value to check.
+    if ((c.op || 'set') !== 'revert') {
+      const invalid = validateSettingValue(SETTINGS_REGISTRY.allKeys.get(lookupKey), c.value);
+      if (invalid) {
+        return res.status(400).json({ error: 'invalid value', detail: invalid, key: c.key, scope: c.scope });
+      }
     }
   }
 

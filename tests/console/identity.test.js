@@ -356,3 +356,21 @@ test('parseJsonOutput tolerates a log line ahead of the JSON', () => {
   assert.equal(parseJsonOutput(''), null);
   assert.equal(parseJsonOutput('not json'), null);
 });
+
+test('GET /api/v1/identity keeps a registered undeclared app listed while its api is down', async () => {
+  // Registered through runtime detection earlier; /auth/status is not
+  // answering now. Dropping it would hide the only place to Disable SSO.
+  const readState = () => ({ apps: { 'vibe-new': { enabled: true }, 'vibe-auth': { enabled: true } } });
+  const { app } = setup({
+    'status vibe-auth': { stdout: statusJson({ slug: 'vibe-auth' }) },
+    'status vibe-tb':   { stdout: statusJson({ slug: 'vibe-tb', enabled: false, declared: true }) },
+    'status vibe-1040': { stdout: statusJson({ slug: 'vibe-1040', enabled: false, declared: true }) },
+    'status vibe-new':  { stdout: statusJson({ slug: 'vibe-new', enabled: true, declared: false, detected: false, registered: true }) },
+    'setup-token':      { stdout: JSON.stringify({ done: true }) },
+  }, { readState });
+  const res = await call(app, 'GET /api/v1/identity');
+  const nw = res.body.apps.find(a => a.slug === 'vibe-new');
+  assert.ok(nw, 'still listed');
+  assert.equal(nw.ssoCapable, true);
+  assert.equal(nw.registered, true);
+});

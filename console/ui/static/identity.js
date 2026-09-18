@@ -361,8 +361,27 @@
   // whenever the Apps list finishes an enable/disable/update (admin.html
   // dispatches vibe:apps-changed), and on a slow tick so an app that gains
   // SSO in an update shows up without a manual Refresh.
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
-  document.addEventListener('vibe:apps-changed', () => { if (!_inflight.size) load(); });
-  setInterval(() => { if (!document.hidden && !_inflight.size) load(); }, 60_000);
+  //
+  // Background reloads (the tick and the apps-changed event) re-render the
+  // cards, which would reset a sign-in mode the operator picked but has
+  // not applied yet. They are skipped while any mode dropdown differs
+  // from the loaded mode or has focus, and never overlap each other.
+  function editing() {
+    for (const sel of section.querySelectorAll('select[data-mode-select]')) {
+      if (sel === document.activeElement) return true;
+      const a = ((_data && _data.apps) || []).find(x => x.slug === sel.dataset.modeSelect);
+      if (a && a.mode && sel.value !== a.mode) return true;
+    }
+    return false;
+  }
+  let _bgLoading = false;
+  async function backgroundLoad() {
+    if (document.hidden || _inflight.size || _bgLoading || editing()) return;
+    _bgLoading = true;
+    try { await load(); } finally { _bgLoading = false; }
+  }
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) backgroundLoad(); });
+  document.addEventListener('vibe:apps-changed', backgroundLoad);
+  setInterval(backgroundLoad, 60_000);
   load();
 })();

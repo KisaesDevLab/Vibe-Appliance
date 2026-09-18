@@ -113,7 +113,7 @@ _id_sso_declared() { [[ "$(_id_sso_field "$1" 'sso.get("capable", False)' false)
 # sso.internalUrl, else the routing default upstream. Empty when unknown.
 _id_auth_upstream() {
   local v
-  v="$(_id_sso_field "$1" '(next((str(x.get("upstream","")) for x in ((data.get("routing") or {}).get("matchers") or []) if str(x.get("path","")).startswith("/auth")), "") or str(sso.get("internalUrl") or "").split("://")[-1] or str((data.get("routing") or {}).get("default_upstream") or ""))' '')"
+  v="$(_id_sso_field "$1" '(next((str(x.get("upstream","")) for x in ((data.get("routing") or {}).get("matchers") or []) if str(x.get("path","")).startswith("/auth")), "") or str(sso.get("internalUrl") or "").split("://")[-1].rstrip("/") or str((data.get("routing") or {}).get("default_upstream") or ""))' '')"
   [[ "$v" == "null" ]] && v=""
   printf '%s' "$v"
 }
@@ -138,7 +138,46 @@ _id_sso_detected() {
   probe_health_200 "http://${up}/auth/status"
 }
 
-_id_sso_capable() { _id_sso_declared "$1" || _id_sso_detected "$1"; }
+# Registered = the broker's client id is in the product's env file. That is
+# evidence of SSO support on its own: an app registered through runtime
+# detection must stay manageable (disable-all, rebase, the panel) even
+# while its api is down and /auth/status cannot answer.
+_id_registered() {
+  local env="${VIBE_ENV_DIR}/$1.env"
+  [[ -f "$env" && -n "$(_extract_env_value "$env" VIBE_OIDC_CLIENT_ID)" ]]
+}
+
+_id_sso_capable() { _id_sso_declared "$1" || _id_registered "$1" || _id_sso_detected "$1"; }
+
+# Env keys the manifest declares (env.required / env.optional), one per
+# line. Any VIBE_OIDC_* among them is OPERATOR-owned policy (MFA at the
+# IdP, JIT, fallback role, role map), set on the Settings page: the
+# broker's registration block never overwrites it and `disable` never
+# strips it. Only the broker-written keys come and go with registration.
+_id_operator_keys() {
+  local m; m="$(_id_manifest "$1")"
+  [[ -f "$m" ]] || return 0
+  # tr: callers compare whole lines, and python on a CRLF host appends a
+  # carriage return to every name.
+  python3 - "$m" <<'PY' 2>/dev/null | tr -d '\r' || true
+import json, sys
+env = (json.load(open(sys.argv[1])).get("env") or {})
+for section in ("required", "optional"):
+    for e in (env.get(section) or []):
+        if isinstance(e, dict) and e.get("name"):
+            print(e["name"])
+PY
+}
+
+# Refuse an action on an app that is not SSO-capable and not registered.
+# Without this, `disable` on a plain app wrote VIBE_AUTH_MODE=local into
+# its env and force-recreated it.
+_id_require_target() {
+  local slug="$1"
+  [[ -f "$(_id_manifest "$slug")" ]] || die "${slug}: unknown app (no manifest)."
+  _id_sso_capable "$slug" && return 0
+  die "${slug} is not SSO-capable and not registered with vibe-auth: its manifest declares no sso block, its env has no VIBE_OIDC_CLIENT_ID and its api does not answer /auth/status. Nothing to do."
+}
 
 _id_va_enabled() {
   python3 -c "import json;print('1' if (json.load(open('${VIBE_STATE_FILE}')).get('apps',{}).get('${VA_SLUG}',{}).get('enabled')) else '0')" 2>/dev/null | grep -q 1
@@ -212,21 +251,36 @@ PYEOF
 }
 
 # Write the VIBE_OIDC_* block (JSON "env" object) into the product's env file.
+# Keys the manifest declares are operator-owned (see _id_operator_keys)
+# and are never overwritten here, even if a broker release starts
+# returning one.
 _id_write_env_block() {
-  local slug="$1" json="$2" k v
+  local slug="$1" json="$2" k v owned
+  owned="$(_id_operator_keys "$slug")"
   while IFS=$'\t' read -r k v; do
     [[ -n "$k" ]] || continue
+    if grep -qxF -- "$k" <<< "$owned"; then
+      log_info "keeping operator-set ${k} for ${slug}; the broker's value is ignored" slug="$slug"
+      continue
+    fi
     secrets_set_kv_per_app "$slug" "$k" "$v"
   done < <(python3 -c 'import json,sys; e=json.load(sys.stdin).get("env",{}); [print(k, v, sep="\t") for k,v in e.items() if k.startswith("VIBE_OIDC_")]' <<< "$json")
 }
 
+# Strips the broker-written VIBE_OIDC_* block only. Operator-owned keys
+# (manifest-declared, e.g. VIBE_OIDC_REQUIRE_MFA_AMR) stay: stripping
+# them dropped the MFA requirement to the package default (false) for
+# every later re-registration.
 _id_clear_env_block() {
   local slug="$1" f="${VIBE_ENV_DIR}/$1.env"
   [[ -f "$f" ]] || return 0
-  python3 - "$f" <<'PYEOF'
+  python3 - "$f" "$(_id_operator_keys "$slug")" <<'PYEOF'
 import os, sys
 p = sys.argv[1]
-lines = [l for l in open(p).read().split("\n") if not l.startswith("VIBE_OIDC_")]
+keep = set(k.strip() for k in sys.argv[2].split("\n") if k.strip())
+def broker_key(l):
+    return l.startswith("VIBE_OIDC_") and l.split("=", 1)[0] not in keep
+lines = [l for l in open(p).read().split("\n") if not broker_key(l)]
 tmp = f"{p}.tmp.{os.getpid()}"
 with open(tmp, "w") as f: f.write("\n".join(lines).rstrip("\n") + "\n")
 os.chmod(tmp, 0o600); os.replace(tmp, p)
@@ -288,14 +342,15 @@ _id_require_va() {
   _id_va_healthy || die "vibe-auth is not healthy yet (broker/authentik still starting). Diagnose: docker logs vibe-auth --tail 50 ; then retry."
 }
 
-# Every ENABLED app that is SSO-capable: declared in its manifest, or
-# detected at runtime (see _id_sso_detected). Providers are excluded.
+# Every ENABLED app that is SSO-capable: declared in its manifest,
+# already registered, or detected at runtime (see _id_sso_detected).
+# Providers are excluded.
 _id_enabled_sso_slugs() {
   local slug declared
   while IFS=$'\t' read -r slug declared; do
     [[ -n "$slug" ]] || continue
     if [[ "$declared" == "1" ]]; then printf '%s\n' "$slug"
-    elif _id_sso_detected "$slug"; then printf '%s\n' "$slug"
+    elif _id_registered "$slug" || _id_sso_detected "$slug"; then printf '%s\n' "$slug"
     fi
   done < <(python3 - "$VIBE_STATE_FILE" "${APPLIANCE_DIR}/console/manifests" <<'PYEOF'
 import json, os, sys
@@ -322,13 +377,15 @@ id_status() {
   _id_sso_declared "$slug" && declared=true
   # Probe only what the manifest does not already settle, and only running apps.
   [[ "$declared" == false && "$enabled" == true ]] && _id_sso_detected "$slug" && detected=true
-  [[ "$declared" == true || "$detected" == true ]] && capable=true
   if [[ -f "$env" ]]; then
     [[ -n "$(_extract_env_value "$env" VIBE_OIDC_CLIENT_ID)" ]] && registered=true
     issuer="$(_extract_env_value "$env" VIBE_OIDC_ISSUER)"
     local m; m="$(_extract_env_value "$env" VIBE_AUTH_MODE)"; [[ -n "$m" ]] && mode="$m"
   fi
   [[ -f "$VA_ENV" && -n "$(_extract_env_value "$VA_ENV" "$(_id_breakglass_key "$slug")")" ]] && bg=true
+  # Registered counts: an app registered via runtime detection stays
+  # capable (and listed) while its api is down.
+  [[ "$declared" == true || "$detected" == true || "$registered" == true ]] && capable=true
   _id_va_enabled && va_enabled=true
   [[ "$va_enabled" == true ]] && _id_va_healthy && va_healthy=true
   python3 -c 'import json,sys; a=sys.argv[1:]; print(json.dumps({"slug":a[0],"ssoCapable":a[1]=="true","registered":a[2]=="true","mode":a[3],"breakglass":a[4]=="true","issuer":a[5] or None,"vibeAuthEnabled":a[6]=="true","vibeAuthHealthy":a[7]=="true","enabled":a[8]=="true","declared":a[9]=="true","detected":a[10]=="true"}))' \
@@ -357,6 +414,7 @@ id_register() {
 
 id_rotate() {
   local slug="$1" resp
+  _id_require_target "$slug"
   _id_require_va
   resp="$(_id_api POST "/registrations/${slug}/rotate" '{}')" || die "rotate failed for ${slug}"
   _id_write_env_block "$slug" "$resp"
@@ -373,6 +431,7 @@ id_unregister() {
 
 id_disable() {
   local slug="$1"
+  _id_require_target "$slug"
   id_unregister "$slug"
   _id_clear_env_block "$slug"
   [[ -f "${VIBE_ENV_DIR}/${slug}.env" ]] && secrets_set_kv_per_app "$slug" VIBE_AUTH_MODE local
@@ -384,6 +443,7 @@ id_mode() {
   local slug="$1" mode="$2" env="${VIBE_ENV_DIR}/$1.env"
   case "$mode" in local|both|oidc_only) ;; *) die "mode must be local, both or oidc_only" ;; esac
   [[ -f "$env" ]] || die "${slug} is not enabled"
+  _id_require_target "$slug"
   if [[ "$mode" != "local" ]]; then
     [[ -n "$(_extract_env_value "$env" VIBE_OIDC_CLIENT_ID)" ]] || die "${slug} is not registered with vibe-auth. Fix: sudo vibe identity register ${slug}"
   fi
@@ -468,7 +528,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     disable)           [[ -n "$slug" ]] || die "slug required"; id_disable "$slug" ;;
     unregister)        [[ -n "$slug" ]] || die "slug required"; id_unregister "$slug" ;;
     mode)              [[ -n "$slug" && -n "${3:-}" ]] || die "usage: identity.sh mode <slug> <local|both|oidc_only>"; id_mode "$slug" "$3" ;;
-    rotate-breakglass) [[ -n "$slug" ]] || die "slug required"; _id_breakglass "$slug" rotate ;;
+    rotate-breakglass) [[ -n "$slug" ]] || die "slug required"; _id_require_target "$slug"; _id_breakglass "$slug" rotate ;;
     setup-token)       id_setup_token ;;
     rebase)            id_rebase ;;
     register-all)      id_register_all ;;
