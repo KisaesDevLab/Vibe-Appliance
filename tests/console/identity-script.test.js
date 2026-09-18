@@ -153,3 +153,76 @@ _id_api GET /setup/token '' >/dev/null
 cat "$VIBE_ENV_DIR/cap"`);
   assert.equal(out, 'STDIN_HAS_TOKEN');
 });
+
+// ----- runtime SSO detection (dynamic Identity panel) --------------------
+//
+// Fixture manifests + state live in the temp env dir; the probe and the
+// health helper are stubbed so nothing touches docker.
+const DYN_SETUP = `
+_id_manifest() { printf '%s' "$VIBE_ENV_DIR/$1.json"; }
+export VIBE_STATE_FILE="$VIBE_ENV_DIR/state.json"
+cat > "$VIBE_ENV_DIR/state.json" <<'J'
+{"apps":{"acme":{"enabled":true},"old":{"enabled":true},"off":{"enabled":false},"vibe-auth":{"enabled":false}}}
+J
+cat > "$VIBE_ENV_DIR/acme.json" <<'J'
+{"slug":"acme","routing":{"default_upstream":"acme-web:80","matchers":[{"name":"api","path":"/api/*","upstream":"acme-api:9000"},{"name":"auth","path":"/auth/*","upstream":"acme-api:9000"}]}}
+J
+cat > "$VIBE_ENV_DIR/old.json" <<'J'
+{"slug":"old","routing":{"default_upstream":"old-server:3000"}}
+J
+cat > "$VIBE_ENV_DIR/off.json" <<'J'
+{"slug":"off","routing":{"default_upstream":"off-server:3000"}}
+J
+cat > "$VIBE_ENV_DIR/declared.json" <<'J'
+{"slug":"declared","routing":{"default_upstream":"d-web:80"},"sso":{"capable":true,"internalUrl":"http://d-api:4000"}}
+J
+# Only acme's api answers /auth/status.
+probe_health_200() { [[ "$1" == "http://acme-api:9000/auth/status" ]]; }
+log_warn() { echo "warn: $*" >&2; }
+`;
+
+test('auth upstream: /auth matcher, else sso.internalUrl, else default upstream', () => {
+  assert.equal(run(ENV_SUBPATH, DYN_SETUP + '_id_auth_upstream acme'), 'acme-api:9000');
+  assert.equal(run(ENV_SUBPATH, DYN_SETUP + '_id_auth_upstream declared'), 'd-api:4000');
+  assert.equal(run(ENV_SUBPATH, DYN_SETUP + '_id_auth_upstream old'), 'old-server:3000');
+  assert.equal(run(ENV_SUBPATH, DYN_SETUP + '_id_auth_upstream nope'), '');
+});
+
+test('runtime detection: enabled + api answers /auth/status; never for disabled apps', () => {
+  const t = (slug) => run(ENV_SUBPATH, DYN_SETUP + `if _id_sso_detected ${slug}; then echo yes; else echo no; fi`);
+  assert.equal(t('acme'), 'yes');
+  assert.equal(t('old'), 'no', 'enabled but no /auth/status');
+  assert.equal(t('off'), 'no', 'disabled apps are never probed');
+  // Capability = declared OR detected.
+  const c = (slug) => run(ENV_SUBPATH, DYN_SETUP + `if _id_sso_capable ${slug}; then echo yes; else echo no; fi`);
+  assert.equal(c('declared'), 'yes');
+  assert.equal(c('acme'), 'yes');
+  assert.equal(c('old'), 'no');
+});
+
+test('status reports enabled / declared / detected so the panel can group and badge', () => {
+  const st = (slug) => JSON.parse(run(ENV_SUBPATH, DYN_SETUP + `id_status ${slug}`));
+  const acme = st('acme');
+  assert.equal(acme.enabled, true);
+  assert.equal(acme.declared, false);
+  assert.equal(acme.detected, true);
+  assert.equal(acme.ssoCapable, true);
+  assert.equal(acme.registered, false);
+  const decl = st('declared');
+  assert.equal(decl.enabled, false);
+  assert.equal(decl.declared, true);
+  assert.equal(decl.detected, false, 'declared apps are not probed');
+  assert.equal(decl.ssoCapable, true);
+  const off = st('off');
+  assert.equal(off.ssoCapable, false);
+});
+
+test('enabled SSO slugs include runtime-detected apps and exclude disabled or plain ones', () => {
+  const out = run(ENV_SUBPATH, DYN_SETUP + `
+cat > "$VIBE_ENV_DIR/vibe-auth.json" <<'J'
+{"slug":"vibe-auth","provides":["identity"],"routing":{"default_upstream":"vibe-auth:8080"}}
+J
+APPLIANCE_DIR="$(mktemp -d)"; mkdir -p "$APPLIANCE_DIR/console/manifests"; cp "$VIBE_ENV_DIR"/*.json "$APPLIANCE_DIR/console/manifests/"
+_id_enabled_sso_slugs | sort | tr '\n' ' '`);
+  assert.equal(out.trim(), 'acme');
+});

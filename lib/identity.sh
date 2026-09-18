@@ -107,7 +107,38 @@ except Exception:
 PYEOF
 }
 
-_id_sso_capable() { [[ "$(_id_sso_field "$1" 'sso.get("capable", False)' false)" == "true" ]]; }
+_id_sso_declared() { [[ "$(_id_sso_field "$1" 'sso.get("capable", False)' false)" == "true" ]]; }
+
+# host:port that serves the product's /auth/* — its /auth matcher, else
+# sso.internalUrl, else the routing default upstream. Empty when unknown.
+_id_auth_upstream() {
+  local v
+  v="$(_id_sso_field "$1" '(next((str(x.get("upstream","")) for x in ((data.get("routing") or {}).get("matchers") or []) if str(x.get("path","")).startswith("/auth")), "") or str(sso.get("internalUrl") or "").split("://")[-1] or str((data.get("routing") or {}).get("default_upstream") or ""))' '')"
+  [[ "$v" == "null" ]] && v=""
+  printf '%s' "$v"
+}
+
+_id_app_enabled() {
+  python3 -c "import json;print('1' if (json.load(open('${VIBE_STATE_FILE}')).get('apps',{}).get('$1',{}).get('enabled')) else '0')" 2>/dev/null | grep -q 1
+}
+
+# Runtime detection. A product can gain SSO in a release before the
+# appliance ships the matching manifest: every product embedding
+# @kisaesdevlab/vibe-auth answers GET /auth/status (public, unprefixed —
+# Caddy strips the prefix and so do we) on its api tier. An ENABLED app
+# that answers 200 there is SSO-capable whatever its vendored manifest
+# says; registration then uses the package defaults (/auth/oidc/callback,
+# /auth/oidc/backchannel, no public paths, `npx vibe-auth` break-glass).
+# Declared capability never probes.
+_id_sso_detected() {
+  local slug="$1" up
+  _id_app_enabled "$slug" || return 1
+  up="$(_id_auth_upstream "$slug")"
+  [[ -n "$up" ]] || return 1
+  probe_health_200 "http://${up}/auth/status"
+}
+
+_id_sso_capable() { _id_sso_declared "$1" || _id_sso_detected "$1"; }
 
 _id_va_enabled() {
   python3 -c "import json;print('1' if (json.load(open('${VIBE_STATE_FILE}')).get('apps',{}).get('${VA_SLUG}',{}).get('enabled')) else '0')" 2>/dev/null | grep -q 1
@@ -257,8 +288,16 @@ _id_require_va() {
   _id_va_healthy || die "vibe-auth is not healthy yet (broker/authentik still starting). Diagnose: docker logs vibe-auth --tail 50 ; then retry."
 }
 
+# Every ENABLED app that is SSO-capable: declared in its manifest, or
+# detected at runtime (see _id_sso_detected). Providers are excluded.
 _id_enabled_sso_slugs() {
-  python3 - "$VIBE_STATE_FILE" "${APPLIANCE_DIR}/console/manifests" <<'PYEOF'
+  local slug declared
+  while IFS=$'\t' read -r slug declared; do
+    [[ -n "$slug" ]] || continue
+    if [[ "$declared" == "1" ]]; then printf '%s\n' "$slug"
+    elif _id_sso_detected "$slug"; then printf '%s\n' "$slug"
+    fi
+  done < <(python3 - "$VIBE_STATE_FILE" "${APPLIANCE_DIR}/console/manifests" <<'PYEOF'
 import json, os, sys
 state, mdir = sys.argv[1:3]
 apps = (json.load(open(state)).get("apps") or {})
@@ -267,16 +306,23 @@ for f in sorted(os.listdir(mdir)):
     try: m = json.load(open(os.path.join(mdir, f)))
     except Exception: continue
     slug = m.get("slug") or f[:-5]
-    if (m.get("sso") or {}).get("capable") and (apps.get(slug) or {}).get("enabled"):
-        print(slug)
+    if "identity" in (m.get("provides") or []): continue
+    if not (apps.get(slug) or {}).get("enabled"): continue
+    print(slug, "1" if (m.get("sso") or {}).get("capable") else "0", sep="\t")
 PYEOF
+)
 }
 
 # ---------------------------------------------------------------- actions
 
 id_status() {
   local slug="$1" env="${VIBE_ENV_DIR}/$1.env" capable=false registered=false mode="local" issuer="" bg=false va_enabled=false va_healthy=false
-  _id_sso_capable "$slug" && capable=true
+  local enabled=false declared=false detected=false
+  _id_app_enabled "$slug" && enabled=true
+  _id_sso_declared "$slug" && declared=true
+  # Probe only what the manifest does not already settle, and only running apps.
+  [[ "$declared" == false && "$enabled" == true ]] && _id_sso_detected "$slug" && detected=true
+  [[ "$declared" == true || "$detected" == true ]] && capable=true
   if [[ -f "$env" ]]; then
     [[ -n "$(_extract_env_value "$env" VIBE_OIDC_CLIENT_ID)" ]] && registered=true
     issuer="$(_extract_env_value "$env" VIBE_OIDC_ISSUER)"
@@ -285,15 +331,18 @@ id_status() {
   [[ -f "$VA_ENV" && -n "$(_extract_env_value "$VA_ENV" "$(_id_breakglass_key "$slug")")" ]] && bg=true
   _id_va_enabled && va_enabled=true
   [[ "$va_enabled" == true ]] && _id_va_healthy && va_healthy=true
-  python3 -c 'import json,sys; a=sys.argv[1:]; print(json.dumps({"slug":a[0],"ssoCapable":a[1]=="true","registered":a[2]=="true","mode":a[3],"breakglass":a[4]=="true","issuer":a[5] or None,"vibeAuthEnabled":a[6]=="true","vibeAuthHealthy":a[7]=="true"}))' \
-    "$slug" "$capable" "$registered" "$mode" "$bg" "$issuer" "$va_enabled" "$va_healthy"
+  python3 -c 'import json,sys; a=sys.argv[1:]; print(json.dumps({"slug":a[0],"ssoCapable":a[1]=="true","registered":a[2]=="true","mode":a[3],"breakglass":a[4]=="true","issuer":a[5] or None,"vibeAuthEnabled":a[6]=="true","vibeAuthHealthy":a[7]=="true","enabled":a[8]=="true","declared":a[9]=="true","detected":a[10]=="true"}))' \
+    "$slug" "$capable" "$registered" "$mode" "$bg" "$issuer" "$va_enabled" "$va_healthy" "$enabled" "$declared" "$detected"
 }
 
 id_register() {
   local slug="$1"
-  _id_sso_capable "$slug" || die "${slug} does not declare sso.capable in its manifest"
   _id_require_va
   [[ -f "${VIBE_ENV_DIR}/${slug}.env" ]] || die "${slug} is not enabled (no env file). Enable it first."
+  if ! _id_sso_declared "$slug"; then
+    _id_sso_detected "$slug" || die "${slug} is not SSO-capable: its manifest declares no sso block and its api does not answer /auth/status. Update the app (and then the appliance) to a release with Vibe Auth support."
+    log_warn "${slug} answers /auth/status but its vendored manifest predates SSO: registering with the package defaults (redirect /auth/oidc/callback, back-channel /auth/oidc/backchannel, no public paths). Update the appliance for the app's full sso block and break-glass command." slug="$slug"
+  fi
   local base_url body resp
   base_url="$(_id_product_base_url "$slug")"
   body="$(_id_registration_body "$slug" "$base_url")"

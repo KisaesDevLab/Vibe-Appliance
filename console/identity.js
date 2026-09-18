@@ -5,7 +5,11 @@
 // script FILE with an argv array (`/bin/bash lib/identity.sh <action>
 // <slug> [arg]`) and relays exit code + output, exactly like runToggle in
 // server.js does for enable/disable. Which apps appear is read from the
-// manifests (`sso.capable`, `provides: ["identity"]`) — there is no
+// manifests (`sso.capable`, `provides: ["identity"]`) plus what the host
+// reports at runtime: identity.sh probes every ENABLED app whose manifest
+// has no sso block at GET /auth/status (the endpoint every product built
+// on @kisaesdevlab/vibe-auth serves), so an app that gains SSO in a
+// release ahead of the appliance's vendored manifest still shows up. No
 // `if (slug === 'vibe-auth')` anywhere in this file.
 //
 // Security notes:
@@ -66,6 +70,10 @@ module.exports = function registerIdentityRoutes(app, deps) {
   const {
     requireAdmin, MANIFESTS, APPLIANCE_DIR, VIBE_DIR, log, SLUG_RE,
   } = deps;
+  // readState() -> state.json object; optional (unit tests omit it). With
+  // it, enabled-ness is known up front and undeclared enabled apps are
+  // probed for runtime SSO support; without it only declared apps appear.
+  const readState = typeof deps.readState === 'function' ? deps.readState : null;
   if (typeof requireAdmin !== 'function') throw new Error('identity routes need deps.requireAdmin');
   if (!MANIFESTS) throw new Error('identity routes need deps.MANIFESTS');
 
@@ -138,8 +146,11 @@ module.exports = function registerIdentityRoutes(app, deps) {
     });
   }
 
-  // Validate :slug, look up its manifest, and require sso.capable.
-  // Sends the 4xx itself and returns null when the request is bad.
+  // Validate :slug and look up its manifest. Sends the 4xx itself and
+  // returns null when the request is bad. SSO capability is NOT gated
+  // here on the manifest: the script is authoritative (declared in the
+  // manifest OR detected at runtime) and refuses with a precise message
+  // otherwise. The identity provider itself can never be a target.
   function ssoManifestOr4xx(slug, res) {
     if (typeof slug !== 'string' || !SLUG_RE.test(slug)) {
       res.status(400).json({ error: 'invalid slug' });
@@ -150,26 +161,39 @@ module.exports = function registerIdentityRoutes(app, deps) {
       res.status(404).json({ error: 'unknown app' });
       return null;
     }
-    if (!isSsoCapable(m)) {
+    if (providesIdentity(m)) {
       res.status(400).json({
         error: 'not sso-capable',
-        detail: `${m.displayName || slug} does not declare an sso block in its manifest, ` +
-                'so Vibe Auth cannot register it. Nothing to fix here unless the app ' +
-                'gained SSO support in a newer release — update the app first.',
+        detail: `${m.displayName || slug} is the identity provider; it is not registered with itself.`,
       });
       return null;
     }
     return m;
   }
 
-  async function statusFor(m) {
+  // enabled-ness from state.json: true/false, or null when unknown.
+  function enabledMap() {
+    if (!readState) return null;
+    let state;
+    try { state = readState(); } catch { return null; }
+    const apps = (state && state.apps) || {};
+    const out = {};
+    for (const slug of Object.keys(MANIFESTS)) out[slug] = !!(apps[slug] && apps[slug].enabled === true);
+    return out;
+  }
+
+  async function statusFor(m, enabled) {
     const slug = m.slug;
     const r = await runIdentity(['status', slug], 'sso-status', { slug });
     const parsed = r.code === 0 ? parseJsonOutput(r.stdout) : null;
+    const declared = isSsoCapable(m);
     const base = {
       slug,
       displayName: m.displayName || slug,
-      ssoCapable: isSsoCapable(m),
+      ssoCapable: declared,
+      declared,
+      detected: false,
+      enabled: enabled == null ? null : !!enabled,
       providesIdentity: providesIdentity(m),
       edgeGate: !!(m.sso && m.sso.edgeGate),
       breakglassService: (m.sso && m.sso.breakglassService) || null,
@@ -189,20 +213,39 @@ module.exports = function registerIdentityRoutes(app, deps) {
         exit_code: r.code,
       };
     }
-    return { ...base, ...parsed, slug };
+    const merged = { ...base, ...parsed, slug };
+    // The script's view wins where it reports; the manifest fills the rest.
+    merged.declared = declared || parsed.declared === true;
+    merged.detected = parsed.detected === true;
+    merged.ssoCapable = merged.declared || merged.detected;
+    if (merged.enabled == null && typeof parsed.enabled === 'boolean') merged.enabled = parsed.enabled;
+    return merged;
   }
 
-  // Run every SSO-capable app plus every identity provider through
-  // `status`, then ask the broker for its setup state.
+  // Run every identity provider, every app whose manifest declares SSO,
+  // and every ENABLED app that might have gained SSO at runtime through
+  // `status`, then ask the broker for its setup state. Apps that are
+  // neither declared nor detected are dropped from the answer.
   async function collectIdentity() {
     const all = Object.values(MANIFESTS);
+    const enabled = enabledMap();
     const providers = all.filter(providesIdentity);
-    const ssoApps = all.filter(m => isSsoCapable(m) && !providesIdentity(m));
-    const targets = [...providers, ...ssoApps];
+    const declaredApps = all.filter(m => isSsoCapable(m) && !providesIdentity(m));
+    // Runtime candidates: enabled, undeclared, and with a routed api tier
+    // to probe (a manifest without `routing` has nothing to answer).
+    const candidates = enabled
+      ? all.filter(m => !isSsoCapable(m) && !providesIdentity(m) && enabled[m.slug] && m.routing)
+      : [];
+    const targets = [...providers, ...declaredApps, ...candidates];
 
-    const statuses = await mapLimit(targets, STATUS_CONCURRENCY, statusFor);
+    const statuses = await mapLimit(targets, STATUS_CONCURRENCY,
+      (m) => statusFor(m, enabled ? enabled[m.slug] : null));
     const providerStatuses = statuses.filter(s => s.providesIdentity);
-    const apps = statuses.filter(s => !s.providesIdentity);
+    const apps = statuses
+      .filter(s => !s.providesIdentity && (s.declared || s.detected))
+      // Enabled apps first (they are the ones to configure), then by name.
+      .sort((a, b) => (Number(b.enabled === true) - Number(a.enabled === true))
+        || String(a.displayName).localeCompare(String(b.displayName)));
 
     // Broker state: prefer what the provider's own status says; fall
     // back to any app status (every status carries vibeAuth* fields).

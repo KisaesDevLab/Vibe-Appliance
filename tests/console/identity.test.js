@@ -20,6 +20,9 @@ const MANIFESTS = {
   'vibe-tb':   { slug: 'vibe-tb', displayName: 'Trial Balance', sso: { capable: true, breakglassService: 'vibe-tb-api' } },
   'vibe-1040': { slug: 'vibe-1040', displayName: 'Vibe 1040', sso: { capable: true, edgeGate: true } },
   'vibe-plain': { slug: 'vibe-plain', displayName: 'Plain' },
+  // Routed but without an sso block — the shape of a product whose
+  // vendored manifest predates its SSO support.
+  'vibe-new':  { slug: 'vibe-new', displayName: 'Newer App', routing: { default_upstream: 'vibe-new-api:80', matchers: [] } },
 };
 
 // ----- fakes ------------------------------------------------------------
@@ -138,8 +141,10 @@ test('GET /api/v1/identity aggregates sso-capable apps and the broker', async ()
   assert.equal(res.statusCode, 200);
   const b = res.body;
 
-  // Only manifests with sso.capable, minus the provider itself.
+  // Without readState: only manifests with sso.capable, minus the provider itself.
   assert.deepEqual(b.apps.map(a => a.slug).sort(), ['vibe-1040', 'vibe-tb']);
+  assert.equal(b.apps.find(a => a.slug === 'vibe-tb').declared, true);
+  assert.equal(b.apps.find(a => a.slug === 'vibe-tb').enabled, null, 'enabled unknown without state');
   const tb = b.apps.find(a => a.slug === 'vibe-tb');
   assert.equal(tb.registered, true);
   assert.equal(tb.mode, 'both');
@@ -159,11 +164,60 @@ test('GET /api/v1/identity aggregates sso-capable apps and the broker', async ()
   assert.equal(b.vibeAuth.setupUrl, 'https://auth.example/setup');
   assert.equal(b.vibeAuth.setupToken, 'tok-secret');
 
-  // vibe-plain (no sso block) was never probed; the script path is argv[0].
+  // vibe-plain / vibe-new (no sso block) were never probed without state; the script path is argv[0].
   const probed = spawnScript.calls.filter(c => c[1] === 'status').map(c => c[2]).sort();
   assert.deepEqual(probed, ['vibe-1040', 'vibe-auth', 'vibe-tb']);
   assert.ok(spawnScript.calls.every(c => /[\\/]lib[\\/]identity\.sh$/.test(c[0])),
     'argv[0] must be the identity.sh script path');
+});
+
+test('GET /api/v1/identity is dynamic: enabled-ness from state, runtime-detected apps included, disabled ones pending', async () => {
+  const readState = () => ({ apps: {
+    'vibe-tb': { enabled: true }, 'vibe-1040': { enabled: false },
+    'vibe-new': { enabled: true }, 'vibe-plain': { enabled: true }, 'vibe-auth': { enabled: true },
+  } });
+  const { app, spawnScript } = setup({
+    'status vibe-auth': { stdout: statusJson({ slug: 'vibe-auth' }) },
+    'status vibe-tb':   { stdout: statusJson({ slug: 'vibe-tb', registered: true, mode: 'both', enabled: true, declared: true }) },
+    'status vibe-1040': { stdout: statusJson({ slug: 'vibe-1040', enabled: false, declared: true }) },
+    // The script probed /auth/status on the running api and found SSO.
+    'status vibe-new':  { stdout: statusJson({ slug: 'vibe-new', enabled: true, declared: false, detected: true }) },
+    'setup-token':      { stdout: JSON.stringify({ done: true, url: 'https://auth.example/admin' }) },
+  }, { readState });
+  const res = await call(app, 'GET /api/v1/identity');
+  assert.equal(res.statusCode, 200);
+  const b = res.body;
+
+  // Enabled apps first, then by name; the disabled declared app is still listed (pending).
+  assert.deepEqual(b.apps.map(a => a.slug), ['vibe-new', 'vibe-tb', 'vibe-1040']);
+  const tb = b.apps.find(a => a.slug === 'vibe-tb');
+  assert.equal(tb.enabled, true);
+  assert.equal(tb.declared, true);
+  assert.equal(tb.detected, false);
+  const nw = b.apps.find(a => a.slug === 'vibe-new');
+  assert.equal(nw.enabled, true);
+  assert.equal(nw.declared, false);
+  assert.equal(nw.detected, true);
+  assert.equal(nw.ssoCapable, true, 'runtime detection makes the app configurable');
+  assert.equal(b.apps.find(a => a.slug === 'vibe-1040').enabled, false);
+
+  // Probed: providers, declared apps, and enabled+routed undeclared apps —
+  // but never an enabled app with no routing block (vibe-plain).
+  const probed = spawnScript.calls.filter(c => c[1] === 'status').map(c => c[2]).sort();
+  assert.deepEqual(probed, ['vibe-1040', 'vibe-auth', 'vibe-new', 'vibe-tb']);
+});
+
+test('GET /api/v1/identity drops an enabled undeclared app the script did not detect', async () => {
+  const readState = () => ({ apps: { 'vibe-new': { enabled: true }, 'vibe-auth': { enabled: true } } });
+  const { app } = setup({
+    'status vibe-auth': { stdout: statusJson({ slug: 'vibe-auth' }) },
+    'status vibe-tb':   { stdout: statusJson({ slug: 'vibe-tb', enabled: false, declared: true }) },
+    'status vibe-1040': { stdout: statusJson({ slug: 'vibe-1040', enabled: false, declared: true }) },
+    'status vibe-new':  { stdout: statusJson({ slug: 'vibe-new', enabled: true, declared: false, detected: false }) },
+    'setup-token':      { stdout: JSON.stringify({ done: true }) },
+  }, { readState });
+  const res = await call(app, 'GET /api/v1/identity');
+  assert.deepEqual(res.body.apps.map(a => a.slug).sort(), ['vibe-1040', 'vibe-tb']);
 });
 
 test('GET /api/v1/identity omits the setup token once setup is done', async () => {
@@ -188,18 +242,25 @@ test('GET /api/v1/identity skips setup-token when the broker is not enabled', as
 
 // ----- slug validation --------------------------------------------------
 
-test('slug routes validate the slug and require sso.capable', async () => {
-  const { app, spawnScript } = setup({});
+test('slug routes validate the slug, refuse the provider, and leave capability to the script', async () => {
+  const { app, spawnScript } = setup({
+    'register vibe-plain': { code: 1, stderr: 'vibe-plain is not SSO-capable: its manifest declares no sso block and its api does not answer /auth/status.' },
+  });
   let res = await call(app, 'POST /api/v1/identity/:slug/register', { params: { slug: '../etc' } });
   assert.equal(res.statusCode, 400);
   res = await call(app, 'POST /api/v1/identity/:slug/register', { params: { slug: 'vibe-nope' } });
   assert.equal(res.statusCode, 404);
-  res = await call(app, 'POST /api/v1/identity/:slug/register', { params: { slug: 'vibe-plain' } });
+  // The identity provider is never a registration target.
+  res = await call(app, 'POST /api/v1/identity/:slug/register', { params: { slug: 'vibe-auth' } });
   assert.equal(res.statusCode, 400);
   assert.equal(res.body.error, 'not sso-capable');
-  res = await call(app, 'GET /api/v1/identity/:slug', { params: { slug: 'vibe-plain' } });
-  assert.equal(res.statusCode, 400);
   assert.equal(spawnScript.calls.length, 0, 'nothing may be spawned for a rejected slug');
+  // An undeclared app is not rejected by the manifest alone: the script
+  // probes /auth/status (runtime SSO) and its refusal is relayed verbatim.
+  res = await call(app, 'POST /api/v1/identity/:slug/register', { params: { slug: 'vibe-plain' } });
+  assert.equal(res.statusCode, 500);
+  assert.match(res.body.stderr, /not SSO-capable/);
+  assert.deepEqual(spawnScript.calls.map(c => c.slice(1)), [['register', 'vibe-plain']]);
 });
 
 // ----- actions ----------------------------------------------------------
