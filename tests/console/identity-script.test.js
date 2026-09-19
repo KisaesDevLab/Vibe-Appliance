@@ -236,7 +236,10 @@ _id_enabled_sso_slugs | sort | tr '\n' ' '`);
 const POLICY_SETUP = DYN_SETUP + `
 cat > "$VIBE_ENV_DIR/pol.json" <<'J'
 {"slug":"pol","routing":{"default_upstream":"pol-api:80"},"sso":{"capable":true},
- "env":{"optional":[{"name":"VIBE_OIDC_REQUIRE_MFA_AMR","value":"true"},{"name":"VIBE_OIDC_ROLE_MAP"}]}}
+ "env":{"optional":[
+   {"name":"VIBE_OIDC_REQUIRE_MFA_AMR","value":"true","ui":{"tier":1,"category":"Application","input":"toggle"}},
+   {"name":"VIBE_OIDC_ROLE_MAP","ui":{"tier":1,"category":"Application","input":"textarea","appliance":"per-app"}},
+   {"name":"VIBE_OIDC_CLIENT_ID","doc":"Written by registration. Documented here only: no ui block, so NOT operator-owned."}]}}
 J
 cat > "$VIBE_ENV_DIR/pol.env" <<'J'
 ALLOWED_ORIGIN=http://10.0.0.5:5176
@@ -249,6 +252,8 @@ VIBE_AUTH_MODE=both
 J
 secrets_set_kv_per_app() { local f="$VIBE_ENV_DIR/$1.env"; grep -v "^$2=" "$f" > "$f.t" || true; echo "$2=$3" >> "$f.t"; mv "$f.t" "$f"; }
 log_info() { :; }
+log_step() { :; }
+log_ok() { :; }
 `;
 
 test('disable strips only the broker block; operator policy keys stay', () => {
@@ -300,4 +305,65 @@ cat > "$VIBE_ENV_DIR/slash.json" <<'J'
 J
 _id_auth_upstream slash`);
   assert.equal(out, 's-api:4000');
+});
+
+// ----- second review round ------------------------------------------------
+
+test('only Tier-1 Settings keys are operator-owned; a documented broker key is not', () => {
+  // pol.json documents VIBE_OIDC_CLIENT_ID without a ui block. Treating every
+  // declared name as owned made register/rotate/rebase silently skip it.
+  const keys = run(ENV_SUBPATH, POLICY_SETUP + `_id_operator_keys pol | sort | tr '\n' ' '`);
+  assert.equal(keys.trim(), 'VIBE_OIDC_REQUIRE_MFA_AMR VIBE_OIDC_ROLE_MAP');
+  const resp = JSON.stringify({ env: { VIBE_OIDC_CLIENT_ID: 'rotated-id' } });
+  const out = run(ENV_SUBPATH, POLICY_SETUP + `_id_write_env_block pol '${resp}'; cat "$VIBE_ENV_DIR/pol.env"`);
+  assert.match(out, /^VIBE_OIDC_CLIENT_ID=rotated-id$/m);
+});
+
+const ACTION_STUBS = `
+_id_require_va() { :; }
+_id_recreate() { :; }
+_id_breakglass() { :; }
+`;
+
+test('register re-registers an already-registered undeclared app without a fresh probe', () => {
+  // "old" does not answer /auth/status (api down / still starting).
+  const out = run(ENV_SUBPATH, POLICY_SETUP + ACTION_STUBS + `
+printf 'ALLOWED_ORIGIN=http://10.0.0.5\\nVIBE_OIDC_CLIENT_ID=old-client\\n' > "$VIBE_ENV_DIR/old.env"
+_id_api() { echo '{"env":{"VIBE_OIDC_CLIENT_ID":"fresh-client"}}'; }
+id_register old >/dev/null
+cat "$VIBE_ENV_DIR/old.env"`);
+  assert.match(out, /^VIBE_OIDC_CLIENT_ID=fresh-client$/m);
+});
+
+test('register-all and disable-all survive one product failing through die', () => {
+  const out = run(ENV_SUBPATH, POLICY_SETUP + ACTION_STUBS + `
+_id_enabled_sso_slugs() { printf 'bad\\ngood\\n'; }
+_id_registered() { return 0; }
+_extract_env_value() { echo some-client; }
+id_register() { [[ "$1" == bad ]] && die "boom"; echo "registered $1"; }
+id_disable()  { [[ "$1" == bad ]] && die "boom"; echo "disabled $1"; }
+id_register_all 2>/dev/null || echo "rc=$?"
+id_disable_all 2>/dev/null`);
+  assert.match(out, /registered good/, 'the loop went on after the failure');
+  assert.match(out, /rc=1/, 'and the failure is still reported');
+  assert.match(out, /disabled good/);
+});
+
+test('mode both/oidc_only is refused when the broker holds no registration; local never asks', () => {
+  const setup = POLICY_SETUP + ACTION_STUBS + `_id_api() { return 1; }\n`;
+  const refused = run(ENV_SUBPATH, setup + `( id_mode pol oidc_only ) 2>&1 || true; grep '^VIBE_AUTH_MODE=' "$VIBE_ENV_DIR/pol.env"`);
+  assert.match(refused, /did not confirm a registration/);
+  assert.match(refused, /Fix: sudo vibe identity register pol/);
+  assert.match(refused, /^VIBE_AUTH_MODE=both$/m, 'mode untouched');
+  const local = run(ENV_SUBPATH, setup + `id_mode pol local >/dev/null 2>&1; grep '^VIBE_AUTH_MODE=' "$VIBE_ENV_DIR/pol.env"`);
+  assert.equal(local, 'VIBE_AUTH_MODE=local');
+});
+
+test('refusals carry a diagnose and a fix hint', () => {
+  const unknown = run(ENV_SUBPATH, POLICY_SETUP + `( _id_require_target nope ) 2>&1 || true`);
+  assert.match(unknown, /Diagnose: ls /);
+  assert.match(unknown, /Fix: /);
+  const plain = run(ENV_SUBPATH, POLICY_SETUP + `( _id_require_target old ) 2>&1 || true`);
+  assert.match(plain, /Diagnose: sudo vibe identity status old/);
+  assert.match(plain, /Fix: update old/);
 });

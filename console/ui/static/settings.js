@@ -14,7 +14,7 @@
 // operators can confirm in DevTools (F12 → Console) that the file
 // they're running is the version they expect, vs. a stale cached
 // copy. Compare against the server's /api/v1/version response.
-const SETTINGS_JS_VERSION = '2026-09-18-textarea-one-line-and-live-models';
+const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
 
 (function () {
   // eslint-disable-next-line no-console
@@ -2671,7 +2671,9 @@ const SETTINGS_JS_VERSION = '2026-09-18-textarea-one-line-and-live-models';
         return;
       }
       if (saveResp.result !== 'saved') {
-        wiz.error = 'settings save ' + (saveResp.result || 'failed') + ': ' + (saveResp.reason || 'unknown');
+        // A 4xx refusal (validation, lock) carries error/detail, not result/reason.
+        wiz.error = 'settings save ' + (saveResp.result || 'failed') + ': ' +
+          (saveResp.reason || saveResp.detail || saveResp.error || 'unknown');
         finishProv('FAILED');
         return;
       }

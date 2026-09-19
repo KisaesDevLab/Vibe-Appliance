@@ -2380,3 +2380,33 @@ Append to this list as phases complete. Format:
   `vibe:apps-changed`; the pending card has a style. Not changed: the
   enable path still auto-registers only manifest-declared apps; an app
   known only through runtime detection needs Register on the panel.
+- 2026-09-19: second review round on the same branch (code review of the
+  fixes above, ten findings). (1) `register-all`, `disable-all` and the
+  rebase recreate run each product in a subshell: a failure inside
+  reports through `die` (exit), which used to end the whole loop and
+  leave every later product unregistered. (2) `register` accepts an app
+  that was registered before without a fresh `/auth/status` probe, so
+  "Fix registration" and `register-all` work while its api is still
+  starting. (3) A client id in the env file is no longer taken as proof
+  of registration where it matters: `mode both|oidc_only` asks the broker
+  (`GET /registrations/<slug>`) and refuses with a fix hint when it holds
+  none — disabling a product drops the broker registration and keeps the
+  env block, and `oidc_only` against a missing client locks staff out.
+  The enable path now also re-registers a product whose env already
+  carries a client id, which closes that window for apps known only
+  through runtime detection. (4) One definition of an operator-owned key,
+  `lib/operator-keys.sh` (`ui.tier == 1`, per-app or both), used by both
+  the env re-render and `identity.sh`; a manifest entry without a Tier-1
+  ui block is documentation only, so documenting `VIBE_OIDC_CLIENT_ID`
+  cannot block registration from writing it. (5) The re-render keeps an
+  operator value only when it is non-empty: a cleared field falls back to
+  the template default (per-app fields have no Revert button). (6)
+  Settings validation: `non-empty` applies only while the field applies
+  (showIf / hideIf evaluated against the batch, then the env files), so a
+  provider switch that blanks the old provider's credentials saves; all
+  problems in a batch are reported together by field label; live-option
+  fields (Anthropic model) accept static options or an id-shaped value,
+  not free text; the Cloudflare Tunnel wizard shows the refusal detail.
+  (7) The panel's unapplied-edit guard compares each dropdown with what
+  it showed at render, so an out-of-range `VIBE_AUTH_MODE` no longer
+  stops background reloads. (8) New refusals carry diagnose and fix hints.

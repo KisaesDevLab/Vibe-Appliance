@@ -41,7 +41,25 @@ test('enum checks static options, including an explicit empty option; dynamic fi
   const opts = [{ value: '', label: 'None' }, { value: 'preparer', label: 'P' }];
   assert.equal(v(f('enum', { options: opts }), 'preparer'), null);
   assert.match(v(f('enum', { options: opts }), 'owner'), /must be one of \(empty\), preparer/);
-  assert.equal(v(f('enum', { options: [{ value: 'a', label: 'A' }], dynamic: 'anthropic-models' }), 'claude-new-model'), null);
+  // Live-option fields: unknown ids pass (new / retired models), free text does not.
+  const dyn = f('enum', { options: [{ value: 'claude-sonnet-5', label: 'S' }], dynamic: 'anthropic-models' });
+  assert.equal(v(dyn, 'claude-sonnet-5'), null);
+  assert.equal(v(dyn, 'claude-new-model-20270101'), null);
+  assert.match(v(dyn, 'claude opus # x'), /not a valid value/);
+});
+
+test('non-empty applies only while the field applies (showIf all-match, hideIf any-match)', () => {
+  const cred = f('non-empty', { showIf: { DDNS_PROVIDER: 'namecheap' } });
+  const ctx = (vals) => ({ valueOf: (k) => (k in vals ? vals[k] : null) });
+  assert.match(v(cred, '', ctx({ DDNS_PROVIDER: 'namecheap' })), /required/);
+  assert.equal(v(cred, '', ctx({ DDNS_PROVIDER: 'none' })), null, 'provider switched away: may be cleared');
+  assert.equal(v(cred, '', ctx({})), null, 'dependency unset: field is hidden');
+  assert.match(v(cred, ''), /required/, 'no context: strict');
+  const multi = f('non-empty', { showIf: { EMAIL_PROVIDER: ['resend', 'smtp'] }, hideIf: { TUNNEL: 'true' } });
+  assert.match(v(multi, '', ctx({ EMAIL_PROVIDER: 'smtp', TUNNEL: 'false' })), /required/);
+  assert.equal(v(multi, '', ctx({ EMAIL_PROVIDER: 'smtp', TUNNEL: 'true' })), null);
+  assert.equal(v(multi, '', ctx({ EMAIL_PROVIDER: 'postmark' })), null);
+  assert.match(v(f('non-empty'), '', ctx({})), /required/, 'no predicates: always applies');
 });
 
 test('boolean, email, url, time zone, state codes, api key', () => {

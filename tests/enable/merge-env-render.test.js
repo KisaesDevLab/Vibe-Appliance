@@ -84,3 +84,23 @@ test('first render: the template default applies; old-only keys are still carrie
   assert.match(out, /^VIBE_OIDC_CLIENT_ID=abc$/m);
   assert.match(out, /^VIBE_APP_SUBDOMAIN=books$/m);
 });
+
+test('a cleared (empty) operator value falls back to the template default', () => {
+  // Per-app fields have no Revert button: an empty line that shadowed the
+  // default forever left no way back to it.
+  const out = merge({
+    old: 'MAIL_SMTP_HOST=\nVIBE_OIDC_REQUIRE_MFA_AMR=false\n',
+    fresh: 'MAIL_SMTP_HOST=smtp.default.example\nVIBE_OIDC_REQUIRE_MFA_AMR=true\n',
+    manifest: MANIFEST,
+  });
+  assert.match(out, /^MAIL_SMTP_HOST=smtp\.default\.example$/m);
+  assert.match(out, /^VIBE_OIDC_REQUIRE_MFA_AMR=false$/m, 'a set value still wins');
+});
+
+test('ownership is the shared rule in lib/operator-keys.sh, for both scripts', () => {
+  const idSrc = fs.readFileSync(path.join(REPO, 'lib', 'identity.sh'), 'utf8');
+  const enSrc = fs.readFileSync(LIB, 'utf8');
+  assert.match(idSrc, /operator_owned_keys "\$\(_id_manifest "\$1"\)"/);
+  assert.match(enSrc, /operator_owned_keys "\$manifest"/);
+  assert.doesNotMatch(enSrc, /def operator_keys/, 'no second definition in the renderer');
+});

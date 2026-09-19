@@ -43,6 +43,12 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   log_init
 fi
 
+# The one definition of an operator-owned env key (see the file header).
+if ! declare -F operator_owned_keys >/dev/null 2>&1; then
+  # shellcheck source=/dev/null
+  . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/operator-keys.sh"
+fi
+
 VA_SLUG="vibe-auth"
 VA_ENV="${VIBE_ENV_DIR}/${VA_SLUG}.env"
 VA_UPSTREAM="http://vibe-auth:8080"
@@ -149,34 +155,26 @@ _id_registered() {
 
 _id_sso_capable() { _id_sso_declared "$1" || _id_registered "$1" || _id_sso_detected "$1"; }
 
-# Env keys the manifest declares (env.required / env.optional), one per
-# line. Any VIBE_OIDC_* among them is OPERATOR-owned policy (MFA at the
-# IdP, JIT, fallback role, role map), set on the Settings page: the
+# Operator-owned env keys for a product, one per line: the manifest's
+# Tier-1 per-app Settings fields (lib/operator-keys.sh is the single
+# definition, shared with the env re-render). Any VIBE_OIDC_* among them
+# is operator policy (MFA at the IdP, JIT, fallback role, role map): the
 # broker's registration block never overwrites it and `disable` never
-# strips it. Only the broker-written keys come and go with registration.
-_id_operator_keys() {
-  local m; m="$(_id_manifest "$1")"
-  [[ -f "$m" ]] || return 0
-  # tr: callers compare whole lines, and python on a CRLF host appends a
-  # carriage return to every name.
-  python3 - "$m" <<'PY' 2>/dev/null | tr -d '\r' || true
-import json, sys
-env = (json.load(open(sys.argv[1])).get("env") or {})
-for section in ("required", "optional"):
-    for e in (env.get(section) or []):
-        if isinstance(e, dict) and e.get("name"):
-            print(e["name"])
-PY
-}
+# strips it. A manifest entry without a Tier-1 ui block is documentation
+# only, so documenting VIBE_OIDC_CLIENT_ID never blocks registration.
+_id_operator_keys() { operator_owned_keys "$(_id_manifest "$1")"; }
 
 # Refuse an action on an app that is not SSO-capable and not registered.
 # Without this, `disable` on a plain app wrote VIBE_AUTH_MODE=local into
 # its env and force-recreated it.
 _id_require_target() {
   local slug="$1"
-  [[ -f "$(_id_manifest "$slug")" ]] || die "${slug}: unknown app (no manifest)."
+  [[ -f "$(_id_manifest "$slug")" ]] \
+    || die "${slug}: unknown app — no manifest at $(_id_manifest "$slug"). Common causes: a typo in the slug, or an app newer than this appliance build." \
+           "Diagnose: ls ${APPLIANCE_DIR}/console/manifests/ ; Fix: use a slug from that list, or update the appliance from the console's Updates panel and retry."
   _id_sso_capable "$slug" && return 0
-  die "${slug} is not SSO-capable and not registered with vibe-auth: its manifest declares no sso block, its env has no VIBE_OIDC_CLIENT_ID and its api does not answer /auth/status. Nothing to do."
+  die "${slug} is not SSO-capable and not registered with vibe-auth: its manifest declares no sso block, its env has no VIBE_OIDC_CLIENT_ID and its api does not answer /auth/status. Nothing was changed." \
+      "Diagnose: sudo vibe identity status ${slug} ; docker exec vibe-console curl -s -o /dev/null -w '%{http_code}\n' http://$(_id_auth_upstream "$slug")/auth/status (200 = SSO support). Fix: update ${slug} to a release with Vibe Auth support, then Register it on the console's Single sign-on panel."
 }
 
 _id_va_enabled() {
@@ -397,8 +395,14 @@ id_register() {
   _id_require_va
   [[ -f "${VIBE_ENV_DIR}/${slug}.env" ]] || die "${slug} is not enabled (no env file). Enable it first."
   if ! _id_sso_declared "$slug"; then
-    _id_sso_detected "$slug" || die "${slug} is not SSO-capable: its manifest declares no sso block and its api does not answer /auth/status. Update the app (and then the appliance) to a release with Vibe Auth support."
-    log_warn "${slug} answers /auth/status but its vendored manifest predates SSO: registering with the package defaults (redirect /auth/oidc/callback, back-channel /auth/oidc/backchannel, no public paths). Update the appliance for the app's full sso block and break-glass command." slug="$slug"
+    # An app registered earlier (client id in its env) is re-registered
+    # without a fresh probe: "Fix registration" and register-all must work
+    # for it even while its api is still starting.
+    if ! _id_registered "$slug"; then
+      _id_sso_detected "$slug" || die "${slug} is not SSO-capable: its manifest declares no sso block and its api does not answer /auth/status." \
+        "Diagnose: docker exec vibe-console curl -s -o /dev/null -w '%{http_code}\n' http://$(_id_auth_upstream "$slug")/auth/status ; docker logs ${slug}-server --tail 50. Fix: update the app (and then the appliance) to a release with Vibe Auth support, then retry Register."
+    fi
+    log_warn "${slug} supports SSO (it answers /auth/status, or was registered before) but its vendored manifest predates SSO: registering with the package defaults (redirect /auth/oidc/callback, back-channel /auth/oidc/backchannel, no public paths). Update the appliance for the app's full sso block and break-glass command." slug="$slug"
   fi
   local base_url body resp
   base_url="$(_id_product_base_url "$slug")"
@@ -446,6 +450,14 @@ id_mode() {
   _id_require_target "$slug"
   if [[ "$mode" != "local" ]]; then
     [[ -n "$(_extract_env_value "$env" VIBE_OIDC_CLIENT_ID)" ]] || die "${slug} is not registered with vibe-auth. Fix: sudo vibe identity register ${slug}"
+    # The client id in the env file is not proof: disabling a product drops
+    # its broker registration and keeps the env block. Turning SSO on
+    # against a client the broker no longer has breaks every SSO sign-in
+    # (and with oidc_only, every sign-in but break-glass). Ask the broker.
+    _id_require_va
+    _id_api GET "/registrations/${slug}" '' >/dev/null 2>&1 \
+      || die "${mode} refused for ${slug}: vibe-auth did not confirm a registration for it. Common causes: the app was disabled and re-enabled (the broker registration was dropped, the env block kept), or the broker's database was reset." \
+             "Diagnose: sudo vibe identity status ${slug} ; docker logs vibe-auth --tail 50. Fix: sudo vibe identity register ${slug} (or the panel's Fix registration), then set the mode again."
   fi
   if [[ "$mode" == "oidc_only" ]]; then
     [[ -n "$(_extract_env_value "$VA_ENV" "$(_id_breakglass_key "$slug")")" ]] \
@@ -495,7 +507,9 @@ id_rebase() {
     [[ -n "$slug" ]] || continue
     local one; one="$(python3 -c 'import json,sys; d=json.load(sys.stdin); p=[x for x in d["products"] if x["slug"]==sys.argv[1]][0]; print(json.dumps({"env": p["env"]}))' "$slug" <<< "$resp")"
     _id_write_env_block "$slug" "$one"
-    _id_recreate "$slug" || log_warn "recreate failed for ${slug} after rebase" slug="$slug"
+    # Subshell: a failure inside calls die (exit), which must end this
+    # product's step, not the loop.
+    ( _id_recreate "$slug" ) || log_warn "recreate failed for ${slug} after rebase. Fix: sudo vibe identity register ${slug}" slug="$slug"
   done < <(python3 -c 'import json,sys; d=json.load(sys.stdin); [print(p["slug"]) for p in d["products"] if p["slug"] in json.loads(sys.argv[1])]' "$products" <<< "$resp")
   log_ok "vibe-auth rebased for $(python3 -c 'import json,sys;print(len(json.loads(sys.argv[1])))' "$products") product(s)"
 }
@@ -504,7 +518,10 @@ id_register_all() {
   _id_require_va
   local slug rc=0
   for slug in $(_id_enabled_sso_slugs); do
-    id_register "$slug" || { log_warn "registration failed for ${slug}; continuing" slug="$slug"; rc=1; }
+    # Subshell: id_register reports failure through die (exit 1), which
+    # would otherwise end the whole loop and leave every later product
+    # unregistered.
+    ( id_register "$slug" ) || { log_warn "registration failed for ${slug}; continuing" slug="$slug"; rc=1; }
   done
   return $rc
 }
@@ -513,7 +530,7 @@ id_disable_all() {
   local slug
   for slug in $(_id_enabled_sso_slugs); do
     [[ -n "$(_extract_env_value "${VIBE_ENV_DIR}/${slug}.env" VIBE_OIDC_CLIENT_ID)" ]] || continue
-    id_disable "$slug" || log_warn "could not disable SSO for ${slug}" slug="$slug"
+    ( id_disable "$slug" ) || log_warn "could not disable SSO for ${slug}. Fix: sudo vibe identity disable ${slug}" slug="$slug"
   done
 }
 

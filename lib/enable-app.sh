@@ -46,6 +46,12 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   log_init
 fi
 
+# The one definition of an operator-owned env key (see the file header).
+if ! declare -F operator_owned_keys >/dev/null 2>&1; then
+  # shellcheck source=/dev/null
+  . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/operator-keys.sh"
+fi
+
 # enable_app <slug>
 enable_app() {
   local slug="${1:-}"
@@ -328,7 +334,12 @@ print((json.load(open('${manifest}')).get('runtime') or 'appliance'))
       log_step "registering enabled SSO-capable products with vibe-auth"
       bash "${APPLIANCE_DIR}/lib/identity.sh" register-all 2>&1 | tee -a "$VIBE_LOG_FILE" >&2 \
         || log_warn "some products could not be registered with vibe-auth; use the console Identity panel → Fix, or: sudo vibe identity register <slug>"
-    elif [[ "$_sso_capable" == "true" && "$_va_state" == "1" ]]; then
+    elif [[ "$_va_state" == "1" ]] && { [[ "$_sso_capable" == "true" ]] || [[ -n "$(_extract_env_value "${VIBE_ENV_DIR}/${slug}.env" VIBE_OIDC_CLIENT_ID)" ]]; }; then
+      # Declared in the manifest, OR registered before (client id still in
+      # the env): disabling a product drops its broker registration and
+      # keeps the env block, so a re-enable must re-register — also for an
+      # app known only through runtime detection. Without this its panel
+      # card said "registered" against a client the broker no longer had.
       log_step "registering $slug with vibe-auth"
       bash "${APPLIANCE_DIR}/lib/identity.sh" register "$slug" 2>&1 | tee -a "$VIBE_LOG_FILE" >&2 \
         || log_warn "$slug is running on local sign-in; vibe-auth registration failed. Fix: console Identity panel → Fix, or: sudo vibe identity register $slug"
@@ -1056,9 +1067,11 @@ _image_uid_gid() {
 # Merge with the existing file:
 #   - keys the new render lacks are carried forward (ANTHROPIC_API_KEY
 #     and similar optional settings);
-#   - keys the manifest surfaces as Tier-1 per-app Settings (ui.tier 1,
-#     ui.appliance per-app | both) keep the EXISTING value even when the
-#     template also sets them. The template value is only the first-render
+#   - operator-owned keys (lib/operator-keys.sh: the manifest's Tier-1
+#     per-app Settings fields) keep the EXISTING value even when the
+#     template also sets them, unless that value is EMPTY: a field the
+#     operator cleared falls back to the template default, which is the
+#     only way back to it (per-app fields have no Revert button). The template value is only the first-render
 #     default; the operator owns the key after that. Without this, every
 #     re-render (enable, bootstrap, routing change) reset those settings
 #     to the template default: Vibe 1099's VIBE_OIDC_REQUIRE_MFA_AMR,
@@ -1068,20 +1081,8 @@ _image_uid_gid() {
 _merge_env_render() {
   local src="$1" tmp="$2" manifest="$3"
   [[ -f "$src" ]] || return 0
-  python3 - "$src" "$tmp" "$manifest" <<'PYEOF'
-import json, sys
-def operator_keys(path):
-    try:
-        env = (json.load(open(path)).get("env") or {})
-    except Exception:
-        return set()
-    out = set()
-    for section in ("required", "optional"):
-        for e in (env.get(section) or []):
-            ui = (e or {}).get("ui") or {}
-            if ui.get("tier") == 1 and ui.get("appliance", "per-app") in ("per-app", "both") and e.get("name"):
-                out.add(e["name"])
-    return out
+  python3 - "$src" "$tmp" "$(operator_owned_keys "$manifest")" <<'PYEOF'
+import sys
 def parse(path):
     rows = {}
     with open(path) as f:
@@ -1094,13 +1095,13 @@ def parse(path):
 
 old = parse(sys.argv[1])
 new = parse(sys.argv[2])
-owned = operator_keys(sys.argv[3]) if len(sys.argv) > 3 else set()
+owned = set(k.strip() for k in (sys.argv[3] if len(sys.argv) > 3 else "").split("\n") if k.strip())
 merged_lines = []
 for line in open(sys.argv[2]).read().splitlines():
     s = line.strip()
     if s and not s.startswith("#") and "=" in s:
         k = s.split("=", 1)[0]
-        if k in owned and k in old:
+        if k in owned and old.get(k, "") != "":
             line = f"{k}={old[k]}"
     merged_lines.append(line)
 new_keys = set(new.keys())

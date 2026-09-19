@@ -200,6 +200,7 @@
       : '<p class="muted">No app on this appliance supports single sign-on yet. Apps appear here automatically ' +
         'when their manifest declares SSO or their running api answers <span class="mono">/auth/status</span>.</p>';
     els.rebase.disabled = !(v.installed && v.enabled);
+    for (const sel of section.querySelectorAll('select[data-mode-select]')) sel.dataset.rendered = sel.value;
   }
 
   // ---------- data ----------
@@ -365,12 +366,14 @@
   // Background reloads (the tick and the apps-changed event) re-render the
   // cards, which would reset a sign-in mode the operator picked but has
   // not applied yet. They are skipped while any mode dropdown differs
-  // from the loaded mode or has focus, and never overlap each other.
+  // from what it showed at render or has focus, and never overlap.
   function editing() {
     for (const sel of section.querySelectorAll('select[data-mode-select]')) {
-      if (sel === document.activeElement) return true;
-      const a = ((_data && _data.apps) || []).find(x => x.slug === sel.dataset.modeSelect);
-      if (a && a.mode && sel.value !== a.mode) return true;
+      if (sel === document.activeElement && document.hasFocus()) return true;
+      // Compare with what the dropdown showed right after render, not with
+      // the loaded mode: an env value outside the three options (hand edit,
+      // newer package) selects nothing, and would read as a permanent edit.
+      if (sel.dataset.rendered !== undefined && sel.value !== sel.dataset.rendered) return true;
     }
     return false;
   }
