@@ -294,11 +294,26 @@ test('health_extra entries are well-formed and name a service the overlay declar
   }
 });
 
+// Does a routing matcher path (Caddy syntax, as the renderers read it: an
+// exact path, or a `/prefix/*` wildcard) route request path `p`?
+function matcherCovers(matcherPath, p) {
+  if (matcherPath === p) return true;
+  return matcherPath.endsWith('/*') && p.startsWith(matcherPath.slice(0, -1));
+}
+
 test('an sso-capable manifest carries everything lib/identity.sh needs', () => {
-  // lib/identity.sh registers the product from this block: the /auth/*
-  // matcher is what lets the broker's back-channel logout and the browser's
-  // OIDC callback reach the API tier (render-caddyfile.sh builds routes ONLY
-  // from routing.matchers — nothing is derived from sso.redirectPaths), and
+  // lib/identity.sh registers the product from this block: the auth matchers
+  // are what let the broker's back-channel logout and the browser's OIDC
+  // callback reach the API tier (render-caddyfile.sh builds routes ONLY from
+  // routing.matchers — nothing is derived from sso.redirectPaths).
+  //
+  // Most products route `/auth/*` wholesale. That is not required, and one
+  // product cannot: vibe-payroll's SPA owns /auth/magic and /auth/reset
+  // (emailed login-link and password-reset landing pages), so it routes the
+  // engine's paths one by one. What IS required is asserted below — every
+  // path the broker registers is routed, all to ONE tier, and that tier is
+  // the one lib/identity.sh will pick (its first matcher under /auth).
+  //
   // breakglassCommand is docker-exec'd in breakglassService with the image's
   // own WORKDIR and no shell, so it must be an argv array whose "ensure"
   // element identity.sh can swap for "rotate". A product that declares
@@ -311,13 +326,22 @@ test('an sso-capable manifest carries everything lib/identity.sh needs', () => {
     assert.ok(Array.isArray(data.requires) && data.requires.includes('identity'),
       `${file}: sso.capable requires "identity" in requires[]`);
     const matchers = (data.routing && data.routing.matchers) || [];
-    const auth = matchers.find((m) => m.path === '/auth/*');
-    assert.ok(auth, `${file}: sso.capable needs a routing matcher for /auth/* (the API tier)`);
+    // The tier lib/identity.sh resolves: the first matcher under /auth.
+    const auth = matchers.find((m) => String(m.path || '').startsWith('/auth'));
+    assert.ok(auth, `${file}: sso.capable needs a routing matcher under /auth (the API tier)`);
+    const registered = [...(sso.redirectPaths || []), ...(sso.logoutPaths || [])];
+    assert.ok(registered.length > 0, `${file}: sso.capable needs redirectPaths / logoutPaths`);
+    for (const p of registered) {
+      const hit = matchers.find((m) => matcherCovers(String(m.path || ''), p));
+      assert.ok(hit, `${file}: sso path "${p}" is not routed by any routing matcher — it would land on the default upstream (the SPA)`);
+      assert.strictEqual(hit.upstream, auth.upstream,
+        `${file}: sso path "${p}" routes to ${hit.upstream}, but lib/identity.sh resolves the auth tier as ${auth.upstream}`);
+    }
     if (sso.internalUrl !== undefined) {
       assert.match(sso.internalUrl, /^https?:\/\/[a-z0-9.-]+:\d+$/,
         `${file}: sso.internalUrl "${sso.internalUrl}" is not http://<service>:<port>`);
       assert.strictEqual(sso.internalUrl.replace(/^https?:\/\//, ''), auth.upstream,
-        `${file}: sso.internalUrl must name the same upstream as the /auth/* matcher`);
+        `${file}: sso.internalUrl must name the same upstream as the auth matcher`);
     }
     const overlay = fs.readFileSync(path.join(root, 'apps', `${data.slug}.yml`), 'utf8');
     const service = sso.breakglassService || `${data.slug}-server`;

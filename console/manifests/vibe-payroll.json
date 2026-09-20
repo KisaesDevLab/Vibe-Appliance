@@ -18,9 +18,27 @@
 
   "routing": {
     "default_upstream": "vibe-payroll-web:8080",
+    "_doc": "Single sign-on (Vibe Auth) engine routes go to the API tier ONE PATH AT A TIME, never as /auth/* like the other products. This SPA owns /auth/magic and /auth/reset (the emailed login-link and password-reset landing pages); a blanket /auth/* matcher would send every such link to the API, which 404s it. lib/identity.sh finds the auth tier by the first matcher whose path starts with /auth — keep auth_oidc first among them. Mirrors routing in Vibe-Payroll-Time: caddy/Caddyfile*, frontend/vite.config.ts, .appliance/manifest.json.",
     "matchers": [
-      { "name": "api", "path": "/api/*", "upstream": "vibe-payroll-api:4000" }
+      { "name": "api",               "path": "/api/*",           "upstream": "vibe-payroll-api:4000" },
+      { "name": "auth_oidc",         "path": "/auth/oidc/*",     "upstream": "vibe-payroll-api:4000" },
+      { "name": "auth_status",       "path": "/auth/status",     "upstream": "vibe-payroll-api:4000" },
+      { "name": "auth_me",           "path": "/auth/me",         "upstream": "vibe-payroll-api:4000" },
+      { "name": "auth_settings",     "path": "/auth/settings",   "upstream": "vibe-payroll-api:4000" },
+      { "name": "auth_settings_sub", "path": "/auth/settings/*", "upstream": "vibe-payroll-api:4000" }
     ]
+  },
+
+  "requires": ["identity"],
+  "sso": {
+    "capable":       true,
+    "redirectPaths": ["/auth/oidc/callback"],
+    "logoutPaths":   ["/auth/oidc/backchannel"],
+    "publicPaths":   ["/api/v1/ping", "/api/v1/health", "/api/v1/health/ready", "/api/v1/version", "/api/v1/appliance/info", "/api/v1/setup/*", "/api/v1/auth/*", "/api/v1/kiosk/*", "/auth/magic", "/auth/reset", "/login/local", "/kiosk", "/kiosk/*"],
+    "edgeGate":      false,
+    "internalUrl":   "http://vibe-payroll-api:4000",
+    "breakglassService": "vibe-payroll-api",
+    "breakglassCommand": ["node", "--import", "tsx/esm", "node_modules/@kisaesdevlab/vibe-auth/dist/cli.js", "breakglass", "ensure", "--json"]
   },
 
   "depends": ["postgres", "redis"],
@@ -111,6 +129,74 @@
           "input":     "number",
           "appliance": "per-app",
           "validate":  "number-range:3000:60000"
+        }
+      },
+      {
+        "name":  "VIBE_OIDC_REQUIRE_MFA_AMR",
+        "value": "true",
+        "doc":   "Refuse a single sign-on login whose ID token carries no MFA `amr` claim. Vibe Time Keeper has no second factor of its own, so the identity provider's MFA is the only one an SSO session gets; keep this on unless the firm has deliberately not enrolled staff in MFA at Vibe Auth. Not written by registration (identity.sh writes only the broker's VIBE_OIDC_* block), so the value set here survives Register / Fix / rebase. Never affects kiosk PIN / badge punches.",
+        "ui": {
+          "tier":      1,
+          "category":  "Application",
+          "label":     "SSO requires MFA at the identity provider",
+          "helpText":  "On: a Vibe Auth sign-in is accepted only when the identity provider reports multi-factor authentication. Off: password-only SSO logins are accepted. Local (password / login-link) sign-in and kiosk punches are unaffected.",
+          "input":     "toggle",
+          "appliance": "per-app",
+          "validate":  "enum",
+          "options": [
+            { "value": "true",  "label": "Required"     },
+            { "value": "false", "label": "Not required" }
+          ]
+        }
+      },
+      {
+        "name":  "VIBE_OIDC_ALLOW_JIT",
+        "value": "true",
+        "doc":   "Just-in-time provisioning: create a staff account on first SSO sign-in (role from the Vibe group map; joins the firm's single company). Off = only accounts already present (matched by verified email) can sign in with SSO. A just-in-time account has no local password and cannot mail itself one.",
+        "ui": {
+          "tier":      1,
+          "category":  "Application",
+          "label":     "Create staff accounts on first SSO sign-in",
+          "helpText":  "On: anyone the identity provider admits gets an account automatically, with the role mapped from their Vibe group. Off: staff must be added in the app (Team) with the same email before SSO lets them in.",
+          "input":     "toggle",
+          "appliance": "per-app",
+          "validate":  "enum",
+          "options": [
+            { "value": "true",  "label": "Enabled"  },
+            { "value": "false", "label": "Disabled" }
+          ]
+        }
+      },
+      {
+        "name": "VIBE_OIDC_DEFAULT_ROLE",
+        "doc":  "Role for an SSO user whose Vibe groups map to nothing. Empty = no role → the login is refused (safest). Roles: super_admin (appliance-wide), company_admin, supervisor, employee.",
+        "ui": {
+          "tier":      1,
+          "category":  "Application",
+          "label":     "SSO fallback role",
+          "helpText":  "Applied when a signed-in user is in none of the mapped Vibe groups. \"None\" refuses such logins — recommended.",
+          "input":     "dropdown",
+          "appliance": "per-app",
+          "validate":  "enum",
+          "options": [
+            { "value": "",              "label": "None (refuse the login)" },
+            { "value": "employee",      "label": "Employee"                },
+            { "value": "supervisor",    "label": "Supervisor"              },
+            { "value": "company_admin", "label": "Company admin"           }
+          ]
+        }
+      },
+      {
+        "name": "VIBE_OIDC_ROLE_MAP",
+        "doc":  "JSON object, Vibe group → role. Empty = the app's built-in map: vibe-admin / vibe-it → super_admin, vibe-partner → company_admin, vibe-manager → supervisor, vibe-staff → employee. A value saved on the app's own Appliance → Authentication page overrides this. The app never demotes its last SuperAdmin, whatever this says.",
+        "ui": {
+          "tier":      1,
+          "category":  "Application",
+          "label":     "SSO group → role map (JSON)",
+          "helpText":  "Example: {\"vibe-partner\":\"company_admin\",\"vibe-manager\":\"supervisor\",\"vibe-staff\":\"employee\"}. Leave blank for the built-in map. Roles: super_admin, company_admin, supervisor, employee.",
+          "input":     "textarea",
+          "appliance": "per-app",
+          "validate":  "regex:^(\\s*|\\s*\\{[\\s\\S]*\\}\\s*)$"
         }
       },
       {
