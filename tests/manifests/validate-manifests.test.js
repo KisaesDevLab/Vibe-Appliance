@@ -311,8 +311,13 @@ test('an sso-capable manifest carries everything lib/identity.sh needs', () => {
     assert.ok(Array.isArray(data.requires) && data.requires.includes('identity'),
       `${file}: sso.capable requires "identity" in requires[]`);
     const matchers = (data.routing && data.routing.matchers) || [];
-    const auth = matchers.find((m) => m.path === '/auth/*');
-    assert.ok(auth, `${file}: sso.capable needs a routing matcher for /auth/* (the API tier)`);
+    // A single-tier product (its api IS the default upstream, no matchers at
+    // all) needs no /auth/* route: every path already reaches it. Anything
+    // with a separate web tier must route /auth/* to the api explicitly.
+    const singleTier = matchers.length === 0;
+    const auth = matchers.find((m) => m.path === '/auth/*')
+      || (singleTier ? { upstream: data.routing && data.routing.default_upstream } : null);
+    assert.ok(auth && auth.upstream, `${file}: sso.capable needs a routing matcher for /auth/* (the API tier)`);
     if (sso.internalUrl !== undefined) {
       assert.match(sso.internalUrl, /^https?:\/\/[a-z0-9.-]+:\d+$/,
         `${file}: sso.internalUrl "${sso.internalUrl}" is not http://<service>:<port>`);
@@ -331,6 +336,38 @@ test('an sso-capable manifest carries everything lib/identity.sh needs', () => {
         `${file}: sso.breakglassCommand needs a literal "ensure" element (identity.sh rewrites it to "rotate")`);
       assert.ok(cmd.includes('--json'), `${file}: sso.breakglassCommand must produce JSON (--json)`);
       assert.notStrictEqual(cmd[0], 'sh', `${file}: sso.breakglassCommand must not go through a shell (argv substitution)`);
+    }
+    // What identity.sh recreates on register/rotate/mode: real services of
+    // the overlay, and never a one-shot.
+    if (sso.recreate !== undefined) {
+      assert.ok(Array.isArray(sso.recreate) && sso.recreate.length > 0, `${file}: sso.recreate must be a non-empty array`);
+      for (const svc of sso.recreate) {
+        assert.match(overlay, new RegExp(`^\\s{2}${svc}:\\s*$`, 'm'),
+          `${file}: sso.recreate names "${svc}", which is not a service in apps/${data.slug}.yml`);
+      }
+      assert.ok(sso.recreate.includes(service),
+        `${file}: sso.recreate must include the break-glass service "${service}" (it reads VIBE_AUTH_MODE)`);
+    }
+    if (sso.breakglassStatusCommand !== undefined) {
+      const sc = sso.breakglassStatusCommand;
+      assert.ok(Array.isArray(sc) && sc.length >= 1 && sc.every((c) => typeof c === 'string'),
+        `${file}: sso.breakglassStatusCommand must be an argv array`);
+      assert.notStrictEqual(sc[0], 'sh', `${file}: sso.breakglassStatusCommand must not go through a shell`);
+    }
+    // The old recipe said vibe-breakglass@localhost; most login validators reject it.
+    if (sso.breakglassIdentifier !== undefined && sso.breakglassIdentifier.includes('@')) {
+      assert.match(sso.breakglassIdentifier, /^[^@\s]+@[^@\s]+\.[^@\s]+$/,
+        `${file}: sso.breakglassIdentifier "${sso.breakglassIdentifier}" needs a dotted domain (not @localhost)`);
+    }
+    if (sso.minBroker !== undefined) {
+      assert.match(sso.minBroker, /^\d+\.\d+\.\d+$/, `${file}: sso.minBroker must be x.y.z`);
+    }
+    // identity.sh derives the registered base URL from ALLOWED_ORIGIN in the
+    // product's env file and dies without it.
+    const tmpl = path.join(root, 'env-templates', 'per-app', `${data.slug}.env.tmpl`);
+    if (fs.existsSync(tmpl)) {
+      assert.match(fs.readFileSync(tmpl, 'utf8'), /^ALLOWED_ORIGIN=/m,
+        `${file}: sso.capable needs ALLOWED_ORIGIN= in env-templates/per-app/${data.slug}.env.tmpl (identity.sh registers from it)`);
     }
   }
 });

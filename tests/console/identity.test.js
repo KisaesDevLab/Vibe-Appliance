@@ -374,3 +374,111 @@ test('GET /api/v1/identity keeps a registered undeclared app listed while its ap
   assert.equal(nw.ssoCapable, true);
   assert.equal(nw.registered, true);
 });
+
+// ----- break-glass verification, rotation, per-product access ------------
+
+const BG_OK = { slug: 'vibe-tb', identifier: 'vibe-breakglass', stored: true, probed: true, exists: true, active: true, admin: true, ready: true, passwordChecked: true, passwordMatches: true, ok: true, problems: [], fix: null };
+
+test('break-glass status relays the script\'s JSON, tolerating a log line ahead of it', async () => {
+  const { app, spawnScript } = setup({ 'breakglass-status vibe-tb': { code: 0, stdout: 'some log line\n' + JSON.stringify(BG_OK) + '\n' } });
+  const res = await call(app, 'GET /api/v1/identity/:slug/breakglass', { params: { slug: 'vibe-tb' } });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body, BG_OK);
+  assert.deepEqual(spawnScript.calls[0].slice(1), ['breakglass-status', 'vibe-tb']);
+});
+
+test('break-glass status: a not-ready account is a 200 with problems, a dead script is a 5xx', async () => {
+  const notReady = { ...BG_OK, ok: false, ready: false, secondFactorEnrolled: false, problems: ['a second factor is required for this account and none is enrolled'] };
+  const a = setup({ 'breakglass-status vibe-1040': { code: 0, stdout: JSON.stringify(notReady) } });
+  const r1 = await call(a.app, 'GET /api/v1/identity/:slug/breakglass', { params: { slug: 'vibe-1040' } });
+  assert.equal(r1.statusCode, 200);
+  assert.equal(r1.body.ok, false);
+  assert.match(r1.body.problems[0], /second factor/);
+
+  const b = setup({ 'breakglass-status vibe-tb': { code: 9, stderr: 'die: vibe-tb is not SSO-capable' } });
+  const r2 = await call(b.app, 'GET /api/v1/identity/:slug/breakglass', { params: { slug: 'vibe-tb' } });
+  assert.equal(r2.statusCode, 500);
+  assert.match(r2.body.detail, /not SSO-capable/);
+
+  const c = setup({});
+  const r3 = await call(c.app, 'GET /api/v1/identity/:slug/breakglass', { params: { slug: 'vibe-auth' } });
+  assert.equal(r3.statusCode, 400, 'the identity provider is never a target');
+});
+
+test('rotate-breakglass needs confirm:true, then runs under the slug lock', async () => {
+  const locks = [];
+  const { app, spawnScript } = setup(
+    { 'rotate-breakglass vibe-tb': { code: 0, stdout: '==== BREAK-GLASS (vibe-tb) ====\nsign in as: vibe-breakglass\npassword:   n3w\n' } },
+    { acquireSlugLock: (slug, name) => { locks.push(['take', slug, name]); return true; }, releaseSlugLock: (slug) => locks.push(['release', slug]) },
+  );
+  const refused = await call(app, 'POST /api/v1/identity/:slug/rotate-breakglass', { params: { slug: 'vibe-tb' }, body: {} });
+  assert.equal(refused.statusCode, 400);
+  assert.match(refused.body.detail, /stops\s+working at once/);
+  assert.equal(spawnScript.calls.length, 0);
+
+  const ok = await call(app, 'POST /api/v1/identity/:slug/rotate-breakglass', { params: { slug: 'vibe-tb' }, body: { confirm: true } });
+  assert.equal(ok.statusCode, 200);
+  assert.match(ok.body.stdout, /password: {3}n3w/);
+  assert.deepEqual(spawnScript.calls[0].slice(1), ['rotate-breakglass', 'vibe-tb']);
+  assert.deepEqual(locks, [['take', 'vibe-tb', 'sso-rotate-breakglass'], ['release', 'vibe-tb']]);
+});
+
+test('access: read, restrict with a seed, open; bad bodies never reach the script', async () => {
+  const { app, spawnScript } = setup({
+    'access vibe-tb': { code: 0, stdout: JSON.stringify({ slug: 'vibe-tb', restricted: true, seeded: 4 }) },
+  });
+  const read = await call(app, 'GET /api/v1/identity/:slug/access', { params: { slug: 'vibe-tb' } });
+  assert.equal(read.statusCode, 200);
+  assert.equal(read.body.restricted, true);
+  assert.deepEqual(spawnScript.calls[0].slice(1), ['access', 'vibe-tb']);
+
+  const put = await call(app, 'POST /api/v1/identity/:slug/access', { params: { slug: 'vibe-tb' }, body: { restricted: true, seed: 'everyone' } });
+  assert.equal(put.statusCode, 200);
+  assert.deepEqual(spawnScript.calls[1].slice(1), ['access', 'vibe-tb', 'restricted', 'everyone']);
+
+  await call(app, 'POST /api/v1/identity/:slug/access', { params: { slug: 'vibe-tb' }, body: { restricted: false } });
+  assert.deepEqual(spawnScript.calls[2].slice(1), ['access', 'vibe-tb', 'open', 'none']);
+
+  const before = spawnScript.calls.length;
+  const bad1 = await call(app, 'POST /api/v1/identity/:slug/access', { params: { slug: 'vibe-tb' }, body: { restricted: 'yes' } });
+  assert.equal(bad1.statusCode, 400);
+  const bad2 = await call(app, 'POST /api/v1/identity/:slug/access', { params: { slug: 'vibe-tb' }, body: { restricted: true, seed: '; rm -rf /' } });
+  assert.equal(bad2.statusCode, 400);
+  const bad3 = await call(app, 'POST /api/v1/identity/:slug/access', { params: { slug: 'Bad Slug' }, body: { restricted: true } });
+  assert.equal(bad3.statusCode, 400);
+  assert.equal(spawnScript.calls.length, before, 'nothing was spawned for a bad request');
+});
+
+test('status rows say what to type for break-glass (a full address when the product needs one)', async () => {
+  const M = { ...MANIFESTS, 'vibe-mail': { slug: 'vibe-mail', displayName: 'Mail', sso: { capable: true, breakglassIdentifier: 'vibe-breakglass@mail.local' } } };
+  const { app } = setup({ status: { code: 0, stdout: JSON.stringify({ registered: true, mode: 'both', breakglass: true, vibeAuthEnabled: true, vibeAuthHealthy: true }) }, 'setup-token': { code: 0, stdout: '{"done":true,"url":"http://x/admin"}' } }, { MANIFESTS: M });
+  const res = await call(app, 'GET /api/v1/identity', {});
+  const byslug = Object.fromEntries(res.body.apps.map(a => [a.slug, a]));
+  assert.equal(byslug['vibe-mail'].breakglassIdentifier, 'vibe-breakglass@mail.local');
+  assert.equal(byslug['vibe-tb'].breakglassIdentifier, 'vibe-breakglass');
+});
+
+test('address drift is surfaced on the panel payload, and reapply-address runs the script once', async () => {
+  const drift = { drift: true, current: '10.0.0.77', rendered: '10.0.0.5', vibeAuth: true, affected: [{ slug: 'vibe-tb', rendered: '10.0.0.5' }] };
+  const { app, spawnScript } = setup({
+    status: { code: 0, stdout: JSON.stringify({ registered: true, mode: 'both', breakglass: true, vibeAuthEnabled: true, vibeAuthHealthy: true }) },
+    'address-drift': { code: 0, stdout: JSON.stringify(drift) },
+    'setup-token': { code: 0, stdout: '{"done":true,"url":"http://x/admin"}' },
+    'reapply-address': { code: 0, stdout: 'ok' },
+  });
+  const res = await call(app, 'GET /api/v1/identity', {});
+  assert.deepEqual(res.body.vibeAuth.addressDrift, drift);
+  const r = await call(app, 'POST /api/v1/identity/reapply-address', {});
+  assert.equal(r.statusCode, 200);
+  assert.ok(spawnScript.calls.some(c => c[1] === 'reapply-address'));
+});
+
+test('no drift → the field is absent (nothing to show)', async () => {
+  const { app } = setup({
+    status: { code: 0, stdout: JSON.stringify({ registered: true, mode: 'both', breakglass: true, vibeAuthEnabled: true, vibeAuthHealthy: true }) },
+    'address-drift': { code: 0, stdout: JSON.stringify({ drift: false, current: '10.0.0.5', rendered: '10.0.0.5', vibeAuth: false, affected: [] }) },
+    'setup-token': { code: 0, stdout: '{"done":true,"url":"http://x/admin"}' },
+  });
+  const res = await call(app, 'GET /api/v1/identity', {});
+  assert.equal(res.body.vibeAuth.addressDrift, undefined);
+});

@@ -1078,6 +1078,15 @@ _image_uid_gid() {
 #     Vibe Time & Billing's SMTP and storage settings, Vibe Recap's
 #     model settings. Trade-off: a changed template default for such a
 #     key reaches only fresh installs.
+#   - identity-owned keys keep the EXISTING value whatever the template
+#     says: VIBE_AUTH_MODE (set from the console's Single sign-on panel or
+#     `vibe identity mode`) and the broker's registration block
+#     (lib/identity.sh _id_write_env_block). They used to survive only
+#     because no template happened to name them; the first template to
+#     document `VIBE_AUTH_MODE=local` would have dropped that product out
+#     of oidc_only on every enable, bootstrap and routing change. A host or
+#     routing change still reaches them: enable_app re-registers the
+#     product afterwards, which rewrites the block.
 _merge_env_render() {
   local src="$1" tmp="$2" manifest="$3"
   [[ -f "$src" ]] || return 0
@@ -1096,6 +1105,9 @@ def parse(path):
 old = parse(sys.argv[1])
 new = parse(sys.argv[2])
 owned = set(k.strip() for k in (sys.argv[3] if len(sys.argv) > 3 else "").split("\n") if k.strip())
+# Owned by the Single sign-on panel / lib/identity.sh, never by a template.
+owned |= {"VIBE_AUTH_MODE", "VIBE_OIDC_ISSUER", "VIBE_OIDC_INTERNAL_BASE", "VIBE_OIDC_CLIENT_ID",
+          "VIBE_OIDC_CLIENT_SECRET", "VIBE_OIDC_PUBLIC_URL", "VIBE_OIDC_IDP_NAME"}
 merged_lines = []
 for line in open(sys.argv[2]).read().splitlines():
     s = line.strip()

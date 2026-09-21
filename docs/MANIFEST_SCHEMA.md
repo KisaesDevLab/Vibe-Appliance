@@ -470,7 +470,11 @@ enable.
   "edgeGate":         false,
   "internalUrl":      "http://vibe-tb-server:3001",
   "breakglassService": "vibe-tb-server",
-  "breakglassCommand": ["npx", "vibe-auth", "breakglass", "ensure", "--json"]
+  "breakglassCommand": ["npx", "vibe-auth", "breakglass", "ensure", "--json"],
+  "breakglassIdentifier":    "vibe-breakglass@vibe-1099.local",   // optional
+  "breakglassStatusCommand": ["node", "dist/auth/breakglass-status.js"], // optional
+  "recreate":                ["vibe-tb-server"],                  // optional
+  "minBroker":               "1.0.4"                              // optional
 }
 ```
 
@@ -482,9 +486,58 @@ with the broker, writes the returned `VIBE_OIDC_*` block into
 `VIBE_BREAKGLASS_PASSWORD_<SLUG>` in `vibe-auth.env` and printed to
 CREDENTIALS.txt). `VIBE_AUTH_MODE` is **never** written by registration —
 the firm flips `local → both → oidc_only` from the Identity panel
-(`identity.sh mode`), which refuses `oidc_only` until a break-glass
-password exists. `edgeGate` adds Caddy `forward_auth` in front of the whole
-app (D10, off by default); `publicPaths` bypass it.
+(`identity.sh mode`). `edgeGate` adds Caddy `forward_auth` in front of the
+whole app (D10, off by default); `publicPaths` bypass it.
+
+**The appliance manages sign-in; it does not trust strings in env files.**
+
+- **Break-glass is verified, not assumed.** A stored password proves
+  nothing: the account lives in the product's database and the two drift
+  apart after a database restore, a rollback, or an admin disabling the
+  account in the product. `identity.sh breakglass-status <slug>` asks the
+  product (`breakglassCommand` with `ensure` swapped for `status`, plus
+  `breakglassStatusCommand` when the product has rules of its own, such as
+  Vibe 1040's mandatory second factor) and pipes the stored password to
+  `… verify` on stdin (package ≥ 1.0.6) to confirm it still signs in. The
+  panel's pill, and the `oidc_only` switch, use that answer. A product on an
+  older package still reports exists/active; `passwordChecked` is then false.
+- **`breakglassIdentifier`** is what the operator types at `/login/local`.
+  Default `vibe-breakglass`. A product that validates the login field as an
+  email names its full address (a dotted domain, never `@localhost`). It is
+  printed in the break-glass banner, in CREDENTIALS.txt and on the panel.
+- **`recreate`** lists the compose services that read the identity settings,
+  normally just the tier serving `/auth/*`. Register, rotate, mode, disable
+  and rebase recreate only those. Without it, every overlay service except
+  one-shots (`restart: "no"`) is recreated: a secret rotation must not re-run
+  a migration container or wipe a volume an init one-shot repopulates.
+- **`minBroker`** is the lowest vibe-auth version the product can register
+  against (the appliance-wide floor is 1.0.2). Use 1.0.4 for any product
+  that requires MFA at the identity provider.
+- **Declaring `sso.capable` is a statement about the release, not the running
+  image.** First registration therefore probes `GET /auth/status` on the api
+  tier and refuses, before writing anything, when the image has no Vibe Auth
+  support yet.
+- **Who may sign in.** `identity.sh access <slug> [open|restricted]
+  [everyone|none]` (broker ≥ 1.0.5) restricts single sign-on for a product
+  to the people ticked in Vibe Auth → Users plus `vibe-admin`. Enforced by
+  the identity provider: no env change, no recreate. In `both` mode a local
+  product password still works; `oidc_only` makes the restriction complete.
+- **The sign-in mode and the registration block belong to the panel.**
+  `VIBE_AUTH_MODE` and the broker-written `VIBE_OIDC_*` keys keep their
+  existing value across every env re-render, whatever a template says.
+- **Address changes.** In LAN mode a DHCP move leaves every registered
+  redirect URI on the old address. `identity.sh address-drift` detects it
+  (the panel shows a banner); `reapply-address` re-renders and re-registers
+  vibe-auth and each registered product at the current address.
+- **Tailscale mode** is refused for registration for now: app origins render
+  as `http://<ip>` there while browsers use the https tailnet name, so every
+  sign-in would fail on a redirect mismatch.
+- Updating the identity provider warns, by name, which `oidc_only` products
+  will be reachable only through break-glass while it restarts.
+
+An sso-capable product's env template must render `ALLOWED_ORIGIN`
+(`identity.sh` derives the registered base URL from it); the manifest tests
+check this.
 
 ---
 

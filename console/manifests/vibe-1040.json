@@ -31,9 +31,17 @@
   "requiredApps": [
     "vibe-ai-router"
   ],
+  "requires": [
+    "identity"
+  ],
   "dataOwner": "10001:10001",
   "env": {
     "required": [
+      {
+        "name": "ALLOWED_ORIGIN",
+        "from": "subdomain-url",
+        "doc": "Read by nothing inside the app. The appliance identity script derives the base URL it registers with the Vibe Auth broker from this key in the product env, and VIBE_OIDC_PUBLIC_URL (hence the OIDC redirect URI) follows from that registration. Rendered with the scheme of the install mode: https://1040.<domain> in domain mode, http://<ip>:5177 in LAN mode. Never hardcode https here - Caddy issues no certificate for a bare IP."
+      },
       {
         "name": "DATABASE_URL",
         "from": "database-url"
@@ -222,5 +230,42 @@
     "description": "Creates the first staff admin from SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD. No demo data, no pre-enrolled MFA secret."
   },
   "health": "/health",
-  "health_timeout_s": 180
+  "health_timeout_s": 180,
+  "sso": {
+    "capable": true,
+    "redirectPaths": [
+      "/auth/oidc/callback"
+    ],
+    "logoutPaths": [
+      "/auth/oidc/backchannel"
+    ],
+    "publicPaths": [
+      "/health",
+      "/api/auth/login",
+      "/api/auth/forgot",
+      "/api/auth/reset",
+      "/api/auth/mfa/*",
+      "/api/auth/totp/*",
+      "/api/auth/factor",
+      "/api/auth/logout"
+    ],
+    "edgeGate": false,
+    "internalUrl": "http://vibe-1040:8240",
+    "breakglassService": "vibe-1040",
+    "breakglassCommand": [
+      "node",
+      "node_modules/@kisaesdevlab/vibe-auth/dist/cli.js",
+      "breakglass",
+      "ensure",
+      "--json"
+    ],
+    "breakglassStatusCommand": [
+      "node",
+      "dist/auth/breakglass-status.js"
+    ],
+    "recreate": [
+      "vibe-1040"
+    ],
+    "minBroker": "1.0.4"
+  }
 }

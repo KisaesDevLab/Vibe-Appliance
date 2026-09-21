@@ -323,6 +323,10 @@ const ACTION_STUBS = `
 _id_require_va() { :; }
 _id_recreate() { :; }
 _id_breakglass() { :; }
+# The broker floor and break-glass verification have their own tests
+# (identity-management.test.js); these cases are about the env block.
+_id_require_broker() { :; }
+id_breakglass_status() { echo '{"ok":true,"problems":[]}'; }
 `;
 
 test('register re-registers an already-registered undeclared app without a fresh probe', () => {

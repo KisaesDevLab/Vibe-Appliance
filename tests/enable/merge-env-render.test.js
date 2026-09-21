@@ -104,3 +104,20 @@ test('ownership is the shared rule in lib/operator-keys.sh, for both scripts', (
   assert.match(enSrc, /operator_owned_keys "\$manifest"/);
   assert.doesNotMatch(enSrc, /def operator_keys/, 'no second definition in the renderer');
 });
+
+test('the sign-in mode and the broker registration block survive a template that names them', () => {
+  // No template names these today, which is the only reason they survived.
+  const out = merge({
+    old: 'VIBE_AUTH_MODE=oidc_only\nVIBE_OIDC_CLIENT_ID=vibe-x-abc\nVIBE_OIDC_CLIENT_SECRET=s3cret\nVIBE_OIDC_ISSUER=http://10.0.0.5/auth/application/o/x/\n',
+    fresh: '# Sign-in mode: local | both | oidc_only\nVIBE_AUTH_MODE=local\nVIBE_OIDC_CLIENT_ID=\nAPP_URL=http://new\n',
+    manifest: MANIFEST,
+  });
+  assert.match(out, /^VIBE_AUTH_MODE=oidc_only$/m, 'a re-render must never drop a product out of oidc_only');
+  assert.match(out, /^VIBE_OIDC_CLIENT_ID=vibe-x-abc$/m);
+  assert.match(out, /^VIBE_OIDC_CLIENT_SECRET=s3cret$/m, 'carried forward');
+  assert.match(out, /^VIBE_OIDC_ISSUER=/m);
+  assert.match(out, /^APP_URL=http:\/\/new$/m);
+  // A fresh install (no previous value) takes the template default.
+  const first = merge({ old: 'OTHER=1\n', fresh: 'VIBE_AUTH_MODE=local\n', manifest: MANIFEST });
+  assert.match(first, /^VIBE_AUTH_MODE=local$/m);
+});

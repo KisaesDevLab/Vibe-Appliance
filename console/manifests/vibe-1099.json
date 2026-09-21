@@ -73,7 +73,12 @@
       "breakglass",
       "ensure",
       "--json"
-    ]
+    ],
+    "breakglassIdentifier": "vibe-breakglass@vibe-1099.local",
+    "recreate": [
+      "vibe1099-app"
+    ],
+    "minBroker": "1.0.4"
   },
   "depends": [
     "postgres",

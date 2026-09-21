@@ -16,9 +16,13 @@
 #   identity.sh disable <slug>           → drop registration, clear VIBE_OIDC_*, VIBE_AUTH_MODE=local, recreate
 #   identity.sh unregister <slug>        → drop the broker registration only (product is being disabled)
 #   identity.sh mode <slug> <local|both|oidc_only>
-#   identity.sh rotate-breakglass <slug>
+#   identity.sh rotate-breakglass <slug>  → new break-glass password (reactivates a disabled account)
+#   identity.sh breakglass-status <slug>  → JSON: is the break-glass account really usable? (asks the product; verifies the stored password)
+#   identity.sh access <slug> [open|restricted] [everyone|none] → who may use single sign-on for this product
 #   identity.sh setup-token              → JSON {token,done,url}
-#   identity.sh rebase                   → re-derive issuers/redirects after a host, IP or routing change
+#   identity.sh rebase                   → re-derive issuers/redirects after a routing change
+#   identity.sh address-drift            → JSON: did the host's LAN address change under the rendered URLs?
+#   identity.sh reapply-address          → re-render + re-register vibe-auth and every registered product at the current address
 #   identity.sh register-all             → every enabled sso.capable product (run after enabling vibe-auth)
 #   identity.sh disable-all              → every registered product back to local (run before disabling vibe-auth)
 #
@@ -290,7 +294,7 @@ PYEOF
 _id_recreate() {
   local slug="$1" m services default_tag
   m="$(_id_manifest "$slug")"
-  services="$(_overlay_services "$slug")"
+  services="$(_id_recreate_services "$slug")"
   [[ -n "$services" ]] || die "could not derive services for ${slug}"
   default_tag="$(_manifest_field "$m" 'data["image"]["defaultTag"]')"
   export APP_TAG="${default_tag:-latest}"
@@ -303,36 +307,204 @@ _id_recreate() {
     || die "${slug} did not become healthy after recreate. Diagnose: docker logs ${slug}-server --tail 100 ; Fix: sudo vibe identity disable ${slug} to fall back to local sign-in"
 }
 
+# ---------------------------------------------------------------- break-glass
+#
+# The break-glass PASSWORD lives here (vibe-auth.env); the ACCOUNT and its
+# hash live in the product's database. They drift apart silently: a product
+# database restore, `update --rollback --with-db`, an admin disabling or
+# demoting the account in the product UI. A stored password string is
+# therefore not evidence of anything. Everything that used to test "is a
+# password stored?" now asks the product (breakglass-status below).
+
 _id_breakglass_key() { local u; u="$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; printf 'VIBE_BREAKGLASS_PASSWORD_%s' "$u"; }
 
-# Ensure the product's vibe-breakglass admin (D12). Password captured once → vibe-auth.env.
-_id_breakglass() {
-  local slug="$1" action="${2:-ensure}" m container cmd_json out
-  m="$(_id_manifest "$slug")"
-  container="$(_id_sso_field "$slug" 'sso.get("breakglassService") or (data["slug"] + "-server")' "${slug}-server")"
+_id_breakglass_container() {
+  _id_sso_field "$1" 'sso.get("breakglassService") or (data["slug"] + "-server")' "$1-server"
+}
+
+# What the operator types into the product's /login/local form. Products
+# that sign people in by email and validate the field as an email (Vibe
+# 1099) reject the bare username, so their manifest names the address.
+_id_breakglass_identifier() {
+  _id_sso_field "$1" 'sso.get("breakglassIdentifier") or "vibe-breakglass"' 'vibe-breakglass'
+}
+
+# argv of the break-glass CLI, one element per line, with the literal
+# `ensure` element replaced by $2 (rotate | status | verify).
+_id_breakglass_argv() {
+  local slug="$1" verb="$2" cmd_json
   cmd_json="$(_id_sso_field "$slug" 'sso.get("breakglassCommand") or ["npx","vibe-auth","breakglass","ensure","--json"]' '["npx","vibe-auth","breakglass","ensure","--json"]')"
+  python3 -c 'import json,sys; [print(sys.argv[2] if x == "ensure" else x) for x in json.loads(sys.argv[1])]' "$cmd_json" "$verb" | tr -d '\r'
+}
+
+# Ensure (or rotate) the product's vibe-breakglass admin (D12). The password
+# is captured once → vibe-auth.env. Returns 1 when the CLI could not run.
+_id_breakglass() {
+  local slug="$1" action="${2:-ensure}" container out line
+  container="$(_id_breakglass_container "$slug")"
   local -a cmd=()
-  while IFS= read -r line; do cmd+=("$line"); done < <(python3 -c 'import json,sys; [print(x) for x in json.loads(sys.argv[1])]' "$cmd_json")
-  if [[ "$action" == "rotate" ]]; then
-    local i; for i in "${!cmd[@]}"; do [[ "${cmd[$i]}" == "ensure" ]] && cmd[$i]="rotate"; done
-  fi
+  while IFS= read -r line; do [[ -n "$line" ]] && cmd+=("$line"); done < <(_id_breakglass_argv "$slug" "$action")
   log_step "provisioning break-glass admin in ${container}" slug="$slug"
-  if ! out="$(docker exec -i "$container" "${cmd[@]}" 2>>"$VIBE_LOG_FILE")"; then
-    log_warn "break-glass provisioning failed in ${container}; oidc_only will stay refused for ${slug}. Diagnose: docker exec -it ${container} ${cmd[*]}" slug="$slug"
+  if ! out="$(docker exec -i "$container" "${cmd[@]}" 2>>"$VIBE_LOG_FILE" </dev/null)"; then
+    log_warn "break-glass provisioning failed in ${container}; oidc_only will stay refused for ${slug}. Common causes: the app image predates Vibe Auth support, or the manifest's sso.breakglassService / sso.breakglassCommand do not match the image." slug="$slug"
+    log_warn "Diagnose: docker exec -it ${container} ${cmd[*]} ; Fix: update ${slug} and the appliance, then: sudo vibe identity register ${slug}" slug="$slug"
     return 1
   fi
-  local pw status
-  pw="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("password",""))' <<< "$out" 2>/dev/null || true)"
-  status="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("status",""))' <<< "$out" 2>/dev/null || true)"
+  local pw status ident
+  pw="$(python3 -c 'import json,sys
+t=sys.stdin.read()
+d=None
+for l in reversed([x for x in t.splitlines() if x.strip().startswith("{")]):
+    try:
+        d=json.loads(l); break
+    except Exception: pass
+print((d or {}).get("password",""))' <<< "$out" 2>/dev/null || true)"
+  status="$(python3 -c 'import json,sys
+t=sys.stdin.read()
+d=None
+for l in reversed([x for x in t.splitlines() if x.strip().startswith("{")]):
+    try:
+        d=json.loads(l); break
+    except Exception: pass
+print((d or {}).get("status","") if d is not None else "unparsable")' <<< "$out" 2>/dev/null || true)"
+  if [[ "$status" == "unparsable" || -z "$status" ]]; then
+    log_warn "break-glass CLI in ${container} printed no JSON; treating it as a failure. Diagnose: docker exec -it ${container} ${cmd[*]}" slug="$slug"
+    return 1
+  fi
+  ident="$(_id_breakglass_identifier "$slug")"
   if [[ -n "$pw" ]]; then
     secrets_set_kv_per_app "$VA_SLUG" "$(_id_breakglass_key "$slug")" "$pw"
     # Shown ONCE here (console captures stdout) and archived in CREDENTIALS.txt.
-    printf '\n==== BREAK-GLASS (%s) ====\nusername: vibe-breakglass\npassword: %s\nStored under %s in %s and in %s/CREDENTIALS.txt\n===========================\n\n' \
-      "$slug" "$pw" "$(_id_breakglass_key "$slug")" "$VA_ENV" "$VIBE_DIR"
+    printf '\n==== BREAK-GLASS (%s) ====\nsign in as: %s\npassword:   %s\nwhere:      the product'"'"'s /login/local page\nStored under %s in %s and in %s/CREDENTIALS.txt\n===========================\n\n' \
+      "$slug" "$ident" "$pw" "$(_id_breakglass_key "$slug")" "$VA_ENV" "$VIBE_DIR"
     declare -F secrets_write_credentials >/dev/null && secrets_write_credentials >/dev/null 2>&1 || true
   else
-    log_info "break-glass admin already present for ${slug} (${status:-exists}); password unchanged" slug="$slug"
+    log_info "break-glass admin already present for ${slug} (${status}); password unchanged" slug="$slug"
   fi
+}
+
+# breakglass-status <slug> → one JSON document on stdout. Read-only.
+#
+#   stored           a password is kept on the appliance for this product
+#   probed           the product answered `breakglass status`
+#   exists/active/admin
+#   ready            the PRODUCT says the account can be used in an outage
+#                    (incl. product rules: second factor enrolled, not locked,
+#                    no forced password change — package >= 1.0.6 or the
+#                    manifest's sso.breakglassStatusCommand)
+#   passwordChecked  the product can verify a password (package >= 1.0.6 and
+#                    UserAdapter.verifyLocalPassword)
+#   passwordMatches  the stored password still authenticates
+#   ok               stored AND ready AND not (passwordChecked and mismatch)
+#   problems[]       why not, in words an operator can act on
+#
+# The stored password travels on stdin to `docker exec -i`, never in argv.
+id_breakglass_status() {
+  local slug="$1" container pw stored=false out="" cout="" vout="" rc=0 line
+  container="$(_id_breakglass_container "$slug")"
+  pw="$(_extract_env_value "$VA_ENV" "$(_id_breakglass_key "$slug")")"
+  [[ -n "$pw" ]] && stored=true
+
+  local -a cmd=() vcmd=() ccmd=()
+  while IFS= read -r line; do [[ -n "$line" ]] && cmd+=("$line"); done < <(_id_breakglass_argv "$slug" status)
+  while IFS= read -r line; do [[ -n "$line" ]] && vcmd+=("$line"); done < <(_id_breakglass_argv "$slug" verify)
+  while IFS= read -r line; do [[ -n "$line" ]] && ccmd+=("$line"); done < <(_id_sso_field "$slug" '"\n".join(sso.get("breakglassStatusCommand") or [])' '' | tr -d '\r')
+
+  out="$(docker exec -i "$container" "${cmd[@]}" 2>>"${VIBE_LOG_FILE:-/dev/null}" </dev/null)" || rc=$?
+  if [[ ${#ccmd[@]} -gt 0 ]]; then
+    cout="$(docker exec -i "$container" "${ccmd[@]}" 2>>"${VIBE_LOG_FILE:-/dev/null}" </dev/null)" || cout=""
+  fi
+  if [[ "$stored" == true && $rc -eq 0 ]]; then
+    vout="$(printf '%s' "$pw" | docker exec -i "$container" "${vcmd[@]}" 2>>"${VIBE_LOG_FILE:-/dev/null}")" || vout=""
+  fi
+
+  python3 - "$slug" "$stored" "$rc" "$(_id_breakglass_identifier "$slug")" "$container" "$out" "$cout" "$vout" <<'PYEOF'
+import json, sys
+slug, stored, rc, ident, container, out, cout, vout = sys.argv[1:9]
+stored = stored == "true"
+
+def last_json(text):
+    for l in reversed([x for x in (text or "").splitlines() if x.strip().startswith("{")]):
+        try:
+            return json.loads(l)
+        except Exception:
+            pass
+    return None
+
+st = last_json(out) if rc == "0" else None
+custom = last_json(cout)
+ver = last_json(vout)
+problems = []
+r = {"slug": slug, "identifier": ident, "container": container, "stored": stored, "probed": st is not None,
+     "exists": None, "active": None, "admin": None, "ready": False,
+     "passwordChecked": False, "passwordMatches": None}
+
+if st is None:
+    problems.append(f"could not run the break-glass status command in {container}: the container is down, the image predates Vibe Auth support, or the manifest's sso.breakglassService/breakglassCommand do not match the image")
+else:
+    r["exists"] = bool(st.get("exists"))
+    r["active"] = bool(st.get("active"))
+    # package < 1.0.6 reports no admin/ready: the role cannot be judged here.
+    r["admin"] = st.get("admin") if "admin" in st else None
+    if not r["exists"]:
+        problems.append("the account does not exist in the product (database restored or reset?)")
+    elif not r["active"]:
+        problems.append("the account is disabled in the product")
+    if r["admin"] is False:
+        problems.append("the account is no longer an administrator in the product")
+    for p in (st.get("problems") or []):
+        if isinstance(p, str) and p not in problems and not p.startswith("account ") and not p.startswith("role is"):
+            problems.append(p)
+    for k in ("secondFactorEnrolled", "locked", "mustChangePassword"):
+        if k in st:
+            r[k] = st[k]
+
+if custom is not None:
+    # A product's own readiness script (e.g. Vibe 1040: the second factor).
+    for k in ("secondFactorEnrolled", "locked", "mustChangePassword"):
+        if k in custom:
+            r[k] = custom[k]
+    if custom.get("secondFactorEnrolled") is False and not any("second factor" in p for p in problems):
+        problems.append("a second factor is required for this account and none is enrolled: sign in once at /login/local and enrol an authenticator NOW, not during an outage")
+    if custom.get("ready") is False and not problems:
+        problems.append("the product reports the break-glass account is not ready")
+
+if not stored:
+    problems.append("no break-glass password is stored on the appliance")
+
+if ver is not None and ver.get("checked") is True:
+    r["passwordChecked"] = True
+    r["passwordMatches"] = bool(ver.get("matches"))
+    if not r["passwordMatches"]:
+        problems.append("the stored password no longer signs in (the product database was restored, or the password was changed in the product)")
+
+r["ready"] = st is not None and r["exists"] is True and r["active"] is True and r["admin"] is not False and not [p for p in problems if "stored" not in p and "no longer signs in" not in p]
+r["ok"] = bool(stored and r["ready"] and r["passwordMatches"] is not False)
+r["problems"] = problems
+if r["ok"]:
+    r["fix"] = None
+elif st is None:
+    r["fix"] = f"sudo vibe identity register {slug}"
+elif r["exists"] is False or not stored:
+    r["fix"] = f"sudo vibe identity register {slug}   (recreates the account and stores a new password)"
+elif r["passwordMatches"] is False or r["active"] is False:
+    r["fix"] = f"sudo vibe identity rotate-breakglass {slug}   (reactivates the account and sets a new password)"
+else:
+    r["fix"] = "follow the problem text; then re-check"
+print(json.dumps(r))
+PYEOF
+}
+
+# Die unless the product's break-glass account is verifiably usable.
+_id_require_breakglass_ok() {
+  local slug="$1" why="$2" js ok probs fix
+  js="$(id_breakglass_status "$slug")" || js='{}'
+  ok="$(python3 -c 'import json,sys; print("1" if json.loads(sys.argv[1] or "{}").get("ok") else "0")' "$js" 2>/dev/null || echo 0)"
+  [[ "$ok" == "1" ]] && return 0
+  probs="$(python3 -c 'import json,sys; print("; ".join(json.loads(sys.argv[1] or "{}").get("problems") or ["break-glass status unavailable"]))' "$js" 2>/dev/null || echo "break-glass status unavailable")"
+  fix="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1] or "{}").get("fix") or "")' "$js" 2>/dev/null || true)"
+  die "${why} refused for ${slug}: the break-glass account is not usable — ${probs}." \
+      "Diagnose: sudo vibe identity breakglass-status ${slug} ; Fix: ${fix:-sudo vibe identity register ${slug}} ; then retry. While the product stays in 'both' mode, local passwords keep working."
 }
 
 _id_require_va() {
@@ -366,6 +538,194 @@ PYEOF
 )
 }
 
+# ---------------------------------------------------------------- broker floor
+#
+# The appliance and the broker ship separately (`defaultTag: latest`), so a
+# box can run a broker that predates what a product needs. Known floors:
+#   1.0.2  scheme follows the appliance origin (plain http in LAN mode)
+#   1.0.4  a sign-in that ENROLS a second factor carries amr "mfa"; a product
+#          that requires MFA at the IdP (VIBE_OIDC_REQUIRE_MFA_AMR=true)
+#          refuses every user's first sign-in on an older broker
+#   1.0.5  per-product access (GET|PUT /registrations/<slug>/access)
+VA_MIN_VERSION="1.0.2"
+
+_id_va_version() {
+  local resp
+  resp="$(_id_api GET /version '' 2>/dev/null)" || return 1
+  python3 -c 'import json,sys; print(json.load(sys.stdin).get("version") or "")' <<< "$resp" 2>/dev/null | tr -d '\r'
+}
+
+# _id_version_ge <have> <want>  → exit 0 when have >= want (numeric x.y.z).
+_id_version_ge() {
+  python3 - "$1" "$2" <<'PYEOF'
+import re, sys
+def parse(v):
+    m = re.match(r"^\s*v?(\d+)\.(\d+)\.(\d+)", v or "")
+    return tuple(int(x) for x in m.groups()) if m else None
+have, want = parse(sys.argv[1]), parse(sys.argv[2])
+sys.exit(0 if have is not None and want is not None and have >= want else 1)
+PYEOF
+}
+
+# _id_require_broker <min-version> <what needs it>
+_id_require_broker() {
+  local want="$1" what="$2" have
+  have="$(_id_va_version)" || have=""
+  [[ -n "$have" ]] || die "${what}: could not read the vibe-auth version (GET /version). Diagnose: docker logs vibe-auth --tail 50 ; Fix: wait for vibe-auth to become healthy, then retry."
+  _id_version_ge "$have" "$want" && return 0
+  die "${what} needs vibe-auth ${want} or newer; this appliance runs ${have}." \
+      "Fix: update Vibe Auth from the console's Updates panel (or: sudo vibe update vibe-auth), then retry. Nothing was changed."
+}
+
+# The broker version a product needs: the manifest's sso.minBroker, never
+# below the appliance-wide floor.
+_id_product_min_broker() {
+  local want; want="$(_id_sso_field "$1" 'sso.get("minBroker") or ""' '')"
+  if [[ -n "$want" ]] && _id_version_ge "$want" "$VA_MIN_VERSION"; then printf '%s' "$want"; else printf '%s' "$VA_MIN_VERSION"; fi
+}
+
+# ---------------------------------------------------------------- what to recreate
+#
+# Identity settings are env vars read by ONE tier: the one that serves
+# /auth/*. Recreating the whole overlay for a secret rotation or a mode
+# change re-ran migration one-shots, bounced queue workers mid-job and, in
+# one product, wiped a static volume the web tier was serving. So:
+#   1. sso.recreate in the manifest, when present, is the exact list;
+#   2. otherwise every overlay service EXCEPT one-shots (restart: "no").
+_id_recreate_services() {
+  local slug="$1" all declared
+  all="$(_overlay_services "$slug")"
+  [[ -n "$all" ]] || return 0
+  declared="$(_id_sso_field "$slug" '" ".join(sso.get("recreate") or [])' '')"
+  if [[ -n "$declared" ]]; then
+    # Only names that really are services of this overlay.
+    local s out=""
+    for s in $declared; do
+      grep -qxF -- "$s" <<< "$(tr ' ' '\n' <<< "$all")" && out+="${out:+ }$s"
+    done
+    [[ -n "$out" ]] && { printf '%s' "$out"; return 0; }
+    log_warn "sso.recreate for ${slug} names no service of its overlay (${declared}); recreating the default set" slug="$slug"
+  fi
+  local oneshots
+  oneshots="$( ( cd "$APPLIANCE_DIR" && compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" config --format json ) 2>/dev/null \
+    | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for name, svc in (d.get("services") or {}).items():
+    if str(svc.get("restart") or "") == "no":
+        print(name)' 2>/dev/null | tr -d '\r' || true)"
+  local s out=""
+  for s in $all; do
+    grep -qxF -- "$s" <<< "$oneshots" && continue
+    out+="${out:+ }$s"
+  done
+  printf '%s' "${out:-$all}"
+}
+
+# ---------------------------------------------------------------- per-product access
+#
+# Who may sign in to a product through single sign-on (broker >= 1.0.5).
+# A product is open to every firm user until it is restricted; then only
+# the people ticked in Vibe Auth → Users, and vibe-admin members, get in.
+# Enforcement is authentik's: nothing is written to the product's env and
+# nothing is recreated. In 'both' mode a local product password still works.
+#
+#   identity.sh access <slug>                          → JSON {slug,restricted,...}
+#   identity.sh access <slug> restricted [everyone|none]
+#   identity.sh access <slug> open
+id_access() {
+  local slug="$1" want="${2:-}" seed="${3:-none}" resp body
+  _id_require_target "$slug"
+  _id_require_va
+  _id_require_broker "1.0.5" "per-product access"
+  _id_registered "$slug" || die "${slug} is not registered with vibe-auth, so there is nothing to restrict. Fix: sudo vibe identity register ${slug}"
+  if [[ -z "$want" ]]; then
+    resp="$(_id_api GET "/registrations/${slug}/access" '')" \
+      || die "could not read access for ${slug}: vibe-auth has no registration for it. Fix: sudo vibe identity register ${slug}"
+    python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"slug": sys.argv[1], "restricted": bool(d.get("restricted")), "updatedAt": d.get("updatedAt"), "updatedBy": d.get("updatedBy")}))' "$slug" <<< "$resp"
+    return 0
+  fi
+  case "$want" in open|restricted) ;; *) die "usage: identity.sh access <slug> [open|restricted] [everyone|none]" ;; esac
+  case "$seed" in everyone|none) ;; *) die "seed must be 'everyone' (start with every active user ticked) or 'none' (administrators only)" ;; esac
+  body="$(python3 -c 'import json,sys; print(json.dumps({"restricted": sys.argv[1] == "restricted", "seed": sys.argv[2]}))' "$want" "$seed")"
+  resp="$(_id_api PUT "/registrations/${slug}/access" "$body")" || die "could not change access for ${slug}. Diagnose: docker logs vibe-auth --tail 50"
+  if [[ "$want" == "restricted" ]]; then
+    log_ok "${slug}: single sign-on restricted to ticked users and vibe-admin members$( [[ "$seed" == "everyone" ]] && printf ' (started with every active user ticked)')"
+    log_info "Tick or untick people in Vibe Auth → Users. While ${slug} is in 'both' mode a local product password still signs in; switch it to oidc_only to make the restriction complete." slug="$slug"
+  else
+    log_ok "${slug}: single sign-on open to every firm user again (the ticked list is kept)"
+  fi
+  python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"slug": sys.argv[1], "restricted": bool(d.get("restricted")), "seeded": d.get("seeded", 0)}))' "$slug" <<< "$resp"
+}
+
+# ---------------------------------------------------------------- address drift
+#
+# In LAN mode every URL the appliance renders carries the host's IPv4
+# address: each app's ALLOWED_ORIGIN, vibe-auth's own origin, and — built
+# from those — every redirect URI registered with the identity provider. A
+# DHCP move updates state.json (console/server.js refreshHostIp) and
+# nothing else. Local sign-in keeps working at the new address; EVERY
+# single sign-on product fails at once with a redirect mismatch, and
+# products in oidc_only are down to break-glass. `rebase` alone cannot fix
+# it: it rebuilds URLs from env files that still hold the old address.
+#
+#   identity.sh address-drift    → JSON {drift, rendered, current, affected[]}
+#   identity.sh reapply-address  → re-render + re-register vibe-auth and every
+#                                  registered product at the current address
+
+_id_origin_host() { local o="${1#*://}"; o="${o%%/*}"; o="${o%%:*}"; printf '%s' "$o"; }
+
+id_address_drift() {
+  local current rendered slug rows=""
+  current="$(_host_ip_effective 2>/dev/null || true)"
+  rendered="$(_id_origin_host "$(_extract_env_value "$VA_ENV" VIBE_AUTH_APPLIANCE_ORIGIN)")"
+  for slug in $(_id_enabled_sso_slugs); do
+    _id_registered "$slug" || continue
+    rows+="${slug}"$'\t'"$(_id_origin_host "$(_extract_env_value "${VIBE_ENV_DIR}/${slug}.env" ALLOWED_ORIGIN)")"$'\n'
+  done
+  python3 - "$current" "$rendered" "$rows" <<'PYEOF'
+import json, re, sys
+current, rendered, rows = sys.argv[1:4]
+ipv4 = lambda h: bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}$", h or ""))
+affected = []
+for line in rows.splitlines():
+    if "\t" not in line: continue
+    slug, host = line.split("\t", 1)
+    if ipv4(host) and ipv4(current) and host != current:
+        affected.append({"slug": slug, "rendered": host})
+# Only an IPv4 literal can drift this way: a domain or a tailnet name does
+# not change when the address does.
+va = ipv4(rendered) and ipv4(current) and rendered != current
+print(json.dumps({"drift": bool(va or affected), "current": current or None,
+                  "rendered": rendered or None, "vibeAuth": va, "affected": affected}))
+PYEOF
+}
+
+id_reapply_address() {
+  local js drift slug
+  js="$(id_address_drift)"
+  drift="$(python3 -c 'import json,sys; print("1" if json.loads(sys.argv[1]).get("drift") else "0")' "$js")"
+  if [[ "$drift" != "1" ]]; then
+    log_ok "address unchanged: vibe-auth and every registered product already use $(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("current") or "the current address")' "$js")"
+    return 0
+  fi
+  log_warn "this appliance's address changed: $(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(str(d.get("rendered")) + " -> " + str(d.get("current")))' "$js"). Re-rendering and re-registering; each app restarts once."
+  # The identity provider first: products register against ITS new origin.
+  # (Its enable hook re-registers every product; each product's own enable
+  # below then registers again with the product's new address.)
+  ( bash "${APPLIANCE_DIR}/lib/enable-app.sh" "$VA_SLUG" ) 2>&1 | tee -a "${VIBE_LOG_FILE:-/dev/null}" >&2 \
+    || die "could not re-render ${VA_SLUG} at the new address. Diagnose: tail -50 ${VIBE_LOG_FILE} ; Fix: sudo vibe enable ${VA_SLUG}, then: sudo vibe identity reapply-address"
+  local rc=0
+  for slug in $(python3 -c 'import json,sys; [print(a["slug"]) for a in json.loads(sys.argv[1]).get("affected") or []]' "$js" | tr -d '\r'); do
+    ( bash "${APPLIANCE_DIR}/lib/enable-app.sh" "$slug" ) 2>&1 | tee -a "${VIBE_LOG_FILE:-/dev/null}" >&2 \
+      || { log_warn "could not re-render ${slug}; it still points at the old address. Fix: sudo vibe enable ${slug}" slug="$slug"; rc=1; }
+  done
+  [[ $rc -eq 0 ]] && log_ok "address re-applied; single sign-on now uses $(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("current"))' "$js")"
+  return $rc
+}
+
 # ---------------------------------------------------------------- actions
 
 id_status() {
@@ -380,14 +740,16 @@ id_status() {
     issuer="$(_extract_env_value "$env" VIBE_OIDC_ISSUER)"
     local m; m="$(_extract_env_value "$env" VIBE_AUTH_MODE)"; [[ -n "$m" ]] && mode="$m"
   fi
+  # "breakglass" = a password is STORED here. Whether the account is usable is
+  # a separate, slower question (docker exec): `breakglass-status <slug>`.
   [[ -f "$VA_ENV" && -n "$(_extract_env_value "$VA_ENV" "$(_id_breakglass_key "$slug")")" ]] && bg=true
   # Registered counts: an app registered via runtime detection stays
   # capable (and listed) while its api is down.
   [[ "$declared" == true || "$detected" == true || "$registered" == true ]] && capable=true
   _id_va_enabled && va_enabled=true
   [[ "$va_enabled" == true ]] && _id_va_healthy && va_healthy=true
-  python3 -c 'import json,sys; a=sys.argv[1:]; print(json.dumps({"slug":a[0],"ssoCapable":a[1]=="true","registered":a[2]=="true","mode":a[3],"breakglass":a[4]=="true","issuer":a[5] or None,"vibeAuthEnabled":a[6]=="true","vibeAuthHealthy":a[7]=="true","enabled":a[8]=="true","declared":a[9]=="true","detected":a[10]=="true"}))' \
-    "$slug" "$capable" "$registered" "$mode" "$bg" "$issuer" "$va_enabled" "$va_healthy" "$enabled" "$declared" "$detected"
+  python3 -c 'import json,sys; a=sys.argv[1:]; print(json.dumps({"slug":a[0],"ssoCapable":a[1]=="true","registered":a[2]=="true","mode":a[3],"breakglass":a[4]=="true","issuer":a[5] or None,"vibeAuthEnabled":a[6]=="true","vibeAuthHealthy":a[7]=="true","enabled":a[8]=="true","declared":a[9]=="true","detected":a[10]=="true","breakglassIdentifier":a[11]}))' \
+    "$slug" "$capable" "$registered" "$mode" "$bg" "$issuer" "$va_enabled" "$va_healthy" "$enabled" "$declared" "$detected" "$(_id_breakglass_identifier "$slug")"
 }
 
 id_register() {
@@ -404,6 +766,30 @@ id_register() {
     fi
     log_warn "${slug} supports SSO (it answers /auth/status, or was registered before) but its vendored manifest predates SSO: registering with the package defaults (redirect /auth/oidc/callback, back-channel /auth/oidc/backchannel, no public paths). Update the appliance for the app's full sso block and break-glass command." slug="$slug"
   fi
+  # A manifest that DECLARES sso says what the release should contain, not what
+  # the running image does contain (every manifest pins `latest`; the box may
+  # not have pulled yet). Registering an image without Vibe Auth support
+  # "succeeds", writes env the app ignores and shows a Registered badge on an
+  # app with no single sign-on. First registration therefore asks the app.
+  if _id_sso_declared "$slug" && ! _id_registered "$slug"; then
+    local _try _seen=false
+    for _try in 1 2 3 4 5; do
+      _id_sso_detected "$slug" && { _seen=true; break; }
+      sleep "${VIBE_IDENTITY_PROBE_SLEEP:-3}"
+    done
+    [[ "$_seen" == true ]] || die "${slug} declares single sign-on in its manifest but its running image does not answer /auth/status, so it has no Vibe Auth support yet. Nothing was changed." \
+      "Diagnose: docker exec vibe-console curl -s -o /dev/null -w '%{http_code}\n' http://$(_id_auth_upstream "$slug")/auth/status ; Fix: update ${slug} from the console's Updates panel (or: sudo vibe update ${slug}), then Register it again."
+  fi
+  _id_require_broker "$(_id_product_min_broker "$slug")" "registering ${slug}"
+  # Tailscale mode: the browser is on https://<host>.<tailnet>.ts.net (tailscale
+  # serve), but every origin the appliance renders there is http://<default-route
+  # ip>, and Caddy binds 127.0.0.1. A registration would record redirect URIs on
+  # a host the browser never uses, so every sign-in would fail on redirect
+  # mismatch. Refuse rather than configure something that cannot work.
+  local _va_mode; _va_mode="$(_extract_env_value "$VA_ENV" VIBE_AUTH_APPLIANCE_MODE)"
+  if [[ "$_va_mode" == tailscale* && "${VIBE_IDENTITY_ALLOW_TAILSCALE:-0}" != "1" ]]; then
+    die "single sign-on is not supported in Tailscale mode yet: app addresses are rendered as http://<ip> while browsers reach the appliance at its https tailnet name, so sign-in would fail on a redirect mismatch. Nothing was changed; ${slug} keeps local sign-in."         "Fix: use LAN or domain mode for single sign-on. To try it anyway: VIBE_IDENTITY_ALLOW_TAILSCALE=1 sudo -E vibe identity register ${slug}"
+  fi
   local base_url body resp
   base_url="$(_id_product_base_url "$slug")"
   body="$(_id_registration_body "$slug" "$base_url")"
@@ -412,8 +798,24 @@ id_register() {
   _id_write_env_block "$slug" "$resp"
   # D11: VIBE_AUTH_MODE is NOT written here.
   _id_recreate "$slug"
-  _id_breakglass "$slug" ensure || true
-  log_ok "${slug} registered with vibe-auth (mode unchanged: $(_extract_env_value "${VIBE_ENV_DIR}/${slug}.env" VIBE_AUTH_MODE || echo local))"
+  # Registration stands even when break-glass does not: single sign-on works
+  # without it. But say so plainly — a swallowed failure used to end in the
+  # same green line as a success.
+  local _bg_js="" _bg_ok="0" _bg_probs=""
+  if _id_breakglass "$slug" ensure; then
+    _bg_js="$(id_breakglass_status "$slug" 2>/dev/null)" || _bg_js=""
+    _bg_ok="$(python3 -c 'import json,sys; print("1" if json.loads(sys.argv[1] or "{}").get("ok") else "0")' "$_bg_js" 2>/dev/null || echo 0)"
+    _bg_probs="$(python3 -c 'import json,sys; print("; ".join(json.loads(sys.argv[1] or "{}").get("problems") or []))' "$_bg_js" 2>/dev/null || true)"
+  else
+    _bg_probs="the break-glass command could not run in the product container"
+  fi
+  local _mode; _mode="$(_extract_env_value "${VIBE_ENV_DIR}/${slug}.env" VIBE_AUTH_MODE)"; _mode="${_mode:-local}"
+  if [[ "$_bg_ok" == "1" ]]; then
+    log_ok "${slug} registered with vibe-auth (mode unchanged: ${_mode}); break-glass verified"
+  else
+    log_warn "${slug} registered with vibe-auth (mode unchanged: ${_mode}), but its BREAK-GLASS ACCOUNT IS NOT READY: ${_bg_probs:-unknown}. Single sign-on works; oidc_only stays refused until this is fixed." slug="$slug"
+    log_warn "Diagnose: sudo vibe identity breakglass-status ${slug}" slug="$slug"
+  fi
 }
 
 id_rotate() {
@@ -460,8 +862,10 @@ id_mode() {
              "Diagnose: sudo vibe identity status ${slug} ; docker logs vibe-auth --tail 50. Fix: sudo vibe identity register ${slug} (or the panel's Fix registration), then set the mode again."
   fi
   if [[ "$mode" == "oidc_only" ]]; then
-    [[ -n "$(_extract_env_value "$VA_ENV" "$(_id_breakglass_key "$slug")")" ]] \
-      || die "oidc_only refused for ${slug}: no break-glass password stored. Fix: sudo vibe identity register ${slug} (provisions vibe-breakglass), then retry."
+    # A stored password string proves nothing: the account may be gone,
+  # disabled, demoted, missing a required second factor, or hold another
+  # password after a database restore. Ask the product.
+    _id_require_breakglass_ok "$slug" "oidc_only"
     log_warn "switching ${slug} to oidc_only: local passwords stop working for everyone except vibe-breakglass" slug="$slug"
   fi
   secrets_set_kv_per_app "$slug" VIBE_AUTH_MODE "$mode"
@@ -545,11 +949,15 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     disable)           [[ -n "$slug" ]] || die "slug required"; id_disable "$slug" ;;
     unregister)        [[ -n "$slug" ]] || die "slug required"; id_unregister "$slug" ;;
     mode)              [[ -n "$slug" && -n "${3:-}" ]] || die "usage: identity.sh mode <slug> <local|both|oidc_only>"; id_mode "$slug" "$3" ;;
-    rotate-breakglass) [[ -n "$slug" ]] || die "slug required"; _id_require_target "$slug"; _id_breakglass "$slug" rotate ;;
+    rotate-breakglass) [[ -n "$slug" ]] || die "slug required"; _id_require_target "$slug"; _id_breakglass "$slug" rotate || die "break-glass rotation failed for ${slug}; the stored password was NOT changed. Diagnose: sudo vibe identity breakglass-status ${slug}" ;;
+    breakglass-status) [[ -n "$slug" ]] || die "slug required"; _id_require_target "$slug"; id_breakglass_status "$slug" ;;
+    access)            [[ -n "$slug" ]] || die "slug required"; id_access "$slug" "${3:-}" "${4:-none}" ;;
     setup-token)       id_setup_token ;;
     rebase)            id_rebase ;;
+    address-drift)     id_address_drift ;;
+    reapply-address)   id_reapply_address ;;
     register-all)      id_register_all ;;
     disable-all)       id_disable_all ;;
-    *) die "usage: identity.sh <status|register|rotate|disable|unregister|mode|rotate-breakglass|setup-token|rebase|register-all|disable-all> [slug] [mode]" ;;
+    *) die "usage: identity.sh <status|register|rotate|disable|unregister|mode|rotate-breakglass|breakglass-status|access|setup-token|rebase|address-drift|reapply-address|register-all|disable-all> [slug] [arg]" ;;
   esac
 fi

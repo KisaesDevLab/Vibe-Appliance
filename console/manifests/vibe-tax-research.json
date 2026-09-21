@@ -18,11 +18,26 @@
   "routing": {
     "default_upstream": "vibe-tax-web:80",
     "matchers": [
-      { "name": "api", "path": "/api/*", "upstream": "vibe-tax-api:4000", "streaming": true }
+      { "name": "api", "path": "/api/*", "upstream": "vibe-tax-api:4000", "streaming": true },
+      { "name": "auth", "path": "/auth/*", "upstream": "vibe-tax-api:4000" }
     ]
   },
 
   "depends": ["postgres", "redis"],
+  "requires": ["identity"],
+
+  "sso": {
+    "capable":       true,
+    "redirectPaths": ["/auth/oidc/callback"],
+    "logoutPaths":   ["/auth/oidc/backchannel"],
+    "publicPaths":   ["/api/health", "/api/health/deep", "/api/ping", "/api/setup/*", "/api/webhooks/*", "/api/dl/*", "/api/auth/login", "/api/auth/refresh", "/api/auth/sso/exchange", "/api/auth/forgot-password", "/api/auth/reset-password", "/login/local"],
+    "edgeGate":      false,
+    "internalUrl":   "http://vibe-tax-api:4000",
+    "breakglassService": "vibe-tax-api",
+    "breakglassCommand": ["node", "apps/api/node_modules/@kisaesdevlab/vibe-auth/dist/cli.js", "breakglass", "ensure", "--json"],
+    "breakglassIdentifier": "vibe-breakglass@vibe-tax.local",
+    "recreate":      ["vibe-tax-api"]
+  },
 
   "env": {
     "required": [
