@@ -40,6 +40,11 @@
         "name": "readyz",
         "path": "/readyz",
         "upstream": "vibe-recap-api:3000"
+      },
+      {
+        "name": "auth",
+        "path": "/auth/*",
+        "upstream": "vibe-recap-api:3000"
       }
     ]
   },
@@ -50,6 +55,42 @@
   "requiredApps": [
     "vibe-ai-router"
   ],
+  "requires": [
+    "identity"
+  ],
+  "sso": {
+    "capable": true,
+    "redirectPaths": [
+      "/auth/oidc/callback"
+    ],
+    "logoutPaths": [
+      "/auth/oidc/backchannel"
+    ],
+    "publicPaths": [
+      "/healthz",
+      "/readyz",
+      "/api/v1/health",
+      "/api/setup/*",
+      "/api/auth/login",
+      "/api/auth/password-reset/status",
+      "/api/auth/forgot-password",
+      "/api/auth/reset-password/*",
+      "/api/invite/*"
+    ],
+    "edgeGate": false,
+    "internalUrl": "http://vibe-recap-api:3000",
+    "breakglassService": "vibe-recap-api",
+    "breakglassCommand": [
+      "docker-entrypoint.sh",
+      "breakglass",
+      "ensure",
+      "--json"
+    ],
+    "breakglassIdentifier": "vibe-breakglass@vibe-recap.local",
+    "recreate": [
+      "vibe-recap-api"
+    ]
+  },
   "dataOwner": "1000:1000",
   "resources": {
     "cores": 4,
