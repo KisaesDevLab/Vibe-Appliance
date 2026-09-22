@@ -4,7 +4,7 @@
   "displayName": "Vibe 1040",
   "description": "Reads a client's 1040 source documents and emits a worksheet of totals keyed to Form 1040 and schedule line numbers.",
   "logo": "vibe-1040.svg",
-  "_doc": "In-tree manifest for KisaesDevLab/Vibe-1040 (github.com/KisaesDevLab/Vibe-1040), current release v0.0.1. THREE containers plus a migration one-shot, from two GHCR images: `vibe-1040` runs the Fastify api (8240, and the React review UI it serves at its own root), the BullMQ worker, and the migration one-shot; `vibe-1040-sidecar` is the Python PyMuPDF rasterization worker, which talks to nothing over HTTP - it takes work off the shared Redis and shares the encrypted blob store on disk. THE ROUTER IS A HARD DEPENDENCY: the app's env schema requires a non-empty VIBE_AI_TOKEN, so with vibe-ai-router down even the migration step throws at config-parse time. That is what requiredApps encodes. See also the ROUTER_REQUIRE_US_REGION note in env-templates/per-app/vibe-1040.env.tmpl - the appliance ships it OFF because the router has no region concept yet, and the app fails closed when it is on. MIGRATIONS: This app has no MIGRATIONS_AUTO knob and its server never migrates on boot, so the appliance owns migrations outright - update.sh runs this command with its pre-update dump and health-check rollback behind it. Enable-time migration comes from the overlay's vibe-1040-migrate one-shot instead, which every other service in the set waits on via service_completed_successfully. FIRST LOGIN: Verified against src/db/seed.ts in the upstream repo: it reads SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD from the environment, is a no-op when the user already exists, and deliberately does NOT pre-enrol MFA.",
+  "_doc": "In-tree manifest for KisaesDevLab/Vibe-1040 (github.com/KisaesDevLab/Vibe-1040), current release v0.0.1. THREE containers plus a migration one-shot, from two GHCR images: `vibe-1040` runs the Fastify api (8240, and the React review UI it serves at its own root), the BullMQ worker, and the migration one-shot; `vibe-1040-sidecar` is the Python PyMuPDF rasterization worker, which talks to nothing over HTTP - it takes work off the shared Redis and shares the encrypted blob store on disk. THE ROUTER IS A HARD DEPENDENCY: the app's env schema requires a non-empty VIBE_AI_TOKEN, so with vibe-ai-router down even the migration step throws at config-parse time. That is what requiredApps encodes. See also the ROUTER_REQUIRE_US_REGION note in env-templates/per-app/vibe-1040.env.tmpl - the appliance ships it OFF because the router has no region concept yet, and the app fails closed when it is on. MIGRATIONS: This app has no MIGRATIONS_AUTO knob and its server never migrates on boot, so the appliance owns migrations outright - update.sh runs this command with its pre-update dump and health-check rollback behind it. Enable-time migration comes from the overlay's vibe-1040-migrate one-shot instead, which every other service in the set waits on via service_completed_successfully. FIRST LOGIN: Verified against src/db/seed.ts in the upstream repo: it reads SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD from the environment, is a no-op when the user already exists, and deliberately does NOT pre-enrol MFA. SSO: mirrors Vibe-1040/.appliance/manifest.json (requires identity, sso block, ALLOWED_ORIGIN). 1040 is one service, so /auth/* needs no routing matcher — sso.internalUrl names the same container the default upstream does.",
   "image": {
     "server": "ghcr.io/kisaesdevlab/vibe-1040",
     "defaultTag": "latest",
@@ -24,9 +24,45 @@
   "routing": {
     "default_upstream": "vibe-1040:8240"
   },
+  "sso": {
+    "capable": true,
+    "redirectPaths": [
+      "/auth/oidc/callback"
+    ],
+    "logoutPaths": [
+      "/auth/oidc/backchannel"
+    ],
+    "publicPaths": [
+      "/health",
+      "/api/auth/login",
+      "/api/auth/forgot",
+      "/api/auth/reset",
+      "/api/auth/mfa/*",
+      "/api/auth/totp/*",
+      "/api/auth/factor",
+      "/api/auth/logout"
+    ],
+    "edgeGate": false,
+    "internalUrl": "http://vibe-1040:8240",
+    "breakglassService": "vibe-1040",
+    "breakglassCommand": [
+      "node",
+      "node_modules/@kisaesdevlab/vibe-auth/dist/cli.js",
+      "breakglass",
+      "ensure",
+      "--json"
+    ],
+    "breakglassStatusCommand": [
+      "node",
+      "dist/auth/breakglass-status.js"
+    ]
+  },
   "depends": [
     "postgres",
     "redis"
+  ],
+  "requires": [
+    "identity"
   ],
   "requiredApps": [
     "vibe-ai-router"
@@ -90,6 +126,11 @@
         "name": "STORAGE_LOCAL_PATH",
         "from": "static:/data/blobs",
         "doc": "Blob root inside every container of this app. Bind-mounted from /opt/vibe/data/apps/vibe-1040/blobs, shared by the api, the worker, and the Python sidecar - which is why this app declares dataOwner."
+      },
+      {
+        "name": "ALLOWED_ORIGIN",
+        "from": "subdomain-url",
+        "doc": "Read by nothing inside the app. The appliance identity script derives the base URL it registers with the Vibe Auth broker from this key in the product env, and VIBE_OIDC_PUBLIC_URL (hence the OIDC redirect URI) follows from that registration. Rendered with the scheme of the install mode: https://1040.<domain> in domain mode, http://<ip>:5177 in LAN mode. Never hardcode https here - Caddy issues no certificate for a bare IP."
       }
     ],
     "optional": [
