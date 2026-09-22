@@ -31,6 +31,9 @@ COMMANDS
                                access <slug> [open|restricted] [everyone|none],
                                setup-token, rebase, address-drift,
                                reapply-address, register-all, disable-all.
+  prune-orphans [--dry-run]    Remove containers no enabled app defines any
+                               more (leftovers from a disabled app or a
+                               renamed service). --dry-run only lists them.
   update  --check [slug]       Check for available image updates.
   update  <slug>               Update an app (pre-update DB backup +
                                rollback on failure).
@@ -80,6 +83,12 @@ case "$cmd" in
     #   vibe identity setup-token | rebase | address-drift | reapply-address
     #   vibe identity register-all | disable-all
     exec /bin/bash "${APPLIANCE_DIR}/lib/identity.sh" "$@"
+    ;;
+  prune-orphans)
+    # Containers in the `vibe` compose project that core + every ENABLED app
+    # no longer define. NOT `docker compose up --remove-orphans`: all apps
+    # share one project, so that flag on a per-app call deletes other apps.
+    exec /bin/bash "${APPLIANCE_DIR}/lib/prune-orphans.sh" "$@"
     ;;
   update)
     exec /bin/bash "${APPLIANCE_DIR}/update.sh" "$@"

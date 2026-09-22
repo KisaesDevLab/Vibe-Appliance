@@ -233,6 +233,8 @@ test('register tells the truth about break-glass: verified, or NOT READY with th
 _id_require_va() { :; }
 _id_recreate() { :; }
 probe_health_200() { return 0; }
+# Detection reads the body too: a bare 200 is what an SPA answers for any path.
+_id_probe_body() { printf '%s' '{"mode":"local","oidc":{"enabled":false}}'; }
 _id_api() { case "$2" in /version) echo '{"version":"1.0.6"}';; *) echo '{"env":{"VIBE_OIDC_CLIENT_ID":"c1"}}';; esac; }
 `;
   const bad = run(stubs + `
@@ -367,6 +369,8 @@ test('register refuses Tailscale mode, where single sign-on cannot work, unless 
   const stubs = `
 _id_require_va() { :; }
 probe_health_200() { return 0; }
+# Detection reads the body too: a bare 200 is what an SPA answers for any path.
+_id_probe_body() { printf '%s' '{"mode":"local","oidc":{"enabled":false}}'; }
 _id_api() { echo API >> "$VIBE_ENV_DIR/api"; echo '{"version":"1.0.6","env":{}}'; }
 printf 'VIBE_AUTH_APPLIANCE_ORIGIN=http://100.64.0.1\nVIBE_AUTH_APPLIANCE_MODE=tailscale:single-host\nVIBE_AUTH_BASE_PATH=/vibe-auth/\nVIBE_AUTH_CONSOLE_TOKEN=tok\n' > "$VIBE_ENV_DIR/vibe-auth.env"
 `;

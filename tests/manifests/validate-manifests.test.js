@@ -295,10 +295,11 @@ test('health_extra entries are well-formed and name a service the overlay declar
 });
 
 test('an sso-capable manifest carries everything lib/identity.sh needs', () => {
-  // lib/identity.sh registers the product from this block: the /auth/*
-  // matcher is what lets the broker's back-channel logout and the browser's
-  // OIDC callback reach the API tier (render-caddyfile.sh builds routes ONLY
-  // from routing.matchers — nothing is derived from sso.redirectPaths), and
+  // lib/identity.sh registers the product from this block: for a product whose
+  // SPA is a separate container, the /auth/* matcher is what lets the broker's
+  // back-channel logout and the browser's OIDC callback reach the API tier
+  // (render-caddyfile.sh builds routes ONLY from routing.matchers — nothing is
+  // derived from sso.redirectPaths), and
   // breakglassCommand is docker-exec'd in breakglassService with the image's
   // own WORKDIR and no shell, so it must be an argv array whose "ensure"
   // element identity.sh can swap for "rotate". A product that declares
@@ -310,18 +311,25 @@ test('an sso-capable manifest carries everything lib/identity.sh needs', () => {
     if (!sso || sso.capable !== true) continue;
     assert.ok(Array.isArray(data.requires) && data.requires.includes('identity'),
       `${file}: sso.capable requires "identity" in requires[]`);
-    const matchers = (data.routing && data.routing.matchers) || [];
-    // A single-tier product (its api IS the default upstream, no matchers at
-    // all) needs no /auth/* route: every path already reaches it. Anything
-    // with a separate web tier must route /auth/* to the api explicitly.
-    const singleTier = matchers.length === 0;
-    const auth = matchers.find((m) => m.path === '/auth/*')
-      || (singleTier ? { upstream: data.routing && data.routing.default_upstream } : null);
-    assert.ok(auth && auth.upstream, `${file}: sso.capable needs a routing matcher for /auth/* (the API tier)`);
+    const routing = data.routing || {};
+    const matchers = routing.matchers || [];
+    const auth = matchers.find((m) => m.path === '/auth/*');
     if (sso.internalUrl !== undefined) {
       assert.match(sso.internalUrl, /^https?:\/\/[a-z0-9.-]+:\d+$/,
         `${file}: sso.internalUrl "${sso.internalUrl}" is not http://<service>:<port>`);
-      assert.strictEqual(sso.internalUrl.replace(/^https?:\/\//, ''), auth.upstream,
+    }
+    // The matcher only matters when /auth/* would otherwise land somewhere else:
+    // a product with a separate SPA container (vibe-1099, vibe-tb) routes by
+    // default to the web tier, so /auth/* needs its own route to the API tier.
+    // A single-service product (vibe-1040) already has the default route
+    // pointing at the tier that serves /auth/*, and needs no matcher.
+    const apiTier = sso.internalUrl ? sso.internalUrl.replace(/^https?:\/\//, '') : null;
+    const needsMatcher = !!apiTier && apiTier !== routing.default_upstream;
+    if (needsMatcher) {
+      assert.ok(auth, `${file}: sso.capable with an API tier (${apiTier}) behind a different default upstream (${routing.default_upstream}) needs a routing matcher for /auth/*`);
+    }
+    if (auth && apiTier) {
+      assert.strictEqual(apiTier, auth.upstream,
         `${file}: sso.internalUrl must name the same upstream as the /auth/* matcher`);
     }
     const overlay = fs.readFileSync(path.join(root, 'apps', `${data.slug}.yml`), 'utf8');
@@ -369,6 +377,26 @@ test('an sso-capable manifest carries everything lib/identity.sh needs', () => {
       assert.match(fs.readFileSync(tmpl, 'utf8'), /^ALLOWED_ORIGIN=/m,
         `${file}: sso.capable needs ALLOWED_ORIGIN= in env-templates/per-app/${data.slug}.env.tmpl (identity.sh registers from it)`);
     }
+  }
+});
+
+test('every sso-capable app renders ALLOWED_ORIGIN into its env file', () => {
+  // lib/identity.sh (_id_product_base_url) reads ALLOWED_ORIGIN from
+  // /opt/vibe/env/<slug>.env to build the base URL it registers with the broker.
+  // Products whose template carried only APP_BASE_URL=@ALLOWED_ORIGIN@ — or no
+  // origin key at all — failed registration on the LAN box with "ALLOWED_ORIGIN
+  // missing" (vibe-1099, then vibe-1040). The bare key is what the script reads,
+  // so it belongs in the template AND in the manifest's env contract.
+  const root = path.join(__dirname, '..', '..');
+  for (const { file, data } of applianceManifests()) {
+    if (!(data.sso && data.sso.capable === true)) continue;
+    const tmpl = path.join(root, 'env-templates', 'per-app', `${data.slug}.env.tmpl`);
+    assert.ok(fs.existsSync(tmpl), `${file}: sso.capable but no env template at env-templates/per-app/${data.slug}.env.tmpl`);
+    assert.match(fs.readFileSync(tmpl, 'utf8'), /^ALLOWED_ORIGIN=@ALLOWED_ORIGIN@$/m,
+      `${file}: ${data.slug}.env.tmpl must set ALLOWED_ORIGIN=@ALLOWED_ORIGIN@ (the bare key identity.sh reads), not only APP_BASE_URL`);
+    const env = data.env || {};
+    const declared = [...(env.required || []), ...(env.optional || [])].some((e) => e.name === 'ALLOWED_ORIGIN');
+    assert.ok(declared, `${file}: declare ALLOWED_ORIGIN in env.required (from: "subdomain-url") so it is part of the app's contract`);
   }
 });
 
