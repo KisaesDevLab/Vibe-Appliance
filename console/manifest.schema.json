@@ -313,7 +313,30 @@
           "type": "array",
           "minItems": 1,
           "items": { "type": "string" },
-          "description": "Argv run inside breakglassService to (idempotently) ensure the vibe-breakglass local admin and print {username,password} JSON. Defaults to [\"npx\",\"vibe-auth\",\"breakglass\",\"ensure\",\"--json\"]. Distroless images point this at their own node entrypoint."
+          "description": "Argv run inside breakglassService to (idempotently) ensure the vibe-breakglass local admin and print {username,password} JSON. Defaults to [\"npx\",\"vibe-auth\",\"breakglass\",\"ensure\",\"--json\"]. Distroless images point this at their own node entrypoint. identity.sh swaps the literal \"ensure\" element for \"rotate\", \"status\" and \"verify\"."
+        },
+        "breakglassIdentifier": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 254,
+          "description": "What the operator types at the product's /login/local page for the break-glass account. Default \"vibe-breakglass\". Products that sign people in by email AND validate the field as an email reject the bare username, so they name the full address here (a dotted domain, never @localhost). Shown on the Single sign-on panel, in the break-glass banner and in CREDENTIALS.txt."
+        },
+        "breakglassStatusCommand": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" },
+          "description": "Optional argv run inside breakglassService that prints one JSON line {exists,active,admin,secondFactorEnrolled?,locked?,mustChangePassword?,ready} for the break-glass account and exits 0 whenever it has an answer. For products with readiness rules the package CLI cannot know (Vibe 1040: a mandatory second factor). Merged with `breakglass status` by `identity.sh breakglass-status`. No shell."
+        },
+        "recreate": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+          "description": "Compose services that read the identity settings (VIBE_AUTH_MODE, VIBE_OIDC_*), normally just the tier that serves /auth/*. `identity.sh register|rotate|mode|disable|rebase` recreates ONLY these. Without it every overlay service except one-shots (restart: \"no\") is recreated, which still bounces queue workers mid-job."
+        },
+        "minBroker": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+          "description": "Lowest vibe-auth broker version this product can be registered against. 1.0.4 for any product that requires MFA at the identity provider (VIBE_OIDC_REQUIRE_MFA_AMR=true): on an older broker a sign-in that ENROLS a second factor carries no amr \"mfa\", so every user's first sign-in is refused."
         }
       }
     },

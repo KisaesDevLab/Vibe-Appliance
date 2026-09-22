@@ -30,6 +30,8 @@
 
   const _inflight  = new Map(); // slug -> action
   const _lastOut   = new Map(); // slug -> output text kept across re-renders
+  const _bg        = new Map(); // slug -> break-glass verification from the product ({loading} | {error} | status)
+  const _access    = new Map(); // slug -> {restricted} from the broker ({loading} | {error})
   let _data = null;
 
   function esc(s) {
@@ -120,9 +122,46 @@
     const modePill = a.mode
       ? '<span class="badge ' + (a.mode === 'oidc_only' ? 'badge--warn' : '') + '">mode: ' + esc(a.mode) + '</span>'
       : '';
-    const bgPill = a.breakglass
-      ? '<span class="badge badge--good" title="A break-glass local account exists for this app">break-glass ready</span>'
-      : '<span class="badge badge--warn" title="No break-glass password stored — oidc_only is refused until Register / Fix creates one">no break-glass</span>';
+    // a.breakglass only means "a password is stored on the appliance". Whether
+    // the account can actually be used in an outage comes from the product
+    // (GET …/breakglass, loaded lazily per registered app): it exists, is an
+    // active admin, has a required second factor enrolled, and the stored
+    // password still signs in.
+    const bg = _bg.get(a.slug);
+    let bgPill;
+    if (!a.registered) bgPill = '';
+    else if (!bg || bg.loading) bgPill = '<span class="badge badge--muted">break-glass: checking…</span>';
+    else if (bg.error) bgPill = '<span class="badge badge--warn" title="' + esc(bg.error) + '">break-glass: unknown</span>';
+    else if (bg.ok) {
+      bgPill = '<span class="badge badge--good" title="' + esc(bg.passwordChecked
+        ? 'The product confirms the account is an active admin and the stored password signs in.'
+        : 'The product confirms the account is an active admin. This app version cannot verify the stored password; test the sign-in after any database restore.') +
+        '">break-glass verified</span>';
+    } else {
+      bgPill = '<span class="badge badge--bad" title="' + esc((bg.problems || []).join(' • ')) + '">break-glass NOT ready</span>';
+    }
+    const bgBlocksOidcOnly = !a.breakglass || (bg && !bg.loading && !bg.error && bg.ok === false);
+    const bgProblems = (bg && !bg.loading && !bg.error && bg.ok === false)
+      ? '<div class="small" style="margin:0.5rem 0 0;padding:0.5rem 0.6rem;border-left:3px solid #dc2626">' +
+          '<strong>Break-glass is not ready</strong> — if single sign-on goes down, nobody can get into ' + esc(a.displayName) + ' in OIDC-only mode.' +
+          '<ul style="margin:0.3rem 0 0 1rem;padding:0">' + (bg.problems || []).map(p => '<li>' + esc(p) + '</li>').join('') + '</ul>' +
+          (bg.fix ? '<div class="mono" style="margin-top:0.3rem">' + esc(bg.fix) + '</div>' : '') +
+        '</div>'
+      : '';
+    const acc = _access.get(a.slug);
+    const accessRow = !a.registered ? '' : (
+      '<label class="muted small" style="display:block;margin:0.6rem 0 0.3rem">Who can sign in with single sign-on' +
+        '<select class="btn btn--ghost" style="display:block;width:100%;margin-top:0.25rem" data-access-select="' + esc(a.slug) + '"' +
+          (busy || !acc || acc.loading || acc.error ? ' disabled' : '') +
+          (acc && acc.error ? ' title="' + esc(acc.error) + '"' : '') + '>' +
+          '<option value="open"' + (acc && acc.restricted === false ? ' selected' : '') + '>Everyone in the firm</option>' +
+          '<option value="restricted"' + (acc && acc.restricted === true ? ' selected' : '') + '>Only people ticked in Vibe Auth → Users (and administrators)</option>' +
+        '</select>' +
+      '</label>' +
+      (acc && acc.error ? '<p class="muted small" style="margin:0">' + esc(acc.error) + '</p>' : '') +
+      (acc && acc.restricted === true && a.mode === 'both'
+        ? '<p class="muted small" style="margin:0">In mode “both”, someone who still has a local password for this app can use it. Switch to OIDC-only to make the restriction complete.</p>'
+        : ''));
     // Runtime-detected: the app answers /auth/status but the appliance's
     // vendored manifest predates its SSO support. Registration works with
     // the package defaults; the app-specific bits (public paths, the
@@ -135,7 +174,7 @@
     const disableAll = !!busy;
     const modeOpts = ['local', 'both', 'oidc_only'].map(m =>
       '<option value="' + m + '"' + (a.mode === m ? ' selected' : '') +
-      (m === 'oidc_only' && !a.breakglass ? ' disabled' : '') + '>' + esc(MODE_LABEL[m]) + '</option>').join('');
+      (m === 'oidc_only' && bgBlocksOidcOnly && a.mode !== 'oidc_only' ? ' disabled' : '') + '>' + esc(MODE_LABEL[m]) + '</option>').join('');
 
     const out = _lastOut.get(a.slug);
     return '' +
@@ -150,7 +189,9 @@
           '<dt>slug</dt><dd>' + esc(a.slug) + '</dd>' +
           '<dt>issuer</dt><dd>' + (a.issuer ? esc(a.issuer) : '<span class="muted">—</span>') + '</dd>' +
           (a.breakglassService ? '<dt>break-glass in</dt><dd>' + esc(a.breakglassService) + '</dd>' : '') +
+          (a.registered ? '<dt>break-glass sign-in</dt><dd><span class="mono">' + esc(a.breakglassIdentifier || 'vibe-breakglass') + '</span> at the app\'s <span class="mono">/login/local</span> page</dd>' : '') +
         '</dl>' +
+        bgProblems +
         '<label class="muted small" style="display:block;margin:0.6rem 0 0.3rem">Sign-in mode' +
           '<select class="btn btn--ghost" style="display:block;width:100%;margin-top:0.25rem" data-mode-select="' + esc(a.slug) + '"' +
             (disableAll || !a.registered ? ' disabled' : '') +
@@ -169,10 +210,40 @@
             (disableAll || !a.registered ? ' disabled' : '') + '>' +
             (busy === 'disable' ? 'Disabling…' : 'Disable SSO') + '</button>' +
         '</div>' +
+        accessRow +
+        (a.registered
+          ? '<div class="app-card__actions">' +
+              '<button class="btn btn--ghost" type="button" data-id-action="access" data-slug="' + esc(a.slug) + '"' +
+                (disableAll || !brokerReady || !acc || acc.loading || acc.error ? ' disabled' : '') + '>' +
+                (busy === 'access' ? 'Applying…' : 'Apply access') + '</button>' +
+              '<button class="btn btn--ghost" type="button" data-id-action="bgcheck" data-slug="' + esc(a.slug) + '"' +
+                (disableAll ? ' disabled' : '') + ' title="Ask the app again whether its break-glass account is usable">Re-check break-glass</button>' +
+              '<button class="btn btn--ghost" type="button" data-id-action="rotate-breakglass" data-slug="' + esc(a.slug) + '"' +
+                (disableAll ? ' disabled' : '') + '>' +
+                (busy === 'rotate-breakglass' ? 'Working…' : 'New break-glass password') + '</button>' +
+            '</div>'
+          : '') +
         (out != null
           ? '<pre class="app-card__output">' + esc(out) + '</pre>'
           : '<pre class="app-card__output" hidden></pre>') +
       '</article>';
+  }
+
+  // The box's LAN address changed under every rendered URL (DHCP).
+  function driftHtml(v) {
+    const d = v && v.addressDrift;
+    if (!d || !d.drift) return '';
+    const n = (d.affected || []).length;
+    return '' +
+      '<div class="small" style="margin:0.6rem 0;padding:0.6rem 0.7rem;border-left:3px solid #dc2626">' +
+        '<strong>This appliance’s address changed</strong> from <span class="mono">' + esc(d.rendered || '?') + '</span> to ' +
+        '<span class="mono">' + esc(d.current || '?') + '</span>. Single sign-on still points at the old address, so every ' +
+        'SSO sign-in fails' + (n ? ' (' + n + ' registered app' + (n === 1 ? '' : 's') + ')' : '') + '. Local passwords keep working; ' +
+        'OIDC-only apps are reachable only with their break-glass account.' +
+        '<div style="margin-top:0.4rem"><button class="btn" type="button" id="identity-reapply-address">' +
+          (_reapplying ? 'Re-applying…' : 'Use the new address') + '</button> ' +
+          '<span class="muted">Restarts Vibe Auth and each registered app once. A DHCP reservation for this box prevents it happening again.</span></div>' +
+      '</div>';
   }
 
   function render() {
@@ -190,7 +261,7 @@
       : !v.enabled
         ? 'Vibe Auth is not installed. ' + live.length + ' enabled app(s) can use it once it is.' + more
         : reg + ' of ' + live.length + ' enabled SSO-capable app(s) registered with Vibe Auth.' + more;
-    els.broker.innerHTML = brokerHtml(v);
+    els.broker.innerHTML = brokerHtml(v) + driftHtml(v);
     els.list.innerHTML = live.length || pending.length
       ? live.map(a => appCardHtml(a, v)).join('') +
         (pending.length
@@ -200,6 +271,7 @@
       : '<p class="muted">No app on this appliance supports single sign-on yet. Apps appear here automatically ' +
         'when their manifest declares SSO or their running api answers <span class="mono">/auth/status</span>.</p>';
     els.rebase.disabled = !(v.installed && v.enabled);
+    for (const sel of section.querySelectorAll('select[data-mode-select]')) sel.dataset.rendered = sel.value;
   }
 
   // ---------- data ----------
@@ -212,10 +284,47 @@
       els.error.hidden = true;
       els.error.textContent = '';
       render();
+      void loadDetails();
     } catch (err) {
       els.error.hidden = false;
       els.error.textContent = 'Could not load SSO status: ' + err.message;
     }
+  }
+
+  // Break-glass verification and access are asked of the product / broker per
+  // app (a docker exec and an API call), so they load after the list, two at
+  // a time, and fill in as they arrive.
+  let _detailsRun = 0;
+  async function loadOne(slug) {
+    const base = '/api/v1/identity/' + encodeURIComponent(slug);
+    const get = async (url) => {
+      const r = await fetch(url, { credentials: 'same-origin' });
+      let data = {};
+      try { data = await r.json(); } catch { /* non-JSON */ }
+      if (!r.ok) throw new Error(data.detail || data.error || ('HTTP ' + r.status));
+      return data;
+    };
+    await Promise.all([
+      get(base + '/breakglass').then(d => _bg.set(slug, d), e => _bg.set(slug, { error: e.message })),
+      get(base + '/access').then(d => _access.set(slug, d), e => _access.set(slug, { error: e.message })),
+    ]);
+  }
+  async function loadDetails(only) {
+    const run = ++_detailsRun;
+    const apps = ((_data && _data.apps) || []).filter(a => a.enabled !== false && a.registered && (!only || a.slug === only));
+    for (const a of apps) {
+      if (!_bg.has(a.slug)) _bg.set(a.slug, { loading: true });
+      if (!_access.has(a.slug)) _access.set(a.slug, { loading: true });
+    }
+    const queue = apps.map(a => a.slug);
+    const worker = async () => {
+      while (queue.length) {
+        const slug = queue.shift();
+        await loadOne(slug);
+        if (run === _detailsRun || only) render();
+      }
+    };
+    await Promise.all([worker(), worker()]);
   }
 
   // ---------- actions ----------
@@ -251,7 +360,15 @@
         'Before continuing, confirm the break-glass password for ' + name +
         ' is already stored in the firm password manager / Recovery Kit — ' +
         'if Vibe Auth is ever down, that account is the only way in.\n\n' +
-        'The script refuses the switch if no break-glass password exists.');
+        'The switch is refused unless the app itself confirms the break-glass account is usable ' +
+        '(active admin, any required second factor enrolled, stored password still signs in).');
+    }
+    if (action === 'rotate-breakglass') {
+      return window.confirm(
+        'Create a new break-glass password for ' + name + '?\n\n' +
+        'The current one stops working immediately. The new password is shown once in the output below ' +
+        'and saved on the appliance (sudo vibe credentials). Store it in the firm password manager now.\n\n' +
+        'This also reactivates the account if it was disabled in ' + name + '.');
     }
     if (action === 'disable') {
       return window.confirm(
@@ -283,6 +400,29 @@
       if (mode === a.mode) { flash(slug, 'already in mode ' + mode); return; }
       if (!confirmFor(action, a, mode)) return;
       body = { mode, confirm: mode === 'oidc_only' ? true : undefined };
+    } else if (action === 'bgcheck') {
+      _bg.set(slug, { loading: true });
+      render();
+      await loadDetails(slug);
+      return;
+    } else if (action === 'access') {
+      const sel = section.querySelector('select[data-access-select="' + slug + '"]');
+      const want = sel && sel.value;
+      const cur = _access.get(slug) || {};
+      if (!want) return;
+      if ((want === 'restricted') === (cur.restricted === true)) { flash(slug, 'access is already ' + (cur.restricted ? 'restricted' : 'open to everyone')); return; }
+      const name = a.displayName || slug;
+      let seed = 'none';
+      if (want === 'restricted') {
+        if (!window.confirm('Restrict ' + name + '?\n\nOnly people ticked for it in Vibe Auth → Users, and vibe-admin members, will be able to sign in with single sign-on. Everyone else sees “Permission denied”.')) return;
+        seed = window.confirm('Start with everyone who has an active account ticked, then untick people?\n\nOK = start with everyone\nCancel = start with administrators only') ? 'everyone' : 'none';
+      } else if (!window.confirm('Open ' + name + ' to every firm user again?\n\nThe ticked list is kept in case you restrict it later.')) {
+        return;
+      }
+      body = { restricted: want === 'restricted', seed };
+    } else if (action === 'rotate-breakglass') {
+      if (!confirmFor(action, a)) return;
+      body = { confirm: true };
     } else if (!confirmFor(action, a)) {
       return;
     }
@@ -297,6 +437,8 @@
       _lastOut.set(slug, 'request failed: ' + err.message);
     } finally {
       _inflight.delete(slug);
+      _bg.delete(slug);
+      _access.delete(slug);
       await load();
     }
   }
@@ -304,6 +446,26 @@
   function flash(slug, text) {
     _lastOut.set(slug, text);
     render();
+  }
+
+  let _reapplying = false;
+  async function reapplyAddress() {
+    if (_reapplying) return;
+    if (!window.confirm('Use the new address?\n\nVibe Auth and every registered app are re-rendered with the appliance’s current address and restart once, one after another. Staff who are signed in may need to sign in again.')) return;
+    _reapplying = true;
+    render();
+    els.rebaseOut.hidden = true;
+    try {
+      const { r, data } = await post('/api/v1/identity/reapply-address');
+      els.rebaseOut.hidden = false;
+      els.rebaseOut.textContent = outputText(r, data);
+    } catch (err) {
+      els.rebaseOut.hidden = false;
+      els.rebaseOut.textContent = 'request failed: ' + err.message;
+    } finally {
+      _reapplying = false;
+      await load();
+    }
   }
 
   async function rebase() {
@@ -353,6 +515,7 @@
     const btn = ev.target.closest('button');
     if (!btn) return;
     if (btn.dataset.idAction) { runAction(btn); return; }
+    if (btn.id === 'identity-reapply-address') { reapplyAddress(); return; }
     if (btn.dataset.copyToken) { copyToken(); }
   });
   els.refresh.addEventListener('click', load);
@@ -361,8 +524,29 @@
   // whenever the Apps list finishes an enable/disable/update (admin.html
   // dispatches vibe:apps-changed), and on a slow tick so an app that gains
   // SSO in an update shows up without a manual Refresh.
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
-  document.addEventListener('vibe:apps-changed', () => { if (!_inflight.size) load(); });
-  setInterval(() => { if (!document.hidden && !_inflight.size) load(); }, 60_000);
+  //
+  // Background reloads (the tick and the apps-changed event) re-render the
+  // cards, which would reset a sign-in mode the operator picked but has
+  // not applied yet. They are skipped while any mode dropdown differs
+  // from what it showed at render or has focus, and never overlap.
+  function editing() {
+    for (const sel of section.querySelectorAll('select[data-mode-select]')) {
+      if (sel === document.activeElement && document.hasFocus()) return true;
+      // Compare with what the dropdown showed right after render, not with
+      // the loaded mode: an env value outside the three options (hand edit,
+      // newer package) selects nothing, and would read as a permanent edit.
+      if (sel.dataset.rendered !== undefined && sel.value !== sel.dataset.rendered) return true;
+    }
+    return false;
+  }
+  let _bgLoading = false;
+  async function backgroundLoad() {
+    if (document.hidden || _inflight.size || _bgLoading || editing()) return;
+    _bgLoading = true;
+    try { await load(); } finally { _bgLoading = false; }
+  }
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) backgroundLoad(); });
+  document.addEventListener('vibe:apps-changed', backgroundLoad);
+  setInterval(backgroundLoad, 60_000);
   load();
 })();

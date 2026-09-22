@@ -46,6 +46,12 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   log_init
 fi
 
+# The one definition of an operator-owned env key (see the file header).
+if ! declare -F operator_owned_keys >/dev/null 2>&1; then
+  # shellcheck source=/dev/null
+  . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/operator-keys.sh"
+fi
+
 # enable_app <slug>
 enable_app() {
   local slug="${1:-}"
@@ -328,7 +334,12 @@ print((json.load(open('${manifest}')).get('runtime') or 'appliance'))
       log_step "registering enabled SSO-capable products with vibe-auth"
       bash "${APPLIANCE_DIR}/lib/identity.sh" register-all 2>&1 | tee -a "$VIBE_LOG_FILE" >&2 \
         || log_warn "some products could not be registered with vibe-auth; use the console Identity panel → Fix, or: sudo vibe identity register <slug>"
-    elif [[ "$_sso_capable" == "true" && "$_va_state" == "1" ]]; then
+    elif [[ "$_va_state" == "1" ]] && { [[ "$_sso_capable" == "true" ]] || [[ -n "$(_extract_env_value "${VIBE_ENV_DIR}/${slug}.env" VIBE_OIDC_CLIENT_ID)" ]]; }; then
+      # Declared in the manifest, OR registered before (client id still in
+      # the env): disabling a product drops its broker registration and
+      # keeps the env block, so a re-enable must re-register — also for an
+      # app known only through runtime detection. Without this its panel
+      # card said "registered" against a client the broker no longer had.
       log_step "registering $slug with vibe-auth"
       bash "${APPLIANCE_DIR}/lib/identity.sh" register "$slug" 2>&1 | tee -a "$VIBE_LOG_FILE" >&2 \
         || log_warn "$slug is running on local sign-in; vibe-auth registration failed. Fix: console Identity panel → Fix, or: sudo vibe identity register $slug"
@@ -1051,6 +1062,74 @@ _image_uid_gid() {
   printf '%s:%s' "$uid" "$gid"
 }
 
+# _merge_env_render <existing-env> <new-render> <manifest>
+# Rewrites <new-render> in place. See the rules below.
+# Merge with the existing file:
+#   - keys the new render lacks are carried forward (ANTHROPIC_API_KEY
+#     and similar optional settings);
+#   - operator-owned keys (lib/operator-keys.sh: the manifest's Tier-1
+#     per-app Settings fields) keep the EXISTING value even when the
+#     template also sets them, unless that value is EMPTY: a field the
+#     operator cleared falls back to the template default, which is the
+#     only way back to it (per-app fields have no Revert button). The template value is only the first-render
+#     default; the operator owns the key after that. Without this, every
+#     re-render (enable, bootstrap, routing change) reset those settings
+#     to the template default: Vibe 1099's VIBE_OIDC_REQUIRE_MFA_AMR,
+#     Vibe Time & Billing's SMTP and storage settings, Vibe Recap's
+#     model settings. Trade-off: a changed template default for such a
+#     key reaches only fresh installs.
+#   - identity-owned keys keep the EXISTING value whatever the template
+#     says: VIBE_AUTH_MODE (set from the console's Single sign-on panel or
+#     `vibe identity mode`) and the broker's registration block
+#     (lib/identity.sh _id_write_env_block). They used to survive only
+#     because no template happened to name them; the first template to
+#     document `VIBE_AUTH_MODE=local` would have dropped that product out
+#     of oidc_only on every enable, bootstrap and routing change. A host or
+#     routing change still reaches them: enable_app re-registers the
+#     product afterwards, which rewrites the block.
+_merge_env_render() {
+  local src="$1" tmp="$2" manifest="$3"
+  [[ -f "$src" ]] || return 0
+  python3 - "$src" "$tmp" "$(operator_owned_keys "$manifest")" <<'PYEOF'
+import sys
+def parse(path):
+    rows = {}
+    with open(path) as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#") or "=" not in s: continue
+            k, v = s.split("=", 1)
+            rows[k] = v
+    return rows
+
+old = parse(sys.argv[1])
+new = parse(sys.argv[2])
+owned = set(k.strip() for k in (sys.argv[3] if len(sys.argv) > 3 else "").split("\n") if k.strip())
+# Owned by the Single sign-on panel / lib/identity.sh, never by a template.
+owned |= {"VIBE_AUTH_MODE", "VIBE_OIDC_ISSUER", "VIBE_OIDC_INTERNAL_BASE", "VIBE_OIDC_CLIENT_ID",
+          "VIBE_OIDC_CLIENT_SECRET", "VIBE_OIDC_PUBLIC_URL", "VIBE_OIDC_IDP_NAME"}
+merged_lines = []
+for line in open(sys.argv[2]).read().splitlines():
+    s = line.strip()
+    if s and not s.startswith("#") and "=" in s:
+        k = s.split("=", 1)[0]
+        if k in owned and old.get(k, "") != "":
+            line = f"{k}={old[k]}"
+    merged_lines.append(line)
+new_keys = set(new.keys())
+extras = []
+for k, v in old.items():
+    if k not in new_keys:
+        extras.append(f"{k}={v}")
+if extras:
+    merged_lines.append("")
+    merged_lines.append("# --- preserved from previous render ---")
+    merged_lines += extras
+with open(sys.argv[2], "w") as f:
+    f.write("\n".join(merged_lines) + "\n")
+PYEOF
+}
+
 _render_app_env() {
   # $5 (src) is the EXISTING env file to preserve values from; defaults
   # to $out for the real enable path, where they are the same file. The
@@ -1556,38 +1635,8 @@ with open(dst, "w") as f:
     f.write(body)
 PYEOF
 
-  # Merge: keep operator-set keys from the existing file that don't
-  # appear in the new render. Specifically useful for ANTHROPIC_API_KEY
-  # and similar optional settings.
-  if [[ -f "$src" ]]; then
-    python3 - "$src" "$tmp" <<'PYEOF'
-import sys
-def parse(path):
-    rows = {}
-    with open(path) as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith("#") or "=" not in s: continue
-            k, v = s.split("=", 1)
-            rows[k] = v
-    return rows
-
-old = parse(sys.argv[1])
-new = parse(sys.argv[2])
-merged_lines = open(sys.argv[2]).read().splitlines()
-new_keys = set(new.keys())
-extras = []
-for k, v in old.items():
-    if k not in new_keys:
-        extras.append(f"{k}={v}")
-if extras:
-    merged_lines.append("")
-    merged_lines.append("# --- preserved from previous render ---")
-    merged_lines += extras
-with open(sys.argv[2], "w") as f:
-    f.write("\n".join(merged_lines) + "\n")
-PYEOF
-  fi
+  # Carry operator values forward (see _merge_env_render).
+  _merge_env_render "$src" "$tmp" "$manifest"
 
   mv "$tmp" "$out"
   chmod 600 "$out"

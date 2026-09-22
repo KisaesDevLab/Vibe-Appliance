@@ -35,7 +35,8 @@
     "edgeGate":      false,
     "internalUrl":   "http://vibe-tb-server:3001",
     "breakglassService": "vibe-tb-server",
-    "breakglassCommand": ["node", "server/node_modules/@kisaesdevlab/vibe-auth/dist/cli.js", "breakglass", "ensure", "--json"]
+    "breakglassCommand": ["node", "server/node_modules/@kisaesdevlab/vibe-auth/dist/cli.js", "breakglass", "ensure", "--json"],
+    "recreate":      ["vibe-tb-server"]
   },
 
   "env": {

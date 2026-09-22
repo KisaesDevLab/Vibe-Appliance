@@ -26,6 +26,7 @@ const Database    = require('better-sqlite3');
 // endpoints like cf-helpers) because the PUBLIC landing payload above
 // those endpoints uses it too, and a const require is not hoisted.
 const landingOrderLib = require('./lib/landing-order');
+const { validateSettingValue } = require('./lib/settings-validate');
 
 // ----- config -----------------------------------------------------------
 
@@ -4825,6 +4826,10 @@ function _fieldDescriptor(envEntry, providingSlug) {
     helpText:            ui.helpText || envEntry.doc || '',
     input:               ui.input || 'text',
     options:             ui.options || null,
+    // Live option source (e.g. 'anthropic-models'). Omitted before, so the
+    // page's live-model merge never ran; the save validator also needs it
+    // to skip the static-options check for these fields.
+    dynamic:             ui.dynamic || null,
     validate:            ui.validate || null,
     testEndpoint:        ui.testEndpoint || null,
     showIf:              ui.showIf || null,
@@ -5102,6 +5107,45 @@ app.post('/api/v1/settings/save', requireAdmin, testRateLimit, globalOp('setting
       : (c.scope.split(':')[1] + '::' + c.key);
     if (!SETTINGS_REGISTRY.allKeys.has(lookupKey)) {
       return res.status(400).json({ error: 'unknown setting at this scope: ' + c.scope + '/' + c.key });
+    }
+  }
+
+  // Enforce each field's manifest ui.validate rule, and refuse line breaks
+  // in any value (lib/settings-save.sh writes KEY=<value> on one line). A
+  // revert deletes the key, so there is no value to check. Every problem
+  // in the batch is reported at once, by field label; nothing is written.
+  // A dependency (showIf / hideIf) resolves to the value it will have
+  // AFTER this save: the batch first, then the scope's env file, then
+  // appliance.env — the same order the page uses.
+  {
+    const envCache = new Map();
+    const envOf = (name) => {
+      if (!envCache.has(name)) envCache.set(name, parseEnvFile(path.join(ENV_DIR, name + '.env')));
+      return envCache.get(name);
+    };
+    const problems = [];
+    for (const c of body.changes) {
+      if ((c.op || 'set') === 'revert') continue;
+      const slug = c.scope === 'appliance' ? null : c.scope.split(':')[1];
+      const field = SETTINGS_REGISTRY.allKeys.get(slug ? slug + '::' + c.key : c.key);
+      const valueOf = (key) => {
+        const inBatch = body.changes.find(x => x.key === key && x.scope === c.scope)
+          || body.changes.find(x => x.key === key && x.scope === 'appliance');
+        if (inBatch && (inBatch.op || 'set') !== 'revert') return inBatch.value == null ? '' : String(inBatch.value);
+        if (slug && envOf(slug)[key] !== undefined) return envOf(slug)[key];
+        const a = envOf('appliance')[key];
+        return a === undefined ? null : a;
+      };
+      const invalid = validateSettingValue(field, c.value, { valueOf });
+      if (invalid) problems.push({ key: c.key, scope: c.scope, message: invalid });
+    }
+    if (problems.length) {
+      return res.status(400).json({
+        error: 'invalid value',
+        detail: problems.map(p => p.message).join(' | ') +
+          ' — nothing was saved. Correct the field(s) and save again.',
+        problems,
+      });
     }
   }
 

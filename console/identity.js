@@ -27,6 +27,7 @@
 const path = require('path');
 
 const MODES = ['local', 'both', 'oidc_only'];
+const ACCESS_SEEDS = ['everyone', 'none'];
 const STATUS_CONCURRENCY = 3;
 
 function isSsoCapable(m) {
@@ -197,6 +198,9 @@ module.exports = function registerIdentityRoutes(app, deps) {
       providesIdentity: providesIdentity(m),
       edgeGate: !!(m.sso && m.sso.edgeGate),
       breakglassService: (m.sso && m.sso.breakglassService) || null,
+      // What the operator types at the product's /login/local page. Products
+      // that validate the field as an email name the full address.
+      breakglassIdentifier: (m.sso && m.sso.breakglassIdentifier) || 'vibe-breakglass',
     };
     if (!parsed) {
       return {
@@ -217,7 +221,9 @@ module.exports = function registerIdentityRoutes(app, deps) {
     // The script's view wins where it reports; the manifest fills the rest.
     merged.declared = declared || parsed.declared === true;
     merged.detected = parsed.detected === true;
-    merged.ssoCapable = merged.declared || merged.detected;
+    // A registered app stays capable (and listed) while its api is down:
+    // detection alone would drop an app registered through it.
+    merged.ssoCapable = merged.declared || merged.detected || merged.registered === true;
     if (merged.enabled == null && typeof parsed.enabled === 'boolean') merged.enabled = parsed.enabled;
     return merged;
   }
@@ -225,7 +231,7 @@ module.exports = function registerIdentityRoutes(app, deps) {
   // Run every identity provider, every app whose manifest declares SSO,
   // and every ENABLED app that might have gained SSO at runtime through
   // `status`, then ask the broker for its setup state. Apps that are
-  // neither declared nor detected are dropped from the answer.
+  // neither declared, registered nor detected are dropped from the answer.
   async function collectIdentity() {
     const all = Object.values(MANIFESTS);
     const enabled = enabledMap();
@@ -242,7 +248,7 @@ module.exports = function registerIdentityRoutes(app, deps) {
       (m) => statusFor(m, enabled ? enabled[m.slug] : null));
     const providerStatuses = statuses.filter(s => s.providesIdentity);
     const apps = statuses
-      .filter(s => !s.providesIdentity && (s.declared || s.detected))
+      .filter(s => !s.providesIdentity && (s.declared || s.detected || s.registered === true))
       // Enabled apps first (they are the ones to configure), then by name.
       .sort((a, b) => (Number(b.enabled === true) - Number(a.enabled === true))
         || String(a.displayName).localeCompare(String(b.displayName)));
@@ -264,6 +270,15 @@ module.exports = function registerIdentityRoutes(app, deps) {
     };
     if (providerStatuses.length && providerStatuses.every(s => s.error)) {
       vibeAuth.error = providerStatuses[0].error;
+    }
+
+    // LAN-mode address drift (DHCP): every registered redirect URI still
+    // names the old address, so every SSO sign-in fails at once while local
+    // sign-in keeps working. Nothing else surfaces it.
+    if (vibeAuth.installed && vibeAuth.enabled) {
+      const d = await runIdentity(['address-drift'], 'sso-address-drift');
+      const drift = d.code === 0 ? parseJsonOutput(d.stdout) : null;
+      if (drift && drift.drift === true) vibeAuth.addressDrift = drift;
     }
 
     if (vibeAuth.installed && vibeAuth.enabled) {
@@ -307,6 +322,13 @@ module.exports = function registerIdentityRoutes(app, deps) {
     sendResult(res, 'rebase', null, r);
   });
 
+  // Same global gate as rebase: it restarts vibe-auth and every registered
+  // product, one after another.
+  app.post('/api/v1/identity/reapply-address', requireAdmin, testRateLimit, rebaseGate, async (_req, res) => {
+    const r = await runIdentity(['reapply-address'], 'sso-reapply-address');
+    sendResult(res, 'reapply-address', null, r);
+  });
+
   app.get('/api/v1/identity/:slug', requireAdmin, async (req, res) => {
     const m = ssoManifestOr4xx(req.params.slug, res);
     if (!m) return;
@@ -346,6 +368,86 @@ module.exports = function registerIdentityRoutes(app, deps) {
   app.post('/api/v1/identity/:slug/disable', requireAdmin, testRateLimit, (req, res) =>
     runSlugAction(req, res, 'disable', []));
 
+  // ----- break-glass ----------------------------------------------------
+  //
+  // `breakglass` in the status list only means "a password is stored here".
+  // This asks the PRODUCT: does the account exist, is it active and an
+  // admin, is a required second factor enrolled, and does the stored
+  // password still sign in? It docker-execs into the product, so it is a
+  // separate, lazily-loaded call rather than part of every status row. The
+  // answer carries no secret.
+  app.get('/api/v1/identity/:slug/breakglass', requireAdmin, async (req, res) => {
+    const m = ssoManifestOr4xx(req.params.slug, res);
+    if (!m) return;
+    const r = await runIdentity(['breakglass-status', m.slug], 'sso-breakglass-status', { slug: m.slug });
+    if (r.spawnError) return sendResult(res, 'breakglass-status', m.slug, r);
+    const parsed = r.code === 0 ? parseJsonOutput(r.stdout) : null;
+    if (!parsed) {
+      return res.status(r.code === 0 ? 502 : 500).json({
+        error: 'break-glass status unavailable',
+        detail: trim(r.stderr) || 'identity.sh breakglass-status printed no JSON',
+        slug: m.slug,
+        exit_code: r.code,
+      });
+    }
+    res.json(parsed);
+  });
+
+  // New break-glass password (also reactivates a disabled account). The old
+  // password stops working immediately, so the UI must have warned and sent
+  // confirm:true. The new password is in stdout, shown to this admin once.
+  app.post('/api/v1/identity/:slug/rotate-breakglass', requireAdmin, testRateLimit, (req, res) => {
+    const body = (req.body && typeof req.body === 'object') ? req.body : {};
+    if (body.confirm !== true) {
+      return res.status(400).json({
+        error: 'confirmation required',
+        detail: 'Rotating replaces the break-glass password: the one in the firm password manager stops ' +
+                'working at once. Re-send with { confirm: true } and store the new password that is returned.',
+      });
+    }
+    return runSlugAction(req, res, 'rotate-breakglass', []);
+  });
+
+  // ----- who may sign in (per-product access) ---------------------------
+  //
+  // Open = every firm user. Restricted = the people ticked in Vibe Auth →
+  // Users, plus vibe-admin members. Enforced by the identity provider:
+  // nothing is written to the product's env and nothing is recreated.
+  app.get('/api/v1/identity/:slug/access', requireAdmin, async (req, res) => {
+    const m = ssoManifestOr4xx(req.params.slug, res);
+    if (!m) return;
+    const r = await runIdentity(['access', m.slug], 'sso-access-read', { slug: m.slug });
+    if (r.spawnError) return sendResult(res, 'access', m.slug, r);
+    const parsed = r.code === 0 ? parseJsonOutput(r.stdout) : null;
+    if (!parsed) {
+      return res.status(500).json({
+        error: 'access unavailable',
+        detail: trim(r.stderr) || 'identity.sh access printed no JSON',
+        slug: m.slug,
+        exit_code: r.code,
+      });
+    }
+    res.json(parsed);
+  });
+
+  app.post('/api/v1/identity/:slug/access', requireAdmin, testRateLimit, (req, res) => {
+    const body = (req.body && typeof req.body === 'object') ? req.body : {};
+    if (typeof body.restricted !== 'boolean') {
+      return res.status(400).json({
+        error: 'invalid access',
+        detail: 'body must be { restricted: true | false, seed?: "everyone" | "none" }',
+      });
+    }
+    const seed = body.seed === undefined ? 'none' : body.seed;
+    if (!ACCESS_SEEDS.includes(seed)) {
+      return res.status(400).json({
+        error: 'invalid seed',
+        detail: `seed must be one of: ${ACCESS_SEEDS.join(', ')}`,
+      });
+    }
+    return runSlugAction(req, res, 'access', [body.restricted ? 'restricted' : 'open', seed]);
+  });
+
   app.post('/api/v1/identity/:slug/mode', requireAdmin, testRateLimit, (req, res) => {
     const body = (req.body && typeof req.body === 'object') ? req.body : {};
     const mode = body.mode;
@@ -356,8 +458,10 @@ module.exports = function registerIdentityRoutes(app, deps) {
       });
     }
     // oidc_only turns local passwords off for everyone except the
-    // break-glass account. The script refuses without a stored
-    // break-glass password; the UI must also have shown its warning and
+    // break-glass account. The script refuses unless the product confirms
+    // that account is usable (exists, active, admin, required second
+    // factor enrolled, stored password still signs in) — a stored password
+    // string is not evidence. The UI must also have shown its warning and
     // sent confirm:true, so an accidental POST can never lock a firm out.
     if (mode === 'oidc_only' && body.confirm !== true) {
       return res.status(400).json({
@@ -372,6 +476,7 @@ module.exports = function registerIdentityRoutes(app, deps) {
 };
 
 module.exports.MODES = MODES;
+module.exports.ACCESS_SEEDS = ACCESS_SEEDS;
 module.exports.parseJsonOutput = parseJsonOutput;
 module.exports.isSsoCapable = isSsoCapable;
 module.exports.providesIdentity = providesIdentity;

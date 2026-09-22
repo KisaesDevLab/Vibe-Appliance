@@ -609,8 +609,17 @@ PYEOF
   # printed copy covers emergency access when SSO is down.
   local breakglass_lines=""
   if [[ -f "${VIBE_ENV_DIR}/vibe-auth.env" ]]; then
-    breakglass_lines="$(python3 - "${VIBE_ENV_DIR}/vibe-auth.env" <<'PYEOF' 2>/dev/null || true
-import sys
+    breakglass_lines="$(python3 - "${VIBE_ENV_DIR}/vibe-auth.env" "${APPLIANCE_DIR:-/opt/vibe/appliance}/console/manifests" <<'PYEOF' 2>/dev/null || true
+import json, os, sys
+mdir = sys.argv[2] if len(sys.argv) > 2 else ""
+def identifier(slug):
+    # Products that sign people in by email and validate the field as an
+    # email reject the bare username; their manifest names the address.
+    try:
+        sso = (json.load(open(os.path.join(mdir, slug + ".json"))).get("sso") or {})
+        return sso.get("breakglassIdentifier") or "vibe-breakglass"
+    except Exception:
+        return "vibe-breakglass"
 rows = []
 for raw in open(sys.argv[1]):
     line = raw.strip()
@@ -621,8 +630,9 @@ for raw in open(sys.argv[1]):
             rows.append((slug, v))
 for slug, pw in rows:
     print(f"  {slug}")
-    print(f"    Username:  vibe-breakglass")
-    print(f"    Password:  {pw}")
+    print(f"    Sign in as: {identifier(slug)}   (at the app's /login/local page)")
+    print(f"    Password:   {pw}")
+    print(f"    Check it:   sudo vibe identity breakglass-status {slug}")
     print()
 PYEOF
 )"

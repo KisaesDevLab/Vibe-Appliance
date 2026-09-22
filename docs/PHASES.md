@@ -2351,3 +2351,62 @@ Append to this list as phases complete. Format:
   Apps list's new `vibe:apps-changed` event and on a 60 s tick.
   Registration/rotate/disable/mode routes no longer 400 on "manifest not
   sso.capable" — the script is authoritative and its refusal is relayed.
+- 2026-09-18: review fixes for the SSO panel and the Vibe 1099 SSO merge.
+  (1) Security: `identity.sh disable` stripped every `VIBE_OIDC_*` line,
+  including the operator policy keys (MFA at the IdP, JIT, fallback role,
+  role map). The package default for `VIBE_OIDC_REQUIRE_MFA_AMR` is false,
+  so Disable + Register let SSO logins skip MFA. Manifest-declared keys
+  are operator-owned now: `disable` keeps them and the broker's
+  registration block can never overwrite them. (2) Re-render: the env
+  merge kept old values only for keys the template lacks, so every Tier-1
+  per-app setting the template also sets reverted on each enable,
+  bootstrap or routing change (Vibe 1099 MFA, Vibe Time & Billing SMTP
+  and storage, Vibe Recap models, Vibe AI Router local model). Tier-1
+  per-app/both keys now keep the existing value; the merge is its own
+  function (`_merge_env_render`) with tests. Trade-off: a changed template
+  default for such a key reaches fresh installs only. (3) Settings save
+  now enforces each field's `ui.validate` rule server-side
+  (`console/lib/settings-validate.js`) and refuses line breaks in any
+  value; `settings-save.sh` refuses them too, and the page joins a
+  multi-line textarea onto one line. The registry descriptor now carries
+  `dynamic`, which it never did, so the live Anthropic model list merges
+  into the dropdown for the first time. (4) Identity: a registered app
+  counts as SSO-capable (listed, reached by disable-all and rebase) even
+  when runtime detection fails because its api is down; disable, mode,
+  rotate and rotate-breakglass refuse an app that is neither capable nor
+  registered; a trailing slash on `sso.internalUrl` no longer doubles in
+  the probe URL. (5) Panel: background reloads skip while a sign-in mode
+  is picked but not applied; the host-action path also dispatches
+  `vibe:apps-changed`; the pending card has a style. Not changed: the
+  enable path still auto-registers only manifest-declared apps; an app
+  known only through runtime detection needs Register on the panel.
+- 2026-09-19: second review round on the same branch (code review of the
+  fixes above, ten findings). (1) `register-all`, `disable-all` and the
+  rebase recreate run each product in a subshell: a failure inside
+  reports through `die` (exit), which used to end the whole loop and
+  leave every later product unregistered. (2) `register` accepts an app
+  that was registered before without a fresh `/auth/status` probe, so
+  "Fix registration" and `register-all` work while its api is still
+  starting. (3) A client id in the env file is no longer taken as proof
+  of registration where it matters: `mode both|oidc_only` asks the broker
+  (`GET /registrations/<slug>`) and refuses with a fix hint when it holds
+  none — disabling a product drops the broker registration and keeps the
+  env block, and `oidc_only` against a missing client locks staff out.
+  The enable path now also re-registers a product whose env already
+  carries a client id, which closes that window for apps known only
+  through runtime detection. (4) One definition of an operator-owned key,
+  `lib/operator-keys.sh` (`ui.tier == 1`, per-app or both), used by both
+  the env re-render and `identity.sh`; a manifest entry without a Tier-1
+  ui block is documentation only, so documenting `VIBE_OIDC_CLIENT_ID`
+  cannot block registration from writing it. (5) The re-render keeps an
+  operator value only when it is non-empty: a cleared field falls back to
+  the template default (per-app fields have no Revert button). (6)
+  Settings validation: `non-empty` applies only while the field applies
+  (showIf / hideIf evaluated against the batch, then the env files), so a
+  provider switch that blanks the old provider's credentials saves; all
+  problems in a batch are reported together by field label; live-option
+  fields (Anthropic model) accept static options or an id-shaped value,
+  not free text; the Cloudflare Tunnel wizard shows the refusal detail.
+  (7) The panel's unapplied-edit guard compares each dropdown with what
+  it showed at render, so an out-of-range `VIBE_AUTH_MODE` no longer
+  stops background reloads. (8) New refusals carry diagnose and fix hints.

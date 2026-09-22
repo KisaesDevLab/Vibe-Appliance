@@ -514,6 +514,14 @@ for c in payload.get("changes", []):
     else:
         print(f"_settings_apply_changes: unknown scope {scope!r}", file=sys.stderr)
         sys.exit(2)
+    # One line per key: a value with a line break would split into env
+    # lines compose cannot parse. The console route refuses these too;
+    # this is the script-level guard for any other caller.
+    if any(ch in str(c.get("value", "")) for ch in "\r\n"):
+        print(f"_settings_apply_changes: {c['key']}: value contains a line break; nothing was written. "
+              "Env files hold one line per key. Fix: put the value on one line (JSON can be minified) and save again.",
+              file=sys.stderr)
+        sys.exit(2)
     changes_by_file.setdefault(target, {})[c["key"]] = {
         "value": c.get("value", ""),
         "op":    op,

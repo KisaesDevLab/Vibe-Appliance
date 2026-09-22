@@ -73,7 +73,12 @@
       "breakglass",
       "ensure",
       "--json"
-    ]
+    ],
+    "breakglassIdentifier": "vibe-breakglass@vibe-1099.local",
+    "recreate": [
+      "vibe1099-app"
+    ],
+    "minBroker": "1.0.4"
   },
   "depends": [
     "postgres",
@@ -174,7 +179,7 @@
       {
         "name": "VIBE_OIDC_REQUIRE_MFA_AMR",
         "value": "true",
-        "doc": "Refuse a single sign-on login whose ID token carries no MFA `amr` claim. An SSO session bypasses the app's own TOTP, so the identity provider's MFA stands in; keep this on unless the firm has deliberately not enrolled staff in MFA at Vibe Auth. Not written by registration (identity.sh writes only the broker's VIBE_OIDC_* block), so the value set here survives Register / Fix / rebase.",
+        "doc": "Refuse a single sign-on login whose ID token carries no MFA `amr` claim. An SSO session bypasses the app's own TOTP, so the identity provider's MFA stands in; keep this on unless the firm has deliberately not enrolled staff in MFA at Vibe Auth. Operator-owned: registration never writes it, Disable SSO never strips it, and a re-render keeps the value set here (Tier-1 keys win over the template default). It survives Register / Fix / rebase / Disable / re-enable.",
         "ui": {
           "tier": 1,
           "category": "Application",

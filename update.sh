@@ -446,6 +446,32 @@ cmd_update() {
   log_set_phase "update"
   log_step "starting update" slug="$slug"
 
+  # Updating the identity provider stops it until it is healthy again (first
+  # authentik start after an image change can take minutes). Products in
+  # 'both' mode fall back to local passwords meanwhile; products in
+  # 'oidc_only' are reachable ONLY through their break-glass account. Say so
+  # before it happens, by name — this script otherwise knows nothing of SSO.
+  if [[ "$(_manifest_field "$manifest" '"1" if "identity" in (data.get("provides") or []) else ""')" == "1" ]]; then
+    local _sso_only="" _sso_both="" _f _s _m
+    for _f in "${VIBE_ENV_DIR:-/opt/vibe/env}"/*.env; do
+      [[ -f "$_f" ]] || continue
+      _s="$(basename "$_f" .env)"
+      # Read directly: update.sh does not source enable-app.sh's env helpers.
+      _m="$(sed -n 's/^VIBE_AUTH_MODE=//p' "$_f" 2>/dev/null | tail -n 1 | tr -d '[:space:]')"
+      [[ -n "$(sed -n 's/^VIBE_OIDC_CLIENT_ID=//p' "$_f" 2>/dev/null | tail -n 1 | tr -d '[:space:]')" ]] || continue
+      case "$_m" in
+        oidc_only) _sso_only+="${_sso_only:+, }${_s}" ;;
+        both)      _sso_both+="${_sso_both:+, }${_s}" ;;
+      esac
+    done
+    if [[ -n "$_sso_only" ]]; then
+      log_warn "single sign-on will be DOWN while $slug updates. OIDC-only products cannot be signed in to except with their break-glass account: ${_sso_only}. Passwords: sudo vibe credentials. Check them first: sudo vibe identity breakglass-status <slug>" slug="$slug"
+    fi
+    if [[ -n "$_sso_both" ]]; then
+      log_info "single sign-on will be down while $slug updates; these products keep working with local passwords: ${_sso_both}" slug="$slug"
+    fi
+  fi
+
   # Source shared.env so APP_TAG / db creds are available.
   # shellcheck source=/dev/null
   set -a; . "$VIBE_ENV_SHARED"; set +a

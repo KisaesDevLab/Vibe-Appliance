@@ -14,7 +14,7 @@
 // operators can confirm in DevTools (F12 → Console) that the file
 // they're running is the version they expect, vs. a stale cached
 // copy. Compare against the server's /api/v1/version response.
-const SETTINGS_JS_VERSION = '2026-07-30-tunnel-scope-and-rootserved-urls';
+const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
 
 (function () {
   // eslint-disable-next-line no-console
@@ -837,6 +837,10 @@ const SETTINGS_JS_VERSION = '2026-07-30-tunnel-scope-and-rootserved-urls';
   function readInputValue(input) {
     if (input.tagName === 'SELECT')   return input.value;
     if (input.type === 'checkbox')    return input.checked ? 'true' : 'false';
+    // Env files hold one line per key (the server refuses line breaks):
+    // a pasted multi-line value, e.g. pretty-printed JSON, is joined onto
+    // one line. Whitespace between JSON tokens is insignificant.
+    if (input.tagName === 'TEXTAREA') return input.value.replace(/\s*[\r\n]+\s*/g, ' ').trim();
     return input.value;
   }
 
@@ -2667,7 +2671,9 @@ const SETTINGS_JS_VERSION = '2026-07-30-tunnel-scope-and-rootserved-urls';
         return;
       }
       if (saveResp.result !== 'saved') {
-        wiz.error = 'settings save ' + (saveResp.result || 'failed') + ': ' + (saveResp.reason || 'unknown');
+        // A 4xx refusal (validation, lock) carries error/detail, not result/reason.
+        wiz.error = 'settings save ' + (saveResp.result || 'failed') + ': ' +
+          (saveResp.reason || saveResp.detail || saveResp.error || 'unknown');
         finishProv('FAILED');
         return;
       }
