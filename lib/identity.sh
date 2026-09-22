@@ -122,20 +122,40 @@ _id_app_enabled() {
   python3 -c "import json;print('1' if (json.load(open('${VIBE_STATE_FILE}')).get('apps',{}).get('$1',{}).get('enabled')) else '0')" 2>/dev/null | grep -q 1
 }
 
-# Runtime detection. A product can gain SSO in a release before the
-# appliance ships the matching manifest: every product embedding
-# @kisaesdevlab/vibe-auth answers GET /auth/status (public, unprefixed —
-# Caddy strips the prefix and so do we) on its api tier. An ENABLED app
-# that answers 200 there is SSO-capable whatever its vendored manifest
-# says; registration then uses the package defaults (/auth/oidc/callback,
+# Body of a GET, through the same vibe-console curl the health probe uses.
+# Separate function so the script tests can stub it.
+_id_probe_body() {
+  docker exec vibe-console curl -s --max-time 5 "$1" 2>/dev/null || true
+}
+
+# Runtime detection. A product can gain SSO in a release before the appliance
+# ships the matching manifest: every product embedding @kisaesdevlab/vibe-auth
+# answers GET /auth/status (public, unprefixed — Caddy strips the prefix and so
+# do we) on its api tier with the engine's JSON status. An ENABLED app that
+# answers with THAT is SSO-capable whatever its vendored manifest says;
+# registration then uses the package defaults (/auth/oidc/callback,
 # /auth/oidc/backchannel, no public paths, `npx vibe-auth` break-glass).
 # Declared capability never probes.
+#
+# The status code alone is not evidence: a product whose web tier serves a
+# single-page app answers 200 with index.html for EVERY path, so vibe-ai-router
+# and vibe-tx-converter — neither of which contains a line of SSO code — were
+# detected, registered, recreated and then failed break-glass on the LAN box.
+# Require the engine's shape: a JSON object with "mode" and an "oidc" object.
 _id_sso_detected() {
-  local slug="$1" up
+  local slug="$1" up body
   _id_app_enabled "$slug" || return 1
   up="$(_id_auth_upstream "$slug")"
   [[ -n "$up" ]] || return 1
-  probe_health_200 "http://${up}/auth/status"
+  probe_health_200 "http://${up}/auth/status" || return 1
+  body="$(_id_probe_body "http://${up}/auth/status")"
+  [[ -n "$body" ]] || return 1
+  printf '%s' "$body" | python3 -c 'import json,sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+sys.exit(0 if isinstance(d, dict) and "mode" in d and isinstance(d.get("oidc"), dict) else 1)' 2>/dev/null
 }
 
 _id_sso_capable() { _id_sso_declared "$1" || _id_sso_detected "$1"; }
@@ -347,8 +367,13 @@ id_register() {
   # `die` inside the command substitution kills only the subshell, so a product
   # env file without ALLOWED_ORIGIN used to leave base_url empty and the broker
   # answered "HTTP 400 invalid url" — two misleading errors for one missing key.
-  base_url="$(_id_product_base_url "$slug")" || true
-  [[ -n "$base_url" ]] || die "cannot derive ${slug}'s base URL: ALLOWED_ORIGIN missing in ${VIBE_ENV_DIR}/${slug}.env. Fix: sudo vibe enable ${slug} (re-renders the env from its template), then retry."
+  base_url="$(_id_product_base_url "$slug" 2>/dev/null)" || true
+  if [[ -z "$base_url" ]]; then
+    # Not `die`: register-all calls this in a loop, and one product missing a
+    # key is not an aborted bootstrap. The dispatch below still exits non-zero.
+    log_error "cannot derive ${slug}'s base URL: ALLOWED_ORIGIN missing in ${VIBE_ENV_DIR}/${slug}.env. Fix: sudo vibe enable ${slug} (re-renders the env from its template), then retry." slug="$slug"
+    return 1
+  fi
   body="$(_id_registration_body "$slug" "$base_url")"
   log_step "registering ${slug} with vibe-auth" base_url="$base_url"
   resp="$(_id_api POST /registrations "$body")" || die "registration failed for ${slug}"
@@ -356,7 +381,8 @@ id_register() {
   # D11: VIBE_AUTH_MODE is NOT written here.
   _id_recreate "$slug"
   _id_breakglass "$slug" ensure || true
-  log_ok "${slug} registered with vibe-auth (mode unchanged: $(_extract_env_value "${VIBE_ENV_DIR}/${slug}.env" VIBE_AUTH_MODE || echo local))"
+  local mode; mode="$(_extract_env_value "${VIBE_ENV_DIR}/${slug}.env" VIBE_AUTH_MODE)"
+  log_ok "${slug} registered with vibe-auth (mode unchanged: ${mode:-local})"
 }
 
 id_rotate() {

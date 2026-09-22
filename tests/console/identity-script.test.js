@@ -162,7 +162,7 @@ const DYN_SETUP = `
 _id_manifest() { printf '%s' "$VIBE_ENV_DIR/$1.json"; }
 export VIBE_STATE_FILE="$VIBE_ENV_DIR/state.json"
 cat > "$VIBE_ENV_DIR/state.json" <<'J'
-{"apps":{"acme":{"enabled":true},"old":{"enabled":true},"off":{"enabled":false},"vibe-auth":{"enabled":false}}}
+{"apps":{"acme":{"enabled":true},"old":{"enabled":true},"spa":{"enabled":true},"off":{"enabled":false},"vibe-auth":{"enabled":false}}}
 J
 cat > "$VIBE_ENV_DIR/acme.json" <<'J'
 {"slug":"acme","routing":{"default_upstream":"acme-web:80","matchers":[{"name":"api","path":"/api/*","upstream":"acme-api:9000"},{"name":"auth","path":"/auth/*","upstream":"acme-api:9000"}]}}
@@ -176,8 +176,18 @@ J
 cat > "$VIBE_ENV_DIR/declared.json" <<'J'
 {"slug":"declared","routing":{"default_upstream":"d-web:80"},"sso":{"capable":true,"internalUrl":"http://d-api:4000"}}
 J
-# Only acme's api answers /auth/status.
-probe_health_200() { [[ "$1" == "http://acme-api:9000/auth/status" ]]; }
+cat > "$VIBE_ENV_DIR/spa.json" <<'J'
+{"slug":"spa","routing":{"default_upstream":"spa-web:80"}}
+J
+# acme runs the vibe-auth engine. spa has no SSO at all: like any single-page
+# app its web tier answers 200 with index.html for EVERY path, /auth/status too.
+probe_health_200() { [[ "$1" == "http://acme-api:9000/auth/status" || "$1" == "http://spa-web:80/auth/status" ]]; }
+_id_probe_body() {
+  case "$1" in
+    http://acme-api:9000/auth/status) printf '%s' '{"mode":"local","product":"acme","oidc":{"enabled":false,"idpName":"Vibe Auth","reachable":false,"startPath":"/auth/oidc/start"},"localLoginVisible":true,"breakglassPath":"/login/local"}' ;;
+    http://spa-web:80/auth/status)    printf '%s' '<!doctype html><html><head><title>App</title></head><body><div id="root"></div></body></html>' ;;
+  esac
+}
 log_warn() { echo "warn: $*" >&2; }
 `;
 
@@ -193,11 +203,16 @@ test('runtime detection: enabled + api answers /auth/status; never for disabled 
   assert.equal(t('acme'), 'yes');
   assert.equal(t('old'), 'no', 'enabled but no /auth/status');
   assert.equal(t('off'), 'no', 'disabled apps are never probed');
+  // A 200 is not evidence on its own: an SPA answers it for every path.
+  // Registering such an app writes VIBE_OIDC_* it ignores, recreates it and
+  // then fails break-glass — vibe-ai-router and vibe-tx-converter on the LAN box.
+  assert.equal(t('spa'), 'no', 'a 200 that is not the engine JSON must not count as SSO');
   // Capability = declared OR detected.
   const c = (slug) => run(ENV_SUBPATH, DYN_SETUP + `if _id_sso_capable ${slug}; then echo yes; else echo no; fi`);
   assert.equal(c('declared'), 'yes');
   assert.equal(c('acme'), 'yes');
   assert.equal(c('old'), 'no');
+  assert.equal(c('spa'), 'no');
 });
 
 test('status reports enabled / declared / detected so the panel can group and badge', () => {
