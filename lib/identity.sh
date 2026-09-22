@@ -344,7 +344,11 @@ id_register() {
     log_warn "${slug} answers /auth/status but its vendored manifest predates SSO: registering with the package defaults (redirect /auth/oidc/callback, back-channel /auth/oidc/backchannel, no public paths). Update the appliance for the app's full sso block and break-glass command." slug="$slug"
   fi
   local base_url body resp
-  base_url="$(_id_product_base_url "$slug")"
+  # `die` inside the command substitution kills only the subshell, so a product
+  # env file without ALLOWED_ORIGIN used to leave base_url empty and the broker
+  # answered "HTTP 400 invalid url" — two misleading errors for one missing key.
+  base_url="$(_id_product_base_url "$slug")" || true
+  [[ -n "$base_url" ]] || die "cannot derive ${slug}'s base URL: ALLOWED_ORIGIN missing in ${VIBE_ENV_DIR}/${slug}.env. Fix: sudo vibe enable ${slug} (re-renders the env from its template), then retry."
   body="$(_id_registration_body "$slug" "$base_url")"
   log_step "registering ${slug} with vibe-auth" base_url="$base_url"
   resp="$(_id_api POST /registrations "$body")" || die "registration failed for ${slug}"
