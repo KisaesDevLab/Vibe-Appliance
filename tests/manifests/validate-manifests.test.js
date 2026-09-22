@@ -322,9 +322,18 @@ test('an sso-capable manifest carries everything lib/identity.sh needs', () => {
     // a product with a separate SPA container (vibe-1099, vibe-tb) routes by
     // default to the web tier, so /auth/* needs its own route to the API tier.
     // A single-service product (vibe-1040) already has the default route
-    // pointing at the tier that serves /auth/*, and needs no matcher.
+    // pointing at the tier that serves /auth/*, and needs no matcher. Nor does
+    // a product whose own web tier proxies the engine routes to its api in the
+    // image (vibe-time-billing): it declares sso.authViaDefaultUpstream, and a
+    // blanket /auth/* matcher would in fact break the SPA pages it serves at
+    // /auth/login and /auth/verify.
     const apiTier = sso.internalUrl ? sso.internalUrl.replace(/^https?:\/\//, '') : null;
-    const needsMatcher = !!apiTier && apiTier !== routing.default_upstream;
+    const needsMatcher = !!apiTier && apiTier !== routing.default_upstream && sso.authViaDefaultUpstream !== true;
+    if (sso.authViaDefaultUpstream === true) {
+      assert.ok(apiTier && apiTier !== routing.default_upstream,
+        `${file}: sso.authViaDefaultUpstream only means something when the api tier differs from routing.default_upstream`);
+      assert.ok(!auth, `${file}: sso.authViaDefaultUpstream says the web tier proxies /auth/*, so drop the /auth/* matcher`);
+    }
     if (needsMatcher) {
       assert.ok(auth, `${file}: sso.capable with an API tier (${apiTier}) behind a different default upstream (${routing.default_upstream}) needs a routing matcher for /auth/*`);
     }

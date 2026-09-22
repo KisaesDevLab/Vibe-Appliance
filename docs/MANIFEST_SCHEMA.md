@@ -474,9 +474,20 @@ enable.
   "breakglassIdentifier":    "vibe-breakglass@vibe-1099.local",   // optional
   "breakglassStatusCommand": ["node", "dist/auth/breakglass-status.js"], // optional
   "recreate":                ["vibe-tb-server"],                  // optional
-  "minBroker":               "1.0.4"                              // optional
+  "minBroker":               "1.0.4",                             // optional
+  "authViaDefaultUpstream":  false                                // optional
 }
 ```
+
+`authViaDefaultUpstream: true` says the product's OWN web tier proxies the
+engine routes (`/auth/oidc/*`, `/auth/status`, `/auth/settings*`, `/auth/me`)
+to its api tier inside the image, so the appliance adds no `/auth/*` matcher
+even though `sso.internalUrl` names a different service than
+`routing.default_upstream`. `vibe-time-billing` is the case it exists for: it
+serves `/auth/login`, `/auth/verify` and `/auth/reset-password` from its own
+SPA, so a blanket `/auth/*` matcher would break those pages. Set it only when
+the image really does that proxying — without it and without a matcher, the
+OIDC callback lands on the SPA and sign-in fails.
 
 When `vibe-auth` is enabled, `lib/identity.sh register <slug>` (run by
 `enable-app.sh` and by the console's Identity panel) registers the product
