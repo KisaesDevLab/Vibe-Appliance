@@ -1121,6 +1121,15 @@ PYEOF
       log_warn "app re-enable failed; marked status=failed in state — see ${VIBE_LOG_DIR}/bootstrap.log" slug="$slug"
     fi
   done <<<"$slugs"
+
+  # Every app is up: now the leftovers are knowable. Each per-app compose call
+  # above saw the other apps as "orphan containers" (all apps share the project
+  # `vibe`) and said so; that warning is noise. This sweep compares the whole
+  # project against core + EVERY enabled app, so what it removes is a real
+  # leftover: a disabled app whose containers survived, or a service an update
+  # renamed or dropped. Never fatal.
+  log_step "removing orphan containers left by earlier installs"
+  prune_orphans || log_warn "orphan sweep failed; run: sudo vibe prune-orphans --dry-run"
 }
 
 # --- Phase 8 — write CREDENTIALS.txt and print the success banner ----
@@ -1291,7 +1300,7 @@ main() {
   local lib="${APPLIANCE_DIR}/lib"
   for f in log.sh compose-files.sh state.sh lan-only-cookies.sh preflight.sh secrets.sh render-caddyfile.sh \
            render-haproxy.sh ufw-rules.sh \
-           health-probe.sh db-bootstrap.sh enable-app.sh disable-app.sh; do
+           health-probe.sh db-bootstrap.sh enable-app.sh disable-app.sh prune-orphans.sh; do
     if [[ ! -f "${lib}/${f}" ]]; then
       _pre_die "missing ${lib}/${f}. Is this a complete clone of the Vibe-Appliance repo?"
     fi
