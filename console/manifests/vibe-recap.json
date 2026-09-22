@@ -4,7 +4,7 @@
   "displayName": "Vibe Recap",
   "description": "Turns a finished Form 1040 package into a narrated plain-English video summary for the client, verified line by line against the return, approved by the preparer, delivered by download.",
   "logo": "vibe-recap.svg",
-  "_doc": "In-tree manifest for KisaesDevLab/Vibe-Recap. THREE containers plus a migration one-shot, from three GHCR images: `vibe-recap-api` (Fastify, 3000; also the migration and seed one-shots), `vibe-recap-web` (nginx serving the React UI, 80), `vibe-recap-worker` (Python: extraction, script, verifier, Kokoro narration, Playwright slides, ffmpeg). NETWORK POSTURE: the worker never joins vibe_net. It lives on a private internal network behind `vibe-recap-relay`, a socat container that forwards exactly four ports (postgres 5432, redis 6379, vibe-ai-router 8220, vibellm 11434) and carries those names as aliases so the shared env file works unchanged; the worker therefore has no internet route on the appliance either. ROUTER: script generation goes through vibe-ai-router by default (task class `recap_script`, registered by the api at startup and starting local_only until the firm admin widens it). Unlike Vibe-1040 the router is not fatal - with an empty token the app falls back to the appliance's local model server through OLLAMA_URL - but the token is minted at enable like every other app, hence requiredApps. OCR of scanned pages needs an Ollama-native endpoint (`/api/chat` with images); if vibellm only speaks /v1 the job fails cleanly at `ocr` and the preparer asks for a text-layer PDF. MIGRATIONS: the api honours MIGRATIONS_AUTO; the appliance sets it false and runs `migrate` as the one-shot in the overlay (idempotent) and at update time. FIRST LOGIN: `seed-admin` creates the first admin from SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD, is a no-op once any user exists, and the app's /setup page disables itself as soon as a user exists.",
+  "_doc": "In-tree manifest for KisaesDevLab/Vibe-Recap. THREE containers plus a migration one-shot, from three GHCR images: `vibe-recap-api` (Fastify, 3000; also the migration and seed one-shots), `vibe-recap-web` (nginx serving the React UI, 80), `vibe-recap-worker` (Python: extraction, script, verifier, Kokoro narration, Playwright slides, ffmpeg). NETWORK POSTURE: the worker never joins vibe_net. It lives on a private internal network behind `vibe-recap-relay`, a socat container that forwards exactly four ports (postgres 5432, redis 6379, vibe-ai-router 8220, vibellm 11434) and carries those names as aliases so the shared env file works unchanged; the worker therefore has no internet route on the appliance either. ROUTER: script generation goes through vibe-ai-router by default (task class `recap_script`, registered by the api at startup and starting local_only until the firm admin widens it). Unlike Vibe-1040 the router is not fatal - with an empty token the app falls back to the appliance's local model server through OLLAMA_URL - but the token is minted at enable like every other app, hence requiredApps. OCR of scanned pages needs an Ollama-native endpoint (`/api/chat` with images); if vibellm only speaks /v1 the job fails cleanly at `ocr` and the preparer asks for a text-layer PDF. MIGRATIONS: the api honours MIGRATIONS_AUTO; the appliance sets it false and runs `migrate` as the one-shot in the overlay (idempotent) and at update time. FIRST LOGIN: `seed-admin` creates the first admin from SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD, is a no-op once any user exists, and the app's /setup page disables itself as soon as a user exists. SINGLE SIGN-ON (docs/sso.md): the api embeds @kisaesdevlab/vibe-auth and serves /auth/* itself, hence the `auth` matcher past the web tier; `requires: identity` is soft (the app runs on local sign-in without Vibe Auth) and registration never sets VIBE_AUTH_MODE. The break-glass command goes through the image entrypoint for the same reason the seed does, and because the CLI must run from /app/apps/api. Copy the `sso` block into the appliance's vendored manifest only once a Recap image that carries single sign-on is what `defaultTag` resolves to.",
   "image": {
     "server": "ghcr.io/kisaesdevlab/vibe-recap-api",
     "client": "ghcr.io/kisaesdevlab/vibe-recap-web",
@@ -40,7 +40,44 @@
         "name": "readyz",
         "path": "/readyz",
         "upstream": "vibe-recap-api:3000"
+      },
+      {
+        "name": "auth",
+        "path": "/auth/*",
+        "upstream": "vibe-recap-api:3000"
       }
+    ]
+  },
+  "requires": [
+    "identity"
+  ],
+  "sso": {
+    "capable": true,
+    "redirectPaths": [
+      "/auth/oidc/callback"
+    ],
+    "logoutPaths": [
+      "/auth/oidc/backchannel"
+    ],
+    "publicPaths": [
+      "/healthz",
+      "/readyz",
+      "/api/v1/health",
+      "/api/setup/*",
+      "/api/auth/login",
+      "/api/auth/password-reset/status",
+      "/api/auth/forgot-password",
+      "/api/auth/reset-password/*",
+      "/api/invite/*"
+    ],
+    "edgeGate": false,
+    "internalUrl": "http://vibe-recap-api:3000",
+    "breakglassService": "vibe-recap-api",
+    "breakglassCommand": [
+      "docker-entrypoint.sh",
+      "breakglass",
+      "ensure",
+      "--json"
     ]
   },
   "depends": [
@@ -97,11 +134,6 @@
         "name": "MIGRATIONS_AUTO",
         "from": "static:false",
         "doc": "The appliance runs migrations explicitly (overlay one-shot at enable, update.sh at update)."
-      },
-      {
-        "name": "LICENSE_ENFORCE",
-        "from": "static:false",
-        "doc": "Kisaes licensing check stays informational until the licensing server is live (Vibe-Recap QUESTIONS.md Q35)."
       },
       {
         "name": "SEED_ADMIN_PASSWORD",
