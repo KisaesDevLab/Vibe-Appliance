@@ -299,6 +299,11 @@
           "default": false,
           "description": "Opt-in Caddy forward_auth in front of the whole app via authentik's embedded outpost (D10). Off by default: the app's own middleware already enforces sign-in; the gate adds defence in depth for apps with weak local auth."
         },
+        "authViaDefaultUpstream": {
+          "type": "boolean",
+          "default": false,
+          "description": "The product's OWN web tier proxies the engine routes (/auth/oidc/*, /auth/status, /auth/settings*, /auth/me) to its api tier inside the image, so the appliance adds no /auth/* matcher even though sso.internalUrl names a different service than routing.default_upstream. vibe-time-billing is the case this exists for: it serves /auth/login, /auth/verify and /auth/reset-password from its own SPA, so a blanket /auth/* matcher would break those pages. Set it only when the image really proxies - without that and without a matcher, the OIDC callback lands on the SPA and sign-in fails."
+        },
         "breakglassService": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9-]*$",

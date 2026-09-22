@@ -39,11 +39,56 @@
 
   "depends": ["postgres", "redis"],
 
+  "requires": ["identity"],
+
+  "sso": {
+    "capable":       true,
+    "redirectPaths": ["/auth/oidc/callback"],
+    "logoutPaths":   ["/auth/oidc/backchannel"],
+    "publicPaths": [
+      "/health",
+      "/health/*",
+      "/metrics",
+      "/api/webhooks/*",
+      "/api/auth/*",
+      "/api/portal/*",
+      "/api/shared*",
+      "/api/pay",
+      "/api/pay/*",
+      "/api/ach-verify/*",
+      "/api/mail-assets/*",
+      "/api/public/*",
+      "/api/calendar/rsvp",
+      "/api/v1/*",
+      "/mcp",
+      "/v1/internal/*",
+      "/api/staff/admin/unlock",
+      "/desktop/*",
+      "/auth/status",
+      "/auth/login",
+      "/auth/login/*",
+      "/auth/verify",
+      "/auth/reset-password"
+    ],
+    "edgeGate":               false,
+    "authViaDefaultUpstream": true,
+    "internalUrl":            "http://vibe-time-billing-api:3001",
+    "breakglassService":      "vibe-time-billing-api",
+    "breakglassCommand":      ["node", "--experimental-transform-types", "--no-warnings=ExperimentalWarning", "--import", "/app/ops/docker/esm-resolve-hook.mjs", "apps/api/node_modules/@kisaesdevlab/vibe-auth/dist/cli.js", "breakglass", "ensure", "--json"],
+    "recreate":               ["vibe-time-billing-api"],
+    "_doc": "Mirrored from Vibe-Time-Billing/.appliance/manifest.json. The engine routes (/auth/oidc/*, /auth/status, /auth/settings*, /auth/me) are proxied to the api tier by the app's OWN in-image Caddy, so routing.matchers stays as it is and authViaDefaultUpstream says so: no blanket /auth/* matcher, because the SPA owns /auth/login, /auth/verify and /auth/reset-password. internalUrl is where authentik POSTs back-channel logout. Product-side settings (mode, issuer, client id/secret, MFA requirement) live in Admin -> Security -> Single sign-on and override the VIBE_OIDC_* env block."
+  },
+
   "env": {
     "required": [
       { "name": "DATABASE_URL", "from": "database-url" },
       { "name": "REDIS_URL",    "from": "redis-url" },
       { "name": "APP_BASE_URL", "from": "subdomain-url" },
+      {
+        "name": "ALLOWED_ORIGIN",
+        "from": "subdomain-url",
+        "doc":  "The rendered browser origin of this app. lib/identity.sh reads it from the product env to build the base URL it registers with the Vibe Auth broker; VIBE_OIDC_PUBLIC_URL, and so the OIDC redirect URI, follow from that registration. Rendered with the scheme of the install mode - never https for a bare IP."
+      },
       {
         "name":   "STAFF_JWT_SECRET",
         "from":   "generated:hex32",
@@ -154,6 +199,43 @@
         "name": "MAIL_FROM",
         "doc":  "From header for outbound mail, e.g. \"Smith & Co CPAs <billing@smithcpas.com>\".",
         "ui": { "tier": 1, "category": "Email & SMS", "label": "Mail from address", "helpText": "Shown on sign-in, invoice, and portal emails. Use an address your SMTP relay is allowed to send as.", "input": "text", "appliance": "per-app" }
+      }
+      ,
+      {
+        "name":  "VIBE_OIDC_REQUIRE_MFA_AMR",
+        "value": "true",
+        "doc":   "Refuse a single sign-on login whose ID token carries no MFA `amr` claim. An SSO session stands in for the app's own second factor, so keep this on unless the firm has deliberately not enrolled staff in MFA at Vibe Auth. Registration never writes this key, so the value set here survives Register / Fix / rebase.",
+        "ui": {
+          "tier":      1,
+          "category":  "Application",
+          "label":     "SSO requires MFA at the identity provider",
+          "helpText":  "On: a Vibe Auth sign-in is accepted only when the identity provider reports multi-factor authentication. Off: password-only SSO logins are accepted. Local sign-in to Time & Billing is unaffected.",
+          "input":     "toggle",
+          "appliance": "per-app",
+          "validate":  "enum",
+          "options": [
+            { "value": "true",  "label": "Required" },
+            { "value": "false", "label": "Not required" }
+          ]
+        }
+      },
+      {
+        "name":  "VIBE_OIDC_ALLOW_JIT",
+        "value": "true",
+        "doc":   "Just-in-time provisioning: create a staff user on first SSO sign-in, with the role mapped from the Vibe group. Off = only staff already present in the app (matched by verified email) can sign in.",
+        "ui": {
+          "tier":      1,
+          "category":  "Application",
+          "label":     "Create staff accounts on first SSO sign-in",
+          "helpText":  "On: anyone the identity provider admits gets an account automatically. Off: staff must be added in Time & Billing with the same email before SSO lets them in.",
+          "input":     "toggle",
+          "appliance": "per-app",
+          "validate":  "enum",
+          "options": [
+            { "value": "true",  "label": "Enabled" },
+            { "value": "false", "label": "Disabled" }
+          ]
+        }
       }
     ]
   },
