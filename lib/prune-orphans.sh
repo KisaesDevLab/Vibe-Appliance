@@ -60,6 +60,18 @@ _prune_compose_files() {
   local -a all=()
   compose_files
   all=( "${COMPOSE_FILES[@]}" )
+
+  # The Cloudflare Tunnel sidecar is neither core nor an app: it lives in
+  # infra/cloudflared.yml, which compose_files() never emits. Without it in
+  # this list `config --services` cannot name the service, so a RUNNING
+  # connector looks like a leftover and the sweep deletes a live tunnel.
+  # (That is exactly what happened on 2026-09-28: phase_apps swept
+  # vibe-cloudflared and every public hostname went to Cloudflare 1033.)
+  # Include the overlay whenever it exists — cloudflared-down.sh owns
+  # retiring the connector, never this sweep.
+  if [[ -f "${APPLIANCE_DIR}/infra/cloudflared.yml" ]]; then
+    all+=( -f "${APPLIANCE_DIR}/infra/cloudflared.yml" )
+  fi
   while read -r slug; do
     [[ -n "$slug" ]] || continue
     [[ -f "${APPLIANCE_DIR}/apps/${slug}.yml" ]] || continue
@@ -75,9 +87,11 @@ _prune_compose_files() {
 }
 
 # Service names the appliance should be running, across every enabled app.
-# Profile-gated services (cloudflared, bundled profiles) are included: without
+# Profile-gated services (bundled profiles) are included: without
 # COMPOSE_PROFILES they are absent from `config --services` and a running one
-# would look like an orphan.
+# would look like an orphan. Note cloudflared is NOT profile-gated and lives
+# outside compose_files() entirely — it is covered by _prune_compose_files()
+# adding infra/cloudflared.yml to the file list, not by anything here.
 _prune_expected_services() {
   local profiles
   profiles="$(docker compose "${PRUNE_COMPOSE_FILES[@]}" config --profiles 2>/dev/null | paste -sd, -)"
