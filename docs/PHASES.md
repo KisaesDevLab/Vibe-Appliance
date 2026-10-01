@@ -2453,3 +2453,25 @@ Append to this list as phases complete. Format:
   `EMAILIT_API_KEY=` that overrode the appliance's saved key and wiped a
   hand-set one on every re-render; it is commented out, and the env merge
   drops a leftover blank for any key the template documents as inherited.
+- 2026-10-01: code-review fixes on `feat/host-resolver`. (1) The hostname
+  pre-flight counted every manifest's labels, enabled or not, so an
+  existing install whose main host label matched some app's default
+  (`portal`, `client`, `tb`) would have been refused on every bootstrap
+  re-run and routing save; it now counts only hostnames that are served
+  (enabled apps; a primary host only in subdomain-per-app mode or for
+  rootServedOnly apps). (2) bootstrap pre-flights the candidate names
+  before writing state.json or appliance.env, not after. (3) A crashed
+  checker exits 70, never 1, so it cannot read as "invalid hostnames";
+  env files with a non-UTF-8 byte no longer crash the resolver. (4) The
+  routing reconcile's affected set comes from the routing changes only.
+  (5) The scripts' fallback tunnel name is `vibe-appliance` again (the
+  wizard still proposes a unique one), so a legacy unnamed tunnel is
+  found. (6) The console caches a resolver failure instead of re-spawning
+  it per request. (7) Test buttons fill a saved secret only when the
+  request's destination (host, endpoint, URL) is the saved one. (8) The
+  Cockpit-origins hint is a warning and is in the Hostname tag help text.
+  Known and left as is: an appliance that adopted another appliance's
+  tunnel under the old same-domain guard still trusts that tunnel's id
+  (checking it would falsely refuse a legitimate single-host install that
+  renames its only hostname); and the provision makes two DNS lookups per
+  hostname.

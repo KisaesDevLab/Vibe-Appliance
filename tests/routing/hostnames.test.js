@@ -235,14 +235,16 @@ test('validate rejects a malformed tag and a tag that pushes a label past 63 cha
   for (const bad of ['-office', 'office-', 'of_fice', 'of.fice', 'a'.repeat(33)]) {
     assert.equal(validate(fx, `HOST_TAG=${bad}`).code, 1, `tag "${bad}" must be rejected`);
   }
-  const long = mkFixture({ manifests: [app('vibe-long', 'l'.repeat(40))] });
+  const long = mkFixture({ manifests: [app('vibe-long', 'l'.repeat(40), { rootServedOnly: true })] });
   const r = validate(long, `HOST_TAG=${'t'.repeat(30)}`);
   assert.equal(r.code, 1);
   assert.match(r.err, /longer than 63/);
 });
 
 test('validate rejects duplicate and reserved labels and names the setting to change', () => {
-  const fx = mkFixture();
+  // subdomain-per-app: every enabled app owns a hostname, so app labels
+  // are real claims.
+  const fx = mkFixture({ applianceEnv: 'DOMAIN_ROUTING_MODE=subdomain-per-app\n' });
   let r = validate(fx, 'vibe-tb:VIBE_APP_SUBDOMAIN=cockpit');
   assert.equal(r.code, 1);
   assert.match(r.err, /'cockpit' is claimed by both/);
@@ -260,6 +262,65 @@ test('validate rejects duplicate and reserved labels and names the setting to ch
 
   r = validate(fx, 'INFRA_SUBDOMAIN_BACKUP=Bad_Label');
   assert.equal(r.code, 1);
+});
+
+test('validate only counts hostnames that are actually served', () => {
+  // The regression this guards: an existing single-host install whose main
+  // host label equals some app's DEFAULT label rendered fine, and must
+  // keep validating — otherwise every bootstrap re-run and every routing
+  // save on that install is refused after upgrade.
+
+  // (a) An app that is not enabled claims nothing. Shipped manifests,
+  // nothing enabled, main host named like vibe-time-billing's portal.
+  const real = ['--state', path.join(os.tmpdir(), 'vibe-hosts-no-such-state.json'),
+                '--env-dir', path.join(os.tmpdir(), 'vibe-hosts-no-such-env'),
+                '--manifests', path.join(REPO, 'console', 'manifests')];
+  for (const label of ['portal', 'client', 'auth', 'tb', 'connect', 'practice']) {
+    const r = spawnSync('python3', [SCRIPT, ...real, 'validate', '--set', `tunnel_subdomain=${label}`], { encoding: 'utf8' });
+    assert.equal(r.status, 0, `main host "${label}" with no app enabled: ${r.stderr}`);
+  }
+
+  // (b) Single-host: an enabled, path-mounted app has no hostname of its
+  // own, so its label cannot collide with the main host...
+  const single = mkFixture();
+  assert.equal(validate(single, 'tunnel_subdomain=tb').code, 0, 'tb is a path under the main host here');
+  assert.equal(validate(single, 'vibe-tb:VIBE_APP_SUBDOMAIN=cockpit').code, 0);
+  // ...but a rootServedOnly app and an extra surface DO have one.
+  assert.equal(validate(single, 'tunnel_subdomain=1040').code, 1, 'rootServedOnly app is served at 1040.<domain>');
+  assert.equal(validate(single, 'tunnel_subdomain=client').code, 1, 'the client portal is served at client.<domain>');
+
+  // (c) The same label becomes a collision the moment the routing mode
+  // gives the app its own hostname — caught when that setting is saved.
+  assert.equal(validate(single, 'tunnel_subdomain=tb', 'DOMAIN_ROUTING_MODE=subdomain-per-app').code, 1);
+
+  // (d) A disabled app's label is free.
+  const off = mkFixture({ applianceEnv: 'DOMAIN_ROUTING_MODE=subdomain-per-app\n',
+    apps: { 'vibe-tb': { enabled: true }, 'vibe-mybooks': { enabled: false } } });
+  assert.equal(validate(off, 'tunnel_subdomain=mybooks').code, 0);
+});
+
+test('a crashed checker never reads as "invalid hostnames"', () => {
+  // Exit 1 means "the operator must fix a label". Callers (bootstrap, the
+  // console save routes) block on it. An internal error must use a
+  // different code, or a broken checker would block every save.
+  const src = fs.readFileSync(SCRIPT, 'utf8');
+  assert.match(src, /EXIT_INTERNAL = 70/);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vibe-hosts-crash-'));
+  // state.json whose `apps` is not an object: resolve() trips over it.
+  fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify({ config: {}, apps: 'not-an-object' }));
+  const fx = mkFixture();
+  const r = spawnSync('python3', [SCRIPT, '--state', path.join(dir, 'state.json'),
+    '--env-dir', fx.edir, '--manifests', fx.mdir, 'validate'], { encoding: 'utf8' });
+  assert.notEqual(r.status, 1, `a crash must not exit 1 (got ${r.status}: ${r.stderr})`);
+  if (r.status !== 0) assert.match(r.stderr, /internal error/);
+});
+
+test('an env file with a non-UTF-8 byte does not take the resolver down', () => {
+  const fx = mkFixture();
+  fs.writeFileSync(path.join(fx.edir, 'appliance.env'),
+    Buffer.concat([Buffer.from('HOST_TAG=office2\nNOTE='), Buffer.from([0xff, 0xfe]), Buffer.from('\n')]));
+  assert.equal(run(fx, 'get', 'main-label').trim(), 'vibe-office2');
+  assert.equal(validate(fx).code, 0);
 });
 
 test('validate: the no-Caddy-surface app does not collide with the infra host it shares a name with', () => {
@@ -344,6 +405,24 @@ test('settings-save picks the reconcile job from the manifest, for any declared 
     ['routing-reconcile']);
   assert.deepEqual(jobs([{ scope: 'appliance', key: 'TZ', value: 'America/Chicago' }]), [],
     'an unrelated setting triggers no reconcile');
+
+  // The reconcile's affected set comes from the ROUTING changes only. An
+  // unrelated appliance setting in the same save must not turn one app's
+  // rename into a restart of every enabled app.
+  const scopes = (changes) => {
+    const payload = path.join(dir, 'payload.json');
+    fs.writeFileSync(payload, JSON.stringify({ changes }));
+    return execFileSync('python3', [py, payload, MANIFESTS_DIR, 'routing-scopes'], { encoding: 'utf8' })
+      .split(/\r?\n/).filter(Boolean);
+  };
+  assert.deepEqual(scopes([
+    { scope: 'per-app:vibe-connect', key: 'VIBE_APP_SUBDOMAIN_CLIENT', value: 'clients' },
+    { scope: 'appliance', key: 'DDNS_INTERVAL_MIN', value: '10' },
+  ]), ['per-app:vibe-connect'], 'only the app whose host label changed');
+  assert.deepEqual(scopes([{ scope: 'appliance', key: 'HOST_TAG', value: 'office2' }]), ['appliance']);
+  const save = fs.readFileSync(path.join(REPO, 'lib', 'settings-save.sh'), 'utf8');
+  assert.match(save, /_settings_job_scan "\$payload_file" routing-scopes/,
+    'the reconcile job derives its affected set from the routing scopes');
 });
 
 // --- one label rule, several copies -----------------------------------

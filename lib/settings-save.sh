@@ -285,11 +285,44 @@ settings_save_apply() {
 _settings_run_post_save_jobs() {
   local payload_file="$1"
   local jobs
-  jobs="$(python3 - "$payload_file" "${APPLIANCE_DIR}/console/manifests" <<'PYEOF'
+  jobs="$(_settings_job_scan "$payload_file" jobs)" || return 1
+
+  local rc=0
+  local job
+  while IFS= read -r job; do
+    [[ -z "$job" ]] && continue
+    log_step "post-save dispatch" job="$job"
+    case "$job" in
+      dns-provider-switch)
+        _post_save_dns_provider_switch || rc=1
+        ;;
+      corpus-sync)
+        _post_save_corpus_sync || rc=1
+        ;;
+      routing-reconcile)
+        _post_save_routing_reconcile "$payload_file" || rc=1
+        ;;
+      *)
+        log_warn "unknown post-save job (skipping)" job="$job"
+        ;;
+    esac
+  done <<<"$jobs"
+  return "$rc"
+}
+
+# Internal: read the payload's changes against the manifests.
+#   _settings_job_scan <payload> jobs            -> post-save jobs, one per line
+#   _settings_job_scan <payload> routing-scopes  -> the scope of each change
+#       whose manifest field declares postSaveJob "routing-reconcile"
+# One scan, so "which keys move hostnames" is answered in a single place.
+_settings_job_scan() {
+  local payload_file="$1" what="${2:-jobs}"
+  python3 - "$payload_file" "${APPLIANCE_DIR}/console/manifests" "$what" <<'PYEOF'
 import json, os, sys
 with open(sys.argv[1]) as f:
     p = json.load(f)
 manifests_dir = sys.argv[2]
+what = sys.argv[3] if len(sys.argv) > 3 else "jobs"
 changes = p.get("changes", [])
 keys = {c.get("key") for c in changes}
 out = []
@@ -321,6 +354,12 @@ def declared_job(change):
     return None
 
 
+if what == "routing-scopes":
+    for c in changes:
+        if declared_job(c) == "routing-reconcile":
+            print(c.get("scope", ""))
+    sys.exit(0)
+
 if "DNS_PROVIDER" in keys:
     out.append("dns-provider-switch")
 for c in changes:
@@ -346,29 +385,6 @@ for j in out:
         seen.add(j); deduped.append(j)
 print("\n".join(deduped))
 PYEOF
-)" || return 1
-
-  local rc=0
-  local job
-  while IFS= read -r job; do
-    [[ -z "$job" ]] && continue
-    log_step "post-save dispatch" job="$job"
-    case "$job" in
-      dns-provider-switch)
-        _post_save_dns_provider_switch || rc=1
-        ;;
-      corpus-sync)
-        _post_save_corpus_sync || rc=1
-        ;;
-      routing-reconcile)
-        _post_save_routing_reconcile "$payload_file" || rc=1
-        ;;
-      *)
-        log_warn "unknown postSaveJob; skipping" job="$job"
-        ;;
-    esac
-  done <<<"$jobs"
-  return "$rc"
 }
 
 # DNS provider switch per addendum §11.4. The standard flow already
@@ -436,20 +452,19 @@ _post_save_corpus_sync() {
 _post_save_routing_reconcile() {
   local payload_file="$1"
 
-  local appliance_changed
-  appliance_changed="$(python3 - "$payload_file" <<'PYEOF'
-import json, sys
-p = json.load(open(sys.argv[1]))
-print("yes" if any(c.get("scope") == "appliance"
-                   for c in p.get("changes", [])) else "no")
-PYEOF
-)"
+  # Only the changes that move a hostname count. A save that also carries
+  # an unrelated appliance setting (a DDNS interval, a time zone) must not
+  # turn one app's rename into a restart of every enabled app.
+  local routing_scopes appliance_changed="no"
+  routing_scopes="$(_settings_job_scan "$payload_file" routing-scopes)" || routing_scopes=""
+  if grep -qx 'appliance' <<<"$routing_scopes"; then
+    appliance_changed="yes"
+  fi
 
   local slugs
-  slugs="$(python3 - "$payload_file" "${VIBE_DIR}/state.json" "${APPLIANCE_DIR}/console/manifests" "$appliance_changed" <<'PYEOF'
+  slugs="$(python3 - "$routing_scopes" "${VIBE_DIR}/state.json" "${APPLIANCE_DIR}/console/manifests" "$appliance_changed" <<'PYEOF'
 import json, os, sys
-payload_path, state_path, manifests_dir, appliance_changed = sys.argv[1:5]
-p = json.load(open(payload_path))
+routing_scopes, state_path, manifests_dir, appliance_changed = sys.argv[1:5]
 try:
     s = json.load(open(state_path))
 except Exception:
@@ -458,9 +473,9 @@ enabled = [slug for slug, e in (s.get("apps") or {}).items() if e.get("enabled")
 if appliance_changed == "yes":
     out = enabled
 else:
-    out = sorted({c.get("scope", "")[len("per-app:"):]
-                  for c in p.get("changes", [])
-                  if c.get("scope", "").startswith("per-app:")})
+    out = sorted({scope[len("per-app:"):]
+                  for scope in routing_scopes.split("\n")
+                  if scope.startswith("per-app:")})
 
 
 def is_identity(slug):
@@ -526,7 +541,8 @@ PYEOF
     fi
     # Cockpit's allowed Origins live in /etc/cockpit on the HOST, which
     # this job (run from the console container) cannot rewrite.
-    log_info "routing-reconcile: if Cockpit's hostname changed, refresh its allowed origins on the host: sudo bash ${APPLIANCE_DIR}/bootstrap.sh"
+    log_warn "routing-reconcile: Cockpit's hostname may have changed, and its allowed origins live on the host where this job cannot reach — until they are refreshed Cockpit shows a blank page after login at its new name" \
+      "fix:sudo bash ${APPLIANCE_DIR}/bootstrap.sh"
   fi
 
   # Re-provision the tunnel so ingress rules + CNAMEs match the new

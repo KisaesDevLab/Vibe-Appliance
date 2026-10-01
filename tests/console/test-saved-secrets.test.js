@@ -16,9 +16,10 @@ const path   = require('node:path');
 const SERVER = fs.readFileSync(path.join(__dirname, '..', '..', 'console', 'server.js'), 'utf8');
 
 function loadHelper(savedEnv, registry) {
-  const start = SERVER.indexOf('function withSavedSecrets(');
-  assert.ok(start !== -1, 'withSavedSecrets not found in console/server.js');
-  const body = SERVER.slice(start, SERVER.indexOf('\n}', start) + 2);
+  const start = SERVER.indexOf('const DESTINATION_KEY_RE');
+  const fn = SERVER.indexOf('function withSavedSecrets(');
+  assert.ok(start !== -1 && fn > start, 'withSavedSecrets not found in console/server.js');
+  const body = SERVER.slice(start, SERVER.indexOf('\n}', fn) + 2);
   // eslint-disable-next-line no-new-func
   return new Function('parseEnvFile', 'path', 'ENV_DIR', 'SETTINGS_REGISTRY',
     `${body}; return withSavedSecrets;`)(
@@ -26,6 +27,10 @@ function loadHelper(savedEnv, registry) {
 }
 
 const REGISTRY = {
+  SMTP_HOST:       { secret: false },
+  SMTP_PASSWORD:   { secret: true },
+  LLM_ENDPOINT:    { secret: false },
+  LLM_API_KEY:     { secret: true },
   EMAIL_PROVIDER:  { secret: false },
   EMAIL_FROM:      { secret: false },
   EMAILIT_API_KEY: { secret: true },
@@ -55,6 +60,24 @@ test('only appliance-scope secrets are filled', () => {
   const b = fill({});
   assert.equal(b['vibe-recap::SOME_SECRET'], undefined);
   assert.equal(b.EMAIL_FROM, undefined, 'a non-secret key is not filled in');
+});
+
+test('a saved secret is never sent to a destination the request chose', () => {
+  // Several tests take their destination from the form. Filling in the
+  // stored key for a request that points somewhere else would hand that
+  // key to any host the caller names.
+  const saved = { LLM_ENDPOINT: 'https://llm.internal.example', LLM_API_KEY: 'sk-saved',
+                  SMTP_HOST: 'smtp.firm.com', SMTP_PASSWORD: 'smtp-saved' };
+  const fill = loadHelper(saved, REGISTRY);
+
+  assert.equal(fill({ LLM_ENDPOINT: 'https://attacker.example', LLM_API_KEY: '' }).LLM_API_KEY, '',
+    'a different endpoint gets no saved key');
+  assert.equal(fill({ SMTP_HOST: 'evil.example', SMTP_PASSWORD: '' }).SMTP_PASSWORD, '');
+
+  // The saved destination (as the Test button on an unedited form sends
+  // it) still gets the saved key.
+  assert.equal(fill({ LLM_ENDPOINT: 'https://llm.internal.example', LLM_API_KEY: '' }).LLM_API_KEY, 'sk-saved');
+  assert.equal(fill({ SMTP_HOST: ' smtp.firm.com ', SMTP_PASSWORD: '' }).SMTP_PASSWORD, 'smtp-saved');
 });
 
 test('every form-driven test endpoint reads its body through withSavedSecrets', () => {

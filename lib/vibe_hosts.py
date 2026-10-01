@@ -97,7 +97,10 @@ def read_env(path):
     read as "all defaults", not as an error."""
     out = {}
     try:
-        with open(path, encoding="utf-8") as f:
+        # errors="replace": a stray non-UTF-8 byte in an env file (a pasted
+        # password, a hand edit) must not take down every consumer of the
+        # resolver. The keys read here are ASCII labels.
+        with open(path, encoding="utf-8", errors="replace") as f:
             for raw in f:
                 line = raw.strip()
                 if not line or line.startswith("#"):
@@ -451,9 +454,18 @@ def _owner(h):
 
 def validate(state, manifests, env, app_envs):
     """Errors (strings) in the DESIRED naming: what would be applied if
-    every app were re-enabled now. Checks the tag, every label, the
-    reserved names and uniqueness across the main host, infra hosts and
-    every appliance app's surfaces. `app_envs` is {slug: env-dict}."""
+    every enabled app were re-enabled now. Checks the tag, every label,
+    the reserved names and uniqueness across the hostnames that would
+    actually be SERVED: the main host, the infra hosts, and each ENABLED
+    appliance app's primary host (only where it has one — subdomain-per-app
+    mode, or a rootServedOnly app) and extra surfaces. `app_envs` is
+    {slug: env-dict}.
+
+    Names that are not served are not claims. An install whose main host
+    label happens to equal some never-enabled app's default (`portal`,
+    `client`, `tb`) renders without conflict, so it must validate; the
+    check runs again when that app is enabled or the routing mode changes,
+    which is when a collision would become real."""
     errors = []
     config = (state.get("config") or {})
     domain = (config.get("domain") or "").strip()
@@ -473,6 +485,7 @@ def validate(state, manifests, env, app_envs):
     state_apps = (state.get("apps") or {})
     env_for_plan = dict(env)
     env_for_plan["HOST_TAG"] = tag
+    per_app = routing_mode(env) == "subdomain-per-app"
     for slug in sorted(manifests):
         manifest = manifests[slug]
         if not is_appliance_app(manifest):
@@ -484,10 +497,15 @@ def validate(state, manifests, env, app_envs):
                 claims.append((host, "%s (installed by %s)" % (slug, manifest.get("runtime")),
                                "a different label on the colliding host", twin))
             continue
+        if not (state_apps.get(slug) or {}).get("enabled"):
+            continue
         plan = plan_app(manifest, env_for_plan, app_envs.get(slug) or {})
-        # No Caddy surface at all (vibe-backup: userFacing:false, no
-        # subdomains[]) -> its `subdomain` is never a hostname.
-        if _primary_served_gate(manifest) and plan["primary"]:
+        # A primary host exists only where resolve() serves one: not for an
+        # app with no Caddy surface (vibe-backup: userFacing:false, no
+        # subdomains[]), and in single-host mode only for rootServedOnly
+        # apps — everything else is a path under the main host.
+        if (plan["primary"] and _primary_served_gate(manifest)
+                and (per_app or manifest.get("rootServedOnly") is True)):
             claims.append((plan["primary"], slug, "%s in %s.env" % (APP_SUBDOMAIN_KEY, slug)))
         for name, label in plan["extras"].items():
             claims.append((label, "%s (%s)" % (slug, name),
@@ -649,5 +667,16 @@ def _main(argv):
     _usage()
 
 
+# Exit codes: 0 ok, 1 the naming is invalid (validate / check-*), 2 usage,
+# 70 internal error. Callers treat 1 as "the operator must fix a label" and
+# anything else as "the checker could not run" — never the same thing.
+EXIT_INTERNAL = 70
+
 if __name__ == "__main__":
-    sys.exit(_main(sys.argv[1:]))
+    try:
+        sys.exit(_main(sys.argv[1:]))
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 - last-resort boundary
+        sys.stderr.write("vibe_hosts.py: internal error: %s: %s\n" % (type(exc).__name__, exc))
+        sys.exit(EXIT_INTERNAL)

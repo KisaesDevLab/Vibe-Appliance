@@ -5542,9 +5542,26 @@ function _probeTcp(host, port, timeoutMs = 5000) {
 // saw it. A value typed into the form still wins (testing before
 // saving); only a blank or absent secret falls back to appliance.env.
 // Appliance-scope secrets only, and only keys the registry marks secret.
+//
+// A saved secret is only ever sent where the SAVED configuration sends it.
+// Several tests take their destination from the form (an SMTP host, an LLM
+// endpoint, an S3 endpoint). If the request names a destination that is
+// not the saved one, nothing is filled in: otherwise a request could point
+// the test at any host and have the server attach the stored key to it.
+// Testing a NEW destination therefore needs the key typed in, which is
+// what the operator is doing anyway when they change provider.
+const DESTINATION_KEY_RE = /(HOST|ENDPOINT|URL|SERVER|BUCKET|REGION)/;
 function withSavedSecrets(body) {
   const out = { ...(body || {}) };
   const saved = parseEnvFile(path.join(ENV_DIR, 'appliance.env'));
+  for (const [key, value] of Object.entries(out)) {
+    if (!DESTINATION_KEY_RE.test(key)) continue;
+    const field = SETTINGS_REGISTRY.allKeys.get(key);
+    if (field && field.secret) continue;
+    if (String(value == null ? '' : value).trim() !== String(saved[key] == null ? '' : saved[key]).trim()) {
+      return out;
+    }
+  }
   for (const [key, field] of SETTINGS_REGISTRY.allKeys) {
     if (!field || !field.secret || key.includes('::')) continue;
     if ((out[key] == null || out[key] === '') && saved[key]) out[key] = saved[key];
@@ -7001,11 +7018,17 @@ function applianceRoutingMode() {
 // resolver has never succeeded (python3 or the script missing) — callers
 // then fall back to the manifest's built-in labels.
 const VIBE_HOSTS_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'vibe_hosts.py');
-const _hostMapCache = { key: null, value: null, warned: false };
+const _hostMapCache = { key: null, value: null, warned: false, failedKey: null };
 function hostMap() {
   const mtime = (f) => { try { return fs.statSync(f).mtimeMs; } catch (_e) { return 0; } };
   const key = `${mtime(STATE_PATH)}|${mtime(path.join(ENV_DIR, 'appliance.env'))}`;
   if (_hostMapCache.value && _hostMapCache.key === key) return _hostMapCache.value;
+  // A failure is cached against the same inputs. This runs synchronously
+  // on the request path, several times per app per request; re-spawning a
+  // resolver that just failed would stall the console for seconds at a
+  // time, exactly when the operator needs it. It is retried as soon as
+  // state.json or appliance.env changes.
+  if (_hostMapCache.failedKey === key) return _hostMapCache.value;
   try {
     const out = execFileSync('python3', [
       VIBE_HOSTS_SCRIPT, '--state', STATE_PATH, '--env-dir', ENV_DIR,
@@ -7014,7 +7037,9 @@ function hostMap() {
     _hostMapCache.value = JSON.parse(out);
     _hostMapCache.key = key;
     _hostMapCache.warned = false;
+    _hostMapCache.failedKey = null;
   } catch (err) {
+    _hostMapCache.failedKey = key;
     if (!_hostMapCache.warned) {
       _hostMapCache.warned = true;
       log('warn', 'hostname resolver failed; showing built-in host labels until it recovers', {

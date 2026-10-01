@@ -696,21 +696,6 @@ PYEOF
     log_info "apex ownership persisted to appliance.env" apex_domain_owned="$CONFIG_APEX_OWNED"
   fi
 
-  # Pre-flight the resulting hostnames before anything is rendered: a
-  # label that is malformed, reserved, too long once tagged, or claimed
-  # twice would otherwise surface later as a Caddyfile that fails to
-  # validate, with no hint which setting to change.
-  local _naming_errors=""
-  if ! _naming_errors="$(python3 "${APPLIANCE_DIR}/lib/vibe_hosts.py" validate 2>&1)"; then
-    die "the appliance's hostnames are not valid:
-${_naming_errors}
-
-  Common causes: a --host-tag or --tunnel-subdomain that makes two hosts share a name, or a per-app Subdomain setting that collides with another host.
-  Diagnose: python3 ${APPLIANCE_DIR}/lib/vibe_hosts.py validate ; python3 ${APPLIANCE_DIR}/lib/vibe_hosts.py list caddy
-  Fix: change the setting named above (flags: --host-tag, --tunnel-subdomain; per-host labels: Configuration → Network, or /opt/vibe/env/appliance.env and /opt/vibe/env/<slug>.env)." \
-      "Then re-run: sudo bash ${APPLIANCE_DIR}/bootstrap.sh. Nothing has been rendered yet."
-  fi
-
   if [[ "$_naming_changed" == "true" && "$(secrets_get_appliance CLOUDFLARE_TUNNEL_ENABLED 2>/dev/null || true)" == "true" ]]; then
     log_warn "the hostname tag changed while the Cloudflare Tunnel is on — the tunnel still routes the old names until it is re-provisioned" \
       "fix:after this run finishes: sudo bash ${APPLIANCE_DIR}/infra/cloudflared-up.sh"
@@ -1454,6 +1439,38 @@ main() {
   fi
   if ! [[ "$CONFIG_TUNNEL_SUBDOMAIN" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
     die "effective tunnel subdomain '$CONFIG_TUNNEL_SUBDOMAIN' is not a valid DNS label." "Fix state.json's config.tunnel_subdomain, or pass --tunnel-subdomain."
+  fi
+
+  # Pre-flight the hostnames this run would produce, BEFORE anything is
+  # written: state.json below, and HOST_TAG / APEX_DOMAIN_OWNED in
+  # phase_secrets. A label that is malformed, reserved, too long once
+  # tagged, or shared by two hosts would otherwise be persisted first and
+  # rejected afterwards, leaving the bad value on disk for the next
+  # enable-app or settings save to render from. The candidate values are
+  # passed with --set; nothing on disk is touched until this passes.
+  local -a _naming_sets=(--set "tunnel_subdomain=${CONFIG_TUNNEL_SUBDOMAIN}")
+  if [[ "$CONFIG_HOST_TAG_EXPLICIT" == "true" ]]; then
+    _naming_sets+=(--set "HOST_TAG=${CONFIG_HOST_TAG}")
+  fi
+  if [[ -n "$CONFIG_APEX_OWNED" ]]; then
+    _naming_sets+=(--set "APEX_DOMAIN_OWNED=${CONFIG_APEX_OWNED}")
+  fi
+  local _naming_errors="" _naming_rc=0
+  _naming_errors="$(python3 "${APPLIANCE_DIR}/lib/vibe_hosts.py" validate "${_naming_sets[@]}" 2>&1)" || _naming_rc=$?
+  if (( _naming_rc == 1 )); then
+    die "the appliance's hostnames would not be valid:
+${_naming_errors}
+
+  Common causes: a --host-tag or --tunnel-subdomain that makes two hosts share a name, or a per-app Subdomain setting that collides with another host.
+  Diagnose: python3 ${APPLIANCE_DIR}/lib/vibe_hosts.py list caddy
+  Fix: change the setting named above (flags: --host-tag, --tunnel-subdomain; per-host labels: Configuration → Network, or /opt/vibe/env/appliance.env and /opt/vibe/env/<slug>.env)." \
+      "Then re-run: sudo bash ${APPLIANCE_DIR}/bootstrap.sh. Nothing has been changed."
+  elif (( _naming_rc != 0 )); then
+    # The checker itself could not run (exit 70 = internal error). That
+    # must not block an install: the Caddy renderer still refuses two site
+    # blocks for one hostname.
+    log_warn "could not pre-flight the hostnames (lib/vibe_hosts.py exited ${_naming_rc}); continuing" \
+      "diagnose:python3 ${APPLIANCE_DIR}/lib/vibe_hosts.py validate"
   fi
 
   # Persist user-supplied config so phase 2 (Phase 2 of build) can read it.

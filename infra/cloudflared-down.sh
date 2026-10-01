@@ -78,20 +78,10 @@ CF_TUNNEL_API_TOKEN="$(_get_env_value CLOUDFLARE_TUNNEL_API_TOKEN)"
 CF_ACCOUNT_ID="$(_get_env_value CLOUDFLARE_ACCOUNT_ID)"
 CF_ZONE_ID="$(_get_env_value CLOUDFLARE_ZONE_ID)"
 CF_TUNNEL_NAME="$(_get_env_value CLOUDFLARE_TUNNEL_NAME)"
-# Same default cloudflared-up.sh uses: vibe-appliance-<domain>[-<tag>].
-# Only matters for the by-name fallback in step 2; an appliance that has
-# provisioned a tunnel finds it by its recorded id.
-if [[ -z "$CF_TUNNEL_NAME" ]]; then
-  _vh=(python3 "$APPLIANCE_DIR/lib/vibe_hosts.py" --state "$VIBE_STATE_FILE"
-       --env-dir "$VIBE_ENV_DIR" --manifests "$APPLIANCE_DIR/console/manifests")
-  _dn_domain="$("${_vh[@]}" get domain 2>/dev/null || true)"
-  _dn_tag="$("${_vh[@]}" get tag 2>/dev/null || true)"
-  if [[ -n "$_dn_domain" ]]; then
-    CF_TUNNEL_NAME="vibe-appliance-${_dn_domain//./-}${_dn_tag:+-${_dn_tag}}"
-  else
-    CF_TUNNEL_NAME="vibe-appliance"
-  fi
-fi
+# Same fallback cloudflared-up.sh uses. Only matters for the by-name
+# lookup in step 2; an appliance that has provisioned a tunnel finds it by
+# its recorded id.
+CF_TUNNEL_NAME="${CF_TUNNEL_NAME:-vibe-appliance}"
 
 # This appliance's tunnel id, recorded by cloudflared-up.sh in
 # state.config.cloudflare_tunnel_id (or, for installs provisioned before

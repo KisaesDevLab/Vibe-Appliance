@@ -229,7 +229,7 @@
         "tier":         1,
         "category":     "Network",
         "label":        "Hostname tag",
-        "helpText":     "Only needed when a second appliance shares this domain. Give each appliance its own short tag (e.g. office2): its hosts become vibe-office2.example.com, tb-office2.example.com, cockpit-office2.example.com and so stop colliding with the other appliance's. Leave blank on a single appliance. Lowercase letters, digits and dashes, up to 32 characters. Saving renames this appliance's hostnames: enabled apps briefly restart, the Cloudflare Tunnel is re-provisioned, and old bookmarks stop working. Clear the field and save to go back.",
+        "helpText":     "Only needed when a second appliance shares this domain. Give each appliance its own short tag (e.g. office2): its hosts become vibe-office2.example.com, tb-office2.example.com, cockpit-office2.example.com and so stop colliding with the other appliance's. Leave blank on a single appliance. Lowercase letters, digits and dashes, up to 32 characters. Saving renames this appliance's hostnames: enabled apps briefly restart, the Cloudflare Tunnel is re-provisioned, and old bookmarks stop working. Cockpit is renamed too: afterwards run 'sudo bash /opt/vibe/appliance/bootstrap.sh' on the host so Cockpit accepts its new name (it shows a blank page until you do). Clear the field and save to go back.",
         "input":        "text",
         "appliance":    "shared",
         "validate":     "regex:^([a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?)?$",

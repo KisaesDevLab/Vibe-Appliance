@@ -324,16 +324,16 @@ fi
 
 TUNNEL_FQDN="${TUNNEL_SUBDOMAIN}.${DOMAIN}"
 
-# Default tunnel name: vibe-appliance-<domain>[-<tag>]. Unique per
-# appliance, so two appliances in one Cloudflare account — even two under
-# ONE domain, told apart by their hostname tag — never look up each
-# other's tunnel by name. Only used when CLOUDFLARE_TUNNEL_NAME is unset
-# AND this appliance has no recorded tunnel yet: an appliance that already
-# has a tunnel finds it by id (section 2), whatever it is called.
+# Tunnel name when CLOUDFLARE_TUNNEL_NAME is unset: the long-standing
+# 'vibe-appliance'. It is deliberately NOT changed to something derived
+# from the domain or tag here — an install that never set a name already
+# has (or half-created) a tunnel called 'vibe-appliance', and a different
+# fallback would strand it and create a second one. The setup wizard is
+# what gives each appliance a unique name (vibe-appliance-<domain>[-<tag>])
+# and writes it to appliance.env; the name only matters until a tunnel id
+# is recorded (section 2), and a name match is never ownership on its own.
 HOST_TAG_VALUE="$("${VIBE_HOSTS[@]}" get tag 2>/dev/null || true)"
-if [[ -z "$CF_TUNNEL_NAME" ]]; then
-  CF_TUNNEL_NAME="vibe-appliance-${DOMAIN//./-}${HOST_TAG_VALUE:+-${HOST_TAG_VALUE}}"
-fi
+CF_TUNNEL_NAME="${CF_TUNNEL_NAME:-vibe-appliance}"
 
 # Caddy listens on :443 in domain mode and tailscale mode. LAN mode is
 # :80-only, which means the tunnel's https://caddy:443 ingress target
