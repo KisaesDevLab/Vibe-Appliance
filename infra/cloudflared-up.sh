@@ -24,7 +24,10 @@
 #                                   (cockpit/portainer/backup) are NEVER
 #                                   tunnelled and stay LAN/Tailscale-only.
 #
-# Reads domain + tunnel_subdomain + enabled apps from /opt/vibe/state.json.
+# Reads domain + enabled apps from /opt/vibe/state.json. Every hostname
+# (the main host, per-app hosts, extra surfaces) comes from
+# lib/vibe_hosts.py, the resolver the Caddy renderer also uses, so the
+# operator's HOST_TAG and per-host overrides apply here unchanged.
 # CLOUDFLARE_TUNNEL_PUBLISH is informational only in the single-hostname
 # model — every enabled app is reachable under the one tunnel hostname,
 # Caddy splits paths per app (path = slug with the redundant `vibe-`
@@ -33,17 +36,20 @@
 #
 # Side effects:
 #   - one tunnel object created in Cloudflare (idempotent: looked up by name)
-#   - ONE CNAME at `${tunnel_subdomain}.${domain}` pointing at
-#     <tunnel-id>.cfargotunnel.com. Stale per-app CNAMEs left over from
-#     the prior subdomain-per-app model are auto-pruned in section 5b.
+#   - one CNAME per tunnelled hostname pointing at
+#     <tunnel-id>.cfargotunnel.com: the main host, plus (subdomain-per-app
+#     mode, rootServedOnly apps, extra surfaces) one per app host. CNAMEs
+#     that point at this tunnel but are no longer wanted — an app
+#     disabled, a label or the HOST_TAG changed — are pruned in section 5b.
 #   - TUNNEL_TOKEN written to /opt/vibe/env/shared.env (mode 600)
 #   - vibe-cloudflared container brought up via the infra/cloudflared.yml
 #     compose extension
 #
 # Hosts NEVER tunnelled (by design):
 #   - apex (@) and www — separate; the apex Caddyfile redirects to the
-#     tunnel subdomain for accidental hits.
-#   - cockpit.<domain>, portainer.<domain>, backup.<domain> — admin
+#     main host for accidental hits.
+#   - the infra hosts (cockpit.<domain>, portainer.<domain>,
+#     backup.<domain> unless tagged or renamed) — admin
 #     surfaces. They're served by Caddy:443 but never registered with
 #     the tunnel ingress. Reach via split DNS to the host LAN IP or
 #     via Tailscale.
@@ -297,20 +303,22 @@ try:
 except Exception:
   pass
 " 2>/dev/null || true)"
-TUNNEL_SUBDOMAIN="$(python3 -c "
-import json, sys
-try:
-  s = json.load(open('$VIBE_STATE_FILE'))
-  print((s.get('config') or {}).get('tunnel_subdomain', '') or 'vibe')
-except Exception:
-  print('vibe')
-" 2>/dev/null || echo 'vibe')"
+# The main host label comes from lib/vibe_hosts.py (the single hostname
+# resolver): state.config.tunnel_subdomain, default 'vibe', with the
+# appliance HOST_TAG applied to the default.
+VIBE_HOSTS=(python3 "$APPLIANCE_DIR/lib/vibe_hosts.py"
+            --state "$VIBE_STATE_FILE" --env-dir "$VIBE_ENV_DIR"
+            --manifests "$APPLIANCE_DIR/console/manifests")
+TUNNEL_SUBDOMAIN="$("${VIBE_HOSTS[@]}" get main-label 2>/dev/null || true)"
 
 if [[ -z "$DOMAIN" ]]; then
   die "state.config.domain not set in $VIBE_STATE_FILE. Cloudflare Tunnel needs to know the apex domain. Re-run bootstrap.sh with --mode domain --domain <yours> --email <you@example.com> first."
 fi
 if [[ -z "$TUNNEL_SUBDOMAIN" ]]; then
-  die "state.config.tunnel_subdomain is empty in $VIBE_STATE_FILE. The tunnel needs a single subdomain to route. Re-run bootstrap.sh with --mode domain --tunnel-subdomain <label>."
+  die "could not resolve the main host label (lib/vibe_hosts.py printed nothing). The tunnel needs a single subdomain to route.
+  Common causes: python3 missing, or $APPLIANCE_DIR/lib/vibe_hosts.py missing from a partial checkout.
+  Diagnose: python3 $APPLIANCE_DIR/lib/vibe_hosts.py get main-label
+  Fix: re-run bootstrap.sh with --mode domain --tunnel-subdomain <label>, then re-run this script."
 fi
 
 TUNNEL_FQDN="${TUNNEL_SUBDOMAIN}.${DOMAIN}"
@@ -352,7 +360,11 @@ CF_API="https://api.cloudflare.com/client/v4"
 # stdout — caller parses with python3 (jq isn't a hard dep).
 cf_api() {
   local method="$1" path="$2" body="${3:-}"
-  local args=( -sS -X "$method"
+  # Bounded: without --max-time a stalled connection hangs this script
+  # forever, and the console holds its "Cloudflare tunnel provision" lock
+  # (pausing every app action) for as long as the script is alive. A
+  # timeout returns an empty body, which every caller already reports.
+  local args=( -sS -X "$method" --connect-timeout 10 --max-time 60
     -H "Authorization: Bearer $CF_TUNNEL_API_TOKEN"
     -H "Content-Type: application/json" )
   if [[ -n "$body" ]]; then args+=( --data "$body" ); fi
@@ -689,9 +701,12 @@ fi
 # aborts with "tls: internal error" (commit 06e962a). The catch-all
 # 404 at the end is required by Cloudflare Tunnel.
 log_step "building tunnel ingress config" host="$TUNNEL_FQDN" routing="$ROUTING_MODE"
-INGRESS_JSON="$(python3 - "$TUNNEL_FQDN" "$DOMAIN" "$VIBE_STATE_FILE" "$APPLIANCE_DIR/console/manifests" "$ROUTING_MODE" <<'PYEOF' || true
-import json, os, sys
-fqdn, domain, state_path, manifests_dir, routing_mode = sys.argv[1:6]
+INGRESS_JSON="$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${APPLIANCE_DIR}/lib${PYTHONPATH:+:${PYTHONPATH}}" python3 - "$VIBE_STATE_FILE" "$APPLIANCE_DIR/console/manifests" "$VIBE_ENV_APPLIANCE" <<'PYEOF' || true
+import json, sys
+
+import vibe_hosts
+
+state_path, manifests_dir, appliance_env_path = sys.argv[1:4]
 
 def caddy_rule(host):
   return {
@@ -703,104 +718,45 @@ def caddy_rule(host):
     },
   }
 
-# The tunnel subdomain (`${TUNNEL_SUBDOMAIN}.${DOMAIN}`) is always the
-# first rule. In single-host mode it fronts every app (Caddy splits
-# paths behind it); in subdomain-per-app mode it fronts the console
-# (landing + admin) while each app gets its own rule below. Every rule
-# forwards to caddy:443 inside vibe_net; noTLSVerify lets Caddy serve
-# its self-signed internal cert (Cloudflare's edge does the public TLS).
-# originServerName=<hostname> makes cloudflared send SNI for the
-# requested host so Caddy's named site block matches — without this, SNI
-# defaults to "caddy" and Caddy aborts with "tls: internal error"
+# Which hostnames the tunnel publishes is decided by lib/vibe_hosts.py —
+# the same host map lib/render-caddyfile.sh renders vhosts from, so the
+# tunnel exposes exactly what Caddy serves:
+#   - the main host, always first. In single-host mode it fronts every
+#     app (Caddy splits paths behind it); in subdomain-per-app mode it
+#     fronts the console (landing + admin).
+#   - each enabled app's PRIMARY host, in subdomain-per-app mode and for
+#     rootServedOnly apps in either mode (Caddy gives those their own
+#     vhost even in single-host — they can't be path-mounted). Skipped
+#     when the app has no operator surface (userFacing:false and no
+#     subdomains[]) or its primary subdomains[] entry is internal:true.
+#   - one rule per extra surface (a non-primary, non-internal
+#     subdomains[] entry such as vibe-connect's client portal), in both
+#     modes. `userFacing: false` blocks every extra.
+#   - never another orchestrator's units (runtime != "appliance"):
+#     Sentinel runs its own cloudflared, and a CNAME written here would
+#     fight its provisioner over the record on every re-run.
+#   - never the apex, www or the infra hosts (cockpit/portainer/backup).
+# Hostnames carry the operator's labels: the appliance HOST_TAG and any
+# per-host override are already applied.
+#
+# Every rule forwards to caddy:443 inside vibe_net; noTLSVerify lets
+# Caddy serve its self-signed internal cert (Cloudflare's edge does the
+# public TLS). originServerName=<hostname> makes cloudflared send SNI for
+# the requested host so Caddy's named site block matches — without this,
+# SNI defaults to "caddy" and Caddy aborts with "tls: internal error"
 # (commit 06e962a). The catch-all 404 at the end is required by
 # Cloudflare Tunnel.
-ingress = [caddy_rule(fqdn)]
-
-try:
-  with open(state_path) as f:
-    state = json.load(f)
-except (FileNotFoundError, ValueError):
+state = vibe_hosts.load_json(state_path, {})
+if not isinstance(state, dict):
   state = {}
-
-def eff_subdomain(manifest, entry):
-  # Operator override (state.apps.<slug>.subdomain, from
-  # VIBE_APP_SUBDOMAIN) wins; else the manifest's built-in subdomain.
-  # Mirrors render-caddyfile.sh's _effective_subdomain().
-  s = (entry.get("subdomain") or "").strip()
-  return s or manifest.get("subdomain", "")
-
-seen_hosts = {fqdn}
-for slug, entry in (state.get("apps") or {}).items():
-  if not entry.get("enabled"):
-    continue
-  man_path = os.path.join(manifests_dir, f"{slug}.json")
-  try:
-    with open(man_path) as f:
-      manifest = json.load(f)
-  except (FileNotFoundError, ValueError):
-    continue
-  # Another orchestrator owns this unit's ingress. Sentinel runs its own
-  # cloudflared with its own Access policies, gRPC (http2Origin) origins and
-  # ACME DNS-01 wildcard; adding its hostnames to THIS tunnel would create a
-  # second route to the same name, and the CNAME would point at this tunnel
-  # rather than Sentinel's - so Sentinel's own provisioner would then fight
-  # this one over the record on every re-run. Mirrors the skip in
-  # lib/render-caddyfile.sh::list_enabled_apps.
-  if manifest.get("runtime", "appliance") != "appliance":
-    continue
-  subdomains = manifest.get("subdomains") or []
-  primary = manifest.get("subdomain", "")
-
-  # subdomain-per-app: add the app's PRIMARY effective subdomain as its
-  # own ingress rule + CNAME. Mirrors render_per_app_subdomain_vhosts'
-  # skip gates so the tunnel exposes exactly what Caddy serves:
-  #   (a) userFacing:false AND no subdomains[] → fully internal; skip.
-  #   (b) the primary subdomains[] entry marked internal:true → skip.
-  #
-  # rootServedOnly apps need the same rule in SINGLE-HOST mode too:
-  # lib/render-caddyfile.sh::render_root_served_vhosts gives them their
-  # own vhost there (they can't be path-mounted), so without a matching
-  # ingress rule + CNAME the hostname Caddy serves would 404 at the
-  # Cloudflare edge.
-  if routing_mode == "subdomain-per-app" or manifest.get("rootServedOnly") is True:
-    primary_internal = any(
-      s.get("name") == primary and s.get("internal") is True for s in subdomains
-    )
-    fully_internal = manifest.get("userFacing") is False and not subdomains
-    if not primary_internal and not fully_internal:
-      sub = eff_subdomain(manifest, entry)
-      if sub:
-        host = f"{sub}.{domain}"
-        if host not in seen_hosts:
-          seen_hosts.add(host)
-          ingress.append(caddy_rule(host))
-
-  # Both modes: one rule per non-primary, non-internal subdomains[]
-  # entry (vibe-connect's client portal at client.<domain>; vibe-shield
-  # keeps gateway.shield internal so it's skipped).
-  #
-  # `userFacing: false` blocks EVERY secondary subdomain unconditionally,
-  # mirroring lib/render-caddyfile.sh::render_extra_subdomain_vhosts,
-  # which does the same. The gate used to read
-  # `userFacing is False and not subdomains`, which diverged from Caddy:
-  # an app with userFacing:false AND a non-primary subdomain got a
-  # proxied CNAME + ingress rule pointing at a hostname Caddy emits no
-  # site block for, so the edge fails the TLS handshake. The primary
-  # rule above keeps its own (looser) gate on purpose — userFacing:false
-  # no longer hides an app's PRIMARY surface, only its extras.
-  if manifest.get("userFacing") is False:
-    continue
-  for sub in subdomains:
-    name = sub.get("name")
-    if not name or name == primary:
-      continue
-    if sub.get("internal") is True:
-      continue
-    host = f"{name}.{domain}"
-    if host in seen_hosts:
-      continue
-    seen_hosts.add(host)
-    ingress.append(caddy_rule(host))
+hosts = vibe_hosts.resolve(state, vibe_hosts.load_manifests(manifests_dir),
+                           vibe_hosts.read_env(appliance_env_path))
+tunnel_hosts = [h["fqdn"] for h in vibe_hosts.hosts_for(hosts, "tunnel")]
+if not tunnel_hosts:
+  print("[cloudflared-up] ERROR: no tunnel hostnames resolved - state.json "
+        "must be in domain mode with a domain set.", file=sys.stderr)
+  sys.exit(2)
+ingress = [caddy_rule(h) for h in tunnel_hosts]
 
 ingress.append({ "service": "http_status:404" })
 print(json.dumps({ "config": { "ingress": ingress } }))
@@ -1154,15 +1110,19 @@ log_ok "Cloudflare Tunnel is up" tunnel_id="$TUNNEL_ID" tunnel_name="$CF_TUNNEL_
 # The single-host line is enough for staff-only apps; client-facing
 # apps like vibe-connect need both surfaced or operators wind up
 # sharing the staff URL with clients and hitting the auth wall.
-PUBLISHED_LINES="$(python3 - "$PUBLISHED_SLUGS_JSON" "$TUNNEL_FQDN" "$DOMAIN" "$APPLIANCE_DIR/console/manifests" "$ROUTING_MODE" "$VIBE_STATE_FILE" <<'PYEOF'
-import json, os, sys
+PUBLISHED_LINES="$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${APPLIANCE_DIR}/lib${PYTHONPATH:+:${PYTHONPATH}}" python3 - "$PUBLISHED_SLUGS_JSON" "$APPLIANCE_DIR/console/manifests" "$VIBE_STATE_FILE" "$VIBE_ENV_APPLIANCE" <<'PYEOF'
+import json, sys
+
+import vibe_hosts
+
 items = json.loads(sys.argv[1])
-host, domain, manifests_dir = sys.argv[2], sys.argv[3], sys.argv[4]
-routing_mode, state_path = sys.argv[5], sys.argv[6]
-try:
-  state_apps = (json.load(open(state_path)).get("apps") or {})
-except Exception:
-  state_apps = {}
+manifests_dir, state_path, appliance_env_path = sys.argv[2:5]
+manifests = vibe_hosts.load_manifests(manifests_dir)
+state = vibe_hosts.load_json(state_path, {})
+if not isinstance(state, dict):
+  state = {}
+hosts = vibe_hosts.resolve(state, manifests, vibe_hosts.read_env(appliance_env_path))
+main_host = hosts["main"]["fqdn"]
 # URL path prefix mirrors lib/render-caddyfile.sh's _path_prefix():
 # the manifest's explicit `pathPrefix` if it declares one, else the slug
 # with the redundant leading `vibe-` stripped (so vibe-tb → tb). This is
@@ -1170,40 +1130,24 @@ except Exception:
 # Caddy actually routes.
 for it in items:
   slug = it['slug']
-  man_path = os.path.join(manifests_dir, f"{slug}.json")
-  try:
-    with open(man_path) as f:
-      manifest = json.load(f)
-  except (FileNotFoundError, ValueError):
-    manifest = {}
+  manifest = manifests.get(slug) or {}
+  app = (hosts["apps"].get(slug) or {"primary": {"served": False}, "extras": []})
   prefix = (manifest.get('pathPrefix') or '').strip() or (
     slug[len('vibe-'):] if slug.startswith('vibe-') else slug)
-  if routing_mode == "subdomain-per-app" or manifest.get("rootServedOnly") is True:
-    # Each app at its own subdomain root. Effective subdomain =
-    # operator override (state) → manifest. rootServedOnly apps land
-    # here in single-host mode too — that's where Caddy serves them.
-    entry = state_apps.get(slug) or {}
-    sub = (entry.get("subdomain") or "").strip() or manifest.get("subdomain", "")
-    print(f"  https://{sub}.{domain}/  ({it['label']})")
+  if app["primary"]["served"]:
+    # The app owns a hostname and serves at its root: subdomain-per-app
+    # mode, or a rootServedOnly app in either mode.
+    print(f"  https://{app['primary']['fqdn']}/  ({it['label']})")
   else:
-    # Single-host: path prefix under the tunnel hostname.
-    print(f"  https://{host}/{prefix}/  ({it['label']})")
-  # Surface each extra (non-primary) subdomain on its own line so the
-  # operator sees the public URL to share with clients — same in both
-  # routing modes. userFacing:false apps are already absent from `items`
-  # per the PUBLISHED_SLUGS_JSON build, so we don't need to re-filter.
-  primary = manifest.get("subdomain", "")
-  for sd in (manifest.get("subdomains") or []):
-    name = sd.get("name") or ""
-    if not name or name == primary:
-      continue
-    # `internal: true` subdomains aren't routed publicly — don't print
-    # a URL the operator can't actually reach.
-    if sd.get("internal") is True:
-      continue
+    # Single-host: path prefix under the main host.
+    print(f"  https://{main_host}/{prefix}/  ({it['label']})")
+  # Surface each extra surface on its own line so the operator sees the
+  # public URL to share with clients — same in both routing modes.
+  # Internal and userFacing:false surfaces are not in the host map.
+  for sd in app["extras"]:
     audience = sd.get("audience") or ""
     label_suffix = f" - {audience}" if audience else ""
-    print(f"      `-> https://{name}.{domain}/  ({it['label']}{label_suffix})")
+    print(f"      `-> https://{sd['fqdn']}/  ({it['label']}{label_suffix})")
 PYEOF
 2>/dev/null || true)"
 
@@ -1225,8 +1169,12 @@ else
 fi
 printf '\n'
 printf 'NOT published (LAN/Tailscale-only by design):\n'
-printf '  %s, www.%s, cockpit.%s, portainer.%s, backup.%s\n' \
-  "$DOMAIN" "$DOMAIN" "$DOMAIN" "$DOMAIN" "$DOMAIN"
+# Everything Caddy serves that the tunnel does not publish: the apex +
+# www (when this appliance owns them) and the infra hosts.
+_not_published="$(comm -23 <("${VIBE_HOSTS[@]}" list caddy 2>/dev/null | sort) \
+                           <("${VIBE_HOSTS[@]}" list tunnel 2>/dev/null | sort) \
+                   | paste -sd, - | sed 's/,/, /g' || true)"
+printf '  %s\n' "${_not_published:-(none)}"
 printf '\n'
 printf 'Verify from a network OUTSIDE your LAN (e.g. cellular):\n'
 printf '  curl -sI https://%s/ — 200/302/401 means the tunnel is working.\n' "$TUNNEL_FQDN"

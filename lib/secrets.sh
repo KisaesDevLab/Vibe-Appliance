@@ -391,7 +391,9 @@ secrets_seed_portainer_password() {
 }
 
 # Resolve a server URL from /opt/vibe/state.json. Domain mode →
-# https://<tunnel_subdomain>.<domain>; otherwise → http://<host_ip>
+# https://<main host>, as resolved by lib/vibe_hosts.py (the main host
+# label is state.config.tunnel_subdomain, default 'vibe', with the
+# appliance HOST_TAG on the default); otherwise → http://<host_ip>
 # (which bootstrap's phase_state_finalize sets to the LAN IP). Falls
 # back to the placeholder when state is unreadable or empty.
 #
@@ -401,6 +403,17 @@ secrets_seed_portainer_password() {
 _server_url_from_state() {
   local state_file="${VIBE_STATE_FILE:-${VIBE_DIR}/state.json}"
   [[ -f "$state_file" ]] || { printf 'http://<your-server-ip>'; return 0; }
+  # main-url is empty outside domain mode (and if the resolver can't run).
+  local main_url=""
+  if [[ -n "${APPLIANCE_DIR:-}" && -f "${APPLIANCE_DIR}/lib/vibe_hosts.py" ]]; then
+    main_url="$(python3 "${APPLIANCE_DIR}/lib/vibe_hosts.py" \
+        --state "$state_file" --env-dir "${VIBE_ENV_DIR:-${VIBE_DIR}/env}" \
+        get main-url 2>/dev/null || true)"
+  fi
+  if [[ -n "$main_url" ]]; then
+    printf '%s\n' "$main_url"
+    return 0
+  fi
   python3 - "$state_file" <<'PYEOF'
 import json, sys
 try:
@@ -409,12 +422,6 @@ except Exception:
     print("http://<your-server-ip>")
     sys.exit(0)
 cfg = s.get("config") or {}
-mode = cfg.get("mode", "")
-domain = cfg.get("domain", "")
-if mode == "domain" and domain:
-    sub = (cfg.get("tunnel_subdomain") or "vibe").strip()
-    print(f"https://{sub}.{domain}")
-    sys.exit(0)
 ip = cfg.get("host_ip", "")
 if ip:
     print(f"http://{ip}")

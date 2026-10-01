@@ -821,40 +821,25 @@ async function ddnsUpdateCycle(force = false) {
     return;
   }
 
-  // Host list: bare apex + www + the single tunnel subdomain + the
-  // three infra subdomains (cockpit/portainer/backup keep their own
-  // subdomains for LAN admin access). In single-host mode apps all live
-  // at /<prefix>/ under the tunnel hostname, so they get no per-subdomain
-  // DNS. Set dedupes if the operator chose 'www' or 'cockpit' as their
-  // tunnel_subdomain (unusual but valid).
-  const hosts = new Set(['@', 'www', 'cockpit', 'portainer', 'backup']);
-  const state = readState();
-  const tunnelSub = (state.config && state.config.tunnel_subdomain) || 'vibe';
-  hosts.add(tunnelSub);
-
-  // subdomain-per-app: each enabled, user-facing app owns its subdomain,
-  // so DDNS must publish an A record per app (plus any non-internal extra
-  // subdomains like vibe-connect's client portal). Mirrors the skip gates
-  // in render-caddyfile.sh / cloudflared-up.sh. Only relevant to the
+  // Host list, from the hostname resolver (lib/vibe_hosts.py, via
+  // hostMap): the bare apex + www when this appliance owns the apex, the
+  // main host, the three infra hosts (cockpit/portainer/backup keep their
+  // own subdomains for LAN admin access) and — in subdomain-per-app mode —
+  // each enabled app's host plus its extra surfaces (e.g. vibe-connect's
+  // client portal). In single-host mode apps live at /<prefix>/ under the
+  // main host, so they get no per-subdomain DNS. Labels carry the
+  // operator's HOST_TAG and per-host overrides. Only relevant to the
   // Namecheap-DDNS path — the Cloudflare Tunnel manages its own CNAMEs.
-  if (applianceRoutingMode() === 'subdomain-per-app') {
-    for (const [slug, entry] of Object.entries((state.apps) || {})) {
-      if (!entry || !entry.enabled) continue;
-      const m = MANIFESTS[slug];
-      if (!m) continue;
-      const subs = Array.isArray(m.subdomains) ? m.subdomains : [];
-      const primary = m.subdomain || '';
-      const fullyInternal = m.userFacing === false && subs.length === 0;
-      const primaryInternal = subs.some((s) => s && s.name === primary && s.internal === true);
-      if (!fullyInternal && !primaryInternal) {
-        const sub = (entry.subdomain || '').trim() || primary;
-        if (sub) hosts.add(sub);
-      }
-      for (const s of subs) {
-        if (!s || !s.name || s.name === primary || s.internal === true) continue;
-        hosts.add(s.name);
-      }
-    }
+  const state = readState();
+  const hm = hostMap();
+  const hosts = new Set();
+  if (hm && Array.isArray(hm.hosts) && hm.hosts.length) {
+    for (const h of hm.hosts) if (h.ddns) hosts.add(h.label);
+  } else {
+    // Resolver unavailable: the built-in set, so DDNS keeps the address
+    // current for the hosts every appliance has.
+    for (const h of ['@', 'www', 'cockpit', 'portainer', 'backup']) hosts.add(h);
+    hosts.add((state.config && state.config.tunnel_subdomain) || 'vibe');
   }
 
   const results = {};
@@ -1910,11 +1895,12 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
         // CNAME) while Caddy served no vhost for that hostname — a TLS
         // handshake failure at the Cloudflare edge. Never advertise or
         // publish a hostname the reverse proxy won't answer.
-        extraSubdomains: m.userFacing === false
-          ? []
-          : ((m.subdomains || [])
-              .filter((sd) => sd && sd.name && sd.name !== m.subdomain && sd.internal !== true)
-              .map((sd) => ({ name: sd.name, audience: sd.audience || null }))),
+        //
+        // Each entry carries `label`: the host label actually served
+        // (the operator's VIBE_APP_SUBDOMAIN_<NAME> override, else the
+        // name with the appliance HOST_TAG). `name` stays the manifest's
+        // identifier for the surface.
+        extraSubdomains: appExtraSurfaces(m),
         defaultTag: m.image && m.image.defaultTag,
         // A console-proxied internal app (userFacing:false, no
         // subdomains[]) has no Caddy surface: its URL is the console's
@@ -4346,7 +4332,7 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, globa
 
     const warnings = [];
     if (mode === 'domain') {
-      warnings.push(`Apps live at https://${newTunnelSub}.${domain}/<app>/ (e.g. /tb, /mybooks). The bare apex (https://${domain}) redirects to that host.`);
+      warnings.push(`Apps live at https://${mainHostLabel(state.config)}.${domain}/<app>/ (e.g. /tb, /mybooks). The bare apex (https://${domain}) redirects to that host.`);
       warnings.push('On the first request Caddy will spend 10–30s issuing a Let\'s Encrypt cert. Subsequent requests are instant.');
       warnings.push('If port 80 isn\'t reachable from the public internet, cert issuance will fail. Use Cloudflare Tunnel or fix DNS first.');
     }
@@ -6893,13 +6879,54 @@ function applianceRoutingMode() {
   }
 }
 
-// Effective primary subdomain for an app: the operator override persisted
-// to state.apps.<slug>.subdomain (from VIBE_APP_SUBDOMAIN, written by
-// lib/enable-app.sh) wins; else the manifest's built-in subdomain.
-// Mirrors render-caddyfile.sh's _effective_subdomain() and
-// cloudflared-up.sh's eff_subdomain() so the console shows the same host
-// the tunnel + Caddy actually serve.
+// The appliance's hostnames, as resolved by lib/vibe_hosts.py — the ONE
+// place a public hostname is decided. Caddy (lib/render-caddyfile.sh),
+// the Cloudflare Tunnel (infra/cloudflared-up.sh), each app's env file
+// (lib/enable-app.sh) and doctor.sh all read the same map, so the console
+// shows the hosts that are actually served — including the operator's
+// appliance-wide HOST_TAG and any per-host override. The console does not
+// re-implement the naming rules; it runs the resolver.
+//
+// Cached on the mtimes of the two inputs that change at runtime
+// (state.json, appliance.env); manifests are baked into the image. A
+// failed run keeps serving the last good map. Returns null only when the
+// resolver has never succeeded (python3 or the script missing) — callers
+// then fall back to the manifest's built-in labels.
+const VIBE_HOSTS_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'vibe_hosts.py');
+const _hostMapCache = { key: null, value: null, warned: false };
+function hostMap() {
+  const mtime = (f) => { try { return fs.statSync(f).mtimeMs; } catch (_e) { return 0; } };
+  const key = `${mtime(STATE_PATH)}|${mtime(path.join(ENV_DIR, 'appliance.env'))}`;
+  if (_hostMapCache.value && _hostMapCache.key === key) return _hostMapCache.value;
+  try {
+    const out = execFileSync('python3', [
+      VIBE_HOSTS_SCRIPT, '--state', STATE_PATH, '--env-dir', ENV_DIR,
+      '--manifests', MANIFESTS_DIR, 'dump',
+    ], { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] });
+    _hostMapCache.value = JSON.parse(out);
+    _hostMapCache.key = key;
+    _hostMapCache.warned = false;
+  } catch (err) {
+    if (!_hostMapCache.warned) {
+      _hostMapCache.warned = true;
+      log('warn', 'hostname resolver failed; showing built-in host labels until it recovers', {
+        err: err.message,
+        diagnose: `python3 ${VIBE_HOSTS_SCRIPT} dump`,
+        fix: 'sudo bash /opt/vibe/appliance/bootstrap.sh',
+      });
+    }
+  }
+  return _hostMapCache.value;
+}
+
+// Effective primary subdomain label for an app: the label lib/enable-app.sh
+// applied (the operator's VIBE_APP_SUBDOMAIN override, else the manifest
+// default with the appliance HOST_TAG) — see hostMap().
 function appEffectiveSubdomain(manifest) {
+  const hm = hostMap();
+  const app = hm && hm.apps && hm.apps[manifest.slug];
+  if (app && app.primary && app.primary.label) return app.primary.label;
+  // Resolver unavailable: the applied label from state, else the manifest.
   try {
     const st = readState();
     const entry = ((st.apps || {})[manifest.slug]) || {};
@@ -6907,6 +6934,32 @@ function appEffectiveSubdomain(manifest) {
   } catch (_e) {
     return manifest.subdomain;
   }
+}
+
+// The main host label — fronts the console, and every path-mounted app in
+// single-host mode. state.config.tunnel_subdomain (default 'vibe') with
+// the HOST_TAG applied to the default.
+function mainHostLabel(config) {
+  const hm = hostMap();
+  if (hm && hm.main && hm.main.label) return hm.main.label;
+  return (config && config.tunnel_subdomain) || 'vibe';
+}
+
+// An app's extra public surfaces (manifest subdomains[] beyond the
+// primary), each with its resolved host label. `internal: true` entries
+// and every extra of a `userFacing: false` app are not public — the
+// resolver applies the same gates Caddy and the tunnel use, so the
+// console never advertises a hostname the reverse proxy won't answer.
+function appExtraSurfaces(manifest) {
+  const hm = hostMap();
+  const app = hm && hm.apps && hm.apps[manifest.slug];
+  if (app && Array.isArray(app.extras)) {
+    return app.extras.map((e) => ({ name: e.name, audience: e.audience || null, label: e.label }));
+  }
+  if (manifest.userFacing === false) return [];
+  return (manifest.subdomains || [])
+    .filter((sd) => sd && sd.name && sd.name !== manifest.subdomain && sd.internal !== true)
+    .map((sd) => ({ name: sd.name, audience: sd.audience || null, label: sd.name }));
 }
 
 // LAN fallback URL — http://<host_ip>/<prefix>/. Goes through Caddy on
@@ -6993,7 +7046,7 @@ function appPublicUrl(manifest, config, live) {
     // single-host (default) → one tunnel subdomain, path per app.
     // Mirrors LAN routing (vibe.local/<prefix>/) so the bundled SPA's
     // base: '/<prefix>/' resolves without a host-level redirect.
-    const sub = config.tunnel_subdomain || 'vibe';
+    const sub = mainHostLabel(config);
     return `https://${sub}.${config.domain}/${prefix}/`;
   }
 

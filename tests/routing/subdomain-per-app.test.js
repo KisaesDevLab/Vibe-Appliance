@@ -121,22 +121,24 @@ function renderCaddy(fx, routingMode) {
   fs.writeFileSync(pyFile, py);
   const envFile = path.join(fx.dir, `appliance-${routingMode}.env`);
   fs.writeFileSync(envFile,
-    `CLOUDFLARE_TUNNEL_ENABLED=true\nDOMAIN_ROUTING_MODE=${routingMode}\n`);
+    `CLOUDFLARE_TUNNEL_ENABLED=true\nDOMAIN_ROUTING_MODE=${routingMode}\n${fx.extraEnv || ''}`);
   const out = path.join(fx.dir, `out-${routingMode}.caddy`);
   execFileSync('python3', [pyFile, fx.tmpl, fx.snippets, fx.manifests, fx.stateFile, out],
-    { env: { ...process.env, TEST_APPLIANCE_ENV: envFile } });
+    { env: { ...process.env, TEST_APPLIANCE_ENV: envFile, PYTHONPATH: path.join(REPO, 'lib') } });
   return fs.readFileSync(out, 'utf8');
 }
 
 // Run the REAL embedded ingress builder from cloudflared-up.sh and return
 // the list of ingress hostnames.
 function buildIngressHosts(fx, routingMode) {
-  const py = extractPyeof(path.join(REPO, 'infra', 'cloudflared-up.sh'), 'ingress = [caddy_rule(fqdn)]');
+  const py = extractPyeof(path.join(REPO, 'infra', 'cloudflared-up.sh'), 'ingress = [caddy_rule(h) for h in tunnel_hosts]');
   const pyFile = path.join(fx.dir, 'ingress.py');
   fs.writeFileSync(pyFile, py + '\n');
+  const envFile = path.join(fx.dir, `appliance-ingress-${routingMode}.env`);
+  fs.writeFileSync(envFile, `DOMAIN_ROUTING_MODE=${routingMode}\n${fx.extraEnv || ''}`);
   const out = execFileSync('python3',
-    [pyFile, 'vibe.firm.com', 'firm.com', fx.stateFile, fx.manifests, routingMode],
-    { encoding: 'utf8' });
+    [pyFile, fx.stateFile, fx.manifests, envFile],
+    { encoding: 'utf8', env: { ...process.env, PYTHONPATH: path.join(REPO, 'lib') } });
   const cfg = JSON.parse(out);
   return cfg.config.ingress.map((r) => r.hostname).filter(Boolean);
 }
@@ -313,34 +315,46 @@ test('userFacing:false blocks secondary subdomains in BOTH Caddy and tunnel ingr
   }
 });
 
-// doctor.sh carries its OWN copy of the extra-subdomain gate, to decide
-// which public hostnames to DNS/cert-check. That makes four independent
-// implementations of one rule (render-caddyfile.sh, cloudflared-up.sh,
-// server.js's extraSubdomains, and this) — which is precisely how they
-// drifted. doctor's copy going stale is not cosmetic: it hard-FAILs two
-// checks per app for hostnames that are deliberately not served, and
-// takes `doctor` to exit 1 on a healthy install.
-function doctorExtraSubdomains(fx, manifestName) {
-  const py = extractPyeof(path.join(REPO, 'doctor.sh'), 'subs = m.get("subdomains") or []');
-  const pyFile = path.join(fx.dir, 'doctor-extras.py');
-  fs.writeFileSync(pyFile, py + '\n');
-  const out = execFileSync('python3', [pyFile, path.join(fx.manifests, manifestName)],
+// doctor.sh used to carry its OWN copy of the hostname gates, to decide
+// which public hostnames to DNS/cert-check — one of four independent
+// implementations of one rule, which is precisely how they drifted. Its
+// copy going stale was not cosmetic: it hard-FAILed two checks per app
+// for hostnames that are deliberately not served, and took `doctor` to
+// exit 1 on a healthy install. It now asks lib/vibe_hosts.py, the same
+// resolver Caddy and the tunnel build from.
+function doctorHosts(fx, routingMode) {
+  const envDir = path.join(fx.dir, `envdir-${routingMode}`);
+  fs.mkdirSync(envDir, { recursive: true });
+  fs.writeFileSync(path.join(envDir, 'appliance.env'),
+    `DOMAIN_ROUTING_MODE=${routingMode}\n${fx.extraEnv || ''}`);
+  const out = execFileSync('python3',
+    [path.join(REPO, 'lib', 'vibe_hosts.py'), '--state', fx.stateFile,
+     '--env-dir', envDir, '--manifests', fx.manifests, 'list', 'doctor'],
     { encoding: 'utf8' });
   return out.split('\n').map(s => s.trim()).filter(Boolean);
 }
 
-test('doctor.sh extra-subdomain gate agrees with Caddy and the tunnel', () => {
-  const fx = withHeadlessExtras(mkFixtures());
-  // userFacing:false -> no public extras, so doctor must not probe them.
-  assert.deepEqual(doctorExtraSubdomains(fx, 'vibe-headless.json'), [],
-    'doctor must not DNS/cert-check extras of a userFacing:false app');
-  // The ordinary case still yields the client portal, in both modes.
-  assert.deepEqual(doctorExtraSubdomains(fx, 'vibe-connect.json'), ['client'],
-    'doctor still checks a normal app\'s non-primary subdomain');
-  // And it must match what the tunnel actually publishes.
-  const hosts = buildIngressHosts(fx, 'single-host');
-  assert.ok(hosts.includes('client.firm.com'));
-  assert.ok(!hosts.includes('hooks.firm.com'));
+test('doctor.sh checks exactly the hostnames the tunnel publishes', () => {
+  // doctor must not keep a private rule: it calls the resolver CLI.
+  const doctor = fs.readFileSync(path.join(REPO, 'doctor.sh'), 'utf8');
+  assert.match(doctor, /vibe_hosts\.py/, 'doctor.sh resolves hostnames through lib/vibe_hosts.py');
+  assert.match(doctor, /list doctor/, 'doctor.sh asks for the doctor host list');
+  assert.doesNotMatch(doctor, /m\.get\("subdomains"\)/,
+    'doctor.sh must not re-implement the subdomains[] gate');
+
+  for (const mode of ['single-host', 'subdomain-per-app']) {
+    const fx = withHeadlessExtras(mkFixtures());
+    const checked = doctorHosts(fx, mode);
+    // userFacing:false -> no public extras, so doctor must not probe them.
+    assert.ok(!checked.includes('hooks.firm.com'),
+      `${mode}: doctor must not DNS/cert-check extras of a userFacing:false app`);
+    // The ordinary case still yields the client portal, in both modes.
+    assert.ok(checked.includes('client.firm.com'),
+      `${mode}: doctor still checks a normal app's non-primary subdomain`);
+    // And it must match what the tunnel actually publishes.
+    assert.deepEqual(new Set(checked), new Set(buildIngressHosts(fx, mode)),
+      `${mode}: doctor's host list is the tunnel's ingress host list`);
+  }
 });
 
 test('userFacing:false still exposes its PRIMARY surface where Caddy serves one', () => {
@@ -581,4 +595,76 @@ test('a foreign unit is skipped whether or not it is currently enabled', () => {
   const out = path.join(fx.dir, 'haproxy-disabled.cfg');
   execFileSync('python3', [pyFile, fx.manifests, fx.stateFile, out]);
   assert.doesNotMatch(fs.readFileSync(out, 'utf8'), /fe_sentinel_core/);
+});
+
+// --- operator-named hosts: appliance tag + overrides -------------------
+
+// A second appliance under the same domain sets HOST_TAG (every built-in
+// label becomes <label>-<tag>) and gives up the apex. Caddy and the
+// tunnel both read lib/vibe_hosts.py, so they must move together.
+function tagged(fx) {
+  fx.extraEnv = 'HOST_TAG=office2\nAPEX_DOMAIN_OWNED=false\n';
+  return fx;
+}
+
+test('HOST_TAG: Caddy serves the tagged hostnames and not the untagged ones', () => {
+  for (const mode of ['single-host', 'subdomain-per-app']) {
+    const caddy = renderCaddy(tagged(mkFixtures()), mode);
+    assert.match(caddy, /\nvibe-office2\.firm\.com \{/, `${mode}: main host is tagged`);
+    assert.doesNotMatch(caddy, /\nvibe\.firm\.com \{/, `${mode}: the untagged main host is gone`);
+    assert.match(caddy, /\nclient-office2\.firm\.com \{/, `${mode}: extra surface is tagged`);
+    assert.match(caddy, /\nairouter-office2\.firm\.com \{/, `${mode}: rootServedOnly app is tagged`);
+    for (const infra of ['cockpit', 'portainer', 'backup']) {
+      assert.ok(caddy.includes(`\n${infra}-office2.firm.com {`), `${mode}: ${infra} is tagged`);
+      assert.ok(!caddy.includes(`\n${infra}.firm.com {`), `${mode}: untagged ${infra} is gone`);
+    }
+    // APEX_DOMAIN_OWNED=false: the first appliance keeps firm.com / www.
+    assert.doesNotMatch(caddy, /\nfirm\.com, www\.firm\.com \{/, `${mode}: no apex block`);
+    assert.doesNotMatch(caddy, /www\.firm\.com/, `${mode}: www is not claimed`);
+  }
+});
+
+test('HOST_TAG: an applied operator label is served verbatim, untagged', () => {
+  // The fixture state records "books" as vibe-mybooks' applied label
+  // (what enable-app wrote from VIBE_APP_SUBDOMAIN).
+  const caddy = renderCaddy(tagged(mkFixtures()), 'subdomain-per-app');
+  assert.match(caddy, /\nbooks\.firm\.com \{/);
+  assert.doesNotMatch(caddy, /books-office2\.firm\.com/);
+  assert.match(caddy, /\ntb-office2\.firm\.com \{/, 'an app with no applied label takes the tag');
+});
+
+test('HOST_TAG: the tunnel publishes exactly the tagged hosts Caddy serves', () => {
+  const fx = tagged(mkFixtures());
+  assert.deepEqual(new Set(buildIngressHosts(fx, 'subdomain-per-app')), new Set([
+    'vibe-office2.firm.com', 'tb-office2.firm.com', 'books.firm.com',
+    'connect-office2.firm.com', 'client-office2.firm.com', 'airouter-office2.firm.com',
+  ]));
+  assert.deepEqual(new Set(buildIngressHosts(fx, 'single-host')), new Set([
+    'vibe-office2.firm.com', 'client-office2.firm.com', 'airouter-office2.firm.com',
+  ]));
+});
+
+test('the apex redirect targets the resolved main host', () => {
+  const fx = mkFixtures();
+  fx.extraEnv = 'HOST_TAG=office2\n';   // still owns the apex
+  const caddy = renderCaddy(fx, 'single-host');
+  const apex = caddy.split('\nfirm.com, www.firm.com {')[1].split('\n}')[0];
+  assert.match(apex, /redir https:\/\/vibe-office2\.firm\.com\{uri\} 308/);
+});
+
+test('two hosts resolving to one name abort the render instead of emitting a broken Caddyfile', () => {
+  // An operator label that lands on another host's name: Caddy would
+  // reject two site blocks for one hostname, so refuse up front and say
+  // who collides.
+  const fx = mkFixtures();
+  const st = JSON.parse(fs.readFileSync(fx.stateFile, 'utf8'));
+  st.apps['vibe-tb'].subdomain = 'cockpit';
+  fs.writeFileSync(fx.stateFile, JSON.stringify(st));
+  // execFileSync pipes stderr by default, so the refusal text rides on
+  // the thrown error.
+  assert.throws(() => renderCaddy(fx, 'subdomain-per-app'), (err) => {
+    assert.equal(err.status, 3);
+    assert.match(String(err.stderr), /cockpit\.firm\.com is claimed by vibe-tb and infra:cockpit/);
+    return true;
+  });
 });

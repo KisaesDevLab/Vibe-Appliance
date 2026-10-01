@@ -965,6 +965,10 @@ phase_infra() {
   # (without it, Cockpit's WebSocket upgrade is rejected after TLS
   # handshake completes — operator gets a blank page).
   export COCKPIT_HOST_IP="${_host_ip:-}"
+  # Cockpit's public hostname — cockpit.<domain> unless the operator set
+  # a HOST_TAG or INFRA_SUBDOMAIN_COCKPIT. Empty outside domain mode.
+  COCKPIT_HOST="$(python3 "$APPLIANCE_DIR/lib/vibe_hosts.py" get cockpit-host 2>/dev/null || true)"
+  export COCKPIT_HOST
   if ! ( cd "$APPLIANCE_DIR" && /bin/bash infra/cockpit-install.sh ); then
     log_warn "cockpit install failed; continuing without it"
     return 0
@@ -1236,7 +1240,14 @@ _install_vibe_cli() {
 # nothing in the appliance itself depends on the result.
 _resolve_server_url() {
   if [[ "$CONFIG_MODE" == "domain" && -n "$CONFIG_DOMAIN" ]]; then
-    printf 'https://%s.%s' "${CONFIG_TUNNEL_SUBDOMAIN:-vibe}" "$CONFIG_DOMAIN"
+    # The main host as lib/vibe_hosts.py resolves it (HOST_TAG applied).
+    local main_url=""
+    main_url="$(python3 "$APPLIANCE_DIR/lib/vibe_hosts.py" get main-url 2>/dev/null || true)"
+    if [[ -n "$main_url" ]]; then
+      printf '%s' "$main_url"
+    else
+      printf 'https://%s.%s' "${CONFIG_TUNNEL_SUBDOMAIN:-vibe}" "$CONFIG_DOMAIN"
+    fi
     return 0
   fi
 

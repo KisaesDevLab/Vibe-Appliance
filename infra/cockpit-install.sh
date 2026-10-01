@@ -78,7 +78,8 @@ cockpit_install() {
 # Origin header doesn't match the cert CN.
 #
 # Origins list covers the modes Cockpit can be reached through:
-#   - https://cockpit.<domain> + https://<domain>   (domain mode via Caddy)
+#   - https://<cockpit host> + https://<domain>     (domain mode via Caddy;
+#     the host is cockpit.<domain> unless the operator tagged/renamed it)
 #   - https://<host>.<tailnet>.ts.net:9090           (tailscale serve)
 #   - https://localhost / https://127.0.0.1          (loopback / SSH-tunnel)
 #
@@ -89,10 +90,14 @@ cockpit_configure() {
   local cfg="/etc/cockpit/cockpit.conf"
   local domain="${1:-}"
   local host_ip="${2:-}"
+  # Cockpit's public hostname as resolved by lib/vibe_hosts.py (the
+  # operator may have tagged or renamed it). bootstrap.sh passes it in
+  # COCKPIT_HOST; a standalone run falls back to the built-in label.
+  local cockpit_host="${3:-}"
 
   local origins=""
   if [[ -n "$domain" ]]; then
-    origins="https://cockpit.${domain} https://${domain}"
+    origins="https://${cockpit_host:-cockpit.${domain}} https://${domain}"
   fi
 
   # In LAN mode (no domain) operators reach Cockpit via the host's
@@ -267,7 +272,7 @@ except Exception:
 }
 
 cockpit_install
-cockpit_configure "${COCKPIT_DOMAIN:-}" "${COCKPIT_HOST_IP:-}"
+cockpit_configure "${COCKPIT_DOMAIN:-}" "${COCKPIT_HOST_IP:-}" "${COCKPIT_HOST:-}"
 cockpit_enable
 cockpit_health_check
 cockpit_add_tailscale_serve

@@ -49,3 +49,6 @@ tools/guides/build/
 *.bak.*
 *.orig
 *.tmp
+
+# Python bytecode from lib/vibe_hosts.py (imported by the renderers and tests)
+__pycache__/

@@ -79,7 +79,7 @@ function render({ edgeGate, providerEnabled, mode }) {
   fs.writeFileSync(envFile, `CLOUDFLARE_TUNNEL_ENABLED=false\nDOMAIN_ROUTING_MODE=${mode === 'perapp' ? 'subdomain-per-app' : 'single-host'}\n`);
   const out = path.join(dir, 'Caddyfile');
   execFileSync('python3', [pyFile, path.join(REPO, 'caddy', 'Caddyfile.tmpl'), path.join(REPO, 'caddy', 'snippets'), manifests, stateFile, out],
-    { env: { ...process.env, TEST_APPLIANCE_ENV: envFile } });
+    { env: { ...process.env, TEST_APPLIANCE_ENV: envFile, PYTHONPATH: path.join(REPO, 'lib') } });
   return fs.readFileSync(out, 'utf8');
 }
 

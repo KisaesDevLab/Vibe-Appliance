@@ -56,10 +56,13 @@ render_caddyfile() {
   # secrets — env_file pulls those at Caddy runtime.
   chmod 644 "$tmp"
 
-  python3 - \
+  # lib/vibe_hosts.py decides every hostname; the renderer imports it.
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${APPLIANCE_DIR}/lib${PYTHONPATH:+:${PYTHONPATH}}" python3 - \
       "$tmpl" "$snippets_dir" "$manifests_dir" \
       "$VIBE_STATE_FILE" "$tmp" <<'PYEOF'
 import json, os, re, sys
+
+import vibe_hosts
 
 (tmpl_path, snippets_dir, manifests_dir,
  state_path, out_path) = sys.argv[1:6]
@@ -184,10 +187,10 @@ def list_enabled_apps(state, manifests_dir):
     return out
 
 
-def render_vhost(slug, manifest, domain, subdomain, tls_internal=False):
+def render_vhost(slug, manifest, host, tls_internal=False):
     """
-    Emit a Caddy site block serving the app at the ROOT of
-    <subdomain>.<domain> — the per-app-subdomain routing model
+    Emit a Caddy site block serving the app at the ROOT of `host`
+    (<label>.<domain>) — the per-app-subdomain routing model
     (DOMAIN_ROUTING_MODE=subdomain-per-app).
 
     The app is served at root: no path prefix, no catch-all redirect.
@@ -204,10 +207,9 @@ def render_vhost(slug, manifest, domain, subdomain, tls_internal=False):
     re-runs enable-app on every affected app when the routing mode or a
     subdomain changes.
 
-    `subdomain` is the EFFECTIVE subdomain: the operator's per-app
-    override (state.apps.<slug>.subdomain, from VIBE_APP_SUBDOMAIN in the
-    per-app env file) if set, else manifest.subdomain. The caller
-    resolves it via _effective_subdomain().
+    `host` is the app's resolved primary hostname from lib/vibe_hosts.py:
+    the label lib/enable-app.sh applied (the operator's VIBE_APP_SUBDOMAIN
+    override, else the manifest default with the appliance HOST_TAG).
 
     tls_internal=True makes Caddy use its embedded local CA for the
     cert (self-signed). Required when the appliance is fronted by
@@ -216,10 +218,8 @@ def render_vhost(slug, manifest, domain, subdomain, tls_internal=False):
     cloudflared's ingress with noTLSVerify=true accepts the self-
     signed cert; Cloudflare's edge handles the real public TLS.
     """
-    if not domain or not subdomain:
+    if not host:
         return ""
-
-    host = f"{subdomain}.{domain}"
 
     routing = manifest.get("routing", {})
     matchers = routing.get("matchers", []) or []
@@ -333,18 +333,22 @@ INFRA_SERVICES = [
 ]
 
 
-def render_apex_vhost(domain, tunnel_subdomain="", tls_internal=False):
+def render_apex_vhost(apex_hosts, main_host="", tls_internal=False):
     """Render the apex site block for domain mode.
 
     In the single-hostname routing model every app — and the console —
-    lives under `${tunnel_subdomain}.${domain}`. The apex itself isn't
+    lives under the main host (`main_host`). The apex itself isn't
     tunnelled; this block only catches the case where the operator (or
     someone on their LAN with split DNS) lands on the bare apex by
     accident. We redirect there so a typo on `firm.com` doesn't return
     nothing, while `vibe.firm.com` stays the canonical surface.
 
-    When `tunnel_subdomain` is empty (legacy callers, or a pre-migration
-    state.json with no `tunnel_subdomain` set), fall back to proxying
+    `apex_hosts` is [<domain>, www.<domain>], or empty when this
+    appliance does not own the apex (APEX_DOMAIN_OWNED=false — a second
+    appliance under the same domain must leave it to the first), in which
+    case no block is emitted.
+
+    When `main_host` is empty (legacy callers), fall back to proxying
     the console at the apex — preserves the old "apex serves the landing
     page" behavior so an in-place upgrade doesn't black out the apex.
 
@@ -353,10 +357,11 @@ def render_apex_vhost(domain, tunnel_subdomain="", tls_internal=False):
     Caddy's local CA; cloudflared's ingress is configured with
     noTLSVerify so the self-signed cert is accepted.
     """
-    if not domain:
+    if not apex_hosts:
         return ""
+    sites = ", ".join(apex_hosts)
     tls_line = "    tls internal\n" if tls_internal else ""
-    if tunnel_subdomain:
+    if main_host:
         # Redirect every request to the single-hostname surface. We use
         # 308 (RFC 7538) instead of 301/302/`permanent` because 301/302
         # downgrade POST→GET per RFC 7231 §6.4.{2,3} — the exact failure
@@ -364,15 +369,15 @@ def render_apex_vhost(domain, tunnel_subdomain="", tls_internal=False):
         # (commits 4907588 / 3a6ffee). 308 is method-preserving and is
         # supported by every modern HTTP client / browser.
         return (
-            f"{domain}, www.{domain} {{\n"
+            f"{sites} {{\n"
             f"{tls_line}"
-            f"    redir https://{tunnel_subdomain}.{domain}{{uri}} 308\n"
+            f"    redir https://{main_host}{{uri}} 308\n"
             f"}}\n"
         )
-    # Legacy: no tunnel_subdomain configured, keep the old apex→console
+    # Legacy: no main host configured, keep the old apex→console
     # behavior so we don't break appliances mid-upgrade.
     return (
-        f"{domain}, www.{domain} {{\n"
+        f"{sites} {{\n"
         f"{tls_line}"
         f"    encode gzip zstd\n"
         f"    log {{\n"
@@ -393,7 +398,7 @@ def render_apex_vhost(domain, tunnel_subdomain="", tls_internal=False):
     )
 
 
-def render_domain_app_vhost(domain, tunnel_subdomain, enabled, tls_internal=False):
+def render_domain_app_vhost(host, enabled, tls_internal=False):
     """Single TLS vhost serving every app under one hostname.
 
     Replaces the per-app subdomain layout (`tb.example.com`,
@@ -431,9 +436,8 @@ def render_domain_app_vhost(domain, tunnel_subdomain, enabled, tls_internal=Fals
 
     tls_internal: see render_apex_vhost.
     """
-    if not domain or not tunnel_subdomain:
+    if not host:
         return ""
-    host = f"{tunnel_subdomain}.{domain}"
 
     lines = [f"{host} {{"]
     if tls_internal:
@@ -499,25 +503,7 @@ def render_domain_app_vhost(domain, tunnel_subdomain, enabled, tls_internal=Fals
     return "\n".join(lines) + "\n"
 
 
-def _effective_subdomain(slug, manifest, state):
-    """Resolve an app's effective primary subdomain.
-
-    Precedence: the operator's per-app override — persisted to
-    state.apps.<slug>.subdomain by lib/enable-app.sh from the
-    VIBE_APP_SUBDOMAIN key in the per-app env file — wins; otherwise the
-    manifest's built-in `subdomain`. Every consumer (this renderer,
-    infra/cloudflared-up.sh, the console's appPublicUrl) resolves the
-    subdomain the same way so Caddy vhosts, tunnel ingress, and the URLs
-    shown in the admin UI all agree.
-    """
-    entry = (state.get("apps") or {}).get(slug) or {}
-    sub = (entry.get("subdomain") or "").strip()
-    if sub:
-        return sub
-    return manifest.get("subdomain", "")
-
-
-def render_console_host_vhost(domain, tunnel_subdomain, tls_internal=False):
+def render_console_host_vhost(host, tls_internal=False):
     """Render the console (landing + admin) site block for
     subdomain-per-app mode.
 
@@ -529,9 +515,8 @@ def render_console_host_vhost(domain, tunnel_subdomain, tls_internal=False):
 
     tls_internal: see render_vhost.
     """
-    if not domain or not tunnel_subdomain:
+    if not host:
         return ""
-    host = f"{tunnel_subdomain}.{domain}"
     lines = [f"{host} {{"]
     if tls_internal:
         lines.append("    tls internal")
@@ -554,7 +539,7 @@ def render_console_host_vhost(domain, tunnel_subdomain, tls_internal=False):
     return "\n".join(lines) + "\n"
 
 
-def render_root_served_vhosts(enabled, domain, state, tls_internal=False):
+def render_root_served_vhosts(enabled, hosts, tls_internal=False):
     """Root-served vhosts for `rootServedOnly` apps in SINGLE-HOST mode.
 
     Single-host normally path-mounts every app under the one tunnel
@@ -568,27 +553,20 @@ def render_root_served_vhosts(enabled, domain, state, tls_internal=False):
     render_per_app_subdomain_vhosts already emits these hosts, and
     emitting both would give Caddy two site blocks for one hostname.
 
-    Same skip gates as the other renderers: a primary marked
-    `internal: true` stays off the edge, and an app with no resolvable
-    subdomain is reported rather than silently dropped.
+    The skip gates live in lib/vibe_hosts.py (`served`): an app with no
+    operator surface at all, or a primary marked `internal: true`, stays
+    off the edge — rootServedOnly doesn't make a headless service public.
+    An app with no resolvable subdomain is reported rather than silently
+    dropped.
     """
-    if not domain:
-        return ""
     blocks = []
     for slug, manifest in enabled:
         if not root_served_only(manifest):
             continue
-        subdomains = manifest.get("subdomains") or []
-        # Same "no operator surface at all" gate the other two renderers
-        # apply — rootServedOnly doesn't make a headless service public.
-        if manifest.get("userFacing") is False and not subdomains:
-            continue
-        primary = manifest.get("subdomain", "")
-        if any((s.get("name") == primary and s.get("internal") is True)
-               for s in subdomains):
-            continue
-        sub = _effective_subdomain(slug, manifest, state)
-        if not sub:
+        primary = hosts["apps"][slug]["primary"]
+        if not primary["served"]:
+            if primary["label"]:
+                continue
             print(
                 f"# WARNING: {slug} is rootServedOnly but has no resolvable "
                 f"subdomain — vhost skipped; it stays reachable on its "
@@ -596,16 +574,16 @@ def render_root_served_vhosts(enabled, domain, state, tls_internal=False):
                 file=sys.stderr,
             )
             continue
-        blocks.append(render_vhost(slug, manifest, domain, sub, tls_internal))
+        blocks.append(render_vhost(slug, manifest, primary["fqdn"], tls_internal))
     return "\n".join(b for b in blocks if b.strip())
 
 
-def render_per_app_subdomain_vhosts(enabled, domain, state, tls_internal=False):
+def render_per_app_subdomain_vhosts(enabled, hosts, tls_internal=False):
     """Emit one root-served vhost per enabled app at its effective
     subdomain — the subdomain-per-app routing model.
 
-    Skip rules mirror render_domain_app_vhost so the two routing models
-    hide the same surfaces:
+    Skip rules (lib/vibe_hosts.py `served`) mirror render_domain_app_vhost
+    so the two routing models hide the same surfaces:
       (a) `userFacing: false` AND no subdomains[] → no operator surface
           at all (vibe-glm-ocr); skip wholesale.
       (b) the primary subdomain entry in `subdomains[]` carries
@@ -618,32 +596,21 @@ def render_per_app_subdomain_vhosts(enabled, domain, state, tls_internal=False):
     render_extra_subdomain_vhosts, same as in single-host mode, so this
     function only owns each app's PRIMARY subdomain.
     """
-    if not domain:
-        return ""
     blocks = []
     for slug, manifest in enabled:
-        subdomains = manifest.get("subdomains") or []
-        if manifest.get("userFacing") is False and not subdomains:
+        primary = hosts["apps"][slug]["primary"]
+        if not primary["served"]:
+            if not primary["label"]:
+                print(
+                    f"# WARNING: {slug} has no resolvable subdomain — vhost skipped",
+                    file=sys.stderr,
+                )
             continue
-        primary = manifest.get("subdomain", "")
-        primary_internal = any(
-            (s.get("name") == primary and s.get("internal") is True)
-            for s in subdomains
-        )
-        if primary_internal:
-            continue
-        sub = _effective_subdomain(slug, manifest, state)
-        if not sub:
-            print(
-                f"# WARNING: {slug} has no resolvable subdomain — vhost skipped",
-                file=sys.stderr,
-            )
-            continue
-        blocks.append(render_vhost(slug, manifest, domain, sub, tls_internal))
+        blocks.append(render_vhost(slug, manifest, primary["fqdn"], tls_internal))
     return "\n".join(b for b in blocks if b.strip())
 
 
-def render_extra_subdomain_vhosts(enabled, domain, tls_internal=False):
+def render_extra_subdomain_vhosts(enabled, hosts, tls_internal=False):
     """Emit additional per-subdomain vhosts for apps that declare a
     `subdomains[]` array beyond their primary `subdomain` field.
 
@@ -672,26 +639,19 @@ def render_extra_subdomain_vhosts(enabled, domain, tls_internal=False):
     container DNS on vibe_net (e.g. http://vibe-shield-gateway:8080),
     not via Caddy.
     """
-    if not domain:
-        return ""
     blocks = []
     for slug, manifest in enabled:
-        subdomains = manifest.get("subdomains") or []
-        if not subdomains:
-            continue
-        # App-level userFacing: false STILL blocks all of its secondary
-        # vhosts (covers GLM-OCR-shaped apps that might one day declare
-        # subdomains[]). Per-entry internal: true is the new finer gate.
-        if manifest.get("userFacing") is False:
-            continue
-        primary = manifest.get("subdomain", "")
+        # Which entries are public surfaces is decided once, in
+        # lib/vibe_hosts.py::extra_entries: app-level userFacing: false
+        # blocks all of an app's secondary vhosts, per-entry
+        # internal: true is the finer gate, and the primary is skipped.
+        # Each surface carries its resolved hostname (operator override
+        # VIBE_APP_SUBDOMAIN_<NAME>, else the name with the HOST_TAG).
+        by_name = {e.get("name"): e for e in (manifest.get("subdomains") or [])}
         default_upstream = (manifest.get("routing", {}) or {}).get("default_upstream", "")
-        for entry in subdomains:
-            name = entry.get("name")
-            if not name or name == primary:
-                continue
-            if entry.get("internal") is True:
-                continue
+        for surface in hosts["apps"][slug]["extras"]:
+            name = surface["name"]
+            entry = by_name[name]
             target = entry.get("target") or default_upstream
             if not target:
                 print(
@@ -700,7 +660,7 @@ def render_extra_subdomain_vhosts(enabled, domain, tls_internal=False):
                     file=sys.stderr,
                 )
                 continue
-            host = f"{name}.{domain}"
+            host = surface["fqdn"]
             # Streaming directive — if the manifest declares a streaming
             # matcher AND that matcher's path is generic enough to apply
             # to this subdomain (i.e. `/socket.io/*` or similar), wrap
@@ -753,11 +713,12 @@ def render_extra_subdomain_vhosts(enabled, domain, tls_internal=False):
     return "\n".join(blocks)
 
 
-def render_infra_vhost(svc, mode, domain, tls_internal=False):
-    """Render a domain-mode site block for an infra service."""
-    if mode != "domain" or not domain:
+def render_infra_vhost(svc, host, tls_internal=False):
+    """Render a domain-mode site block for an infra service. `host` is
+    its resolved hostname (INFRA_SUBDOMAIN_<SLUG> override, else the slug
+    with the HOST_TAG); empty outside domain mode."""
+    if not host:
         return ""
-    host = f"{svc['slug']}.{domain}"
     upstream = svc["upstream"]
     scheme = svc.get("scheme", "http")
     proxy_target = f"{scheme}://{upstream}" if scheme == "https" else upstream
@@ -1088,9 +1049,6 @@ def main():
     mode = config.get("mode", "lan")
     domain = config.get("domain", "")
     email = config.get("email", "")
-    # Single subdomain that fronts every app in domain mode. Default
-    # 'vibe' for state.json files written before this field existed.
-    tunnel_subdomain = (config.get("tunnel_subdomain") or "vibe").strip()
 
     # Tunnel detection — when CLOUDFLARE_TUNNEL_ENABLED=true is in
     # appliance.env, all per-host site blocks switch to `tls internal`
@@ -1104,18 +1062,33 @@ def main():
     tunnel_active = (appliance_env.get("CLOUDFLARE_TUNNEL_ENABLED", "")
                      .strip().lower() == "true")
 
+    # Every hostname this render emits comes from lib/vibe_hosts.py — the
+    # main host (state.config.tunnel_subdomain, default 'vibe'), each
+    # app's applied label, the extra surfaces, the infra hosts and the
+    # apex — with the appliance HOST_TAG and operator overrides already
+    # applied. The tunnel, doctor and the console read the same map.
+    hosts = vibe_hosts.resolve(state, vibe_hosts.load_manifests(manifests_dir), appliance_env)
+    main_host = hosts["main"]["fqdn"]
+    dupes = vibe_hosts.duplicate_hosts(hosts)
+    if dupes:
+        for fqdn, owners in dupes:
+            print(f"ERROR: hostname {fqdn} is claimed by " + " and ".join(owners), file=sys.stderr)
+        print("Fix: give one of them a different label (Configuration → Network), "
+              "then re-run: sudo bash /opt/vibe/appliance/bootstrap.sh", file=sys.stderr)
+        sys.exit(3)
+
     # Domain-mode routing style. 'single-host' (default) fronts every app
-    # under one hostname (`${tunnel_subdomain}.${domain}`) with path
+    # under one hostname (the main host) with path
     # prefixes; 'subdomain-per-app' gives each app its own
     # <subdomain>.<domain> served at root. Operator-selectable via
     # Settings → Network (DOMAIN_ROUTING_MODE in appliance.env). Unknown
     # or blank falls back to single-host so an empty appliance.env — the
     # state on every pre-existing install — never changes behavior.
-    routing_mode = (appliance_env.get("DOMAIN_ROUTING_MODE", "") or "").strip() or "single-host"
-    if routing_mode not in ("single-host", "subdomain-per-app"):
-        print(f"# WARNING: DOMAIN_ROUTING_MODE='{routing_mode}' unknown; using single-host",
+    _raw_routing_mode = (appliance_env.get("DOMAIN_ROUTING_MODE", "") or "").strip()
+    routing_mode = hosts["routingMode"]
+    if _raw_routing_mode and _raw_routing_mode.strip("\"'") != routing_mode:
+        print(f"# WARNING: DOMAIN_ROUTING_MODE='{_raw_routing_mode}' unknown; using single-host",
               file=sys.stderr)
-        routing_mode = "single-host"
 
     with open(tmpl_path) as f:
         body = f.read()
@@ -1150,7 +1123,7 @@ def main():
         # Two routing styles, selected by DOMAIN_ROUTING_MODE:
         #
         # single-host (default): every app + the console live under
-        #   `${tunnel_subdomain}.${domain}` with path-prefix routing
+        #   the main host with path-prefix routing
         #   (mirroring LAN mode). The apex (and www) redirects there.
         #   Adopted 2026-05-12 because per-app subdomains had broken
         #   login flows — the bundled SPAs are built with a base-path
@@ -1160,7 +1133,7 @@ def main():
         #
         # subdomain-per-app: each app gets its own <subdomain>.<domain>
         #   served at ROOT (VITE_BASE_PATH=/, set by enable-app.sh), with
-        #   the console on `${tunnel_subdomain}.${domain}`. No catch-all
+        #   the console on the main host. No catch-all
         #   redirect — the 302 that caused the original breakage is gone;
         #   the SPA base just has to be re-rendered to `/` and the
         #   container force-recreated, which enable-app.sh and the
@@ -1169,31 +1142,31 @@ def main():
         #   (infra/cloudflared-up.sh).
         if routing_mode == "subdomain-per-app":
             vhost_pieces = [
-                render_apex_vhost(domain, tunnel_subdomain=tunnel_subdomain,
+                render_apex_vhost(hosts["apex"], main_host=main_host,
                                   tls_internal=tunnel_active),
-                render_console_host_vhost(domain, tunnel_subdomain,
+                render_console_host_vhost(main_host,
                                           tls_internal=tunnel_active),
-                render_per_app_subdomain_vhosts(enabled, domain, state,
+                render_per_app_subdomain_vhosts(enabled, hosts,
                                                 tls_internal=tunnel_active),
-                render_extra_subdomain_vhosts(enabled, domain,
+                render_extra_subdomain_vhosts(enabled, hosts,
                                               tls_internal=tunnel_active),
             ]
         else:
             vhost_pieces = [
-                render_apex_vhost(domain, tunnel_subdomain=tunnel_subdomain,
+                render_apex_vhost(hosts["apex"], main_host=main_host,
                                   tls_internal=tunnel_active),
-                render_domain_app_vhost(domain, tunnel_subdomain, enabled,
+                render_domain_app_vhost(main_host, enabled,
                                         tls_internal=tunnel_active),
                 # Apps that can't be path-mounted (rootServedOnly) get the
                 # subdomain-per-app treatment even here — they're absent
                 # from the path handlers above.
-                render_root_served_vhosts(enabled, domain, state,
+                render_root_served_vhosts(enabled, hosts,
                                           tls_internal=tunnel_active),
                 # Per-app extra subdomains (apps that declare `subdomains[]`
                 # beyond their primary). vibe-connect uses this to expose the
                 # client portal at client.<domain> on a different internal
                 # port than the staff app's /connect/ mount.
-                render_extra_subdomain_vhosts(enabled, domain,
+                render_extra_subdomain_vhosts(enabled, hosts,
                                               tls_internal=tunnel_active),
             ]
         # Infra services (Cockpit, Portainer, Duplicati) keep their own
@@ -1204,7 +1177,8 @@ def main():
         # adds DNS or /etc/hosts pointing the infra subdomain at the
         # host's LAN IP) or Tailscale only — same as the prior design.
         infra_vhosts = "\n".join(
-            render_infra_vhost(s, mode, domain, tls_internal=tunnel_active)
+            render_infra_vhost(s, hosts["infra"][s["slug"]]["fqdn"],
+                               tls_internal=tunnel_active)
             for s in INFRA_SERVICES
         )
         if infra_vhosts.strip():

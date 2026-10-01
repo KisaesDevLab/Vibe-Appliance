@@ -398,80 +398,32 @@ _warn_if_tunnel_ingress_stale() {
   tunnel_enabled="${tunnel_enabled#\'}"; tunnel_enabled="${tunnel_enabled%\'}"
   [[ "$tunnel_enabled" == "true" ]] || return 0
 
-  # The routing mode decides whether this app needs a hostname of its
-  # own, so read it the same way render-caddyfile.sh and cloudflared-up.sh
-  # do. Anything but the explicit opt-in means single-host.
-  local routing_mode
-  routing_mode="$(grep -m1 '^DOMAIN_ROUTING_MODE=' "$appliance_env" 2>/dev/null | cut -d= -f2- || true)"
-  routing_mode="${routing_mode#\"}"; routing_mode="${routing_mode%\"}"
-  routing_mode="${routing_mode#\'}"; routing_mode="${routing_mode%\'}"
-  [[ "$routing_mode" == "subdomain-per-app" ]] || routing_mode="single-host"
-
-  # List every hostname the TUNNEL would have to learn for this app,
-  # mirroring infra/cloudflared-up.sh's ingress builder exactly. Empty
-  # list → the app is path-mounted under the existing tunnel FQDN and
-  # the tunnel already routes it; nothing to warn about.
+  # List every hostname the TUNNEL would have to learn for this app.
+  # lib/vibe_hosts.py is the same host map infra/cloudflared-up.sh builds
+  # its ingress from, so the two cannot disagree. Empty list → the app is
+  # path-mounted under the existing main host and the tunnel already
+  # routes it; nothing to warn about.
   #
-  # This used to count only non-primary subdomains[] entries and bailed
-  # early on `userFacing: false`, which missed precisely the apps that
-  # need their own hostname most — the rootServedOnly ones. Caddy gives
-  # those a <subdomain>.<domain> vhost even in single-host mode (a path
-  # mount would serve the SPA shell and 404 every asset), so enabling
-  # e.g. vibe-1099 (rootServedOnly, no subdomains[]) or vibe-ai-router
-  # (rootServedOnly, userFacing:false) while the tunnel was up produced
-  # a live vhost with no CNAME and no ingress rule, no warning anywhere,
-  # and an app that simply didn't resolve from outside the LAN.
-  local pending_hosts
-  pending_hosts="$(python3 - "$manifest" "$routing_mode" "$VIBE_STATE_FILE" "$slug" <<'PYEOF' 2>/dev/null || true
-import json, sys
-manifest_path, routing_mode, state_path, slug = sys.argv[1:5]
-try:
-  m = json.load(open(manifest_path))
-except Exception:
-  sys.exit(0)
-try:
-  entry = ((json.load(open(state_path)).get("apps") or {}).get(slug)) or {}
-except Exception:
-  entry = {}
-
-subs    = m.get("subdomains") or []
-primary = m.get("subdomain", "")
-hosts   = []
-
-# (1) Primary hostname — needed when each app owns a subdomain, and for
-# rootServedOnly apps in EITHER mode.
-if routing_mode == "subdomain-per-app" or m.get("rootServedOnly") is True:
-  primary_internal = any(
-    s.get("name") == primary and s.get("internal") is True for s in subs
-  )
-  fully_internal = m.get("userFacing") is False and not subs
-  if not primary_internal and not fully_internal:
-    # Operator override (VIBE_APP_SUBDOMAIN → state.apps.<slug>.subdomain)
-    # wins, same precedence as _effective_subdomain().
-    sub = (entry.get("subdomain") or "").strip() or primary
-    if sub:
-      hosts.append(sub)
-
-# (2) Secondary subdomains — blocked wholesale by userFacing:false, and
-# per-entry by internal:true. Matches render_extra_subdomain_vhosts.
-if m.get("userFacing") is not False:
-  for s in subs:
-    name = s.get("name")
-    if not name or name == primary or s.get("internal") is True:
-      continue
-    hosts.append(name)
-
-seen = set()
-print(",".join(h for h in hosts if not (h in seen or seen.add(h))))
-PYEOF
-)"
+  # The list covers the primary host (subdomain-per-app mode, and
+  # rootServedOnly apps in EITHER mode — Caddy gives those their own
+  # vhost even in single-host, so enabling e.g. vibe-1099 or
+  # vibe-ai-router while the tunnel is up produces a live vhost with no
+  # CNAME and no ingress rule) plus every public extra surface.
+  local pending_hosts routing_mode
+  pending_hosts="$(python3 "${APPLIANCE_DIR}/lib/vibe_hosts.py" \
+      --state "$VIBE_STATE_FILE" --env-dir "$VIBE_ENV_DIR" \
+      --manifests "$(dirname "$manifest")" \
+      list tunnel --slug "$slug" 2>/dev/null | paste -sd, - || true)"
+  routing_mode="$(python3 "${APPLIANCE_DIR}/lib/vibe_hosts.py" \
+      --state "$VIBE_STATE_FILE" --env-dir "$VIBE_ENV_DIR" \
+      get routing-mode 2>/dev/null || true)"
   [[ -n "$pending_hosts" ]] || return 0
 
   log_warn "$slug needs public hostname(s) the Cloudflare Tunnel does not know about yet. enable-app re-rendered Caddy (so the vhost is live on the LAN) but does NOT refresh the tunnel's ingress or CNAMEs. Requests from the public internet will fail to resolve until you re-provision." \
     slug="$slug" \
     pending_hosts="$pending_hosts" \
     routing_mode="$routing_mode" \
-    "diagnose:dig +short ${pending_hosts%%,*}.<your-domain>   # NXDOMAIN until re-provisioned" \
+    "diagnose:dig +short ${pending_hosts%%,*}   # NXDOMAIN until re-provisioned" \
     "fix:click Re-provision in Configuration → Network → Cloudflare Tunnel, or run: sudo bash ${APPLIANCE_DIR}/infra/cloudflared-up.sh"
 }
 
@@ -811,6 +763,25 @@ print(result)
 PYEOF
 }
 
+# Same as _manifest_field, for a JSON document held in a string (e.g. the
+# output of `lib/vibe_hosts.py plan-app`). Prints nothing when the string
+# is empty or not JSON.
+_json_field() {
+  local doc="$1" expr="$2"
+  [[ -n "$doc" ]] || return 0
+  python3 - "$doc" "$expr" <<'PYEOF'
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+except ValueError:
+    sys.exit(0)
+result = eval(sys.argv[2], {"data": data, "json": json})
+if result is None:
+    sys.exit(0)
+print(result)
+PYEOF
+}
+
 # Render a per-app env file from the template.
 #   Markers replaced:
 #     @ALLOWED_ORIGIN@   resolved subdomain URL
@@ -1140,33 +1111,65 @@ _render_app_env() {
   local slug="$1" manifest="$2" tmpl="$3" out="$4"
   local src="${5:-$4}"
 
-  local subdomain mode domain tunnel_subdomain ip allowed_origin vite_base_path session_secure
+  local mode domain tunnel_subdomain ip allowed_origin vite_base_path session_secure
   local staff_app_url client_portal_url
-  subdomain="$(_manifest_field "$manifest" 'data["subdomain"]')"
   mode="$(python3 -c "import json;print(json.load(open('${VIBE_STATE_FILE}')).get('config',{}).get('mode','lan'))")"
   domain="$(python3 -c "import json;print(json.load(open('${VIBE_STATE_FILE}')).get('config',{}).get('domain',''))")"
-  tunnel_subdomain="$(python3 -c "import json;print(json.load(open('${VIBE_STATE_FILE}')).get('config',{}).get('tunnel_subdomain','vibe') or 'vibe')")"
 
-  # Effective primary subdomain for this app: the operator's per-app
-  # override (VIBE_APP_SUBDOMAIN in the existing env file, set via
-  # Settings → Network) wins; otherwise the manifest's built-in
-  # `subdomain`. Read from $out — the CURRENT env file, before this
-  # render overwrites it — then persisted to state.apps.<slug>.subdomain
-  # so the Caddy renderer, the Cloudflare Tunnel provisioner, and the
-  # console URL builder all resolve the same value. VIBE_APP_SUBDOMAIN
-  # isn't in the env template, so the render's merge step (below) carries
-  # it forward on every re-render.
-  local app_subdomain_override eff_subdomain routing_mode
-  app_subdomain_override="$(_extract_env_value "$src" VIBE_APP_SUBDOMAIN)"
-  app_subdomain_override="${app_subdomain_override//[[:space:]]/}"
-  if [[ -n "$app_subdomain_override" ]]; then
-    eff_subdomain="$app_subdomain_override"
-  else
-    eff_subdomain="$subdomain"
+  # Host labels come from lib/vibe_hosts.py — the one hostname resolver
+  # the Caddy renderer, the Cloudflare Tunnel provisioner, doctor and the
+  # console all read.
+  #
+  # tunnel_subdomain is the MAIN host label (state.config.tunnel_subdomain,
+  # default 'vibe', with the appliance HOST_TAG on the default).
+  #
+  # plan-app gives this app's DESIRED labels: the operator's per-app
+  # override — VIBE_APP_SUBDOMAIN for the primary host,
+  # VIBE_APP_SUBDOMAIN_<NAME> for an extra surface, set via Settings →
+  # Network — wins verbatim; otherwise the manifest default with the
+  # HOST_TAG. Overrides are read from $src — the CURRENT env file, before
+  # this render overwrites it. They aren't in the env template, so the
+  # render's merge step (below) carries them forward on every re-render.
+  #
+  # The labels are then persisted to state.apps.<slug>.subdomain /
+  # .subdomains as the APPLIED labels. The resolver serves applied labels,
+  # so Caddy and the tunnel keep answering at exactly the name this env
+  # file was rendered for, even if a later re-enable fails half-way.
+  local -a _vibe_hosts=(python3 "${APPLIANCE_DIR}/lib/vibe_hosts.py"
+                        --state "$VIBE_STATE_FILE" --env-dir "$VIBE_ENV_DIR"
+                        --manifests "$(dirname "$manifest")")
+  tunnel_subdomain="$("${_vibe_hosts[@]}" get main-label 2>/dev/null || true)"
+  [[ -n "$tunnel_subdomain" ]] || tunnel_subdomain="vibe"
+
+  local host_plan eff_subdomain client_subdomain_label routing_mode
+  host_plan="$("${_vibe_hosts[@]}" plan-app "$slug" --app-env "$src" 2>/dev/null || true)"
+  eff_subdomain="$(_json_field "$host_plan" 'data["primary"]')"
+  # The client-portal surface's label — empty unless the app declares a
+  # second subdomain meant for client (not staff) access. Convention from
+  # console/manifests/vibe-connect.json: an entry whose audience contains
+  # "client" OR whose name is "client". Vibe-Connect uses this to expose
+  # its intake/portal SPA at client.<domain> on internal port 8080,
+  # separate from the staff app at the primary subdomain on internal
+  # port 80. The Caddy renderer
+  # (lib/render-caddyfile.sh::render_extra_subdomain_vhosts) emits a
+  # matching vhost, and infra/cloudflared-up.sh provisions a CNAME +
+  # ingress rule for it. Apps without a client portal leave this empty.
+  client_subdomain_label="$(_json_field "$host_plan" 'data["client"]')"
+  if [[ -z "$host_plan" ]]; then
+    # Resolver unavailable (should not happen: it ships beside this
+    # script). Fall back to the manifest default so the render still
+    # produces a usable env file instead of `https://.<domain>`.
+    eff_subdomain="$(_manifest_field "$manifest" 'data["subdomain"]')"
+    log_warn "could not resolve host labels for $slug; using the manifest default" \
+      "diagnose:python3 ${APPLIANCE_DIR}/lib/vibe_hosts.py plan-app $slug"
   fi
   if [[ "${RENDER_CHECK_ONLY:-0}" != "1" ]]; then
     _state_app_set "$slug" subdomain "$eff_subdomain" 2>/dev/null || \
       log_warn "could not persist effective subdomain to state for $slug"
+    if [[ -n "$host_plan" ]]; then
+      _state_app_set_json "$slug" subdomains "$(_json_field "$host_plan" 'json.dumps(data["extras"])')" 2>/dev/null || \
+        log_warn "could not persist extra-surface labels to state for $slug"
+    fi
   fi
 
   # Domain-mode routing style — mirrors lib/render-caddyfile.sh. Read
@@ -1198,35 +1201,6 @@ PYEOF
   # manifest — a missing prefix here would render VITE_BASE_PATH as `//`
   # and break every asset URL, which is worse than ignoring an override.
   [[ -n "$path_prefix" ]] || path_prefix="${slug#vibe-}"
-
-  # The "client portal" subdomain name from the manifest — empty unless
-  # the app declares a second subdomain meant for client (not staff)
-  # access. Convention from console/manifests/vibe-connect.json:16-29:
-  # an entry whose audience contains "client" OR whose name is "client".
-  # Vibe-Connect uses this to expose its intake/portal SPA at
-  # client.<domain> on internal port 8080, separate from the staff app
-  # at the primary subdomain on internal port 80. The Caddy renderer
-  # (lib/render-caddyfile.sh::render_extra_subdomain_vhosts) emits a
-  # matching vhost, and infra/cloudflared-up.sh provisions a CNAME +
-  # ingress rule for it. Apps without a client portal leave this empty.
-  local client_subdomain_name
-  client_subdomain_name="$(python3 - "$manifest" <<'PYEOF' 2>/dev/null
-import json, sys
-try:
-  m = json.load(open(sys.argv[1]))
-except Exception:
-  sys.exit(0)
-primary = m.get("subdomain", "")
-for sub in (m.get("subdomains") or []):
-  name = sub.get("name") or ""
-  if not name or name == primary:
-    continue
-  audience = (sub.get("audience") or "").lower()
-  if name == "client" or "client" in audience:
-    print(name)
-    break
-PYEOF
-)"
 
   # rootServedOnly apps are served at the root of their own subdomain in
   # BOTH routing modes (lib/render-caddyfile.sh::render_root_served_vhosts
@@ -1277,8 +1251,8 @@ PYEOF
     # modes). Vibe-Connect's intake links and magic-link emails embed
     # this; pointing them at staff_app_url auth-gates clients into a
     # login screen they can't pass.
-    if [[ -n "$client_subdomain_name" ]]; then
-      client_portal_url="https://${client_subdomain_name}.${domain}"
+    if [[ -n "$client_subdomain_label" ]]; then
+      client_portal_url="https://${client_subdomain_label}.${domain}"
     else
       client_portal_url=""
     fi
@@ -1871,7 +1845,9 @@ entry = apps.setdefault(slug, {})
 it = iter(kvs)
 for k in it:
     v = next(it)
-    if v in ("true", "false"):
+    if os.environ.get("_STATE_APP_JSON") == "1":
+        entry[k] = json.loads(v)
+    elif v in ("true", "false"):
         entry[k] = (v == "true")
     else:
         entry[k] = v
@@ -1882,6 +1858,14 @@ with open(tmp, "w") as f:
     f.write("\n")
 os.replace(tmp, path)
 PYEOF
+}
+
+# _state_app_set for a structured value: `value` is a JSON document
+# (object/array) stored as-is under state.apps.<slug>.<key>.
+_state_app_set_json() {
+  local slug="$1" key="$2" value="$3"
+  [[ -n "$value" ]] || value='{}'
+  _STATE_APP_JSON=1 _state_app_set "$slug" "$key" "$value"
 }
 
 # _state_app_clear_keys <slug> <key1> [<key2> ...]

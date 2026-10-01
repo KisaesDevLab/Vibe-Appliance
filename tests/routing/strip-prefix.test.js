@@ -43,7 +43,7 @@ function render(mode) {
   }));
   const out = path.join(dir, 'Caddyfile');
   execFileSync('python3', [pyFile, path.join(REPO, 'caddy', 'Caddyfile.tmpl'), path.join(REPO, 'caddy', 'snippets'),
-    path.join(REPO, 'console', 'manifests'), stateFile, out], { env: { ...process.env, TEST_APPLIANCE_ENV: envFile } });
+    path.join(REPO, 'console', 'manifests'), stateFile, out], { env: { ...process.env, TEST_APPLIANCE_ENV: envFile, PYTHONPATH: path.join(REPO, 'lib') } });
   // Python writes CRLF on a Windows dev box; the host renders LF.
   return fs.readFileSync(out, 'utf8').replace(/\r\n/g, '\n');
 }
