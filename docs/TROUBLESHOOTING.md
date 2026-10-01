@@ -153,6 +153,80 @@ painted "✓ Tunnel is up" over a tunnel nothing could resolve, and
 registration. It is now fatal, so "✓ Tunnel is up" means every CNAME
 landed.
 
+### Symptom: provision refuses with "hostname(s) this appliance wants already belong to something else"
+
+Before it changes anything, the provision checks every hostname it is
+about to use. It stops if a name already has a DNS record that is not
+this appliance's: a CNAME that another **live** tunnel answers, or an
+`A`/other record. Nothing was pushed and no DNS record was written, so
+whatever answers those names today still works.
+
+**Common causes**
+
+- A second appliance under the same domain using the same names. Each
+  appliance after the first needs its own hostname tag.
+- An earlier install of this appliance whose tunnel was never torn down.
+- The name is used for something unrelated in that DNS zone.
+
+**Diagnose** — the message lists each hostname and what it points at.
+Cloudflare dashboard → the domain → **DNS**, and Zero Trust → Networks →
+**Tunnels**.
+
+**Fix (any one)**
+
+- Give this appliance unique names: Configuration → Network →
+  **Hostname tag**, or
+  `sudo bash /opt/vibe/appliance/bootstrap.sh --host-tag <tag> --no-apex`.
+- If the other tunnel is an old one you no longer use, delete it and
+  its DNS records in the Cloudflare dashboard.
+- If the record is something you no longer need, delete it there.
+
+Then re-run (idempotent):
+```
+sudo bash /opt/vibe/appliance/infra/cloudflared-up.sh
+```
+
+### Symptom: "could not confirm this appliance's tunnel"
+
+The appliance remembers its tunnel by id and could not confirm it at
+Cloudflare. It refuses to fall back to a lookup by name, because that
+could adopt or delete another appliance's tunnel.
+
+**Fix:** re-run in a minute (rate limits and outages pass). If the tunnel
+really was deleted from the account, forget it on this host and provision
+a fresh one:
+```
+sudo bash /opt/vibe/appliance/infra/cloudflared-down.sh --local-only
+sudo bash /opt/vibe/appliance/infra/cloudflared-up.sh
+```
+
+### Symptom: "A Cloudflare tunnel provision is running … app actions are paused"
+
+A provision normally finishes in a minute or two. If the message is
+still there after several minutes, the script is stuck.
+
+**Diagnose**
+```
+pgrep -af cloudflared-up.sh
+sudo tail -n 30 /opt/vibe/logs/cloudflared.log
+```
+
+**Fix**
+
+- The script is listed and the log is not advancing: stop it, then run it
+  by hand to see where it fails.
+  ```
+  sudo pkill -f cloudflared-up.sh
+  sudo bash /opt/vibe/appliance/infra/cloudflared-up.sh
+  ```
+- Nothing is listed: the script finished and only the console's lock is
+  left (this happens when the browser tab is closed mid-provision). It
+  clears on its own after 45 minutes, or at once with
+  `sudo docker restart vibe-console`.
+
+Cloudflare API calls are time-limited (10 s to connect, 60 s per call),
+so a stalled connection now ends in an error instead of hanging.
+
 ### Symptom: an app enabled after setup isn't reachable publicly
 
 Enabling an app re-renders Caddy but does **not** refresh the tunnel.

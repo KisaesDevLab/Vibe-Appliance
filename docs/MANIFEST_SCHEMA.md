@@ -28,7 +28,7 @@ document is the human-readable companion.
   "logo": "tb.svg",                         // optional, asset under console/ui/static/logos/
 
   "image":      { ... },                    // required, see below
-  "subdomain":  "tb",                       // required for domain mode
+  "subdomain":  "tb",                       // required for domain mode; the DEFAULT host label (see "Host labels")
   "ports":      { ... },                    // required for routing
   "routing":    { ... },                    // required, how Caddy splits traffic
   "depends":    ["postgres", "redis"],      // optional, hard deps the appliance must run
@@ -308,6 +308,46 @@ depend on; the test suite here asserts the conditional-required branch keeps its
 shape for exactly that reason.
 
 ---
+
+## Host labels and operator overrides
+
+`subdomain` and `subdomains[].name` are *default* host labels, not the
+final hostname. `lib/vibe_hosts.py` resolves what is actually served:
+
+| Surface | Default | Operator override (used verbatim) |
+|---|---|---|
+| App primary | `subdomain`, plus `-<HOST_TAG>` when the appliance has a tag | `VIBE_APP_SUBDOMAIN` in `<slug>.env` |
+| Extra surface (`subdomains[]` entry that is not the primary and not `internal`) | its `name`, plus the tag | `VIBE_APP_SUBDOMAIN_<NAME>` in `<slug>.env` |
+
+`<NAME>` is the surface name upper-cased with every non-alphanumeric
+character replaced by `_`: `client` → `VIBE_APP_SUBDOMAIN_CLIENT`,
+`gateway.shield` → `VIBE_APP_SUBDOMAIN_GATEWAY_SHIELD`. A dotted name is
+tagged on the label next to the domain (`gateway.shield-office2`).
+
+An app makes a label editable in the console by declaring the key as a
+Tier-1 field — nothing in the appliance lists apps or surfaces:
+
+```jsonc
+{
+  "name": "VIBE_APP_SUBDOMAIN_CLIENT",
+  "ui": {
+    "tier": 1, "category": "Network", "label": "Client portal subdomain",
+    "input": "text", "appliance": "per-app",
+    "validate": "regex:^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)?$",
+    "postSaveJob": "routing-reconcile"
+  }
+}
+```
+
+`postSaveJob: "routing-reconcile"` is what makes a save re-render the
+app's env file, Caddy and the Cloudflare Tunnel; `lib/settings-save.sh`
+reads it from the manifest. `tests/routing/hostnames.test.js` fails if an
+app declares a public surface without the matching field.
+
+No schema change is involved: these are ordinary `env` entries, so
+`console/manifest.schema.json` (the contract `vibe-sentinel-installer`
+vendors) is untouched. Units with `runtime` other than `appliance` are
+never tagged or renamed here.
 
 ## `image`
 

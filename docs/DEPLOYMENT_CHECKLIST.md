@@ -107,6 +107,19 @@ For each app you want (`vibe-tb`, `vibe-mybooks`, …) in **/admin → Apps**:
   which gives them a root-served vhost at their own subdomain in BOTH
   routing modes (see docs/addenda/emergency-access.md).
 
+### More than one appliance under one domain
+
+- [ ] Every appliance after the first: `--host-tag <tag> --no-apex` at
+      bootstrap (or *Hostname tag* + *This appliance owns the bare
+      domain = No* in Settings → Network).
+- [ ] Settings → Network → **Hostnames this appliance serves** lists no
+      name the other appliance uses.
+- [ ] Each appliance has its own Cloudflare Tunnel (the default name is
+      `vibe-appliance-<domain>[-<tag>]`); provisioning one leaves the
+      other's CNAMEs untouched.
+- [ ] `subdomain-per-app` + Vibe Auth on a tagged appliance: Vibe Auth
+      is 1.0.9 or newer.
+
 If you switch modes or change a subdomain:
 
 - [ ] Save runs the `routing-reconcile` job (re-render env + force-recreate +

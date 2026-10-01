@@ -808,15 +808,50 @@ The appliance auto-rewrites every enabled app's env file (so
 The old CNAME at Cloudflare is auto-pruned; the new one is created.
 About 1 minute end-to-end.
 
-Or do it through the admin UI: **Configuration → Network**, change
-the `tunnel_subdomain` field, **Save**, then click **Provision tunnel
-now**. Same outcome.
+Or do it through the admin UI: **Configuration → Network → Network
+mode**. With **Public domain** selected, change **Main host label** and
+click **Apply changes**. The tunnel is re-provisioned for you when it is
+on. Same outcome.
 
 **How do I add a new app subdomain?**
-You don't — apps don't get their own subdomains anymore. Enabling an
-app from the admin **Apps** tab is the whole flow. The app appears
-at `https://vibe.firm.com/<app>/` (e.g. `/tb/`) immediately. No DNS
-work, no Caddy edit, no Cloudflare re-provision.
+In the default layout (single host) you don't: enabling an app from the
+admin **Apps** tab is the whole flow, and it appears at
+`https://vibe.firm.com/<app>/` (e.g. `/tb/`) immediately. A few apps
+cannot be served under a path and get their own hostname automatically
+(`1040.firm.com`, `client.firm.com` for Connect's client portal); if the
+Cloudflare Tunnel is on, click **Re-provision** on its card after
+enabling one. To give every app its own hostname, set **App routing
+layout** to *Subdomain per app* under Configuration → Network.
+
+**Can I run two appliances under one domain?**
+Yes. Every appliance after the first needs its own *hostname tag* and
+must leave the bare domain to the first one. On the second appliance:
+
+```
+sudo /opt/vibe/appliance/bootstrap.sh \
+  --mode domain \
+  --domain firm.com \
+  --email admin@firm.com \
+  --host-tag office2 \
+  --no-apex
+```
+
+Its hostnames become `vibe-office2.firm.com`, `client-office2.firm.com`,
+`cockpit-office2.firm.com` and so on; the first appliance keeps
+`vibe.firm.com` and `firm.com`. The same two settings are in the admin
+UI under **Configuration → Network** (*Hostname tag* and *This appliance
+owns the bare domain*), and the **Hostnames this appliance serves** list
+there shows exactly what you get before you touch DNS. A name you set
+yourself (Main host label, an app's Subdomain, an infra host label) is
+used as written and never tagged.
+
+If you forget the tag, the Cloudflare Tunnel setup refuses to run and
+tells you which hostnames already belong to the other appliance. Nothing
+is overwritten.
+
+To undo it: `sudo /opt/vibe/appliance/bootstrap.sh --host-tag '' --apex`
+(or clear the field in the admin UI and Save), then re-provision the
+tunnel.
 
 **We run several servers, with Vibe Sentinel on its own box. How do the
 others connect to it?**

@@ -73,6 +73,18 @@ id and are therefore never enumerated as stale, let alone deleted.
 Both connectors can run on one host with one zone. Do not "fix" this by
 teaching either side to prune more broadly.
 
+**Hostname tags (2026-10-01).** An appliance can now carry a hostname
+tag (`HOST_TAG`) so several appliances share one domain; its built-in
+labels become `<label>-<tag>`. That never reaches a Sentinel unit: the
+resolver (`lib/vibe_hosts.py`) names, tags and publishes only
+`runtime: "appliance"` apps, and `console/manifest.schema.json` did not
+change. The one interaction is validation — an *enabled* Sentinel unit's
+`ingress.hostname` is treated as taken, so an operator cannot give an
+appliance host the same label (the `sameProductAs` pair, Vibe Print, is
+exempt: one of the two is enabled, never both). Two *appliances* with
+Sentinel each on one domain is a question for `vibe-sentinel-installer`,
+which owns those hostnames.
+
 ### Emergency ports — reserved, and now enforced
 
 `5171–5198` belongs to this appliance's HAProxy, which publishes them from

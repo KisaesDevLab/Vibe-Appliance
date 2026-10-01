@@ -2410,3 +2410,46 @@ Append to this list as phases complete. Format:
   (7) The panel's unapplied-edit guard compares each dropdown with what
   it showed at render, so an out-of-range `VIBE_AUTH_MODE` no longer
   stops background reloads. (8) New refusals carry diagnose and fix hints.
+- 2026-10-01: operator-named hostnames, so more than one appliance can
+  run under one Cloudflare domain (branch `feat/host-resolver`; not
+  merged). Plan revised in PLAN.md §4. (1) `lib/vibe_hosts.py` is now the
+  single hostname resolver; the Caddy renderer, tunnel provisioner,
+  enable-app, doctor, secrets, the bootstrap banner and the console read
+  it instead of each carrying its own copy of the rule. With no tag set
+  the rendered Caddyfile and tunnel ingress are byte-identical to the
+  previous code over the shipped manifests, both routing modes. (2)
+  `HOST_TAG` (`--host-tag`) suffixes every built-in label;
+  `APEX_DOMAIN_OWNED=false` (`--no-apex`) gives up `<domain>`/`www`;
+  `INFRA_SUBDOMAIN_*`, `VIBE_APP_SUBDOMAIN` (added to vibe-auth and
+  vibe-ai-router) and `VIBE_APP_SUBDOMAIN_<NAME>` (extra surfaces) are
+  verbatim overrides. (3) The `routing-reconcile` job is selected from
+  the manifests' `ui.postSaveJob`, not from key names in the script, and
+  re-enables identity providers first. (4) Hostnames are pre-flighted
+  (duplicates, reserved `www`, 63 characters) by bootstrap and by the
+  console before a save or a mode change writes anything. (5) Cloudflare
+  guards: tunnel found by recorded id, a name match alone is not
+  ownership, and a read-only DNS check refuses to repoint a record
+  another live tunnel answers; API calls are time-bounded. (6) Console:
+  resolved-hostnames list, Main host label field, domain mode editable in
+  place. Deviations and open items: the tunnel guards and the reconcile
+  flow have unit tests only and have NOT been run against a real
+  Cloudflare account or a droplet — the two-appliance test in the plan
+  (fresh droplet A untagged, droplet B `--host-tag office2 --no-apex`,
+  refusal when B has no tag, idempotent re-run, tag change and revert,
+  interrupted reconcile) is still owed. Bundled manifests gained fields
+  that must also land in each app's own `.appliance/manifest.json`
+  (vibe-auth, vibe-ai-router, vibe-connect, vibe-time-billing). Vibe Auth
+  needs broker 1.0.9 (branch `fix/appliance-host-verbatim` in Vibe-Auth)
+  for a non-`auth` label in subdomain-per-app mode. Deferred: a
+  host-runner action to refresh Cockpit's allowed origins after a rename
+  (copy-paste hint until then); DDNS still publishes per-app hosts only
+  in subdomain-per-app mode; Namecheap DDNS has no ownership signal, so
+  two appliances there are kept apart only by the tag and `--no-apex`.
+- 2026-10-01: saved API keys and the Settings Test buttons (branch
+  `fix/emailit-saved-key`). The Test button posted a saved secret as
+  blank (the page never echoes stored secrets), so every test of a saved
+  key answered "<KEY> required"; the test endpoints now fall back to
+  `appliance.env`. `vibe-recap.env.tmpl` shipped a live blank
+  `EMAILIT_API_KEY=` that overrode the appliance's saved key and wiped a
+  hand-set one on every re-render; it is commented out, and the env merge
+  drops a leftover blank for any key the template documents as inherited.

@@ -41,6 +41,10 @@ Vibe-Appliance/
 │   ├── vibe-ai-router.yml       # two services from one image (ROUTER_ROLE)
 │   └── vibe-printer.yml         # single container; own SQLite, no shared PG/Redis
 ├── lib/
+│   ├── vibe_hosts.py            # the ONE hostname resolver (module + CLI):
+│   │                            # tag, per-host labels, apex ownership
+│   ├── cf_guard.py              # read-only ownership checks for the
+│   │                            # Cloudflare Tunnel provisioner
 │   └── sentinel-module.sh       # lifecycle for runtime:"sentinel" units;
 │                                # delegates to vibe-sentinel-installer
 ├── caddy/
@@ -165,7 +169,20 @@ Three deployment modes, set by `CONFIG_MODE` at install. **As of 2026-05-12**, d
 - `single-host` (**default**, unchanged): every app path-mounted under `${tunnel_subdomain}.${domain}`. One cert, one tunnel CNAME. Pre-existing installs stay here on upgrade — the field is absent from their `appliance.env`, and blank/unknown resolves to single-host everywhere.
 - `subdomain-per-app`: each app served at the **root** of its own `${subdomain}.${domain}` (e.g. `tb.firm.com/`), with the console on `${tunnel_subdomain}.${domain}`. The Cloudflare Tunnel provisions one CNAME + ingress rule per enabled app. The 302 that broke logins is gone: `lib/enable-app.sh` sets `VITE_BASE_PATH=/` (so the SPA serves at root with no redirect) and always `--force-recreate`s so the new base is baked into the bundle. Each app's subdomain is operator-editable per app in Settings → Network ("Subdomain" field, `VIBE_APP_SUBDOMAIN` in the per-app env), defaulting to the manifest's built-in value. Saving `DOMAIN_ROUTING_MODE` or any per-app subdomain runs the `routing-reconcile` post-save job (re-render each enabled app's env, force-recreate, re-render Caddy, re-provision the tunnel).
 
-The effective subdomain (operator override → manifest default) is resolved identically by every consumer — `lib/render-caddyfile.sh` (`_effective_subdomain`), `infra/cloudflared-up.sh` (`eff_subdomain`), and the console (`appEffectiveSubdomain`) — and persisted to `state.apps.<slug>.subdomain` by `enable-app.sh`. **Caveat:** `subdomain-per-app` requires each app's web image to serve at a root base path (the `40-base-path.sh` entrypoint rewriting the bundle base to `/`); the same requirement the pre-2026-05-12 design relied on. Apps whose image can't serve at root need an upstream fix — not a workaround in the appliance (per CLAUDE.md "additive, never replacing").
+**As of 2026-10-01**, every hostname is decided in one place and is operator-nameable, so more than one appliance can run under one domain (the reason: a firm with two offices, or a test box beside production, both under one Cloudflare zone — until now every appliance claimed the same `vibe`, `cockpit`, `client`, … names).
+
+- **One resolver.** `lib/vibe_hosts.py` builds the host map from `state.json`, the manifests and `appliance.env`. `lib/render-caddyfile.sh`, `infra/cloudflared-up.sh`, `lib/enable-app.sh`, `doctor.sh`, `lib/secrets.sh`, `bootstrap.sh` and the console all read it (the console by running its CLI). The seven hand-written copies of the rule are gone; adding a consumer means calling the resolver, not re-deriving `<label>.<domain>`.
+- **Hostname tag.** `HOST_TAG` (appliance.env; Settings → Network → "Hostname tag"; `bootstrap.sh --host-tag`) turns every built-in label into `<label>-<tag>`: `vibe-office2`, `tb-office2`, `client-office2`, `cockpit-office2`. Empty (the default) changes nothing.
+- **Per-host labels, used verbatim.** The main host (`state.config.tunnel_subdomain`; `--tunnel-subdomain`; the Network mode panel), the infra hosts (`INFRA_SUBDOMAIN_COCKPIT|PORTAINER|BACKUP`), each app's primary host (`VIBE_APP_SUBDOMAIN`) and each extra surface (`VIBE_APP_SUBDOMAIN_<NAME>`, e.g. `_CLIENT`). An explicit label is never tagged. The main-host default `vibe` counts as "not chosen" and takes the tag.
+- **Apex ownership.** `APEX_DOMAIN_OWNED=false` (`--no-apex`) drops the `<domain>, www.<domain>` site block and the `@`/`www` DDNS records. Only one appliance per domain can own the apex.
+- **Applied labels.** `enable-app.sh` records the labels it rendered an app's env file for in `state.apps.<slug>.subdomain` and `.subdomains`; the resolver serves those, so Caddy, the tunnel and the app's `ALLOWED_ORIGIN` cannot disagree even if a re-enable fails half-way. A tag change therefore reaches an app when it is re-enabled — the `routing-reconcile` job does that for every enabled app, identity providers first.
+- **Pre-flight.** `vibe_hosts.py validate` rejects a malformed or over-long label, the reserved `www`, and two hosts on one name; bootstrap and the console's save routes call it before anything is written. The renderer independently refuses to emit two site blocks for one hostname.
+- **Cloudflare collision guards** (`lib/cf_guard.py`, `infra/cloudflared-up.sh`). The appliance finds its tunnel by recorded id (`state.config.cloudflare_tunnel_id`, else the id inside the connector token), never by name alone; a tunnel found by name is adopted only if it is empty or already serves one of this appliance's hostnames; and before any ingress push or DNS write every wanted hostname is checked — a CNAME that another live tunnel answers, or a non-tunnel record, stops the run with nothing changed.
+- **Vibe Auth** needs broker ≥ 1.0.9 to be served at anything other than `auth.<domain>` in `subdomain-per-app` mode (older brokers hardcode the label); `lib/identity.sh` refuses the combination rather than registering apps against a hostname nothing serves.
+
+This revises §4.1 below wherever it says `${tunnel_subdomain}.${domain}`: read that as "the main host as resolved by `lib/vibe_hosts.py`".
+
+The effective subdomain is persisted to `state.apps.<slug>.subdomain` by `enable-app.sh`. **Caveat:** `subdomain-per-app` requires each app's web image to serve at a root base path (the `40-base-path.sh` entrypoint rewriting the bundle base to `/`); the same requirement the pre-2026-05-12 design relied on. Apps whose image can't serve at root need an upstream fix — not a workaround in the appliance (per CLAUDE.md "additive, never replacing").
 
 ### 4.1 Domain mode (`CONFIG_MODE=domain`)
 
