@@ -85,9 +85,15 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
   // first's ingress and its teardown deletes the first's tunnel.
   // cloudflared-up.sh refuses that collision server-side; this just
   // stops it from happening in the first place.
-  function defaultTunnelName(domain) {
+  //
+  // `tag` is the appliance's hostname tag (HOST_TAG). Two appliances under
+  // ONE domain share the domain slug, so the tag is what keeps their
+  // tunnel names apart. Matches the fallback in infra/cloudflared-up.sh.
+  function defaultTunnelName(domain, tag) {
     const slug = (domain || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-    return slug ? 'vibe-appliance-' + slug : 'vibe-appliance';
+    const t = (tag || '').toLowerCase().replace(/[^a-z0-9-]+/g, '').replace(/^-+|-+$/g, '');
+    if (!slug) return 'vibe-appliance';
+    return 'vibe-appliance-' + slug + (t ? '-' + t : '');
   }
 
   function escapeHtml(s) {

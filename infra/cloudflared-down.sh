@@ -78,7 +78,35 @@ CF_TUNNEL_API_TOKEN="$(_get_env_value CLOUDFLARE_TUNNEL_API_TOKEN)"
 CF_ACCOUNT_ID="$(_get_env_value CLOUDFLARE_ACCOUNT_ID)"
 CF_ZONE_ID="$(_get_env_value CLOUDFLARE_ZONE_ID)"
 CF_TUNNEL_NAME="$(_get_env_value CLOUDFLARE_TUNNEL_NAME)"
-CF_TUNNEL_NAME="${CF_TUNNEL_NAME:-vibe-appliance}"
+# Same default cloudflared-up.sh uses: vibe-appliance-<domain>[-<tag>].
+# Only matters for the by-name fallback in step 2; an appliance that has
+# provisioned a tunnel finds it by its recorded id.
+if [[ -z "$CF_TUNNEL_NAME" ]]; then
+  _vh=(python3 "$APPLIANCE_DIR/lib/vibe_hosts.py" --state "$VIBE_STATE_FILE"
+       --env-dir "$VIBE_ENV_DIR" --manifests "$APPLIANCE_DIR/console/manifests")
+  _dn_domain="$("${_vh[@]}" get domain 2>/dev/null || true)"
+  _dn_tag="$("${_vh[@]}" get tag 2>/dev/null || true)"
+  if [[ -n "$_dn_domain" ]]; then
+    CF_TUNNEL_NAME="vibe-appliance-${_dn_domain//./-}${_dn_tag:+-${_dn_tag}}"
+  else
+    CF_TUNNEL_NAME="vibe-appliance"
+  fi
+fi
+
+# This appliance's tunnel id, recorded by cloudflared-up.sh in
+# state.config.cloudflare_tunnel_id (or, for installs provisioned before
+# that key existed, embedded in the connector token). Read NOW: step 5
+# strips the token. Teardown deletes THIS tunnel, never "whichever tunnel
+# has our name" — Cloudflare allows duplicate names, and a second
+# appliance in the account may be using the same one.
+# shellcheck source=/dev/null
+. "$APPLIANCE_DIR/lib/state.sh"
+CF_GUARD=(python3 "$APPLIANCE_DIR/lib/cf_guard.py")
+RECORDED_TUNNEL_ID="$(state_get_config_kv cloudflare_tunnel_id 2>/dev/null || true)"
+if [[ -z "$RECORDED_TUNNEL_ID" ]]; then
+  RECORDED_TUNNEL_ID="$("${CF_GUARD[@]}" token-tunnel-id "$VIBE_ENV_SHARED" 2>/dev/null || true)"
+fi
+TUNNEL_ALREADY_GONE=0
 
 CF_API="https://api.cloudflare.com/client/v4"
 cf_api() {
@@ -87,7 +115,9 @@ cf_api() {
   # caller's own success check, rather than aborting under `set -e`
   # with no diagnosis — teardown must always reach step 5/6 so the
   # local state gets cleaned up even when Cloudflare is unreachable.
-  curl -sS -X "$method" \
+  # Bounded, like cloudflared-up.sh: a stalled connection must not hang
+  # teardown (and the console's lock) forever.
+  curl -sS -X "$method" --connect-timeout 10 --max-time 60 \
     -H "Authorization: Bearer $CF_TUNNEL_API_TOKEN" \
     -H "Content-Type: application/json" \
     "$CF_API$path" || true
@@ -116,9 +146,49 @@ elif [[ -z "$CF_TUNNEL_API_TOKEN" || -z "$CF_ACCOUNT_ID" || -z "$CF_ZONE_ID" ]];
   exit 0
 fi
 
-# --- 2. Look up tunnel ID by name --------------------------------------
+# --- 2. Look up the tunnel: by recorded id, else by name ----------------
 
-if (( LOCAL_ONLY == 0 )); then
+TUNNEL_ID=""
+if (( LOCAL_ONLY == 0 )) && [[ -n "$RECORDED_TUNNEL_ID" ]]; then
+  log_step "looking up this appliance's tunnel by id" id="$RECORDED_TUNNEL_ID"
+  _own_resp="$(cf_api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$RECORDED_TUNNEL_ID")"
+  _own_state=""; _own_name=""
+  read -r _own_state _own_name <<<"$(printf '%s' "$_own_resp" | "${CF_GUARD[@]}" tunnel-state 2>/dev/null || echo unknown)" || true
+  case "$_own_state" in
+    live)
+      TUNNEL_ID="$RECORDED_TUNNEL_ID"
+      [[ -n "$_own_name" ]] && CF_TUNNEL_NAME="$_own_name"
+      log_info "tunnel found" id="$TUNNEL_ID" name="$CF_TUNNEL_NAME"
+      ;;
+    gone)
+      # Already deleted at Cloudflare: still remove the CNAMEs that
+      # point at it (they answer error 1016), skip the tunnel delete.
+      TUNNEL_ID="$RECORDED_TUNNEL_ID"
+      TUNNEL_ALREADY_GONE=1
+      log_info "this appliance's tunnel is already deleted at Cloudflare; cleaning up its DNS records" id="$TUNNEL_ID"
+      ;;
+    *)
+      die "could not confirm this appliance's tunnel ($RECORDED_TUNNEL_ID) at Cloudflare, so nothing on the Cloudflare side was verified or deleted. The connector container is stopped; DNS records and the tunnel object remain.
+
+  Refusing to fall back to a lookup by name: it could delete another appliance's tunnel that happens to share it.
+
+  Common causes: expired/rotated API token, wrong CLOUDFLARE_ACCOUNT_ID, no network path to api.cloudflare.com.
+
+  Diagnose:
+    sudo grep '^CLOUDFLARE_' $VIBE_ENV_APPLIANCE
+    curl -sS -H 'Authorization: Bearer <token>' ${CF_API}/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${RECORDED_TUNNEL_ID}
+  Fix:
+    Restore a working token via Configuration → Network → Cloudflare
+    Tunnel → Rotate token, then click Tear down again (idempotent).
+    SSH equivalent: sudo bash $APPLIANCE_DIR/infra/cloudflared-down.sh
+  If the token is gone for good (account closed, token unrecoverable),
+  clean up only the host side and handle Cloudflare in the dashboard:
+    sudo bash $APPLIANCE_DIR/infra/cloudflared-down.sh --local-only"
+      ;;
+  esac
+fi
+
+if (( LOCAL_ONLY == 0 )) && [[ -z "$RECORDED_TUNNEL_ID" ]]; then
 log_step "looking up tunnel '$CF_TUNNEL_NAME'"
 search="$(cf_api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel?name=$CF_TUNNEL_NAME&is_deleted=false")"
 # Distinguish "API answered success with an empty result" (genuinely no
@@ -160,7 +230,7 @@ if [[ -z "$TUNNEL_ID" ]]; then
 else
   log_info "tunnel found" id="$TUNNEL_ID"
 fi
-fi  # LOCAL_ONLY == 0
+fi  # by-name fallback (no recorded tunnel id)
 
 # --- 3. Delete CNAMEs that point at this tunnel ------------------------
 
@@ -278,7 +348,7 @@ fi
 
 # --- 4. Delete the tunnel object --------------------------------------
 
-if [[ -n "$TUNNEL_ID" ]]; then
+if [[ -n "$TUNNEL_ID" ]] && (( TUNNEL_ALREADY_GONE == 0 )); then
   log_step "deleting tunnel object"
   # Cloudflare requires the tunnel to be fully cleaned (no active
   # connections) before delete; the connector container is gone by
@@ -315,6 +385,15 @@ if [[ -f "$VIBE_ENV_SHARED" ]] && grep -q '^TUNNEL_TOKEN=' "$VIBE_ENV_SHARED"; t
     log_warn "manual cleanup: edit $VIBE_ENV_SHARED as root and remove the TUNNEL_TOKEN= line."
   fi
 fi
+
+# --- 5b. Forget the recorded tunnel id ---------------------------------
+# The token is gone, so is the tunnel (or, with --local-only, the operator
+# is cleaning Cloudflare up by hand). The next cloudflared-up.sh starts
+# from a clean slate instead of insisting on a tunnel that no longer
+# exists. Empty value deletes the key.
+state_set_config_kv cloudflare_tunnel_id "" \
+  || log_warn "could not clear config.cloudflare_tunnel_id in $VIBE_STATE_FILE" \
+       "fix:remove the cloudflare_tunnel_id line from $VIBE_STATE_FILE (config section) as root"
 
 # --- 6. Clear CLOUDFLARE_TUNNEL_ENABLED + reload Caddy ---------------
 # render-caddyfile.sh switches every site block to `tls internal`

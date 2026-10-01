@@ -169,7 +169,8 @@ CF_TUNNEL_API_TOKEN="$(_get_env_value CLOUDFLARE_TUNNEL_API_TOKEN)"
 CF_ACCOUNT_ID="$(_get_env_value CLOUDFLARE_ACCOUNT_ID)"
 CF_ZONE_ID="$(_get_env_value CLOUDFLARE_ZONE_ID)"
 CF_TUNNEL_NAME="$(_get_env_value CLOUDFLARE_TUNNEL_NAME)"
-CF_TUNNEL_NAME="${CF_TUNNEL_NAME:-vibe-appliance}"
+# Empty here means "not configured"; the default is filled in once the
+# domain and hostname tag are known (see "Default tunnel name" below).
 CF_TUNNEL_PUBLISH="$(_get_env_value CLOUDFLARE_TUNNEL_PUBLISH)"
 
 # Trim quotes/whitespace from values that might have been hand-edited
@@ -322,6 +323,17 @@ if [[ -z "$TUNNEL_SUBDOMAIN" ]]; then
 fi
 
 TUNNEL_FQDN="${TUNNEL_SUBDOMAIN}.${DOMAIN}"
+
+# Default tunnel name: vibe-appliance-<domain>[-<tag>]. Unique per
+# appliance, so two appliances in one Cloudflare account — even two under
+# ONE domain, told apart by their hostname tag — never look up each
+# other's tunnel by name. Only used when CLOUDFLARE_TUNNEL_NAME is unset
+# AND this appliance has no recorded tunnel yet: an appliance that already
+# has a tunnel finds it by id (section 2), whatever it is called.
+HOST_TAG_VALUE="$("${VIBE_HOSTS[@]}" get tag 2>/dev/null || true)"
+if [[ -z "$CF_TUNNEL_NAME" ]]; then
+  CF_TUNNEL_NAME="vibe-appliance-${DOMAIN//./-}${HOST_TAG_VALUE:+-${HOST_TAG_VALUE}}"
+fi
 
 # Caddy listens on :443 in domain mode and tailscale mode. LAN mode is
 # :80-only, which means the tunnel's https://caddy:443 ingress target
@@ -485,6 +497,65 @@ fi
 
 # --- 2. Find or create the tunnel -------------------------------------
 
+CF_GUARD=(python3 "$APPLIANCE_DIR/lib/cf_guard.py")
+# shellcheck source=/dev/null
+. "$APPLIANCE_DIR/lib/state.sh"
+
+# The hostnames this appliance wants the tunnel to serve (the same list
+# the ingress config is built from in section 3).
+DESIRED_HOSTS="$("${VIBE_HOSTS[@]}" list tunnel 2>/dev/null || true)"
+[[ -n "$DESIRED_HOSTS" ]] || die "could not resolve the hostnames to publish (lib/vibe_hosts.py printed nothing).
+  Diagnose: python3 $APPLIANCE_DIR/lib/vibe_hosts.py list tunnel
+  Fix: sudo bash $APPLIANCE_DIR/bootstrap.sh, then re-run this script. Nothing has been changed."
+
+# 2a. This appliance's own tunnel, by ID. A name proves nothing —
+# Cloudflare allows duplicates — so once a tunnel has been provisioned
+# its id is the record of ownership: state.config.cloudflare_tunnel_id,
+# or (installs provisioned before that key existed) the id embedded in
+# the connector token in shared.env. Looking it up by id also means a
+# renamed tunnel, a changed CLOUDFLARE_TUNNEL_NAME or a new hostname tag
+# never spawns a second tunnel.
+TUNNEL_ID=""
+PREVIOUS_TUNNEL_ID=""
+RECORDED_TUNNEL_ID="$(state_get_config_kv cloudflare_tunnel_id 2>/dev/null || true)"
+if [[ -z "$RECORDED_TUNNEL_ID" ]]; then
+  RECORDED_TUNNEL_ID="$("${CF_GUARD[@]}" token-tunnel-id "$VIBE_ENV_SHARED" 2>/dev/null || true)"
+fi
+if [[ -n "$RECORDED_TUNNEL_ID" ]]; then
+  log_step "looking up this appliance's tunnel by id" id="$RECORDED_TUNNEL_ID"
+  _own_resp="$(cf_api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$RECORDED_TUNNEL_ID")"
+  _own_state=""; _own_name=""
+  read -r _own_state _own_name <<<"$(printf '%s' "$_own_resp" | "${CF_GUARD[@]}" tunnel-state 2>/dev/null || echo unknown)" || true
+  case "$_own_state" in
+    live)
+      TUNNEL_ID="$RECORDED_TUNNEL_ID"
+      [[ -n "$_own_name" ]] && CF_TUNNEL_NAME="$_own_name"
+      log_info "tunnel exists; reusing" id="$TUNNEL_ID" name="$CF_TUNNEL_NAME"
+      ;;
+    gone)
+      log_warn "this appliance's tunnel $RECORDED_TUNNEL_ID was deleted at Cloudflare; a new one will be created and its DNS records repointed"
+      PREVIOUS_TUNNEL_ID="$RECORDED_TUNNEL_ID"
+      ;;
+    *)
+      die "could not confirm this appliance's tunnel ($RECORDED_TUNNEL_ID) at Cloudflare. Refusing to continue: looking it up by name instead could adopt another appliance's tunnel or create a duplicate. Nothing has been changed.
+
+  Common causes:
+    - A transient Cloudflare API failure or rate limit.
+    - The API token lost Account.Cloudflare Tunnel:Edit, or CLOUDFLARE_ACCOUNT_ID changed.
+    - The tunnel was removed from the account entirely.
+  Diagnose:
+    curl -sS -H 'Authorization: Bearer <token>' '${CF_API}/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${RECORDED_TUNNEL_ID}' | python3 -m json.tool
+  Fix:
+    Re-run in a minute. If the tunnel really no longer exists, forget it on
+    this host and provision a fresh one:
+      sudo bash $APPLIANCE_DIR/infra/cloudflared-down.sh --local-only
+      sudo bash $APPLIANCE_DIR/infra/cloudflared-up.sh"
+      ;;
+  esac
+fi
+
+# 2b. No tunnel of our own yet: look one up by name, else create it.
+if [[ -z "$TUNNEL_ID" ]]; then
 log_step "looking up tunnel '$CF_TUNNEL_NAME'"
 tunnel_search="$(cf_api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel?name=$CF_TUNNEL_NAME&is_deleted=false")"
 # A parse failure or an API error (success:false — a 429, a 5xx, a
@@ -555,61 +626,53 @@ else
   # 1016 in a zone this script never touches.
   #
   # Guard: read the tunnel's current ingress. If it already carries
-  # hostnames and NONE of them belong to our domain, it is someone
-  # else's tunnel — refuse rather than adopt it. A tunnel with no
+  # hostnames and NONE of them is a hostname this appliance serves, it
+  # is someone else's tunnel — refuse rather than adopt it. "Some
+  # hostname under the same domain" is not ownership: that is exactly
+  # what a second appliance on the domain looks like. A tunnel with no
   # hostnames yet (freshly created, or never configured) is unclaimed
   # and safe to take.
   #
   # Fail-open if the config can't be read: same reasoning as the zone
   # probe above — never brick a correctly-scoped token on a diagnostic.
-  log_step "confirming tunnel '$CF_TUNNEL_NAME' belongs to $DOMAIN"
+  # The DNS pre-flight in section 3b still protects the other appliance's
+  # records.
+  log_step "confirming tunnel '$CF_TUNNEL_NAME' belongs to this appliance"
   existing_cfg="$(cf_api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations")"
-  foreign_hosts="$(python3 - "$existing_cfg" "$DOMAIN" <<'PYEOF' || true
-import json, sys
-raw, domain = sys.argv[1], sys.argv[2]
-try:
-    d = json.loads(raw)
-except Exception:
-    sys.exit(0)          # unreadable -> fail open, print nothing
-if not d.get("success"):
-    sys.exit(0)
-cfg = ((d.get("result") or {}).get("config") or {})
-hosts = [r.get("hostname") for r in (cfg.get("ingress") or []) if r.get("hostname")]
-if not hosts:
-    sys.exit(0)          # unconfigured tunnel -> unclaimed
-# "Belongs to us" = at least one ingress hostname is the domain itself
-# or sits under it. Anything else is another appliance's tunnel.
-if any(h == domain or h.endswith("." + domain) for h in hosts):
-    sys.exit(0)
-print(",".join(sorted(set(hosts))))
-PYEOF
-)"
+  # shellcheck disable=SC2086  # DESIRED_HOSTS is a newline list of hostnames
+  foreign_hosts="$(printf '%s' "$existing_cfg" | "${CF_GUARD[@]}" foreign-hosts $DESIRED_HOSTS 2>/dev/null || true)"
   if [[ -n "$foreign_hosts" ]]; then
-    die "a tunnel named '$CF_TUNNEL_NAME' already exists in this Cloudflare account, but it serves a DIFFERENT domain.
+    die "a tunnel named '$CF_TUNNEL_NAME' already exists in this Cloudflare account, but it belongs to a DIFFERENT appliance.
 
-  Tunnel id:        $TUNNEL_ID
-  Its ingress:      $foreign_hosts
-  This appliance:   $DOMAIN
+  Tunnel id:               $TUNNEL_ID
+  Its hostnames:           $foreign_hosts
+  This appliance serves:   $(printf '%s' "$DESIRED_HOSTS" | paste -sd, -)
 
   Refusing to continue. Reusing it would overwrite that tunnel's routing
-  and take the other domain's apps offline, and tearing down here would
+  and take the other appliance's apps offline, and tearing down here would
   delete it out from under them. Nothing has been changed.
 
-  This happens when two appliances share one Cloudflare account and both
-  keep the default tunnel name.
-
+  Common causes:
+    - Two appliances share one Cloudflare account and the same tunnel name.
+    - This appliance's hostnames were all renamed at once (a new hostname
+      tag) and it lost track of its tunnel.
+  Diagnose: https://one.dash.cloudflare.com/${CF_ACCOUNT_ID}/networks/tunnels
   Fix — give this appliance its own tunnel name:
     1. UI:   Configuration → Network → Cloudflare Tunnel → Set up →
-             change 'Tunnel name' (e.g. vibe-appliance-${DOMAIN//./-}).
-    2. Or:   set CLOUDFLARE_TUNNEL_NAME=vibe-appliance-${DOMAIN//./-}
-             in $VIBE_ENV_APPLIANCE and re-run this script.
-
-  Existing tunnels: https://one.dash.cloudflare.com/${CF_ACCOUNT_ID}/networks/tunnels"
+             change 'Tunnel name' (e.g. vibe-appliance-${DOMAIN//./-}${HOST_TAG_VALUE:+-${HOST_TAG_VALUE}}-2).
+    2. Or:   set CLOUDFLARE_TUNNEL_NAME in $VIBE_ENV_APPLIANCE.
+  Then re-run: sudo bash $APPLIANCE_DIR/infra/cloudflared-up.sh (idempotent)"
   fi
   log_info "tunnel exists; reusing" id="$TUNNEL_ID"
 fi
+fi  # 2b: no tunnel of our own yet
 
 TARGET_CONTENT="${TUNNEL_ID}.cfargotunnel.com"
+
+# Record the tunnel as this appliance's. Every later run — and
+# cloudflared-down.sh — finds it by this id instead of by name.
+state_set_config_kv cloudflare_tunnel_id "$TUNNEL_ID" \
+  || log_warn "could not record the tunnel id in $VIBE_STATE_FILE; the next run falls back to the id in the connector token"
 
 # --- 3. Sanity-check the publish list, then build single-host ingress -
 
@@ -766,6 +829,86 @@ if [[ -z "$INGRESS_JSON" ]]; then
   die "ingress build failed; check that python3 is installed."
 fi
 
+# --- 3b. Pre-flight: every hostname must be free to use ----------------
+#
+# Read-only, and BEFORE the ingress push and any DNS write. Section 5
+# repoints an existing CNAME at this tunnel; that is right when the record
+# is a leftover (nothing there, a deleted tunnel, this appliance's own
+# previous tunnel) and destructive when another appliance's live tunnel
+# answers that name — its app goes dark, and nothing on that appliance
+# says why. So: classify every record first, and if any hostname belongs
+# to someone else, stop with nothing changed.
+#
+# Fail closed: a lookup that cannot be read counts as a conflict. The
+# alternative is overwriting a record we could not inspect.
+log_step "checking the tunnel hostnames are free to use"
+CNAME_CONFLICTS=()
+declare -A _other_tunnel_state=()
+while IFS= read -r _fqdn; do
+  [[ -z "$_fqdn" ]] && continue
+  _recs="$(cf_api GET "/zones/$CF_ZONE_ID/dns_records?name=$_fqdn")"
+  _act=""; _detail=""
+  read -r _act _detail <<<"$(printf '%s' "$_recs" | "${CF_GUARD[@]}" record-action "$_fqdn" "$TARGET_CONTENT" "$TUNNEL_ID" "$PREVIOUS_TUNNEL_ID" 2>/dev/null || echo 'error lib/cf_guard.py could not run')" || true
+  case "$_act" in
+    ok|create|update)
+      ;;
+    check)
+      # A CNAME at another tunnel. Dead tunnel -> a leftover we may
+      # replace. Live, or not visible to this token -> not ours to take.
+      if [[ -z "${_other_tunnel_state[$_detail]:-}" ]]; then
+        _oresp="$(cf_api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$_detail")"
+        _other_tunnel_state[$_detail]="$(printf '%s' "$_oresp" | "${CF_GUARD[@]}" tunnel-state 2>/dev/null || echo unknown)"
+      fi
+      case "${_other_tunnel_state[$_detail]}" in
+        gone)
+          log_info "replacing a CNAME left behind by a deleted tunnel" host="$_fqdn" was="${_detail}.cfargotunnel.com"
+          ;;
+        live*)
+          CNAME_CONFLICTS+=("$_fqdn  ->  ${_detail}.cfargotunnel.com  (live tunnel '${_other_tunnel_state[$_detail]#live }')")
+          ;;
+        *)
+          CNAME_CONFLICTS+=("$_fqdn  ->  ${_detail}.cfargotunnel.com  (a tunnel this token cannot see; assumed live)")
+          ;;
+      esac
+      ;;
+    refuse)
+      CNAME_CONFLICTS+=("$_fqdn  is  $_detail")
+      ;;
+    *)
+      CNAME_CONFLICTS+=("$_fqdn  could not be checked: ${_detail:-no response}")
+      ;;
+  esac
+done <<<"$DESIRED_HOSTS"
+
+if (( ${#CNAME_CONFLICTS[@]} > 0 )); then
+  die "${#CNAME_CONFLICTS[@]} hostname(s) this appliance wants already belong to something else — refusing to take them over.
+
+$(printf '    %s\n' "${CNAME_CONFLICTS[@]}")
+  This appliance's tunnel: ${TARGET_CONTENT}
+
+  No ingress was pushed and no DNS record was written, so whatever answers
+  those names today keeps working. (If this run created the tunnel object
+  '$CF_TUNNEL_NAME', it is empty and is reused on the next run.)
+
+  Common causes:
+    - Another appliance under $DOMAIN uses the same hostnames. Each
+      appliance after the first needs its own hostname tag.
+    - A previous install of this appliance was not torn down, and its
+      tunnel is still alive.
+    - The name is already used for something else in this DNS zone.
+  Diagnose:
+    DNS records:  https://dash.cloudflare.com  ->  $DOMAIN  ->  DNS
+    Tunnels:      https://one.dash.cloudflare.com/${CF_ACCOUNT_ID}/networks/tunnels
+  Fix (any one):
+    1. Give this appliance unique hostnames: Configuration → Network →
+       Hostname tag (or: sudo bash $APPLIANCE_DIR/bootstrap.sh --host-tag <tag> --no-apex).
+    2. If the other tunnel is an old one you no longer use, delete it (and
+       its DNS records) in the Cloudflare dashboard.
+    3. If the record is something else you no longer need, delete it in
+       the Cloudflare dashboard.
+  Then re-run: sudo bash $APPLIANCE_DIR/infra/cloudflared-up.sh (idempotent)"
+fi
+
 # --- 4. Push ingress config to the tunnel -----------------------------
 
 log_step "pushing ingress config to tunnel"
@@ -917,9 +1060,12 @@ while :; do
   # Emits "<total_pages>" on line 1, then "<id> <name>" per stale
   # record. Exits non-zero when the page could not be understood, so a
   # broken enumeration is loud instead of an empty result set.
-  page_out="$(_CURRENT="$current_fqdns" python3 - "$existing" "$TARGET_CONTENT" "$_page" <<'PYEOF'
+  page_out="$(_CURRENT="$current_fqdns" python3 - "$existing" "$TARGET_CONTENT" "$_page" "${PREVIOUS_TUNNEL_ID:+${PREVIOUS_TUNNEL_ID}.cfargotunnel.com}" <<'PYEOF'
 import json, os, sys
 data, target, page = sys.argv[1], sys.argv[2], sys.argv[3]
+# Ours = this tunnel, plus this appliance's previous tunnel when it was
+# found deleted this run (its leftovers point at nothing).
+targets = {target} | ({sys.argv[4]} if len(sys.argv) > 4 and sys.argv[4] else set())
 current = set(s for s in os.environ.get('_CURRENT', '').strip().split('\n') if s)
 try:
   d = json.loads(data)
@@ -934,7 +1080,7 @@ if not d.get("success"):
   sys.exit(1)
 print((d.get("result_info") or {}).get("total_pages", 1))
 for r in (d.get('result') or []):
-  if r.get('content') == target and r.get('name') not in current:
+  if r.get('content') in targets and r.get('name') not in current:
     print(r.get('id', ''), r.get('name', ''))
 PYEOF
 )" || { _prune_ok=0; break; }

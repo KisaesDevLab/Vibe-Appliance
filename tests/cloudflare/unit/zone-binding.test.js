@@ -12,7 +12,8 @@
 // Both subjects are extracted from the real sources rather than
 // reimplemented, so the tests fail if the shipped logic drifts:
 //   - the wizard's zone matcher (console/ui/static/settings.js)
-//   - the tunnel-ownership gate (infra/cloudflared-up.sh, embedded py)
+//   - the tunnel-ownership gate (lib/cf_guard.py, called by
+//     infra/cloudflared-up.sh)
 
 'use strict';
 
@@ -98,60 +99,71 @@ test('default tunnel name is domain-derived, so two appliances differ', () => {
   assert.notEqual(defaultTunnelName('firm.com'), defaultTunnelName('other-client.com'));
   // No domain yet -> legacy name, so existing installs keep their tunnel.
   assert.equal(defaultTunnelName(''), 'vibe-appliance');
+  // Two appliances under ONE domain differ by their hostname tag.
+  assert.equal(defaultTunnelName('firm.com', 'office2'), 'vibe-appliance-firm-com-office2');
+  assert.notEqual(defaultTunnelName('firm.com'), defaultTunnelName('firm.com', 'office2'));
+  assert.equal(defaultTunnelName('firm.com', ''), 'vibe-appliance-firm-com');
 });
 
 // --- subject 2: the tunnel-ownership gate -----------------------------
 
-// Runs the REAL embedded python from cloudflared-up.sh. It prints the
-// foreign ingress hostnames (=> refuse) or nothing (=> safe to use).
-function foreignHosts(configJson, domain) {
-  const src = fs.readFileSync(path.join(REPO, 'infra', 'cloudflared-up.sh'), 'utf8');
-  const re = /<<'PYEOF'[^\n]*\n([\s\S]*?)\nPYEOF/g;
-  let block = null, m;
-  while ((m = re.exec(src)) !== null) {
-    if (m[1].includes('"Belongs to us"')) { block = m[1]; break; }
-  }
-  assert.ok(block, 'tunnel-ownership PYEOF block not found in cloudflared-up.sh');
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vibe-own-'));
-  const py = path.join(dir, 'own.py');
-  fs.writeFileSync(py, block + '\n');
-  return execFileSync('python3', [py, JSON.stringify(configJson), domain],
-    { encoding: 'utf8' }).trim();
+// Runs the REAL gate, lib/cf_guard.py (called by cloudflared-up.sh for a
+// tunnel it found by NAME). It prints the foreign ingress hostnames
+// (=> refuse) or nothing (=> safe to use). `ours` is the list of
+// hostnames this appliance wants to publish.
+function foreignHosts(configJson, ours) {
+  return execFileSync('python3',
+    [path.join(REPO, 'lib', 'cf_guard.py'), 'foreign-hosts', ...ours],
+    { encoding: 'utf8', input: JSON.stringify(configJson) }).trim();
 }
 
 const cfg = (hosts) => ({
   success: true,
   result: { config: { ingress: hosts.map(h => ({ hostname: h })).concat([{ service: 'http_status:404' }]) } },
 });
+const OURS = ['vibe.firm.com', 'client.firm.com'];
+
+test('cloudflared-up.sh takes the ownership decision from lib/cf_guard.py', () => {
+  const src = fs.readFileSync(path.join(REPO, 'infra', 'cloudflared-up.sh'), 'utf8');
+  assert.match(src, /"\$\{CF_GUARD\[@\]\}" foreign-hosts/, 'the name-lookup path must run the foreign-hosts gate');
+});
 
 test('tunnel ownership: refuses a tunnel serving a different domain', () => {
-  // Two appliances, one Cloudflare account, both left at the default
-  // tunnel name. Reusing this tunnel would overwrite the other domain's
-  // ingress; tearing down would delete it out from under them.
-  assert.equal(foreignHosts(cfg(['vibe.other-client.com']), 'firm.com'),
+  // Two appliances, one Cloudflare account, the same tunnel name. Reusing
+  // this tunnel would overwrite the other domain's ingress; tearing down
+  // would delete it out from under them.
+  assert.equal(foreignHosts(cfg(['vibe.other-client.com']), OURS),
     'vibe.other-client.com');
 });
 
+test('tunnel ownership: refuses another appliance under the SAME domain', () => {
+  // The case "some hostname under our domain" used to wave through: a
+  // second appliance on firm.com, tagged office2, finding the first
+  // appliance's tunnel by name. Shared domain is not ownership.
+  assert.equal(foreignHosts(cfg(['vibe.firm.com', 'client.firm.com']),
+    ['vibe-office2.firm.com', 'client-office2.firm.com']),
+    'client.firm.com,vibe.firm.com');
+  assert.equal(foreignHosts(cfg(['firm.com']), OURS), 'firm.com',
+    'the apex alone proves nothing: the tunnel never serves it for us');
+});
+
 test('tunnel ownership: accepts our own tunnel and unclaimed ones', () => {
-  assert.equal(foreignHosts(cfg(['vibe.firm.com', 'client.firm.com']), 'firm.com'), '',
-    'a tunnel already serving our domain is ours');
-  assert.equal(foreignHosts(cfg([]), 'firm.com'), '',
+  assert.equal(foreignHosts(cfg(['vibe.firm.com', 'client.firm.com']), OURS), '',
+    'a tunnel already serving our hostnames is ours');
+  assert.equal(foreignHosts(cfg(['vibe.firm.com', 'old-app.firm.com']), OURS), '',
+    'one hostname in common is enough: the rest are stale rules of ours');
+  assert.equal(foreignHosts(cfg([]), OURS), '',
     'a tunnel with no ingress yet is unclaimed');
-  assert.equal(foreignHosts(cfg(['firm.com']), 'firm.com'), '',
-    'the apex itself counts as ours');
 });
 
 test('tunnel ownership: lookalike domain does not read as ours', () => {
-  // "evilfirm.com" ends with "firm.com" as a raw substring. If the gate
-  // used a bare endsWith it would treat a foreign tunnel as our own and
-  // happily overwrite it.
-  assert.equal(foreignHosts(cfg(['vibe.evilfirm.com']), 'firm.com'),
-    'vibe.evilfirm.com');
+  assert.equal(foreignHosts(cfg(['vibe.evilfirm.com']), OURS), 'vibe.evilfirm.com');
 });
 
 test('tunnel ownership: fails OPEN on an unreadable config', () => {
   // A permissions/transport failure must not block a legitimate
   // provision — the same reasoning as the GET /accounts/{id} trap this
-  // repo hit before. Empty output => proceed.
-  assert.equal(foreignHosts({ success: false, errors: [{ code: 9109 }] }, 'firm.com'), '');
+  // repo hit before. Empty output => proceed (the DNS pre-flight still
+  // refuses to repoint another appliance's records).
+  assert.equal(foreignHosts({ success: false, errors: [{ code: 9109 }] }, OURS), '');
 });
