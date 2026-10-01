@@ -121,3 +121,36 @@ test('the sign-in mode and the broker registration block survive a template that
   const first = merge({ old: 'OTHER=1\n', fresh: 'VIBE_AUTH_MODE=local\n', manifest: MANIFEST });
   assert.match(first, /^VIBE_AUTH_MODE=local$/m);
 });
+
+test('a blank key the template now documents as inherited is dropped, not carried forward', () => {
+  // vibe-recap.env.tmpl used to ship a live `EMAILIT_API_KEY=`. The app's
+  // env file loads AFTER appliance.env, so that blank line replaced the key
+  // saved under Configuration -> Email & SMS with an empty one. The template
+  // now lists the key commented out; an existing install's leftover blank
+  // line must not survive as a "preserved" extra and keep masking it.
+  const fresh = 'APP_URL=http://new\n# EMAILIT_API_KEY=\n';
+  let out = merge({ old: 'APP_URL=http://old\nEMAILIT_API_KEY=\n', fresh, manifest: MANIFEST });
+  assert.doesNotMatch(out, /^EMAILIT_API_KEY=/m, 'the blank override is gone, so appliance.env is inherited');
+
+  // A value the operator set by hand is their own override: keep it.
+  out = merge({ old: 'APP_URL=http://old\nEMAILIT_API_KEY=em_live_abc\n', fresh, manifest: MANIFEST });
+  assert.match(out, /^EMAILIT_API_KEY=em_live_abc$/m);
+
+  // A blank extra the template says nothing about is left alone.
+  out = merge({ old: 'APP_URL=http://old\nSOME_OTHER_KEY=\n', fresh, manifest: MANIFEST });
+  assert.match(out, /^SOME_OTHER_KEY=$/m);
+});
+
+test('no per-app template blanks out a key the appliance Email & SMS settings save', () => {
+  // Compose loads appliance.env, then the app's own env file. A live blank
+  // line for a shared key in a per-app template silently discards the
+  // operator's saved value for that app.
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const dir = path.join(__dirname, '..', '..', 'env-templates', 'per-app');
+  const shared = /^(EMAIL_PROVIDER|EMAIL_FROM|RESEND_API_KEY|POSTMARK_SERVER_TOKEN|EMAILIT_API_KEY|SMTP_HOST|SMTP_PORT|SMTP_USER|SMTP_PASSWORD|TEXTLINK_API_KEY|TWILIO_[A-Z_]+)=\s*$/;
+  for (const f of fs.readdirSync(dir).filter((n) => n.endsWith('.tmpl'))) {
+    const hits = fs.readFileSync(path.join(dir, f), 'utf8').split('\n').filter((l) => shared.test(l));
+    assert.deepEqual(hits, [], `${f}: blank shared key(s) would override appliance.env: ${hits.join(', ')}`);
+  }
+});

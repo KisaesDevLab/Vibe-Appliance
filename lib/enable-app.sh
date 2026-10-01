@@ -1088,9 +1088,23 @@ for line in open(sys.argv[2]).read().splitlines():
             line = f"{k}={old[k]}"
     merged_lines.append(line)
 new_keys = set(new.keys())
+# Keys the template lists COMMENTED OUT ("# KEY=") are documented as
+# inherited from appliance.env, which compose loads before this file. A
+# blank value for such a key left over from an older template (where the
+# line was live) must not be carried forward: `KEY=` here would mask the
+# appliance's saved value with an empty one. A non-blank value is the
+# operator's own override and is preserved like any other extra.
+import re
+inherited = set()
+for line in merged_lines:
+    m = re.match(r"^#\s*([A-Z][A-Z0-9_]*)=", line.strip())
+    if m:
+        inherited.add(m.group(1))
 extras = []
 for k, v in old.items():
     if k not in new_keys:
+        if v == "" and k in inherited:
+            continue
         extras.append(f"{k}={v}")
 if extras:
     merged_lines.append("")

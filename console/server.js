@@ -5502,8 +5502,28 @@ function _probeTcp(host, port, timeoutMs = 5000) {
 
 // 1-token ping to api.anthropic.com. Validates that the key is good
 // without burning meaningful credit. Body: { ANTHROPIC_API_KEY }.
+// Fill in saved secrets a Test request left blank.
+//
+// The Settings page never echoes a stored secret back to the browser: a
+// saved key renders as an empty password box with a "(set)" badge. The
+// Test button posts whatever is in the form, so once a key had been
+// SAVED its field arrived here empty and every test answered
+// "<KEY> required" — the operator's key was fine, the test just never
+// saw it. A value typed into the form still wins (testing before
+// saving); only a blank or absent secret falls back to appliance.env.
+// Appliance-scope secrets only, and only keys the registry marks secret.
+function withSavedSecrets(body) {
+  const out = { ...(body || {}) };
+  const saved = parseEnvFile(path.join(ENV_DIR, 'appliance.env'));
+  for (const [key, field] of SETTINGS_REGISTRY.allKeys) {
+    if (!field || !field.secret || key.includes('::')) continue;
+    if ((out[key] == null || out[key] === '') && saved[key]) out[key] = saved[key];
+  }
+  return out;
+}
+
 app.post('/api/v1/admin/test/anthropic', requireAdmin, testRateLimit, async (req, res) => {
-  const key = (req.body && req.body.ANTHROPIC_API_KEY) || '';
+  const key = withSavedSecrets(req.body).ANTHROPIC_API_KEY || '';
   if (!key) {
     return res.status(400).json({ ok: false, error: 'ANTHROPIC_API_KEY required in body' });
   }
@@ -5843,7 +5863,7 @@ app.post('/api/v1/admin/analyze-log', requireAdmin, async (req, res) => {
 // Real send via Resend or Postmark. Body: { EMAIL_PROVIDER, EMAIL_FROM,
 // RESEND_API_KEY?, POSTMARK_SERVER_TOKEN?, SMTP_*? }.
 app.post('/api/v1/admin/test/email', requireAdmin, testRateLimit, async (req, res) => {
-  const b = req.body || {};
+  const b = withSavedSecrets(req.body);
   // Trim before lowercasing so leading/trailing whitespace from a
   // copy-paste doesn't break the provider dispatch.
   const provider = (b.EMAIL_PROVIDER || '').trim().toLowerCase();
@@ -5950,7 +5970,7 @@ app.post('/api/v1/admin/test/email', requireAdmin, testRateLimit, async (req, re
 // TWILIO_AUTH_TOKEN, FROM_NUMBER, TO_NUMBER }. UI prompts for TO via
 // modal; FROM is operator-configured.
 app.post('/api/v1/admin/test/sms', requireAdmin, testRateLimit, async (req, res) => {
-  const b = req.body || {};
+  const b = withSavedSecrets(req.body);
   const provider = (b.SMS_PROVIDER || '').trim().toLowerCase();
   const to       = (b.TO_NUMBER  || '').trim();
   const from     = (b.FROM_NUMBER || '').trim();
@@ -6132,7 +6152,7 @@ app.get('/api/v1/admin/backup/info', requireAdmin, async (_req, res) => {
 });
 
 app.post('/api/v1/admin/test/backup', requireAdmin, testRateLimit, async (req, res) => {
-  const b = req.body || {};
+  const b = withSavedSecrets(req.body);
   const dest = (b.BACKUP_DESTINATION_TYPE || '').trim().toLowerCase();
   const known = new Set(['none', 's3', 'b2', 'sftp', 'local']);
   if (!known.has(dest)) {
@@ -6169,7 +6189,7 @@ app.post('/api/v1/admin/test/backup', requireAdmin, testRateLimit, async (req, r
 });
 
 app.post('/api/v1/admin/test/dns', requireAdmin, testRateLimit, async (req, res) => {
-  const b = req.body || {};
+  const b = withSavedSecrets(req.body);
   const provider = (b.DNS_PROVIDER || '').trim().toLowerCase();
   if (provider === 'http-01' || provider === '') {
     return res.json({
@@ -6274,7 +6294,7 @@ app.post('/api/v1/admin/test/dns', requireAdmin, testRateLimit, async (req, res)
 // risk as the email/SMS tests — one real API call, but DDNS calls are
 // idempotent so re-pinning the same IP costs nothing.
 app.post('/api/v1/admin/test/ddns', requireAdmin, testRateLimit, async (req, res) => {
-  const b = req.body || {};
+  const b = withSavedSecrets(req.body);
   const provider = (b.DDNS_PROVIDER || '').trim().toLowerCase();
   if (!provider || provider === 'none') {
     return res.json({ ok: true, message: 'DDNS disabled — no probe needed.' });
@@ -6389,7 +6409,7 @@ app.post('/api/v1/admin/test/tailscale', requireAdmin, testRateLimit, (req, res)
 // LLM_MODEL? }. Sends a "Hello" prompt and waits for any response.
 // Forward-compat for Tax-Research-Chat's Tier-2 LLM_ENDPOINT field.
 app.post('/api/v1/admin/test/llm', requireAdmin, testRateLimit, async (req, res) => {
-  const b = req.body || {};
+  const b = withSavedSecrets(req.body);
   const endpoint = b.LLM_ENDPOINT || '';
   if (!endpoint) {
     return res.status(400).json({ ok: false, error: 'LLM_ENDPOINT required' });
