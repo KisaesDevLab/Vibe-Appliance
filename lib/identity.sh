@@ -567,6 +567,9 @@ PYEOF
 #          that requires MFA at the IdP (VIBE_OIDC_REQUIRE_MFA_AMR=true)
 #          refuses every user's first sign-in on an older broker
 #   1.0.5  per-product access (GET|PUT /registrations/<slug>/access)
+#   1.0.9  serves on the appliance origin host verbatim; needed when the
+#          sign-in host is not literally auth.<domain> (HOST_TAG, or a
+#          custom VIBE_APP_SUBDOMAIN) in subdomain-per-app mode
 VA_MIN_VERSION="1.0.2"
 
 _id_va_version() {
@@ -801,6 +804,7 @@ id_register() {
       "Diagnose: docker exec vibe-console curl -s -o /dev/null -w '%{http_code}\n' http://$(_id_auth_upstream "$slug")/auth/status ; Fix: update ${slug} from the console's Updates panel (or: sudo vibe update ${slug}), then Register it again."
   fi
   _id_require_broker "$(_id_product_min_broker "$slug")" "registering ${slug}"
+  _id_require_named_host_broker
   # Tailscale mode: the browser is on https://<host>.<tailnet>.ts.net (tailscale
   # serve), but every origin the appliance renders there is http://<default-route
   # ip>, and Caddy binds 127.0.0.1. A registration would record redirect URIs on
@@ -911,9 +915,13 @@ id_setup_token() {
   python3 -c 'import json,sys; d=json.load(sys.stdin); t=d.get("token"); s=d.get("state") or {}; o=sys.argv[1]; print(json.dumps({"token":t,"done":bool(s.get("done")),"url":(o+"/setup?token="+t) if t else (o+"/admin")}))' "$base" <<< "$resp"
 }
 
-# Host the broker should derive issuers from. Mirrors the broker's own
-# applyApplianceHints(): in subdomain-per-app mode the origin is
-# https://auth.<domain> and the broker wants the bare <domain>.
+# Host the broker should derive issuers from. Brokers before 1.0.9 strip a
+# literal "auth." in subdomain-per-app mode and re-add it themselves, so
+# for the built-in label the origin https://auth.<domain> is sent as the
+# bare <domain>. Any other label (the appliance HOST_TAG gives
+# auth-<tag>, or the operator renamed it) is sent as rendered — broker
+# 1.0.9+ serves on the origin host verbatim; _id_require_named_host_broker
+# refuses older ones.
 _id_va_rebase_host() {
   local origin mode host
   origin="$(_id_va_origin)"
@@ -923,8 +931,23 @@ _id_va_rebase_host() {
   printf '%s' "$host"
 }
 
+# In subdomain-per-app mode vibe-auth has its own hostname. A broker older
+# than 1.0.9 assumes that hostname's label is exactly "auth" and would
+# publish auth.<host> as the sign-in address — a name nothing serves. Stop
+# before registering anything against it.
+_id_require_named_host_broker() {
+  local origin mode host
+  mode="$(_extract_env_value "$VA_ENV" VIBE_AUTH_APPLIANCE_MODE)"
+  [[ "$mode" == *subdomain-per-app ]] || return 0
+  origin="$(_id_va_origin)"
+  host="${origin#*://}"; host="${host%%/*}"
+  [[ "$host" == auth.* ]] && return 0
+  _id_require_broker "1.0.9" "serving the sign-in service at ${host} (a hostname tag or custom subdomain)"
+}
+
 id_rebase() {
   _id_require_va
+  _id_require_named_host_broker
   local products="{}" slug
   for slug in $(_id_enabled_sso_slugs); do
     [[ -n "$(_extract_env_value "${VIBE_ENV_DIR}/${slug}.env" VIBE_OIDC_CLIENT_ID)" ]] || continue

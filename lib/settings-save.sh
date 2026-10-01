@@ -285,13 +285,42 @@ settings_save_apply() {
 _settings_run_post_save_jobs() {
   local payload_file="$1"
   local jobs
-  jobs="$(python3 - "$payload_file" <<'PYEOF'
-import json, sys
+  jobs="$(python3 - "$payload_file" "${APPLIANCE_DIR}/console/manifests" <<'PYEOF'
+import json, os, sys
 with open(sys.argv[1]) as f:
     p = json.load(f)
+manifests_dir = sys.argv[2]
 changes = p.get("changes", [])
 keys = {c.get("key") for c in changes}
 out = []
+
+
+def declared_job(change):
+    """The `ui.postSaveJob` the owning manifest declares for this key:
+    _appliance.json for appliance scope, <slug>.json for per-app scope."""
+    scope = change.get("scope", "")
+    if scope == "appliance":
+        name = "_appliance.json"
+    elif scope.startswith("per-app:"):
+        name = scope[len("per-app:"):] + ".json"
+    else:
+        return None
+    try:
+        with open(os.path.join(manifests_dir, name)) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    # App manifests list fields under env.required/optional; the
+    # appliance-level manifest lists them under settings.
+    env = data.get("env") or {}
+    fields = ((data.get("settings") or [])
+              + (env.get("required") or []) + (env.get("optional") or []))
+    for field in fields:
+        if isinstance(field, dict) and field.get("name") == change.get("key"):
+            return (field.get("ui") or {}).get("postSaveJob")
+    return None
+
+
 if "DNS_PROVIDER" in keys:
     out.append("dns-provider-switch")
 for c in changes:
@@ -299,11 +328,16 @@ for c in changes:
        and c.get("scope", "").endswith("vibe-tax-research"):
         out.append("corpus-sync")
         break
-# Routing changes: the app routing layout (DOMAIN_ROUTING_MODE) or any
-# per-app subdomain (VIBE_APP_SUBDOMAIN) needs env re-render +
-# force-recreate + Caddy re-render + tunnel re-provision — more than the
-# generic `docker compose restart`. One job covers both triggers.
-if "DOMAIN_ROUTING_MODE" in keys or "VIBE_APP_SUBDOMAIN" in keys:
+# Routing changes — the app routing layout (DOMAIN_ROUTING_MODE), the
+# appliance host tag and apex ownership (HOST_TAG, APEX_DOMAIN_OWNED), an
+# infra host label (INFRA_SUBDOMAIN_*) or a per-app host label
+# (VIBE_APP_SUBDOMAIN, VIBE_APP_SUBDOMAIN_<NAME>) — need env re-render +
+# force-recreate + Caddy re-render + tunnel re-provision, more than the
+# generic `docker compose restart`. Which keys those are is declared by
+# the manifests (`ui.postSaveJob: "routing-reconcile"`), not listed here:
+# a new host setting, or an app adding an extra surface, needs no change
+# to this script.
+if any(declared_job(c) == "routing-reconcile" for c in changes):
     out.append("routing-reconcile")
 # De-dupe, preserve order.
 seen = set(); deduped = []
@@ -370,68 +404,77 @@ _post_save_corpus_sync() {
   return 0
 }
 
-# Routing reconcile — the app routing layout (DOMAIN_ROUTING_MODE) or a
-# per-app subdomain (VIBE_APP_SUBDOMAIN) changed. The generic save path
-# already wrote the new values to the env files, but a routing change
-# needs MORE than a `docker compose restart`:
+# Routing reconcile — a setting that moves a hostname changed: the app
+# routing layout (DOMAIN_ROUTING_MODE), the appliance host tag or apex
+# ownership (HOST_TAG, APEX_DOMAIN_OWNED), an infra host label
+# (INFRA_SUBDOMAIN_*), or a per-app host label (VIBE_APP_SUBDOMAIN,
+# VIBE_APP_SUBDOMAIN_<NAME>). The generic save path already wrote the new
+# values to the env files, but a routing change needs MORE than a
+# `docker compose restart`:
 #   - each affected app's env must be re-rendered so ALLOWED_ORIGIN and
-#     VITE_BASE_PATH match the new layout (root vs /prefix/),
+#     VITE_BASE_PATH match the new layout and host (root vs /prefix/),
 #   - the container must be force-recreated so the new SPA base is baked
 #     into the served bundle (`restart` keeps the old bundle — the
 #     2026-05-14 blank-page bug),
 #   - the Caddyfile must be re-rendered + reloaded, and
 #   - if the Cloudflare Tunnel is active, its ingress + CNAMEs must be
-#     re-provisioned to add/rename per-app subdomains.
+#     re-provisioned to add/rename hostnames (and prune the old ones).
 # Re-running enable-app.sh for each affected app does the first three
-# (it renders env, force-recreates, re-renders + reloads Caddy, and
-# health-checks); cloudflared-up.sh does the last. Best-effort: failures
-# are logged with a copy-paste fix and reported via rc, but the settings
-# were already persisted so we never roll back here.
+# (it renders env, records the labels it applied in state, force-
+# recreates, re-renders + reloads Caddy, re-registers the app's SSO
+# redirect URIs, and health-checks); cloudflared-up.sh does the last.
+# Best-effort: failures are logged with a copy-paste fix and reported via
+# rc, but the settings were already persisted so we never roll back here.
+# Reverse: put the old value back and save — the same job runs again.
 #
 # Affected set:
-#   - DOMAIN_ROUTING_MODE changed → every enabled app (the layout
-#     changes for all of them).
-#   - only VIBE_APP_SUBDOMAIN changed → just the per-app scopes that
-#     changed.
+#   - any appliance-scope routing key changed → every enabled app (the
+#     layout, the tag or the main host changes for all of them).
+#   - only per-app keys changed → just those apps.
+# Identity providers (`provides: ["identity"]`) go first: every other
+# app's SSO registration is made against the provider's new address.
 _post_save_routing_reconcile() {
   local payload_file="$1"
 
-  local mode_changed
-  mode_changed="$(python3 - "$payload_file" <<'PYEOF'
+  local appliance_changed
+  appliance_changed="$(python3 - "$payload_file" <<'PYEOF'
 import json, sys
 p = json.load(open(sys.argv[1]))
-print("yes" if any(c.get("key") == "DOMAIN_ROUTING_MODE"
+print("yes" if any(c.get("scope") == "appliance"
                    for c in p.get("changes", [])) else "no")
 PYEOF
 )"
 
   local slugs
-  if [[ "$mode_changed" == "yes" ]]; then
-    slugs="$(python3 - "${VIBE_DIR}/state.json" <<'PYEOF'
-import json, sys
+  slugs="$(python3 - "$payload_file" "${VIBE_DIR}/state.json" "${APPLIANCE_DIR}/console/manifests" "$appliance_changed" <<'PYEOF'
+import json, os, sys
+payload_path, state_path, manifests_dir, appliance_changed = sys.argv[1:5]
+p = json.load(open(payload_path))
 try:
-    s = json.load(open(sys.argv[1]))
+    s = json.load(open(state_path))
 except Exception:
     s = {}
-for slug, e in (s.get("apps") or {}).items():
-    if e.get("enabled"):
-        print(slug)
+enabled = [slug for slug, e in (s.get("apps") or {}).items() if e.get("enabled")]
+if appliance_changed == "yes":
+    out = enabled
+else:
+    out = sorted({c.get("scope", "")[len("per-app:"):]
+                  for c in p.get("changes", [])
+                  if c.get("scope", "").startswith("per-app:")})
+
+
+def is_identity(slug):
+    try:
+        with open(os.path.join(manifests_dir, slug + ".json")) as f:
+            return "identity" in (json.load(f).get("provides") or [])
+    except (OSError, ValueError):
+        return False
+
+
+out = [x for x in out if x]
+print("\n".join(sorted(out, key=lambda slug: (not is_identity(slug), slug))))
 PYEOF
 )"
-  else
-    slugs="$(python3 - "$payload_file" <<'PYEOF'
-import json, sys
-p = json.load(open(sys.argv[1]))
-out = []
-for c in p.get("changes", []):
-    if c.get("key") == "VIBE_APP_SUBDOMAIN":
-        sc = c.get("scope", "")
-        if sc.startswith("per-app:"):
-            out.append(sc[len("per-app:"):])
-print("\n".join(sorted(set(out))))
-PYEOF
-)"
-  fi
 
   local rc=0 slug _rr_manifest _rr_rt
   while IFS= read -r slug; do
@@ -465,6 +508,26 @@ PYEOF
       rc=1
     fi
   done <<<"$slugs"
+
+  # An appliance-wide change (tag, apex ownership, an infra host label)
+  # moves hosts no app owns, and there may be no enabled app to carry the
+  # Caddy re-render — so render + reload once here, after the apps.
+  if [[ "$appliance_changed" == "yes" ]]; then
+    log_step "routing-reconcile: re-rendering Caddyfile + reloading Caddy"
+    if ! ( # shellcheck source=/dev/null
+           . "${APPLIANCE_DIR}/lib/state.sh"
+           # shellcheck source=/dev/null
+           . "${APPLIANCE_DIR}/lib/render-caddyfile.sh"
+           render_caddyfile && reload_caddyfile ) >>"$VIBE_LOG_FILE" 2>&1; then
+      log_warn "routing-reconcile: Caddyfile re-render or reload failed; the previous routing is still being served" \
+        "diagnose:sudo tail -50 $VIBE_LOG_FILE" \
+        "fix:sudo bash ${APPLIANCE_DIR}/bootstrap.sh"
+      rc=1
+    fi
+    # Cockpit's allowed Origins live in /etc/cockpit on the HOST, which
+    # this job (run from the console container) cannot rewrite.
+    log_info "routing-reconcile: if Cockpit's hostname changed, refresh its allowed origins on the host: sudo bash ${APPLIANCE_DIR}/bootstrap.sh"
+  fi
 
   # Re-provision the tunnel so ingress rules + CNAMEs match the new
   # routing. Only when it's actually on — cloudflared-up.sh would bail

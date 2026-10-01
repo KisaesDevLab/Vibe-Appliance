@@ -53,6 +53,20 @@
     ],
     "optional": [
       {
+        "name": "VIBE_APP_SUBDOMAIN",
+        "doc":  "Operator override for this app's host label. Empty = the built-in default (airouter), with the appliance Hostname tag applied. Consumed by the appliance routing (Caddy vhost + Cloudflare Tunnel CNAME/ingress); because this app is rootServedOnly it is served at its own subdomain in BOTH routing modes. Single DNS label — lowercase letters, digits, dashes, no dots.",
+        "ui": {
+          "tier":        1,
+          "category":    "Network",
+          "label":       "Subdomain",
+          "helpText":    "The <subdomain> in <subdomain>.<your-domain> for the AI Router console. Leave blank for the default (airouter, plus the hostname tag if one is set). Lowercase letters, digits, and dashes; no dots. Saving re-renders routing and re-provisions the Cloudflare Tunnel; the app briefly restarts.",
+          "input":       "text",
+          "appliance":   "per-app",
+          "validate":    "regex:^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)?$",
+          "postSaveJob": "routing-reconcile"
+        }
+      },
+      {
         "name": "ROUTER_ADMIN_EMAIL",
         "value": "admin@appliance.local",
         "doc": "Login for the router's admin console. Set this BEFORE first enable if you want a real address — the bootstrap that creates the admin runs exactly once (state.apps.<slug>.seeded gates it), so changing this later creates nothing and the original login stays. To adopt a new address afterwards, add the admin from inside the router's console.",

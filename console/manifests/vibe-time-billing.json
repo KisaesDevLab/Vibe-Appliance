@@ -122,6 +122,20 @@
     ],
     "optional": [
       {
+        "name": "VIBE_APP_SUBDOMAIN_PORTAL",
+        "doc":  "Operator override for the client portal's host label (the 'portal' entry in subdomains[]). Empty = the built-in default (portal), with the appliance Hostname tag applied. The key name is derived from the surface name: VIBE_APP_SUBDOMAIN_<NAME>. Consumed by the appliance routing in both routing modes, and rendered into PORTAL_BASE_URL so portal and payment links carry the new host. Single DNS label — lowercase letters, digits, dashes, no dots.",
+        "ui": {
+          "tier":        1,
+          "category":    "Network",
+          "label":       "Client portal subdomain",
+          "helpText":    "The <subdomain> in <subdomain>.<your-domain> that clients use for the portal. Leave blank for the default (portal, plus the hostname tag if one is set). Lowercase letters, digits, and dashes; no dots. Saving re-renders routing and re-provisions the Cloudflare Tunnel; the app briefly restarts. Links already sent to clients keep the old host and stop working.",
+          "input":       "text",
+          "appliance":   "per-app",
+          "validate":    "regex:^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)?$",
+          "postSaveJob": "routing-reconcile"
+        }
+      },
+      {
         "name": "VIBE_APP_SUBDOMAIN",
         "doc":  "Operator override for this app's subdomain label. Empty = the manifest default (practice). Consumed by the appliance routing (Caddy vhost + Cloudflare Tunnel CNAME/ingress); because this app is rootServedOnly it is served at its own subdomain in BOTH routing modes. Single DNS label — lowercase letters, digits, dashes, no dots.",
         "ui": {

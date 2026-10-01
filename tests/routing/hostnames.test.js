@@ -276,6 +276,76 @@ test('check-label and check-tag exit non-zero with a reason', () => {
   assert.equal(ok('check-tag', 'office.2'), 1);
 });
 
+// --- the settings that move hostnames are declared, not hardcoded ------
+
+const MANIFESTS_DIR = path.join(REPO, 'console', 'manifests');
+const shipped = fs.readdirSync(MANIFESTS_DIR)
+  .filter((f) => f.endsWith('.json'))
+  .map((f) => ({ file: f, data: JSON.parse(fs.readFileSync(path.join(MANIFESTS_DIR, f), 'utf8')) }));
+const fieldsOf = (data) => [
+  ...(data.settings || []),
+  ...((data.env || {}).required || []),
+  ...((data.env || {}).optional || []),
+];
+const reconciles = (data, key) => {
+  const f = fieldsOf(data).find((x) => x && x.name === key);
+  return !!f && (f.ui || {}).postSaveJob === 'routing-reconcile';
+};
+
+test('every appliance-wide host setting triggers the routing reconcile', () => {
+  const appliance = shipped.find((m) => m.file === '_appliance.json').data;
+  for (const key of ['DOMAIN_ROUTING_MODE', 'HOST_TAG', 'APEX_DOMAIN_OWNED',
+    'INFRA_SUBDOMAIN_COCKPIT', 'INFRA_SUBDOMAIN_PORTAINER', 'INFRA_SUBDOMAIN_BACKUP']) {
+    assert.ok(reconciles(appliance, key), `_appliance.json: ${key} must declare postSaveJob routing-reconcile`);
+  }
+});
+
+test('every hostname an app can be served at has an operator override setting', () => {
+  // Manifest-driven: an app that gains an extra surface declares its own
+  // VIBE_APP_SUBDOMAIN_<NAME> field; no script lists surfaces by slug.
+  const keyFor = (name) => 'VIBE_APP_SUBDOMAIN_' + name.toUpperCase().replace(/[^A-Z0-9]/g, '_');
+  for (const { file, data } of shipped) {
+    if (file.startsWith('_') || (data.runtime || 'appliance') !== 'appliance') continue;
+    const subs = data.subdomains || [];
+    const noSurface = data.userFacing === false && subs.length === 0;
+    if (!noSurface) {
+      assert.ok(reconciles(data, 'VIBE_APP_SUBDOMAIN'),
+        `${file}: declares a public host but no VIBE_APP_SUBDOMAIN setting with postSaveJob routing-reconcile`);
+    }
+    if (data.userFacing === false) continue;
+    for (const sd of subs) {
+      if (!sd.name || sd.name === data.subdomain || sd.internal === true) continue;
+      assert.ok(reconciles(data, keyFor(sd.name)),
+        `${file}: extra surface "${sd.name}" needs a ${keyFor(sd.name)} setting with postSaveJob routing-reconcile`);
+    }
+  }
+});
+
+test('settings-save picks the reconcile job from the manifest, for any declared key', () => {
+  const src = fs.readFileSync(path.join(REPO, 'lib', 'settings-save.sh'), 'utf8');
+  const blocks = [...src.matchAll(/<<'PYEOF'[^\n]*\n([\s\S]*?)\nPYEOF/g)];
+  const m = blocks.find((b) => b[1].includes('def declared_job'));
+  assert.ok(m, 'job-detection block not found in lib/settings-save.sh');
+  // The block must not name routing keys itself.
+  assert.doesNotMatch(m[1], /"VIBE_APP_SUBDOMAIN" in keys|"DOMAIN_ROUTING_MODE" in keys/);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vibe-jobs-'));
+  const py = path.join(dir, 'jobs.py');
+  fs.writeFileSync(py, m[1] + '\n');
+  const jobs = (changes) => {
+    const payload = path.join(dir, 'payload.json');
+    fs.writeFileSync(payload, JSON.stringify({ changes }));
+    return execFileSync('python3', [py, payload, MANIFESTS_DIR], { encoding: 'utf8' })
+      .split(/\r?\n/).filter(Boolean);
+  };
+  assert.deepEqual(jobs([{ scope: 'appliance', key: 'HOST_TAG', value: 'office2' }]), ['routing-reconcile']);
+  assert.deepEqual(jobs([{ scope: 'per-app:vibe-connect', key: 'VIBE_APP_SUBDOMAIN_CLIENT', value: 'clients' }]),
+    ['routing-reconcile']);
+  assert.deepEqual(jobs([{ scope: 'per-app:vibe-tb', key: 'VIBE_APP_SUBDOMAIN', value: 'books' }]),
+    ['routing-reconcile']);
+  assert.deepEqual(jobs([{ scope: 'appliance', key: 'TZ', value: 'America/Chicago' }]), [],
+    'an unrelated setting triggers no reconcile');
+});
+
 // --- one label rule, several copies -----------------------------------
 
 test('every copy of the DNS-label pattern accepts and rejects the same labels', () => {

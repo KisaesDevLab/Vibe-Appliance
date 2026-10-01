@@ -75,6 +75,20 @@
     ],
     "optional": [
       {
+        "name": "VIBE_APP_SUBDOMAIN",
+        "doc":  "Operator override for the sign-in service's host label. Empty = the built-in default (auth), with the appliance Hostname tag applied. Consumed by the appliance routing (Caddy vhost + Cloudflare Tunnel CNAME/ingress) when DOMAIN_ROUTING_MODE=subdomain-per-app; ignored in single-host mode. Needs broker 1.0.9 or newer: older brokers assume the label is exactly 'auth'. Single DNS label — lowercase letters, digits, dashes, no dots.",
+        "ui": {
+          "tier":        1,
+          "category":    "Network",
+          "label":       "Subdomain",
+          "helpText":    "The <subdomain> in <subdomain>.<your-domain> for the sign-in service when routing is 'subdomain per app'. Leave blank for the default (auth, plus the hostname tag if one is set). Lowercase letters, digits, and dashes; no dots. Saving re-renders routing, re-registers every app's sign-in address and re-provisions the Cloudflare Tunnel; apps briefly restart.",
+          "input":       "text",
+          "appliance":   "per-app",
+          "validate":    "regex:^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)?$",
+          "postSaveJob": "routing-reconcile"
+        }
+      },
+      {
         "name": "VIBE_AUTH_BRAND_NAME",
         "doc": "Firm name shown on the sign-in page and as the SSO button label in products. The setup wizard sets it too.",
         "ui": {

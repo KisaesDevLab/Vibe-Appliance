@@ -19,7 +19,7 @@ const fs          = require('fs');
 const path        = require('path');
 const crypto      = require('crypto');
 const http        = require('http');
-const { spawn, execFileSync } = require('child_process');
+const { spawn, spawnSync, execFileSync } = require('child_process');
 const Docker      = require('dockerode');
 const Database    = require('better-sqlite3');
 // Landing-page card ordering. Required at the top (not beside its
@@ -4076,6 +4076,21 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, globa
     if (tunnelSub && !DNS_LABEL_RE.test(tunnelSub)) {
       return res.status(400).json({ ok: false, error: 'tunnel_subdomain must be a single DNS label (a-z, 0-9, "-"; no dots)' });
     }
+    // The main host label must not land on another host's name (an app,
+    // an infra host, the reserved www). Same pre-flight the settings
+    // save runs; a resolver that cannot run does not block the switch.
+    if (tunnelSub) {
+      const check = spawnSync('python3', [VIBE_HOSTS_SCRIPT, '--state', STATE_PATH,
+        '--env-dir', ENV_DIR, '--manifests', MANIFESTS_DIR, 'validate',
+        '--set', `tunnel_subdomain=${tunnelSub}`], { encoding: 'utf8', timeout: 10000 });
+      if (check.status === 1) {
+        return res.status(400).json({
+          ok: false,
+          error: String(check.stderr || '').split('\n').map((l) => l.trim()).filter(Boolean).join(' | ')
+            + ' — nothing was changed.',
+        });
+      }
+    }
   }
   if (mode === 'tailscale') {
     // Prereq: tailnet must be Running. Mirror the status endpoint's
@@ -4824,6 +4839,9 @@ function _fieldDescriptor(envEntry, providingSlug) {
     disabledImpacts:     ui.disabledImpacts || [],
     restartRequired:     ui.restartRequired !== false,
     healthCheckTimeout:  ui.healthCheckTimeout || null,
+    // Background job lib/settings-save.sh runs after the write. The save
+    // route reads it to pre-flight hostname changes ('routing-reconcile').
+    postSaveJob:         ui.postSaveJob || null,
     providingSlug,
     providingDisplayName,
   };
@@ -5132,6 +5150,46 @@ app.post('/api/v1/settings/save', requireAdmin, testRateLimit, globalOp('setting
           ' — nothing was saved. Correct the field(s) and save again.',
         problems,
       });
+    }
+  }
+
+  // Pre-flight a hostname change as a whole. A field's own `validate`
+  // rule sees one label at a time; it cannot tell that two hosts now
+  // share a name, that a label is reserved, or that the hostname tag
+  // pushes a label past 63 characters. lib/vibe_hosts.py — the resolver
+  // Caddy and the tunnel build from — checks the naming this save would
+  // produce. A failure writes nothing. If the resolver cannot run at all
+  // the save proceeds: the renderer refuses duplicate hosts on its own,
+  // and a broken checker must not block every settings save.
+  {
+    const routing = body.changes.filter((c) => {
+      const slug = c.scope === 'appliance' ? null : c.scope.split(':')[1];
+      const field = SETTINGS_REGISTRY.allKeys.get(slug ? slug + '::' + c.key : c.key);
+      return field && field.postSaveJob === 'routing-reconcile';
+    });
+    if (routing.length) {
+      const args = [VIBE_HOSTS_SCRIPT, '--state', STATE_PATH, '--env-dir', ENV_DIR,
+                    '--manifests', MANIFESTS_DIR, 'validate'];
+      for (const c of routing) {
+        const value = (c.op || 'set') === 'revert' || c.value == null ? '' : String(c.value);
+        const slug = c.scope === 'appliance' ? null : c.scope.split(':')[1];
+        args.push('--set', `${slug ? slug + ':' : ''}${c.key}=${value}`);
+      }
+      const check = spawnSync('python3', args, { encoding: 'utf8', timeout: 10000 });
+      if (check.status === 1) {
+        const lines = String(check.stderr || '').split('\n').map((l) => l.trim()).filter(Boolean);
+        return res.status(400).json({
+          error: 'invalid hostnames',
+          detail: lines.join(' | ') + ' — nothing was saved. Correct the field(s) and save again.',
+          problems: lines.map((message) => ({ message })),
+        });
+      }
+      if (check.status !== 0) {
+        log('warn', 'hostname pre-flight could not run; saving without it', {
+          err: (check.error && check.error.message) || trim(String(check.stderr || ''), 256),
+          diagnose: `python3 ${VIBE_HOSTS_SCRIPT} validate`,
+        });
+      }
     }
   }
 

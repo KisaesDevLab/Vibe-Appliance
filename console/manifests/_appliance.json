@@ -222,6 +222,85 @@
       }
     },
     {
+      "name":  "HOST_TAG",
+      "value": "",
+      "doc":   "Appliance-wide hostname tag for running more than one appliance under one domain. When set, every built-in host label becomes <label>-<tag>: vibe-office2, tb-office2, client-office2, cockpit-office2. Empty (the default) leaves every hostname exactly as it was. A label the operator set explicitly (the main host label, an infra host label below, or an app's own Subdomain setting) is used as written and never tagged. Resolved by lib/vibe_hosts.py, which lib/render-caddyfile.sh, infra/cloudflared-up.sh, lib/enable-app.sh, doctor.sh and the console all read. Changing it triggers the routing-reconcile post-save job.",
+      "ui": {
+        "tier":         1,
+        "category":     "Network",
+        "label":        "Hostname tag",
+        "helpText":     "Only needed when a second appliance shares this domain. Give each appliance its own short tag (e.g. office2): its hosts become vibe-office2.example.com, tb-office2.example.com, cockpit-office2.example.com and so stop colliding with the other appliance's. Leave blank on a single appliance. Lowercase letters, digits and dashes, up to 32 characters. Saving renames this appliance's hostnames: enabled apps briefly restart, the Cloudflare Tunnel is re-provisioned, and old bookmarks stop working. Clear the field and save to go back.",
+        "input":        "text",
+        "appliance":    "shared",
+        "validate":     "regex:^([a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?)?$",
+        "postSaveJob":  "routing-reconcile"
+      }
+    },
+    {
+      "name":  "APEX_DOMAIN_OWNED",
+      "value": "true",
+      "doc":   "Whether this appliance serves the bare domain and www.<domain> (both redirect to the main host). Only one appliance per domain can. 'false' drops the apex/www site block from the Caddyfile and the '@' and 'www' records from the DDNS host list. Blank counts as 'true' so pre-existing installs keep their apex. Changing it triggers the routing-reconcile post-save job.",
+      "ui": {
+        "tier":         1,
+        "category":     "Network",
+        "label":        "This appliance owns the bare domain",
+        "helpText":     "Yes: example.com and www.example.com redirect to this appliance. Choose No on every appliance after the first one under the same domain, so they do not fight over those two names.",
+        "input":        "dropdown",
+        "appliance":    "shared",
+        "validate":     "enum",
+        "options": [
+          { "value": "true",  "label": "Yes (default)" },
+          { "value": "false", "label": "No — another appliance owns it" }
+        ],
+        "postSaveJob":  "routing-reconcile"
+      }
+    },
+    {
+      "name":  "INFRA_SUBDOMAIN_COCKPIT",
+      "value": "",
+      "doc":   "Host label for Cockpit (host administration) in domain mode. Empty = the built-in 'cockpit', with the Hostname tag applied. A value set here is used as written. Never published through the Cloudflare Tunnel: reach it over the LAN or Tailscale. After changing it, re-run bootstrap.sh on the host so Cockpit's allowed origins follow.",
+      "ui": {
+        "tier":         1,
+        "category":     "Network",
+        "label":        "Cockpit host label",
+        "helpText":     "The <label> in <label>.example.com for Cockpit. Leave blank for the default (cockpit, plus the hostname tag if one is set). One DNS label: lowercase letters, digits and dashes. After saving, run 'sudo bash /opt/vibe/appliance/bootstrap.sh' on the host so Cockpit accepts the new name.",
+        "input":        "text",
+        "appliance":    "shared",
+        "validate":     "regex:^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)?$",
+        "postSaveJob":  "routing-reconcile"
+      }
+    },
+    {
+      "name":  "INFRA_SUBDOMAIN_PORTAINER",
+      "value": "",
+      "doc":   "Host label for Portainer (containers) in domain mode. Empty = the built-in 'portainer', with the Hostname tag applied. A value set here is used as written. Never published through the Cloudflare Tunnel.",
+      "ui": {
+        "tier":         1,
+        "category":     "Network",
+        "label":        "Portainer host label",
+        "helpText":     "The <label> in <label>.example.com for Portainer. Leave blank for the default (portainer, plus the hostname tag if one is set). One DNS label: lowercase letters, digits and dashes.",
+        "input":        "text",
+        "appliance":    "shared",
+        "validate":     "regex:^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)?$",
+        "postSaveJob":  "routing-reconcile"
+      }
+    },
+    {
+      "name":  "INFRA_SUBDOMAIN_BACKUP",
+      "value": "",
+      "doc":   "Host label for Duplicati (backups) in domain mode. Empty = the built-in 'backup', with the Hostname tag applied. A value set here is used as written. Never published through the Cloudflare Tunnel.",
+      "ui": {
+        "tier":         1,
+        "category":     "Network",
+        "label":        "Backup host label",
+        "helpText":     "The <label> in <label>.example.com for Duplicati. Leave blank for the default (backup, plus the hostname tag if one is set). One DNS label: lowercase letters, digits and dashes.",
+        "input":        "text",
+        "appliance":    "shared",
+        "validate":     "regex:^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)?$",
+        "postSaveJob":  "routing-reconcile"
+      }
+    },
+    {
       "name":  "DDNS_PROVIDER",
       "value": "none",
       "doc":   "Dynamic-DNS provider for non-static-IP installs. When set, the console runs a background updater that pushes the appliance's current public IP to the chosen provider on a regular cadence so A records stay accurate across ISP IP rotations.",

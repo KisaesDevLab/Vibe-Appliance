@@ -74,6 +74,15 @@ CONFIG_TUNNEL_SUBDOMAIN_EXPLICIT="false"
 # that downgraded POST→GET (RFC 7231 §6.4.3). See commits 3a6ffee /
 # 4907588 for the history.
 CONFIG_TUNNEL_SUBDOMAIN="vibe"
+# Hostname tag and apex ownership — for running more than one appliance
+# under one domain. Both live in /opt/vibe/env/appliance.env (HOST_TAG,
+# APEX_DOMAIN_OWNED) so the console's Network settings edit the same
+# values; a flag here only writes when it is passed, so a bare re-run
+# keeps whatever is already set. See lib/vibe_hosts.py for the naming
+# rules.
+CONFIG_HOST_TAG=""
+CONFIG_HOST_TAG_EXPLICIT="false"
+CONFIG_APEX_OWNED=""
 CONFIG_TAILSCALE="false"
 CONFIG_TAILSCALE_AUTHKEY=""
 # Tracks whether the operator explicitly opted into Tailscale this
@@ -132,6 +141,15 @@ USAGE
 FLAGS
   --mode {domain,lan,tailscale}   Deployment mode. Default: lan.
   --domain DOMAIN                 Required for --mode domain.
+  --host-tag TAG                  Only for running more than one appliance under
+                                  one domain. Every built-in hostname becomes
+                                  <label>-TAG (vibe-TAG, tb-TAG, cockpit-TAG) so
+                                  the appliances do not collide. Labels you set
+                                  yourself are never tagged. Persisted; pass
+                                  --host-tag '' to clear it.
+  --no-apex | --apex              Whether this appliance serves the bare DOMAIN
+                                  and www.DOMAIN (default: yes). Use --no-apex on
+                                  every appliance after the first under a domain.
   --tunnel-subdomain SUB          Single subdomain label that fronts every app
                                   in --mode domain. Default: vibe. The full
                                   host is ${SUB}.${DOMAIN}; apps live at
@@ -195,6 +213,10 @@ parse_flags() {
       --domain=*)        CONFIG_DOMAIN="${1#*=}"; CONFIG_DOMAIN_EXPLICIT="true"; shift ;;
       --tunnel-subdomain)   CONFIG_TUNNEL_SUBDOMAIN="${2:?--tunnel-subdomain requires a value}"; CONFIG_TUNNEL_SUBDOMAIN_EXPLICIT="true"; shift 2 ;;
       --tunnel-subdomain=*) CONFIG_TUNNEL_SUBDOMAIN="${1#*=}"; CONFIG_TUNNEL_SUBDOMAIN_EXPLICIT="true"; shift ;;
+      --host-tag)        CONFIG_HOST_TAG="${2?--host-tag requires a value (use --host-tag '' to clear it)}"; CONFIG_HOST_TAG_EXPLICIT="true"; shift 2 ;;
+      --host-tag=*)      CONFIG_HOST_TAG="${1#*=}"; CONFIG_HOST_TAG_EXPLICIT="true"; shift ;;
+      --no-apex)         CONFIG_APEX_OWNED="false"; shift ;;
+      --apex)            CONFIG_APEX_OWNED="true"; shift ;;
       --email)           CONFIG_EMAIL="${2:?--email requires a value}"; CONFIG_EMAIL_EXPLICIT="true"; shift 2 ;;
       --email=*)         CONFIG_EMAIL="${1#*=}"; CONFIG_EMAIL_EXPLICIT="true"; shift ;;
       --tailscale)       CONFIG_TAILSCALE="true"; CONFIG_TAILSCALE_EXPLICIT="true"; shift ;;
@@ -239,6 +261,13 @@ parse_flags() {
   fi
   if ! [[ "$CONFIG_TUNNEL_SUBDOMAIN" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
     _pre_die "--tunnel-subdomain must be a single DNS label (a-z, 0-9, '-' allowed; no dots, no underscores; got '$CONFIG_TUNNEL_SUBDOMAIN')"
+  fi
+
+  # Validate the hostname tag early (the repo may not be cloned yet, so
+  # this is a plain regex; lib/vibe_hosts.py re-checks the full naming
+  # once it is available). Empty is valid: it clears the tag.
+  if [[ -n "$CONFIG_HOST_TAG" ]] && ! [[ "$CONFIG_HOST_TAG" =~ ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$ ]]; then
+    _pre_die "--host-tag must be 1-32 characters of a-z, 0-9 and '-', not starting or ending with '-' (got '$CONFIG_HOST_TAG'). Example: --host-tag office2"
   fi
 }
 
@@ -646,6 +675,52 @@ PYEOF
         "${APPLIANCE_DIR}/env-templates/appliance.env.tmpl" \
         "$CONFIG_RESET_ENV"; then
     log_warn "could not render appliance.env; continuing without it"
+  fi
+
+  # Hostname tag / apex ownership (--host-tag, --no-apex, --apex). Only
+  # written when the flag was passed; otherwise appliance.env keeps what
+  # a previous run or the console's Network settings put there. The
+  # hostnames then follow in this same run: phase_caddy renders the main
+  # and infra hosts, and phase_apps re-enables every enabled app, which
+  # re-renders its env file for the new names.
+  local _naming_changed="false"
+  if [[ "$CONFIG_HOST_TAG_EXPLICIT" == "true" ]]; then
+    if [[ "$(secrets_get_appliance HOST_TAG 2>/dev/null || true)" != "$CONFIG_HOST_TAG" ]]; then
+      _naming_changed="true"
+    fi
+    secrets_set_kv_appliance HOST_TAG "$CONFIG_HOST_TAG"
+    log_info "hostname tag persisted to appliance.env" host_tag="${CONFIG_HOST_TAG:-<none>}"
+  fi
+  if [[ -n "$CONFIG_APEX_OWNED" ]]; then
+    secrets_set_kv_appliance APEX_DOMAIN_OWNED "$CONFIG_APEX_OWNED"
+    log_info "apex ownership persisted to appliance.env" apex_domain_owned="$CONFIG_APEX_OWNED"
+  fi
+
+  # Pre-flight the resulting hostnames before anything is rendered: a
+  # label that is malformed, reserved, too long once tagged, or claimed
+  # twice would otherwise surface later as a Caddyfile that fails to
+  # validate, with no hint which setting to change.
+  local _naming_errors=""
+  if ! _naming_errors="$(python3 "${APPLIANCE_DIR}/lib/vibe_hosts.py" validate 2>&1)"; then
+    die "the appliance's hostnames are not valid:
+${_naming_errors}
+
+  Common causes: a --host-tag or --tunnel-subdomain that makes two hosts share a name, or a per-app Subdomain setting that collides with another host.
+  Diagnose: python3 ${APPLIANCE_DIR}/lib/vibe_hosts.py validate ; python3 ${APPLIANCE_DIR}/lib/vibe_hosts.py list caddy
+  Fix: change the setting named above (flags: --host-tag, --tunnel-subdomain; per-host labels: Configuration → Network, or /opt/vibe/env/appliance.env and /opt/vibe/env/<slug>.env)." \
+      "Then re-run: sudo bash ${APPLIANCE_DIR}/bootstrap.sh. Nothing has been rendered yet."
+  fi
+
+  if [[ "$_naming_changed" == "true" && "$(secrets_get_appliance CLOUDFLARE_TUNNEL_ENABLED 2>/dev/null || true)" == "true" ]]; then
+    log_warn "the hostname tag changed while the Cloudflare Tunnel is on — the tunnel still routes the old names until it is re-provisioned" \
+      "fix:after this run finishes: sudo bash ${APPLIANCE_DIR}/infra/cloudflared-up.sh"
+  fi
+  # Two appliances with Namecheap DDNS would both keep updating the apex.
+  if [[ -n "$(secrets_get_appliance HOST_TAG 2>/dev/null || true)" \
+        && "$(secrets_get_appliance APEX_DOMAIN_OWNED 2>/dev/null || true)" != "false" \
+        && "$CONFIG_MODE" == "domain" ]]; then
+    log_warn "a hostname tag is set but this appliance still claims the bare domain and www — if another appliance under ${CONFIG_DOMAIN} also does, they will fight over those names" \
+      "fix:on every appliance after the first: sudo bash ${APPLIANCE_DIR}/bootstrap.sh --no-apex"
   fi
 
   # Persist CLOUDFLARE_API_TOKEN if provided. Caddy reads it from
