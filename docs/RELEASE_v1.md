@@ -171,9 +171,9 @@ the appliance repo if any of them blocks your install.
 
 ### From the Phase 7 update work
 
-- **GHCR private repos aren't supported by `--check`.** Anonymous
-  pull token only. Apps in private repos return `check_failed`;
-  manual `update <slug>` against a tag still works.
+- ~~**GHCR private repos aren't supported by `--check`.**~~ Superseded
+  2026-10-01: private images are pulled and update-checked with the
+  GitHub token saved in Configuration → System → GitHub access.
 - **Rollback is single-step.** Only the immediate prior digest is
   saved as `vibe-rollback-<slug>`. Older versions can be redeployed
   via `docker pull <image>:<old-tag>` + `docker tag … :latest`, but

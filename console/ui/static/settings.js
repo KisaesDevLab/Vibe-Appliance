@@ -183,6 +183,150 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
   // not on every settings tab.
   const TAB_FOR_MAINTENANCE = 'System';
 
+  // GitHub access — the read-only token that lets this appliance pull
+  // private app images from ghcr.io. The token is entered here, verified
+  // by the server against GitHub before it is stored, and never shown
+  // again: the panel only reports whose token it is and what it can pull.
+  // Server: /api/v1/admin/github-access (console/server.js).
+  const GH_STATUS_TEXT = {
+    'not-set':       ['No token saved. Public apps install normally; private apps cannot be installed or updated.', ''],
+    'working':       ['Working — every app image can be pulled.', 'var(--good)'],
+    'partial':       ['Working, but this token cannot reach some images (listed below). Ask your vendor to grant access to them.', 'var(--warn)'],
+    'rejected':      ['GitHub rejects the saved token — it was revoked or has expired. Private apps cannot be installed or updated until you save a new one.', 'var(--bad)'],
+    'missing-scope': ['The saved token cannot read packages. Save one with the read:packages permission.', 'var(--bad)'],
+    'unknown':       ['Could not reach GitHub to check the token. Try Test again in a minute.', 'var(--warn)'],
+  };
+  const GH_IMAGE_TEXT = {
+    'public':      ['public', 'var(--text-muted)'],
+    'private-ok':  ['✓ private, pullable with your token', 'var(--good)'],
+    'needs-token': ['needs a GitHub token (private, or not published)', 'var(--warn)'],
+    'no-access':   ['not available to this token (no access, or not published)', 'var(--bad)'],
+    'unknown':     ['could not check', 'var(--text-muted)'],
+  };
+
+  function renderGithubAccessSection(host) {
+    const section = el('section', {
+      class: 'maintenance',
+      'aria-labelledby': 'gh-access-h',
+      'data-gh-access': '1',
+    });
+    section.appendChild(el('h2', { id: 'gh-access-h' }, ['GitHub access (private app images)']));
+    section.appendChild(el('p', { class: 'help' }, [
+      'Some Vibe apps are published as private images. Paste the read-only GitHub token your vendor sent you ',
+      'and click Save & verify. The token is checked with GitHub before it is stored, is never shown again, ',
+      'and is not included in backups — after restoring a backup, paste it again.',
+    ]));
+    const body = el('div', { 'data-gh-body': '1' }, [el('p', { class: 'help' }, ['Loading…'])]);
+    section.appendChild(body);
+    host.appendChild(section);
+    loadGithubAccess(section);
+  }
+
+  async function githubAccessCall(method, url, payload) {
+    const r = await fetch(url, {
+      method, credentials: 'same-origin',
+      headers: payload ? { 'Content-Type': 'application/json' } : {},
+      body: payload ? JSON.stringify(payload) : undefined,
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data.ok === false) throw new Error(data.error || data.detail || ('HTTP ' + r.status));
+    return data;
+  }
+
+  async function loadGithubAccess(section, data, notice) {
+    const body = section.querySelector('[data-gh-body]');
+    if (!body) return;
+    if (!data) {
+      try { data = await githubAccessCall('GET', '/api/v1/admin/github-access'); }
+      catch (err) {
+        body.innerHTML = '';
+        body.appendChild(el('p', { class: 'help', style: 'color:var(--bad);' }, ['✗ Could not load GitHub access: ' + err.message]));
+        return;
+      }
+    }
+    body.innerHTML = '';
+    if (notice) body.appendChild(el('p', { class: 'help', style: 'color:' + notice[1] + ';font-weight:600;' }, [notice[0]]));
+
+    const [text, color] = GH_STATUS_TEXT[data.status] || GH_STATUS_TEXT.unknown;
+    const status = el('p', { class: 'help', style: color ? 'color:' + color + ';' : '' }, [text]);
+    body.appendChild(status);
+    const facts = [];
+    if (data.login) facts.push('Token belongs to GitHub user ' + data.login);
+    if (data.saved_at) facts.push('saved ' + new Date(data.saved_at).toLocaleString());
+    if (data.checked_at) facts.push('last checked ' + new Date(data.checked_at).toLocaleString());
+    if (facts.length) body.appendChild(el('p', { class: 'help', style: 'color:var(--text-muted);' }, [facts.join(' · ')]));
+    if (data.check_error) body.appendChild(el('p', { class: 'help', style: 'color:var(--warn);' }, ['Last check failed: ' + data.check_error]));
+
+    // Per-image reach — only images that are not simply public, so the
+    // operator sees what matters.
+    const interesting = (data.images || []).filter((i) => i.access !== 'public');
+    if (interesting.length) {
+      const ul = el('ul', { style: 'margin:0.3rem 0 0.5rem;padding-left:1.2rem;' });
+      for (const i of interesting) {
+        const [t, c] = GH_IMAGE_TEXT[i.access] || GH_IMAGE_TEXT.unknown;
+        const apps = (i.apps || []).map((a) => a.displayName).join(', ');
+        ul.appendChild(el('li', { style: 'padding:0.1rem 0;' }, [
+          el('span', { class: 'mono' }, [i.image]),
+          el('span', { class: 'help', style: 'color:' + c + ';' }, [' — ' + t + (apps ? ' (' + apps + ')' : '')]),
+        ]));
+      }
+      body.appendChild(ul);
+    }
+
+    // Entry form.
+    const form = el('div', { style: 'display:grid;gap:0.3rem;max-width:32rem;margin-top:0.4rem;' });
+    form.appendChild(el('label', { for: 'gh-token', style: 'font-weight:600;font-size:0.9em;' },
+      [data.status === 'not-set' ? 'GitHub token' : 'Replace the token']));
+    const input = el('input', {
+      id: 'gh-token', type: 'password', autocomplete: 'off', spellcheck: 'false',
+      placeholder: 'ghp_…',
+      style: 'padding:0.4rem 0.6rem;border:1px solid var(--border);border-radius:4px;background:var(--surface);font:inherit;',
+    });
+    form.appendChild(input);
+    body.appendChild(form);
+
+    const cta = el('div', { class: 'cta-row', style: 'gap:0.5rem;align-items:center;flex-wrap:wrap;margin-top:0.5rem;' });
+    const busy = (btn, label) => { for (const b of cta.querySelectorAll('button')) b.disabled = true; btn.textContent = label; };
+    const saveBtn = el('button', { type: 'button', class: 'btn' }, ['Save & verify']);
+    saveBtn.addEventListener('click', async () => {
+      const token = input.value.trim();
+      if (!token) { input.focus(); return; }
+      busy(saveBtn, 'Verifying…');
+      try {
+        const d = await githubAccessCall('POST', '/api/v1/admin/github-access', { token });
+        input.value = '';
+        loadGithubAccess(section, d, ['✓ Token verified and saved.', 'var(--good)']);
+      } catch (err) {
+        input.value = '';
+        loadGithubAccess(section, data, ['✗ ' + err.message, 'var(--bad)']);
+      }
+    });
+    cta.appendChild(saveBtn);
+
+    if (data.status !== 'not-set') {
+      const testBtn = el('button', { type: 'button', class: 'btn btn--ghost' }, ['Test']);
+      testBtn.addEventListener('click', async () => {
+        busy(testBtn, 'Testing…');
+        try { loadGithubAccess(section, await githubAccessCall('POST', '/api/v1/admin/github-access/test')); }
+        catch (err) { loadGithubAccess(section, data, ['✗ ' + err.message, 'var(--bad)']); }
+      });
+      cta.appendChild(testBtn);
+
+      const removeBtn = el('button', { type: 'button', class: 'btn btn--ghost' }, ['Remove']);
+      removeBtn.addEventListener('click', async () => {
+        if (!window.confirm('Remove the GitHub token?\n\nApps that are already running keep running. Private apps can no longer be installed or updated until a token is saved again.')) return;
+        busy(removeBtn, 'Removing…');
+        try { loadGithubAccess(section, await githubAccessCall('DELETE', '/api/v1/admin/github-access'), ['Token removed.', 'var(--text-muted)']); }
+        catch (err) { loadGithubAccess(section, data, ['✗ ' + err.message, 'var(--bad)']); }
+      });
+      cta.appendChild(removeBtn);
+    }
+    body.appendChild(cta);
+    body.appendChild(el('p', { class: 'help', style: 'margin-top:0.4rem;' }, [
+      'Removing or revoking the token does not stop apps that are already running; it only matters the next time an app is installed or updated.',
+    ]));
+  }
+
   function renderMaintenanceSection(host) {
     const section = el('section', {
       class: 'maintenance',
@@ -1070,6 +1214,13 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
       'aria-selected': state.activeTab === 'Customer landing' ? 'true' : 'false',
       onclick: () => selectTab('Customer landing'),
     }, ['Customer landing']));
+    // A link may name the tab in the URL fragment (/admin/settings#System
+    // from an app card's "Open GitHub access").
+    if (!state.activeTab) {
+      let fromHash = '';
+      try { fromHash = decodeURIComponent((window.location.hash || '').slice(1)); } catch { /* malformed */ }
+      if (fromHash && cats.includes(fromHash)) state.activeTab = fromHash;
+    }
     if (!state.activeTab) state.activeTab = cats[0] || 'Apps';
     selectTab(state.activeTab);
   }
@@ -1150,6 +1301,7 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
     // produce a System tab for some reason, the section still renders
     // here so prune isn't unreachable.
     if (cat === TAB_FOR_MAINTENANCE) {
+      renderGithubAccessSection(panelEl);
       renderMaintenanceSection(panelEl);
     }
 

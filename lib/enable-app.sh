@@ -57,6 +57,9 @@ enable_app() {
   local slug="${1:-}"
   [[ -n "$slug" ]] || die "enable_app: slug required"
   [[ -n "${APPLIANCE_DIR:-}" ]] || die "enable_app: APPLIANCE_DIR not set"
+  # Private app images: use the stored GitHub token for every pull and
+  # `docker run` below, not only the compose ones.
+  registry_auth_env
 
   local manifest="${APPLIANCE_DIR}/console/manifests/${slug}.json"
   local env_tmpl="${APPLIANCE_DIR}/env-templates/per-app/${slug}.env.tmpl"
@@ -153,12 +156,24 @@ print((json.load(open('${manifest}')).get('runtime') or 'appliance'))
   local default_tag
   default_tag="$(_manifest_field "$manifest" 'data["image"]["defaultTag"]')"
   export APP_TAG="$default_tag"
+  # Output is captured as well as logged, so the failure can say WHY
+  # (private image without a token, revoked token, missing image, rate
+  # limit) instead of guessing.
+  local _pull_out
+  _pull_out="$(mktemp)"
   # shellcheck disable=SC2086
   if ! ( cd "$APPLIANCE_DIR" && \
-         compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" pull --include-deps $services ) >>"$VIBE_LOG_FILE" 2>&1; then
-    _state_app_set "$slug" status failed error "image pull failed"
-    die "Image pull failed for $slug. See $VIBE_LOG_FILE; common cause is a registry rate limit."
+         compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" pull --include-deps $services ) >"$_pull_out" 2>&1; then
+    cat "$_pull_out" >>"$VIBE_LOG_FILE" 2>/dev/null || true
+    local _hint
+    _hint="$(pull_failure_hint "$_pull_out")"
+    rm -f "$_pull_out"
+    _state_app_set "$slug" status failed error "image pull failed: ${_hint}"
+    die "Image pull failed for $slug: ${_hint}" \
+        "Diagnose: sudo grep -iE 'denied|unauthorized|manifest|error' $VIBE_LOG_FILE | tail -20. Then retry the enable."
   fi
+  cat "$_pull_out" >>"$VIBE_LOG_FILE" 2>/dev/null || true
+  rm -f "$_pull_out"
 
   # 3. Database (only if the manifest declares one).
   local db_name db_user db_pass

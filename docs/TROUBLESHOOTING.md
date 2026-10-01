@@ -481,15 +481,37 @@ DigitalOcean droplet.
 
 ### `Image pull failed`
 
-GHCR rate-limited the request, or the image isn't published yet.
+The message now says which of these it is:
+
+- **"the registry refused the image"** — the image is private and no
+  GitHub token is saved, the saved token was revoked or expired, the
+  token was not granted that image, or the image is not published yet.
+  GHCR gives the same answer for all four.
+- **"the image or tag does not exist"** — the app's maintainers owe a
+  published build.
+- **"rate-limiting"** — wait a few minutes and retry.
 
 **Diagnose:**
 ```
-sudo tail -100 /opt/vibe/logs/bootstrap.log
-docker pull ghcr.io/kisaesdevlab/vibe-tb-server:latest
+sudo grep -iE 'denied|unauthorized|manifest|error' /opt/vibe/logs/*.log | tail -20
+python3 /opt/vibe/appliance/lib/ghcr_access.py check | python3 -m json.tool
 ```
-**Fix:** wait 60 seconds and re-run. If the image truly doesn't exist
-yet (pre-release Vibe app), open an issue against the appliance repo.
+The second command reports whether GitHub accepts the saved token and,
+for every app image, whether it is public, pullable with the token,
+needs a token, or is not available to it. It never prints the token.
+
+**Fix:** open **Configuration → System → GitHub access**. With no token
+saved, paste the one your vendor sent. With a token saved, click
+**Test**: "rejected" means ask the vendor for a new one; an image marked
+"not available to this token" means ask the vendor to grant access (or
+it is not published yet). Then retry the enable or update.
+
+### Symptom: app card says "needs GitHub access" / "GitHub token rejected"
+
+Same cause and fix as above: the card's image is private. Apps that are
+already running are not affected by a missing or revoked token; only
+the next install or update is. After a restore from backup the token
+has to be pasted again (it is deliberately kept out of backups).
 
 ### `Console health-check timed out`
 

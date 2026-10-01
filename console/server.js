@@ -385,53 +385,107 @@ log('info', 'appliance settings loaded', { count: APPLIANCE_SETTINGS.length });
 
 // ----- GHCR availability cache -----------------------------------------
 //
-// Many operators will see app cards for upstream Vibe images that
-// haven't been built and pushed to GHCR yet. Clicking Enable on those
-// fails at the docker pull step with a generic "Image pull failed"
-// message. Pre-checking saves the round trip and lets the UI disable
-// the button with a clear "image not published" badge.
+// Can each app's images be pulled? Answered by lib/ghcr_access.py for
+// every image.server / image.client / image.extras[] the manifests name on
+// ghcr.io: anonymously ("public"), only with the GitHub token the operator
+// saved in Configuration → System → GitHub access ("private-ok"), not at
+// all because no token is saved ("needs-token"), or not with the saved
+// token ("no-access"). GHCR answers "doesn't exist" and "not yours" with
+// the same denial, so the last two cover an unpublished image as well.
+// The report also says whether GitHub accepts the token at all.
 //
-// Approach: anonymous GHCR token endpoint returns a token if the repo
-// is publicly pullable, errors with code:DENIED otherwise (covers both
-// "doesn't exist" and "private" — for the appliance's purposes both
-// mean "operator can't pull anonymously, so toggle will fail").
+// The token itself never passes through the console's memory: the helper
+// reads it from /opt/vibe/docker/config.json (lib/registry-auth.sh writes
+// it) or, while a new token is being verified, from a mode-600 payload.
 //
-// 10-minute TTL. Pre-warmed on console startup + refreshed in
-// background. /api/v1/apps reads the cached value (zero added latency
-// on the request path).
+// 10-minute TTL, refreshed in the background; /api/v1/apps reads the
+// cached report, so the request path never waits on GHCR. Saving or
+// removing the token refreshes it at once.
 
 const GHCR_TTL_MS = 10 * 60 * 1000;
-const ghcrCache = new Map();   // image (string) → { published: bool, checkedAt: ms } | { error: string, checkedAt: ms }
+const GHCR_ACCESS_SCRIPT   = path.join(APPLIANCE_DIR, 'lib', 'ghcr_access.py');
+const REGISTRY_AUTH_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'registry-auth.sh');
+const REGISTRY_CONFIG_DIR  = path.join(VIBE_DIR, 'docker');
+// image (string) → { published: bool|null, access: string, checkedAt: ms }
+const ghcrCache = new Map();
+const ghcrAccess = { report: null, checkedAt: 0, running: null, error: null };
 
-async function checkGhcrPublished(image) {
-  if (!image) return null;
-  if (!image.startsWith('ghcr.io/')) return null;          // unknown registry — leave UX alone
+// Run lib/ghcr_access.py check. `tokenFile` verifies a NEW token from a
+// payload file instead of the stored one. Resolves { ok, report, error }.
+function runGhcrAccessCheck(tokenFile) {
+  const args = [GHCR_ACCESS_SCRIPT, 'check', '--manifests', MANIFESTS_DIR];
+  if (tokenFile) args.push('--token-file', tokenFile);
+  else args.push('--docker-config', REGISTRY_CONFIG_DIR);
+  return new Promise((resolve) => {
+    let stdout = '', stderr = '', done = false;
+    const child = trackChild(spawn('python3', args, {
+      env: { ...process.env, APPLIANCE_DIR, VIBE_DIR },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }));
+    const finish = (r) => { if (!done) { done = true; clearTimeout(timer); resolve(r); } };
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* gone */ }
+      finish({ ok: false, error: 'the GHCR check timed out after 90 s' });
+    }, 90_000);
+    child.stdout.on('data', (d) => { stdout += d.toString(); });
+    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    child.on('error', (err) => finish({ ok: false, error: 'could not run the GHCR check: ' + err.message }));
+    child.on('exit', (code) => {
+      if (code !== 0) return finish({ ok: false, error: `GHCR check exited ${code}: ${trim(stderr, 300)}` });
+      try { finish({ ok: true, report: JSON.parse(stdout) }); }
+      catch { finish({ ok: false, error: 'GHCR check printed unreadable output' }); }
+    });
+  });
+}
 
-  const cached = ghcrCache.get(image);
-  if (cached && Date.now() - cached.checkedAt < GHCR_TTL_MS) {
-    return cached.published;
+function _applyGhcrReport(report) {
+  const now = Date.now();
+  ghcrAccess.report = report;
+  ghcrAccess.checkedAt = now;
+  ghcrAccess.error = null;
+  ghcrCache.clear();
+  for (const [image, r] of Object.entries((report && report.images) || {})) {
+    const access = (r && r.access) || 'unknown';
+    const published = (access === 'public' || access === 'private-ok') ? true
+      : (access === 'needs-token' || access === 'no-access') ? false : null;
+    ghcrCache.set(image, { published, access, checkedAt: now });
   }
+}
 
-  const repo = image.replace(/^ghcr\.io\//, '');
-  const tokenUrl = `https://ghcr.io/token?scope=repository:${encodeURIComponent(repo)}:pull`;
-
-  try {
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), 5000);
-    const resp = await fetch(tokenUrl, { signal: ac.signal });
-    clearTimeout(timer);
-    let published = false;
-    if (resp.ok) {
-      const data = await resp.json();
-      published = !!data.token && !data.errors;
+// One refresh at a time; concurrent callers share it.
+function refreshGhcrAccess() {
+  if (ghcrAccess.running) return ghcrAccess.running;
+  ghcrAccess.running = (async () => {
+    const r = await runGhcrAccessCheck(null);
+    if (r.ok) {
+      _applyGhcrReport(r.report);
+      const imgs = Object.values(r.report.images || {});
+      log('info', 'GHCR access checked', {
+        images: imgs.length,
+        pullable: imgs.filter((x) => x.access === 'public' || x.access === 'private-ok').length,
+        credential: (r.report.credential || {}).status,
+      });
+    } else {
+      ghcrAccess.error = r.error;
+      log('warn', 'GHCR access check failed', { err: r.error });
     }
-    ghcrCache.set(image, { published, checkedAt: Date.now() });
-    return published;
-  } catch (err) {
-    log('warn', 'GHCR check failed', { image, err: err.message || String(err) });
-    ghcrCache.set(image, { published: null, error: err.message || 'fetch failed', checkedAt: Date.now() });
-    return null;
-  }
+    return r;
+  })().finally(() => { ghcrAccess.running = null; });
+  return ghcrAccess.running;
+}
+
+// The access state shown on an app card, worst image first.
+function appImageAccess(m) {
+  const img = m.image || {};
+  const refs = [img.server, img.client, ...((img.extras || []).map((e) => e && e.image))]
+    .filter((x) => typeof x === 'string' && x.startsWith('ghcr.io/'));
+  if (!refs.length) return null;
+  const states = refs.map((r) => (ghcrCache.get(r) || {}).access || 'unknown');
+  const cred = ((ghcrAccess.report || {}).credential || {}).status;
+  if (states.includes('needs-token')) return cred === 'rejected' ? 'token-rejected' : 'needs-token';
+  if (states.includes('no-access')) return 'no-access';
+  if (states.every((x) => x === 'public' || x === 'private-ok')) return 'ok';
+  return null;
 }
 
 // Per-running-container image identity: short digest, build time, and
@@ -562,26 +616,10 @@ function _appCanonicalContainer(manifest) {
   return slash >= 0 ? noTag.slice(slash + 1) : noTag;
 }
 
-async function prewarmGhcrCache() {
-  const images = new Set();
-  for (const m of Object.values(MANIFESTS)) {
-    if (m.image && m.image.server) images.add(m.image.server);
-    if (m.image && m.image.client) images.add(m.image.client);
-  }
-  if (!images.size) return;
-  log('info', 'pre-warming GHCR availability cache', { count: images.size });
-  await Promise.all([...images].map(img => checkGhcrPublished(img)));
-  let pubCount = 0;
-  for (const img of images) {
-    if (ghcrCache.get(img)?.published === true) pubCount++;
-  }
-  log('info', 'GHCR cache ready', { total: images.size, published: pubCount });
-}
-
 // First check 10s after boot (give the stack time to settle), then
 // every 10 minutes.
-setTimeout(prewarmGhcrCache, 10_000);
-setInterval(prewarmGhcrCache, GHCR_TTL_MS);
+setTimeout(refreshGhcrAccess, 10_000);
+setInterval(refreshGhcrAccess, GHCR_TTL_MS);
 
 // ----- Host LAN IP refresher --------------------------------------------
 //
@@ -1796,7 +1834,7 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
     .map((m) => {
       const s = stateApps[m.slug] || {};
 
-      // Look up GHCR cache (populated by prewarmGhcrCache). If the
+      // Look up GHCR cache (populated by refreshGhcrAccess). If the
       // server image isn't published, the app can't enable. Client
       // image is optional in the schema, so absence of a cached entry
       // for client (when manifest declares one) is treated as
@@ -1954,6 +1992,10 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
         update_error: s.update_error || null,
         update_history: (s.update_history || []).slice(-5),
         image_published,
+        // 'ok' | 'needs-token' | 'no-access' | 'token-rejected' | null
+        // (not yet checked). Drives the card badge and the Enable gate;
+        // see appImageAccess().
+        image_access: appImageAccess(m),
         image_server: serverImg || null,
         image_client: clientImg || null,
         image_server_published: serverPub,
@@ -7068,6 +7110,135 @@ function appEffectiveSubdomain(manifest) {
     return manifest.subdomain;
   }
 }
+
+// ----- GitHub access (private app images) ------------------------------
+//
+// The operator pastes the read-only GitHub token their vendor issued
+// (classic token, read:packages). The console verifies it against GitHub
+// and GHCR, then lib/registry-auth.sh stores it in the Docker client
+// config the pull scripts use (DOCKER_CONFIG, set by registry_auth_env).
+// The token is never returned, logged, or written anywhere else; the
+// status shown is the login it belongs to and what it can pull.
+//
+// CLAUDE.md rule 4: like the Cloudflare and Tailscale tokens, this runs a
+// fixed script from the repo; nothing the browser sends becomes shell.
+
+function _githubAccessView() {
+  const st = readState().config || {};
+  const report = ghcrAccess.report || {};
+  const cred = report.credential || { status: 'unknown' };
+  const images = Object.entries(report.images || {}).map(([image, r]) => {
+    const apps = Object.values(MANIFESTS)
+      .filter((m) => {
+        const i = m.image || {};
+        return [i.server, i.client, ...((i.extras || []).map((e) => e && e.image))].includes(image);
+      })
+      .map((m) => ({ slug: m.slug, displayName: m.displayName || m.slug }));
+    return { image, access: r.access, apps };
+  }).sort((x, y) => x.image.localeCompare(y.image));
+  const present = fs.existsSync(path.join(REGISTRY_CONFIG_DIR, 'config.json'));
+  let status = 'not-set';
+  if (present) {
+    if (cred.status === 'rejected') status = 'rejected';
+    else if (cred.status === 'missing-scope') status = 'missing-scope';
+    else if (cred.status === 'ok') status = images.some((i) => i.access === 'no-access') ? 'partial' : 'working';
+    else status = 'unknown';
+  }
+  return {
+    ok: true,
+    status,
+    login: st.ghcr_login || null,
+    saved_at: st.ghcr_saved_at || null,
+    checked_at: ghcrAccess.checkedAt ? new Date(ghcrAccess.checkedAt).toISOString() : null,
+    check_error: ghcrAccess.error,
+    images,
+  };
+}
+
+function _runRegistryAuth(args) {
+  return new Promise((resolve) => {
+    let stderr = '';
+    const child = trackChild(spawn('/bin/bash', [REGISTRY_AUTH_SCRIPT, ...args], {
+      env: { ...process.env, APPLIANCE_DIR, VIBE_DIR, NO_COLOR: '1' },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    }));
+    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    child.on('exit', (code) => resolve({ code, stderr }));
+    child.on('error', (err) => resolve({ code: -1, stderr: 'spawn failed: ' + err.message }));
+  });
+}
+
+function _auditGithubAccess(newValue, result) {
+  try {
+    db.prepare('INSERT INTO settings_audit (ts, user, category, setting, old_value, new_value, result, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(new Date().toISOString(), ADMIN_USER, 'System', 'GITHUB_ACCESS_TOKEN', null, newValue, result, '{}');
+  } catch (err) {
+    log('warn', 'audit-log insert failed', { err: err.message, key: 'GITHUB_ACCESS_TOKEN' });
+  }
+}
+
+app.get('/api/v1/admin/github-access', requireAdmin, async (_req, res) => {
+  if (!ghcrAccess.report && !ghcrAccess.error) await refreshGhcrAccess();
+  res.json(_githubAccessView());
+});
+
+// Save & verify. Body: { token }. A token GitHub rejects, or one without
+// read:packages, is refused and nothing is stored. A valid token that
+// cannot reach every image is stored, and the panel lists the gaps.
+app.post('/api/v1/admin/github-access', requireAdmin, testRateLimit, globalOp('GitHub access update'), async (req, res) => {
+  const token = typeof (req.body || {}).token === 'string' ? req.body.token.trim() : '';
+  if (!token || /\s/.test(token) || token.length > 255) {
+    return res.status(400).json({ ok: false, error: 'Paste the GitHub token you were given (one line, no spaces).' });
+  }
+  const tmpDir = path.join(VIBE_DIR, 'data');
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const payload = path.join(tmpDir, `.github-access-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.json`);
+  try {
+    fs.writeFileSync(payload, JSON.stringify({ token }), { mode: 0o600 });
+    const check = await runGhcrAccessCheck(payload);
+    if (!check.ok) {
+      return res.status(502).json({ ok: false, error: 'Could not verify the token: ' + check.error + ' — nothing was saved. Check the appliance can reach github.com and ghcr.io, then try again.' });
+    }
+    const cred = check.report.credential || {};
+    if (cred.status === 'rejected') {
+      _auditGithubAccess('(refused)', 'rejected');
+      return res.status(400).json({ ok: false, error: 'GitHub rejected this token (it is mistyped, expired or revoked). Nothing was saved. Ask your vendor for a current token.' });
+    }
+    if (cred.status === 'missing-scope') {
+      _auditGithubAccess('(refused)', 'missing-scope');
+      return res.status(400).json({ ok: false, error: 'This token cannot read packages (it lacks the read:packages permission). Nothing was saved. Ask your vendor for a token with read:packages.' });
+    }
+    if (cred.status !== 'ok') {
+      return res.status(502).json({ ok: false, error: 'GitHub could not be asked about this token right now. Nothing was saved. Try again in a minute.' });
+    }
+    fs.writeFileSync(payload, JSON.stringify({ token, login: cred.login || '' }), { mode: 0o600 });
+    const r = await _runRegistryAuth(['set', payload]);
+    if (r.code !== 0) {
+      return res.status(500).json({ ok: false, error: 'The token was valid but could not be stored: ' + trim(r.stderr, 300) });
+    }
+  } finally {
+    try { fs.unlinkSync(payload); } catch { /* already gone */ }
+  }
+  _auditGithubAccess('(set)', 'saved');
+  await refreshGhcrAccess();
+  res.json(_githubAccessView());
+});
+
+app.post('/api/v1/admin/github-access/test', requireAdmin, testRateLimit, async (_req, res) => {
+  const r = await refreshGhcrAccess();
+  if (!r.ok) return res.status(502).json({ ok: false, error: r.error });
+  res.json(_githubAccessView());
+});
+
+app.delete('/api/v1/admin/github-access', requireAdmin, testRateLimit, globalOp('GitHub access update'), async (_req, res) => {
+  const r = await _runRegistryAuth(['remove']);
+  if (r.code !== 0) {
+    return res.status(500).json({ ok: false, error: 'Could not remove the token: ' + trim(r.stderr, 300) });
+  }
+  _auditGithubAccess('(removed)', 'removed');
+  await refreshGhcrAccess();
+  res.json(_githubAccessView());
+});
 
 // The resolved host map for the admin UI (Network settings, the tunnel
 // wizard). Read-only. Labels are meaningful in every mode; `fqdn` values

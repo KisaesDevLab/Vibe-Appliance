@@ -97,6 +97,18 @@ This separation matters: a future migration to a new host is `tar -czf vibe-data
 
 ---
 
+## 1a. Private app images (GitHub access)
+
+*Added 2026-10-01; the plan previously treated private images as out of scope.*
+
+App images on `ghcr.io/kisaesdevlab` may be private. The vendor issues each customer one read-only GitHub token (a classic personal access token with only `read:packages`, ideally on a per-customer machine account); revoking it is the licence switch. The operator pastes it in **Configuration → System → GitHub access**.
+
+- **Storage.** `lib/registry-auth.sh` writes it to a Docker client config, `/opt/vibe/docker/config.json` (directory 700, file 600). It is deliberately not in `/opt/vibe/env/*.env`, which every app container loads, and not in `state.json` (only the GitHub login and save time are), a log line, argv or an API response. `/opt/vibe/docker` is outside the Duplicati sources, so a restored appliance needs the token entered again.
+- **Use.** Docker reads registry credentials on the CLI side. `registry_auth_env` (in `lib/compose-files.sh`, so every compose call gets it, and called by `enable_app` and `update.sh`) exports `DOCKER_CONFIG=/opt/vibe/docker` when the file exists. That covers pulls run inside the console container and on the host (bootstrap, `vibe`). With no token saved nothing changes.
+- **Verification.** `lib/ghcr_access.py` asks GitHub whether the token is valid and carries `read:packages`, then checks every `image.server` / `image.client` / `image.extras[]` the manifests name on ghcr.io: public, private-and-pullable, needs a token, or not available to this token. GHCR answers "does not exist" and "not yours" alike, so the last two also cover an unpublished image. The console refuses to save a rejected token. The same report drives the app-card badges (replacing the anonymous "image not published" probe), `update.sh`'s digest check, and `doctor.sh`.
+- **Rule 4.** Entering the token is the same documented exception as the Cloudflare and Tailscale tokens: the browser chooses an action, a fixed script in the repo runs it; nothing the browser sends becomes shell.
+- **Scope.** Images only. This repo stays public so the one-line installer and self-update need no credential.
+
 ## 2. Bootstrap flow
 
 `bootstrap.sh` is the single entry. The intended invocation is one line:
@@ -121,7 +133,7 @@ It runs eight phases. Each phase is idempotent, prints a `[PHASE 3/8] …` banne
 | 2 | Install Docker | apt install docker-ce + compose plugin, skip if present and version ≥ 24 | Common cause: existing Docker from snap. Print remove-snap-docker command |
 | 3 | Install Tailscale | optional; apt install + `tailscale up` with authkey | Auth failure: print URL to generate new authkey |
 | 4 | Generate secrets | random 32-hex for each `JWT_SECRET`, `ENCRYPTION_KEY`, `DB_PASSWORD`, console admin pw; idempotent — won't overwrite existing `/opt/vibe/env/*.env` | If env files corrupt, print `--reset-env` flag |
-| 5 | Pull images | `docker compose pull` for core; per-app pulls deferred to first toggle-on | Network: retry 3× with backoff. Auth: error and exit (private images need a PAT) |
+| 5 | Pull images | `docker compose pull` for core; per-app pulls deferred to first toggle-on | Network: retry 3× with backoff. Auth: core images are public. Private app images are pulled with the GitHub token saved in the console (§1a) |
 | 6 | Render Caddyfile | template + CONFIG_MODE → `/opt/vibe/data/caddy/Caddyfile` | Validation runs; if invalid, restore previous and exit |
 | 7 | Bring up core | Caddy + Postgres + Redis + Console; wait until Console `/health` responds | Per-container failure: `docker compose logs <svc>` printed, exit |
 | 8 | Print credentials | Cat `/opt/vibe/CREDENTIALS.txt`; print URLs for landing, admin, optional Tailscale URL | n/a |

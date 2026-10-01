@@ -60,5 +60,53 @@ compose_files() {
     done
   fi
 
+  # Every compose call goes through here, so this is also where the
+  # registry credential for private app images is picked up.
+  registry_auth_env
   return 0
+}
+
+# pull_failure_hint <captured-output-file>
+#
+# One line saying why an image pull failed and what to do, from the
+# output docker printed. Private images are the case that matters: GHCR
+# answers "denied" / "unauthorized" for an image this appliance has no
+# token for, a revoked token, and an image that was never published —
+# they cannot be told apart from here, so the hint names all three.
+#
+# Idempotency: pure; reads the file, prints one line.
+pull_failure_hint() {
+  local out="${1:-}"
+  if [[ -f "$out" ]] && grep -qiE 'unauthorized|denied|authentication required|403 Forbidden' "$out"; then
+    if [[ -f "${VIBE_DIR:-/opt/vibe}/docker/config.json" ]]; then
+      printf '%s' "the registry refused the image: the saved GitHub token was revoked or expired, it has no access to this image, or the image is not published. Check Configuration → System → GitHub access (Test)."
+    else
+      printf '%s' "the registry refused the image: it is private (or not published yet). If your vendor sent you a GitHub token, add it in Configuration → System → GitHub access, then retry."
+    fi
+  elif [[ -f "$out" ]] && grep -qiE 'manifest unknown|not found' "$out"; then
+    printf '%s' "the image or tag does not exist in the registry yet; the app's maintainers owe a published build."
+  elif [[ -f "$out" ]] && grep -qiE 'toomanyrequests|rate limit' "$out"; then
+    printf '%s' "the registry is rate-limiting this host; wait a few minutes and retry."
+  else
+    printf '%s' "common causes: no internet, DNS, or a registry outage or rate limit; retry in a minute."
+  fi
+}
+
+# registry_auth_env
+#
+# Point docker at the appliance's own client config when it holds a
+# GitHub token for ghcr.io (written by lib/registry-auth.sh from the
+# console's Configuration → System → GitHub access). Docker reads
+# registry credentials on the CLI side, so this must be set in whichever
+# process runs `docker compose pull` / `up` — the console container or
+# the host (bootstrap, the `vibe` CLI). Without a stored token nothing is
+# exported and docker keeps its default (~/.docker), exactly as before.
+#
+# Idempotency: pure; only exports DOCKER_CONFIG. Reverse: remove the
+# token (registry-auth.sh remove) — the next call exports nothing.
+registry_auth_env() {
+  local dir="${VIBE_DIR:-/opt/vibe}/docker"
+  if [[ -f "${dir}/config.json" ]]; then
+    export DOCKER_CONFIG="$dir"
+  fi
 }

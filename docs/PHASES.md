@@ -2475,3 +2475,24 @@ Append to this list as phases complete. Format:
   (checking it would falsely refuse a legitimate single-host install that
   renames its only hostname); and the provision makes two DNS lookups per
   hostname.
+- 2026-10-01: private app images (branch `feat/github-access`). The
+  appliance pulls private `ghcr.io/kisaesdevlab` images with one
+  read-only GitHub token per customer, entered and managed in the console
+  (Configuration → System → GitHub access: Save & verify, Test, Remove).
+  Plan revised in PLAN.md §1a. `lib/registry-auth.sh` stores it in
+  `/opt/vibe/docker/config.json` (not in an env file, so app containers
+  never see it; not backed up); `registry_auth_env` in
+  `lib/compose-files.sh` points docker at it for every compose call,
+  inside the console container and on the host. `lib/ghcr_access.py`
+  verifies the token with GitHub and classifies every manifest image;
+  it replaces the anonymous "image not published" probe (now also
+  covering `image.extras[]`) and `update.sh`'s anonymous digest lookup,
+  and feeds a new doctor check. Pull failures now name the cause
+  (refused / missing / rate limit). Verified: 336/336 tests on Linux
+  (node:24-bookworm container, as CI); a console smoke run against the
+  real registry (fake token refused with nothing stored and no copy of
+  it anywhere; the anonymous scan found `vibe-time-billing`'s image not
+  anonymously pullable). Owed: a run with a real private package and a
+  real token, and a fresh-droplet install. Deferred: credentials for
+  other registries; a command-line way to set the token for unattended
+  installs.

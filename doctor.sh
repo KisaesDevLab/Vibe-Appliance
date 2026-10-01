@@ -280,6 +280,71 @@ Fix:      open egress 443 in your cloud firewall"
   fi
 }
 
+# Private app images: is the saved GitHub token accepted, and can every
+# ENABLED app's images be pulled? lib/ghcr_access.py does the checking;
+# the token is read from the Docker config file and never printed.
+check_github_access() {
+  _check_begin "GitHub access (app images)"
+  local report
+  report="$(python3 "${APPLIANCE_DIR}/lib/ghcr_access.py" check \
+      --manifests "${APPLIANCE_DIR}/console/manifests" \
+      --docker-config "${VIBE_DIR}/docker" 2>/dev/null)" || report=""
+  if [[ -z "$report" ]]; then
+    _check_warn "could not check image access" \
+      "Diagnose: python3 ${APPLIANCE_DIR}/lib/ghcr_access.py check"
+    return
+  fi
+  local verdict
+  verdict="$(python3 - "$report" "$VIBE_STATE_FILE" "${APPLIANCE_DIR}/console/manifests" <<'PYEOF'
+import json, os, sys
+report = json.loads(sys.argv[1])
+try:
+    apps = (json.load(open(sys.argv[2])).get("apps") or {})
+except Exception:
+    apps = {}
+cred = (report.get("credential") or {}).get("status")
+images = report.get("images") or {}
+blocked = []
+for slug, e in apps.items():
+    if not (e or {}).get("enabled"):
+        continue
+    try:
+        m = json.load(open(os.path.join(sys.argv[3], slug + ".json")))
+    except Exception:
+        continue
+    i = m.get("image") or {}
+    refs = [i.get("server"), i.get("client")] + [(x or {}).get("image") for x in (i.get("extras") or [])]
+    for r in refs:
+        if r in images and images[r].get("access") in ("needs-token", "no-access"):
+            blocked.append(slug)
+            break
+private = sum(1 for v in images.values() if v.get("access") == "private-ok")
+print("%s|%s|%d" % (cred, ",".join(sorted(set(blocked))), private))
+PYEOF
+)" || verdict="unknown||0"
+  local cred blocked private
+  IFS='|' read -r cred blocked private <<<"$verdict"
+  local fix="Fix:      Configuration → System → GitHub access (Save & verify, or Test)"
+  if [[ "$cred" == "rejected" ]]; then
+    _check_fail "GitHub rejects the saved token (revoked or expired)${blocked:+ — affects: ${blocked}}" \
+      "Running apps keep running; installs and updates of private apps will fail.
+${fix}"
+  elif [[ "$cred" == "missing-scope" ]]; then
+    _check_fail "the saved GitHub token cannot read packages (needs read:packages)" "$fix"
+  elif [[ -n "$blocked" ]]; then
+    _check_fail "enabled app(s) whose images cannot be pulled: ${blocked}" \
+      "Their next update will fail; the running versions are unaffected.
+${fix}"
+  elif [[ "$cred" == "not-set" ]]; then
+    _check_pass "no GitHub token saved; every enabled app's images are public"
+  elif [[ "$cred" == "ok" ]]; then
+    _check_pass "GitHub token works (${private} private image(s) pullable)"
+  else
+    _check_warn "could not reach GitHub to check the saved token" \
+      "Diagnose: python3 ${APPLIANCE_DIR}/lib/ghcr_access.py check"
+  fi
+}
+
 check_core_container() {
   local name="$1" friendly="$2"
   _check_begin "Container $friendly ($name)"
@@ -1054,6 +1119,7 @@ check_host_os
 check_host_disk
 check_host_dns
 check_host_outbound
+check_github_access
 
 check_core_container vibe-caddy    "Caddy"
 check_core_container vibe-postgres "Postgres"

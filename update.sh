@@ -45,6 +45,8 @@ VIBE_ENV_SHARED="${VIBE_ENV_SHARED:-${VIBE_ENV_DIR}/shared.env}"
 # shellcheck source=/dev/null
 . "${APPLIANCE_DIR}/lib/log.sh"
 . "${APPLIANCE_DIR}/lib/compose-files.sh"
+# Private app images: pulls use the stored GitHub token, if any.
+registry_auth_env
 # shellcheck source=/dev/null
 . "${APPLIANCE_DIR}/lib/health-probe.sh"
 log_init
@@ -186,7 +188,12 @@ os.replace(tmp, path)
 PYEOF
 }
 
-# Get the GHCR registry digest for <image>:<tag> using the public anon token.
+# Get the GHCR registry digest for <image>:<tag>. Anonymous first; with
+# the stored GitHub token (Configuration → System → GitHub access) when
+# the image is private. lib/ghcr_access.py does the token exchange and
+# reads the credential from the Docker config file — the token never
+# reaches argv or this script's environment. Prints nothing (rc 1) when
+# the digest cannot be read; the caller reports check_failed.
 _remote_digest() {
   local image="$1" tag="$2"
   # Only ghcr.io is supported in the auto-check path. Other registries
@@ -195,20 +202,8 @@ _remote_digest() {
     ghcr.io/*) ;;
     *) return 1 ;;
   esac
-  local repo="${image#ghcr.io/}"
-  local token
-  token="$(curl -fsS --connect-timeout 3 --max-time 8 "https://ghcr.io/token?scope=repository:${repo}:pull" \
-    | python3 -c 'import json,sys
-try: print(json.load(sys.stdin).get("token",""))
-except: pass' 2>/dev/null || true)"
-  [[ -n "$token" ]] || return 1
-
-  local accept='application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.index.v1+json'
-  curl -fsSI --connect-timeout 3 --max-time 8 \
-    -H "Authorization: Bearer ${token}" \
-    -H "Accept: ${accept}" \
-    "https://ghcr.io/v2/${repo}/manifests/${tag}" 2>/dev/null \
-    | awk -F': ' '/^[Dd]ocker-[Cc]ontent-[Dd]igest/ {gsub(/\r/,"",$2); print $2; exit}'
+  python3 "${APPLIANCE_DIR}/lib/ghcr_access.py" digest "$image" "$tag" \
+    --docker-config "${VIBE_DIR:-/opt/vibe}/docker" 2>/dev/null
 }
 
 # Get the local digest of <image>:<tag>. Returns empty if not pulled yet.
@@ -545,9 +540,12 @@ cmd_update() {
   # Step 2: pull the new image(s).
   log_step "pulling new images for $slug"
   if ! _do_pull "$slug" "$default_tag"; then
-    _state_app_set "$slug" status failed update_error "pull failed"
+    local _hint
+    _hint="$(pull_failure_hint "${_PULL_OUT:-}")"
+    _state_app_set "$slug" status failed update_error "pull failed: ${_hint}"
     _state_app_history_append "$slug" "failed" "$current_tag" "$default_tag" "pull failed"
-    die "Could not pull new images for $slug. See $VIBE_LOG_FILE."
+    die "Could not pull new images for $slug: ${_hint}" \
+        "Diagnose: sudo grep -iE 'denied|unauthorized|manifest|error' $VIBE_LOG_FILE | tail -20. The running version is untouched; retry the update."
   fi
 
   # Step 3: pre-update DB backup (only if the manifest has a database).
@@ -827,8 +825,14 @@ _do_pull() {
     log_error "Fix routing.default_upstream / routing.matchers[].upstream in console/manifests/${slug}.json, then retry."
     return 1
   fi
+  # Captured as well as logged so the caller can classify a failure
+  # (pull_failure_hint). The file is overwritten on every pull.
+  _PULL_OUT="${VIBE_LOG_DIR:-/opt/vibe/logs}/.last-pull.out"
+  local rc=0
   ( cd "$APPLIANCE_DIR" && \
-    compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" pull $services ) >>"$VIBE_LOG_FILE" 2>&1
+    compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" pull $services ) >"$_PULL_OUT" 2>&1 || rc=$?
+  cat "$_PULL_OUT" >>"$VIBE_LOG_FILE" 2>/dev/null || true
+  return "$rc"
 }
 
 _tag_rollback() {

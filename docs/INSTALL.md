@@ -722,6 +722,16 @@ Repeat for the other apps you want enabled. On a 2 GiB droplet, two or
 three apps running comfortably is realistic. For all eight, plan on at
 least 4 GiB RAM (`s-2vcpu-4gb`) — see the droplet-sizing table in §1.
 
+**If a card says "needs GitHub access".** That app's image is private.
+Your vendor sends you a GitHub token (it starts with `ghp_`). Open
+**Configuration → System → GitHub access**, paste it, and click
+**Save & verify**. The panel shows whose token it is and which app images
+it can pull; the cards update within a few seconds. The token is never
+shown again and is not included in backups, so keep the vendor's message:
+after restoring the appliance from a backup you paste it again. If the
+vendor revokes the token, apps that are already running keep running;
+only installs and updates of private apps stop.
+
 Every app card also links a printable **Setup guide (PDF)** for that
 app — the enable steps, where to sign in, and the settings that app
 needs — and the Apps section header links the appliance-wide guide.

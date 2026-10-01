@@ -1089,12 +1089,19 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
     function renderAppCard(a) {
         const foreign = (a.runtime || 'appliance') !== 'appliance';
         const inflight = _inflight.get(a.slug);
-        const notPublished = a.image_published === false;
-        // A foreign runtime's images are not all on GHCR (Wazuh, Falco and
-        // CrowdSec are not ours), and checkGhcrPublished correctly returns
-        // null for those - so the publish badge must not gate its button.
-        let enableDisabled = !a.enabled && !foreign && notPublished;
-        let enableTitle = enableDisabled ? 'Image not published to GHCR yet' : '';
+        // image_access (server: appImageAccess): 'ok', 'needs-token' (private
+        // or unpublished, no GitHub token saved), 'token-rejected', 'no-access'
+        // (the saved token cannot reach it), or null (not checked yet). A
+        // foreign runtime's images are not ours to check, so they never gate.
+        const IMAGE_ACCESS = {
+          'needs-token':    ['needs GitHub access', 'This app\'s image is private (or not published yet). If your vendor sent you a GitHub token, add it in Configuration \u2192 System \u2192 GitHub access.'],
+          'token-rejected': ['GitHub token rejected', 'GitHub rejects the saved token \u2014 it was revoked or has expired. Save a current one in Configuration \u2192 System \u2192 GitHub access.'],
+          'no-access':      ['not available to your token', 'The saved GitHub token cannot pull this app\'s image (no access to it, or it is not published yet). Ask your vendor to grant access.'],
+        };
+        const access = foreign ? null : IMAGE_ACCESS[a.image_access];
+        const notPublished = !!access;
+        let enableDisabled = !a.enabled && notPublished;
+        let enableTitle = enableDisabled ? access[0] : '';
 
         // Resource floor, checked as FREE capacity. The honest answer for most
         // firm hosts is a second box, and saying so before the click beats a
@@ -1119,15 +1126,9 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
         // Build the "image source" hint surfaced when a build is missing.
         let imageHint = '';
         if (notPublished) {
-          const tiers = [];
-          if (a.image_server_published === false) tiers.push(escapeHtml(a.image_server));
-          if (a.image_client_published === false) tiers.push(escapeHtml(a.image_client));
           imageHint =
-            '<div class="error-banner">' +
-              'Image not published to GHCR yet: <span class="mono">' +
-              tiers.join('</span>, <span class="mono">') + '</span>. ' +
-              'The upstream Vibe-* repository owes a tagged GHCR build before this can enable.' +
-            '</div>';
+            '<div class="error-banner">' + escapeHtml(access[1]) +
+            ' <a href="/admin/settings#System">Open GitHub access</a></div>';
         }
 
         return `
@@ -1137,7 +1138,7 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
             <div class="app-card__badges">
               ${appBadge(a.status)}
               ${a.update_available ? '<span class="badge badge--warn">update available</span>' : ''}
-              ${!foreign && notPublished ? '<span class="badge badge--bad">image not published</span>' : ''}
+              ${notPublished ? '<span class="badge badge--bad">' + escapeHtml(access[0]) + '</span>' : ''}
               ${foreign ? '<span class="badge">' + escapeHtml(a.runtime) + '</span>' : ''}
               ${a.disableRequires === 'compensating-control' ? '<span class="badge badge--warn" title="Turning this off needs a recorded compensating control">Security Six</span>' : ''}
               ${a.harnessGate ? '<span class="badge" title="Upgrades are gated on a detection-harness run in the owning installer">harness-gated</span>' : ''}
