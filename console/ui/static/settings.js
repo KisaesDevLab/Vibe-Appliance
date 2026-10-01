@@ -1168,6 +1168,7 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
     // Tunnel wizard is rendered earlier in this branch (above the
     // form) so it leads the tab; DDNS goes after.
     if (cat === 'Network') {
+      renderHostnamesSection(panelEl);
       renderDdnsSection(panelEl);
       renderTailscaleSection(panelEl);
     }
@@ -1238,6 +1239,97 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
   // per-host result list. The Force-update button calls
   // /api/v1/admin/ddns/update which bypasses the IP-unchanged
   // short-circuit on the server side.
+  // Hostnames this appliance serves — read-only, straight from the
+  // server's resolver (lib/vibe_hosts.py via /api/v1/admin/hostnames), so
+  // the operator sees what the Hostname tag and the per-host labels
+  // actually produce before pointing DNS at them. Each row says where the
+  // name comes from and whether the Cloudflare Tunnel publishes it.
+  function renderHostnamesSection(host) {
+    const section = el('section', {
+      class: 'maintenance',
+      'aria-labelledby': 'hostnames-h',
+      'data-hostnames-section': '1',
+    });
+    section.appendChild(el('h2', { id: 'hostnames-h' }, ['Hostnames this appliance serves']));
+    const row = el('div', { class: 'maintenance__row' });
+    const body = el('div', { 'data-hostnames-body': '1' }, [el('p', { class: 'help' }, ['Loading…'])]);
+    const cta = el('div', { class: 'cta-row', style: 'gap:0.5rem;align-items:center;' });
+    cta.appendChild(el('button', {
+      type: 'button', class: 'btn btn--ghost',
+      onclick: () => loadHostnames(section),
+    }, ['Refresh']));
+    row.appendChild(body);
+    row.appendChild(cta);
+    section.appendChild(row);
+    host.appendChild(section);
+    loadHostnames(section);
+  }
+
+  async function loadHostnames(section) {
+    const body = section.querySelector('[data-hostnames-body]');
+    if (!body) return;
+    let hm;
+    try {
+      const r = await fetch('/api/v1/admin/hostnames', { credentials: 'same-origin' });
+      hm = await r.json();
+      if (!r.ok || !hm.ok) throw new Error((hm && (hm.detail || hm.error)) || ('HTTP ' + r.status));
+    } catch (err) {
+      body.innerHTML = '';
+      body.appendChild(el('p', { class: 'help', style: 'color:var(--bad);' }, [
+        '✗ Could not resolve hostnames: ' + err.message,
+      ]));
+      return;
+    }
+    body.innerHTML = '';
+    if (hm.mode !== 'domain' || !hm.domain) {
+      body.appendChild(el('p', { class: 'help' }, [
+        'Hostnames apply in Public domain mode only. In ' + _modeLabel(hm.mode) +
+        ' mode every app is reached under one address with a path per app.',
+      ]));
+      return;
+    }
+    const summary = [
+      'Routing: ' + (hm.routingMode === 'subdomain-per-app' ? 'subdomain per app' : 'single host, path per app'),
+      'Hostname tag: ' + (hm.tag || 'none'),
+      'Bare domain: ' + (hm.apexOwned ? 'served by this appliance' : 'left to another appliance'),
+    ];
+    body.appendChild(el('p', { class: 'help' }, [summary.join(' · ')]));
+
+    const SOURCE = {
+      default:  'built-in name',
+      tagged:   'built-in name + hostname tag',
+      override: 'set by you',
+      applied:  'in use by the app',
+    };
+    const KIND = { main: 'Console and path-routed apps', apex: 'Redirects to the main host', infra: 'Admin tool', app: 'App', extra: 'App' };
+    const sourceOf = (h) => {
+      if (h.kind === 'main') return hm.main.source;
+      if (h.kind === 'infra') return (hm.infra[h.key] || {}).source;
+      const app = (hm.apps || {})[h.slug] || {};
+      if (h.kind === 'app') return (app.primary || {}).source;
+      if (h.kind === 'extra') return ((app.extras || []).find((e) => e.name === h.name) || {}).source;
+      return '';
+    };
+    const list = el('ul', { style: 'margin:0.3rem 0 0;padding-left:1.2rem;' });
+    for (const h of (hm.hosts || [])) {
+      const what = h.kind === 'infra' ? KIND.infra + ' (' + h.key + ')'
+        : h.kind === 'app' ? KIND.app + ' (' + h.slug + ')'
+        : h.kind === 'extra' ? KIND.extra + ' (' + h.slug + ', ' + h.name + ')'
+        : KIND[h.kind] || h.kind;
+      const src = SOURCE[sourceOf(h)] || '';
+      const li = el('li', { style: 'padding:0.12rem 0;' });
+      li.appendChild(el('span', { class: 'mono' }, [h.fqdn]));
+      li.appendChild(el('span', { class: 'help', style: 'color:var(--text-muted);' }, [
+        ' — ' + what + (src ? ' · ' + src : '') + (h.tunnel ? ' · published by the tunnel' : ' · LAN/Tailscale only'),
+      ]));
+      list.appendChild(li);
+    }
+    body.appendChild(list);
+    body.appendChild(el('p', { class: 'help', style: 'margin-top:0.4rem;' }, [
+      'An app keeps the name it was last enabled with: after changing the Hostname tag or a subdomain, saving re-enables the affected apps and this list follows.',
+    ]));
+  }
+
   function renderDdnsSection(host) {
     const section = el('section', {
       class: 'maintenance',
@@ -1508,7 +1600,14 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
       style: 'display:grid;gap:0.7rem;margin-top:0.6rem;max-width:42rem;',
     });
 
-    const sel = { mode: currentMode, domain: currentDomain, email: currentEmail };
+    // tunnel_subdomain is the MAIN host label (state.config). 'vibe' is
+    // the built-in default; the hostname tag is applied to it server-side.
+    const currentTunnelSub = (cfg.tunnel_subdomain || 'vibe').trim() || 'vibe';
+    const sel = {
+      mode: currentMode, domain: currentDomain, email: currentEmail,
+      tunnelSub: currentTunnelSub,
+      current: { domain: currentDomain, email: currentEmail, tunnelSub: currentTunnelSub },
+    };
 
     const repaint = () => renderModeOptions(selWrap, sel, currentMode, tsStatus, section, repaint);
     body.appendChild(selWrap);
@@ -1707,12 +1806,21 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
       wrap.appendChild(row);
     }
 
-    if (sel.mode === currentMode) {
+    if (sel.mode === currentMode && currentMode !== 'domain') {
       // No-op — nothing to switch to.
       wrap.appendChild(el('p', { class: 'help', style: 'margin-top:0.3rem;color:var(--text-muted);' }, [
         'Pick a different mode to see the switch dialog.',
       ]));
       return;
+    }
+    // Already in domain mode: the domain, the ACME email and the main host
+    // label are editable in place — "Apply changes" re-renders routing the
+    // same way a mode switch does. (This used to be a dead end: the label
+    // could only be changed by re-running bootstrap.sh.)
+    if (sel.mode === currentMode) {
+      wrap.appendChild(el('p', { class: 'help', style: 'margin-top:0.3rem;color:var(--text-muted);' }, [
+        'Edit the values below and click Apply changes, or pick a different mode.',
+      ]));
     }
 
     // Per-mode prereq UI.
@@ -1734,6 +1842,20 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
         oninput: (e) => { sel.email = e.target.value.trim(); _refreshSwitchBtn(wrap, sel, currentMode, tsStatus, section); },
       });
       grid.appendChild(eInput);
+      grid.appendChild(el('label', { style: 'font-weight:600;font-size:0.9em;margin-top:0.2rem;' }, ['Main host label']));
+      const hInput = el('input', {
+        type: 'text', value: sel.tunnelSub || 'vibe',
+        placeholder: 'vibe',
+        style: 'padding:0.4rem 0.6rem;border:1px solid var(--border);border-radius:4px;background:var(--surface);font:inherit;',
+        oninput: (e) => { sel.tunnelSub = e.target.value.trim().toLowerCase(); _refreshSwitchBtn(wrap, sel, currentMode, tsStatus, section); },
+      });
+      grid.appendChild(hInput);
+      grid.appendChild(el('p', { class: 'help', style: 'margin:0;' }, [
+        'The <label> in https://<label>.<domain> that fronts the console and every path-routed app. ',
+        'Leave it as "vibe" for the default; a Hostname tag (below, under Network settings) is added to the default automatically, ',
+        'so a second appliance on the same domain becomes vibe-<tag>. A label you type here is used exactly as written. ',
+        'One DNS label: lowercase letters, digits and dashes.',
+      ]));
       wrap.appendChild(grid);
     } else if (sel.mode === 'tailscale') {
       const tsRunning = tsStatus.daemon_state === 'Running';
@@ -1768,6 +1890,12 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
         disabled = true; blockReason = 'Enter a valid domain.';
       } else if (!sel.email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(sel.email)) {
         disabled = true; blockReason = 'Enter a valid ACME contact email.';
+      } else if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(sel.tunnelSub || '')) {
+        disabled = true; blockReason = 'Enter a valid main host label (lowercase letters, digits, dashes).';
+      } else if (sel.mode === currentMode && sel.current
+                 && sel.domain === sel.current.domain && sel.email === sel.current.email
+                 && sel.tunnelSub === sel.current.tunnelSub) {
+        disabled = true; blockReason = 'No changes to apply.';
       }
     } else if (sel.mode === 'tailscale' && tsStatus.daemon_state !== 'Running') {
       disabled = true; blockReason = 'Connect Tailscale first.';
@@ -1776,7 +1904,7 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
     const btn = el('button', {
       type: 'button', class: 'btn',
       onclick: () => doModeSwitch(sel, currentMode, section, tsStatus),
-    }, ['Switch to ' + _modeLabel(sel.mode)]);
+    }, [sel.mode === currentMode ? 'Apply changes' : 'Switch to ' + _modeLabel(sel.mode)]);
     btn.disabled = disabled;
     cta.appendChild(btn);
     if (disabled && blockReason) {
@@ -1792,6 +1920,7 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
     'domain->tailscale': "Public domain access stops. Apps reachable only via the tailnet. Connect's client portal breaks for non-Tailscale clients. Continue?",
     'tailscale->lan':    'Tailnet URLs continue to work as long as Tailscale stays connected, but Caddy stops listening on :443. Apps reachable on the LAN IP. Continue?',
     'tailscale->domain': "Apps will become reachable at https://<app>.{domain}. Requires ports 80 + 443 reachable for cert issuance. Tailnet URLs continue to work in parallel. Continue?",
+    'domain->domain':    "This changes the appliance's public hostnames (main host: https://{host}.{domain}). Every enabled app is re-rendered and restarted, and the Cloudflare Tunnel is re-provisioned if it is on. Old bookmarks and links stop working. Continue?",
   };
 
   async function doModeSwitch(sel, currentMode, section, tsStatus) {
@@ -1813,7 +1942,8 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
 
     const copyKey = currentMode + '->' + sel.mode;
     const tmpl = _MODE_SWITCH_COPY[copyKey] || 'Switch to ' + _modeLabel(sel.mode) + '?';
-    let msg = tmpl.replace('{domain}', sel.domain || '<domain>');
+    let msg = tmpl.replace(/\{domain\}/g, sel.domain || '<domain>')
+                  .replace(/\{host\}/g, sel.tunnelSub || 'vibe');
     // When Tailscale is running and the transition doesn't already
     // mention it (lan↔domain), reassure the operator that the
     // tailnet URL survives the switch.
@@ -1836,6 +1966,7 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
           mode: sel.mode,
           domain: sel.mode === 'domain' ? sel.domain : undefined,
           email:  sel.mode === 'domain' ? sel.email  : undefined,
+          tunnel_subdomain: sel.mode === 'domain' ? (sel.tunnelSub || undefined) : undefined,
         }),
         // 15 min, not 120s: the switch re-renders every enabled app's
         // env and bounces containers; an early abort shows a false
@@ -1858,7 +1989,7 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
       body.innerHTML = '';
       body.appendChild(el('p', null, [
         el('span', { style: 'color:var(--good);font-weight:600;' }, [
-          '✓ Switched to ' + _modeLabel(data.to),
+          (data.from === data.to ? '✓ Changes applied to ' : '✓ Switched to ') + _modeLabel(data.to),
         ]),
       ]));
       if (data.warnings && data.warnings.length) {
@@ -2044,14 +2175,31 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
       // crashed mid-request) left the wizard stuck on the LOADING
       // screen forever — operator's only escape was a full page reload.
       // 10s is generous; healthy round-trips are <100ms.
-      const [stateCfg, appsResp, statusResp] = await Promise.all([
+      const [stateCfg, appsResp, statusResp, hostsResp] = await Promise.all([
         fetchStateConfig(),
         fetchWithTimeout('/api/v1/apps', { credentials: 'same-origin' }, 10_000).catch(() => null),
         fetchWithTimeout('/api/v1/admin/cloudflare/status', { credentials: 'same-origin' }, 10_000).catch(() => null),
+        fetchWithTimeout('/api/v1/admin/hostnames', { credentials: 'same-origin' }, 10_000).catch(() => null),
       ]);
       wiz.domain           = stateCfg.domain;
       wiz.tunnelSubdomain  = stateCfg.tunnel_subdomain || 'vibe';
       wiz.currentMode      = stateCfg.mode;
+
+      // The server-resolved host map (lib/vibe_hosts.py): the labels this
+      // appliance actually serves, with the hostname tag and any operator
+      // override applied. The wizard prints hostnames from it instead of
+      // assuming vibe / cockpit / portainer / backup. If it can't be
+      // fetched the built-in labels above stay in place.
+      wiz.hosts = null;
+      if (hostsResp && hostsResp.ok) {
+        try {
+          const hm = await hostsResp.json();
+          if (hm && hm.ok && hm.main) {
+            wiz.hosts = hm;
+            wiz.tunnelSubdomain = hm.main.label || wiz.tunnelSubdomain;
+          }
+        } catch { /* keep the fallbacks */ }
+      }
 
       if (appsResp && appsResp.ok) {
         try {
@@ -2121,7 +2269,7 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
           if (data.tunnel_name) {
             wiz.tunnelName = data.tunnel_name;
           } else if (wiz.domain) {
-            wiz.tunnelName = defaultTunnelName(wiz.domain);
+            wiz.tunnelName = defaultTunnelName(wiz.domain, wiz.hosts && wiz.hosts.tag);
           }
 
           // Bootstrap state transitions from default IDLE:
@@ -2562,6 +2710,22 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
     // the tunnel by definition in the single-hostname routing model.
     // To change which apps are public, enable/disable them on the
     // Apps tab.
+    // Hostnames Caddy serves that the tunnel never publishes: the apex +
+    // www (only when this appliance owns the bare domain) and the infra
+    // hosts, under whatever labels the operator gave them.
+    function notTunnelledHosts() {
+      const dom = wiz.domain || '<your-domain>';
+      const hm = wiz.hosts;
+      if (!hm || !hm.infra) {
+        return [dom, 'www.' + dom, 'cockpit.' + dom, 'portainer.' + dom, 'backup.' + dom];
+      }
+      const out = hm.apexOwned === false ? [] : [dom, 'www.' + dom];
+      for (const key of ['cockpit', 'portainer', 'backup']) {
+        if (hm.infra[key] && hm.infra[key].label) out.push(hm.infra[key].label + '.' + dom);
+      }
+      return out;
+    }
+
     function renderReachableList() {
       if (!wiz.enabledApps.length) {
         return el('p', { class: 'help', style: 'color:var(--warn);' }, [
@@ -2582,7 +2746,11 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
         const li = el('li', { style: 'padding:0.15rem 0;' });
         li.appendChild(el('span', { style: 'font-weight:600;' }, [a.displayName]));
         li.appendChild(document.createTextNode(' — '));
-        const primaryUrl = a.rootServedOnly
+        // In subdomain-per-app routing EVERY app owns a hostname; this
+        // list used to print the path form regardless of the routing mode.
+        const perApp = !!(wiz.hosts && wiz.hosts.routingMode === 'subdomain-per-app');
+        const ownHost = a.rootServedOnly || perApp;
+        const primaryUrl = ownHost
           ? 'https://' + (a.effectiveSubdomain || a.subdomain) + '.' + dom + '/'
           : 'https://' + host + '/' + pathPrefix(a) + '/';
         li.appendChild(el('span', { class: 'mono' }, [primaryUrl]));
@@ -2610,7 +2778,9 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
             subLi.appendChild(el('span', { style: 'color:var(--text-muted);' }, [' (' + sd.audience + ')']));
           }
           subLi.appendChild(document.createTextNode(' — '));
-          subLi.appendChild(el('span', { class: 'mono' }, ['https://' + sd.name + '.' + dom + '/']));
+          // sd.label is the host label actually served (tag / operator
+          // override applied); sd.name is the manifest's surface name.
+          subLi.appendChild(el('span', { class: 'mono' }, ['https://' + (sd.label || sd.name) + '.' + dom + '/']));
           wrap.appendChild(subLi);
         }
       }
@@ -2788,10 +2958,7 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
       }
       section.appendChild(el('p', { class: 'help', style: 'margin-top:0.2rem;' }, [
         el('strong', null, ['Not exposed via tunnel (LAN/Tailscale-only): ']),
-        wiz.domain || '<your-domain>', ', www.', wiz.domain || '<your-domain>',
-        ', cockpit.', wiz.domain || '<your-domain>',
-        ', portainer.', wiz.domain || '<your-domain>',
-        ', backup.', wiz.domain || '<your-domain>',
+        notTunnelledHosts().join(', '),
       ]));
 
       // Drift warning. Enabling an app that needs its OWN hostname

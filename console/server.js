@@ -4346,6 +4346,36 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, globa
     }
 
     const warnings = [];
+
+    // Staying in (or entering) domain mode with a changed domain or main
+    // host label: the Cloudflare Tunnel, when on, still routes the OLD
+    // hostnames. Re-provision it so ingress + CNAMEs follow, the same
+    // step the settings routing-reconcile job runs. A failure is reported
+    // as a warning with the copy-paste fix — routing on the box itself
+    // is already switched.
+    const tunnelReprovision = { attempted: false, ok: false };
+    if (mode === 'domain' && configChanged
+        && (parseEnvFile(path.join(ENV_DIR, 'appliance.env')).CLOUDFLARE_TUNNEL_ENABLED || '').trim() === 'true') {
+      tunnelReprovision.attempted = true;
+      const r = await new Promise((resolve) => {
+        const child = trackChild(spawn('/bin/bash', [CLOUDFLARED_UP_SCRIPT], {
+          env: { ...process.env, APPLIANCE_DIR, VIBE_DIR, NO_COLOR: '1' },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        }));
+        let stderr = '';
+        child.stderr.on('data', (d) => { stderr += d.toString(); });
+        child.on('exit', (code) => resolve({ code, stderr }));
+        child.on('error', (err) => resolve({ code: -1, stderr: 'spawn failed: ' + err.message }));
+      });
+      tunnelReprovision.ok = r.code === 0;
+      if (!tunnelReprovision.ok) {
+        log('warn', 'tunnel re-provision failed after network change', { code: r.code });
+        warnings.push('The Cloudflare Tunnel could not be re-provisioned for the new hostnames, so it still routes the old ones. '
+          + 'Fix: Configuration → Network → Cloudflare Tunnel → Re-provision, or run: sudo bash /opt/vibe/appliance/infra/cloudflared-up.sh. '
+          + 'Detail: ' + trim(r.stderr, 400));
+      }
+    }
+
     if (mode === 'domain') {
       warnings.push(`Apps live at https://${mainHostLabel(state.config)}.${domain}/<app>/ (e.g. /tb, /mybooks). The bare apex (https://${domain}) redirects to that host.`);
       warnings.push('On the first request Caddy will spend 10–30s issuing a Let\'s Encrypt cert. Subsequent requests are instant.');
@@ -6690,7 +6720,7 @@ function refuseIfBusy(res, advice) {
     res.status(409).json({
       error: 'operation in progress',
       detail: `A ${gl.action} has been running for ${mins} minute(s).${tail}` +
-              ' A wedged lock clears itself after 45 minutes.',
+              ' A lock left by an operation that has ended clears itself after 45 minutes; while its script is still running it holds until the script exits (find it with: pgrep -af /opt/vibe/appliance).',
     });
     return true;
   }
@@ -6768,7 +6798,7 @@ function acquireSlugLock(slug, action, res) {
     res.status(409).json({
       error: 'operation in progress',
       detail: `A ${gl.action} is running (${mins} minute(s) so far) — app actions are paused until it finishes.` +
-              ' A wedged lock clears itself after 45 minutes.',
+              ' A lock left by an operation that has ended clears itself after 45 minutes; while its script is still running it holds until the script exits (find it with: pgrep -af /opt/vibe/appliance).',
     });
     return false;
   }
@@ -7013,6 +7043,21 @@ function appEffectiveSubdomain(manifest) {
     return manifest.subdomain;
   }
 }
+
+// The resolved host map for the admin UI (Network settings, the tunnel
+// wizard). Read-only. Labels are meaningful in every mode; `fqdn` values
+// and `hosts` are empty outside domain mode.
+app.get('/api/v1/admin/hostnames', requireAdmin, (_req, res) => {
+  const hm = hostMap();
+  if (!hm) {
+    return res.status(503).json({
+      ok: false,
+      error: 'hostname resolver unavailable',
+      detail: `Diagnose: python3 ${VIBE_HOSTS_SCRIPT} dump — Fix: sudo bash /opt/vibe/appliance/bootstrap.sh`,
+    });
+  }
+  res.json({ ok: true, ...hm });
+});
 
 // The main host label — fronts the console, and every path-mounted app in
 // single-host mode. state.config.tunnel_subdomain (default 'vibe') with

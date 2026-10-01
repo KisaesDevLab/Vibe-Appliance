@@ -465,7 +465,7 @@ def validate(state, manifests, env, app_envs):
 
     claims = []  # (label, owner, setting-to-change)
     m_label, _src = main_label(config, tag)
-    claims.append((m_label, "the main host", "the main host label (--tunnel-subdomain)"))
+    claims.append((m_label, "the main host", "the main host label (Configuration → Network, or --tunnel-subdomain)"))
     for key in INFRA_KEYS:
         label, _src = infra_label(key, env, tag)
         claims.append((label, "the %s host" % key, infra_env_key(key)))

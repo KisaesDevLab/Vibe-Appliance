@@ -1147,7 +1147,7 @@ CLOUDFLARE_TUNNEL_PUBLISH=tb,connect</pre>
           <dl class="kv app-card__kv">
             <dt>slug</dt><dd>${escapeHtml(a.slug)}</dd>
             ${a.guide ? '<dt>guide</dt><dd><a href="' + escapeHtml(a.guide) + '" target="_blank" rel="noopener">Setup guide (PDF)</a></dd>' : ''}
-            ${a.subdomain ? '<dt>subdomain</dt><dd>' + escapeHtml(a.subdomain) + '</dd>' : ''}
+            ${(a.effectiveSubdomain || a.subdomain) ? '<dt>subdomain</dt><dd>' + escapeHtml(a.effectiveSubdomain || a.subdomain) + '</dd>' : ''}
             ${foreign && a.resources ? '<dt>needs</dt><dd>' + (a.resources.cores || 0) +
                ' cores · ' + (a.resources.ramMb || 0) + ' MB free' +
                (a.resources.diskFormula ? ' <span class="muted">· disk: ' +
