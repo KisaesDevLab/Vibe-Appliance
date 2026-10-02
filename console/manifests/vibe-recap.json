@@ -4,7 +4,7 @@
   "displayName": "Vibe Recap",
   "description": "Turns a finished Form 1040 package into a narrated plain-English video summary for the client, verified line by line against the return, approved by the preparer, delivered by download.",
   "logo": "vibe-recap.svg",
-  "_doc": "In-tree manifest for KisaesDevLab/Vibe-Recap. THREE containers plus a migration one-shot, from three GHCR images: `vibe-recap-api` (Fastify, 3000; also the migration and seed one-shots), `vibe-recap-web` (nginx serving the React UI, 80), `vibe-recap-worker` (Python: extraction, script, verifier, Kokoro narration, Playwright slides, ffmpeg). NETWORK POSTURE: the worker never joins vibe_net. It lives on a private internal network behind `vibe-recap-relay`, a socat container that forwards exactly four ports (postgres 5432, redis 6379, vibe-ai-router 8220, vibellm 11434) and carries those names as aliases so the shared env file works unchanged; the worker therefore has no internet route on the appliance either. ROUTER: script generation goes through vibe-ai-router by default (task class `recap_script`, registered by the api at startup and starting local_only until the firm admin widens it). Unlike Vibe-1040 the router is not fatal - with an empty token the app falls back to the appliance's local model server through OLLAMA_URL - but the token is minted at enable like every other app, hence requiredApps. OCR of scanned pages needs an Ollama-native endpoint (`/api/chat` with images); if vibellm only speaks /v1 the job fails cleanly at `ocr` and the preparer asks for a text-layer PDF. MIGRATIONS: the api honours MIGRATIONS_AUTO; the appliance sets it false and runs `migrate` as the one-shot in the overlay (idempotent) and at update time. FIRST LOGIN: `seed-admin` creates the first admin from SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD, is a no-op once any user exists, and the app's /setup page disables itself as soon as a user exists. SINGLE SIGN-ON (docs/sso.md): the api embeds @kisaesdevlab/vibe-auth and serves /auth/* itself, hence the `auth` matcher past the web tier; `requires: identity` is soft (the app runs on local sign-in without Vibe Auth) and registration never sets VIBE_AUTH_MODE. The break-glass command goes through the image entrypoint for the same reason the seed does, and because the CLI must run from /app/apps/api. Copy the `sso` block into the appliance's vendored manifest only once a Recap image that carries single sign-on is what `defaultTag` resolves to.",
+  "_doc": "In-tree manifest for KisaesDevLab/Vibe-Recap. THREE containers plus a migration one-shot, from three GHCR images: `vibe-recap-api` (Fastify, 3000; also the migration and seed one-shots), `vibe-recap-web` (nginx serving the React UI, 80), `vibe-recap-worker` (Python: extraction, script, verifier, Kokoro narration, Playwright slides, ffmpeg). NETWORK POSTURE: the worker never joins vibe_net. It lives on a private internal network behind `vibe-recap-relay`, a socat container that forwards exactly four ports (postgres 5432, redis 6379, vibe-ai-router 8220, vibellm 11434) and carries those names as aliases so the shared env file works unchanged; the worker therefore has no internet route on the appliance either. ROUTER: script generation goes through vibe-ai-router by default (task class `recap_script`, registered by the api at startup and starting local_only until the firm admin widens it). Unlike Vibe-1040 the router is not fatal - with an empty token the app falls back to the appliance's local model server through OLLAMA_URL - but the token is minted at enable like every other app, hence requiredApps. OCR of scanned pages needs an Ollama-native endpoint (`/api/chat` with images); if vibellm only speaks /v1 the job fails cleanly at `ocr` and the preparer asks for a text-layer PDF. MIGRATIONS: the api honours MIGRATIONS_AUTO; the appliance sets it false and runs `migrate` as the one-shot in the overlay (idempotent) and at update time. FIRST LOGIN: `seed-admin` creates the first admin from SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD, is a no-op once any user exists, and the app's /setup page disables itself as soon as a user exists. SINGLE SIGN-ON (docs/sso.md): the api embeds @kisaesdevlab/vibe-auth and serves /auth/* itself, hence the `auth` matcher past the web tier; `requires: identity` is soft (the app runs on local sign-in without Vibe Auth) and registration never sets VIBE_AUTH_MODE. The break-glass command goes through the image entrypoint for the same reason the seed does, and because the CLI must run from /app/apps/api. Copy the `sso` block into the appliance's vendored manifest only once a Recap image that carries single sign-on is what `defaultTag` resolves to. CLIENT SHARING (Vibe-Recap docs/sharing.md, Q73): the `watch` entry in subdomains[] is a public client surface (watch.<domain>, VIBE_APP_SUBDOMAIN_WATCH) routed whole to vibe-recap-api:3001, the api's watch-only listener, which 404s everything but the client watch routes; the appliance renders its URL into SHARE_PUBLIC_URL through @SURFACE_URL_WATCH@ (needs an appliance with that marker). The `/watch/*` matcher serves the same page on the staff host. Text messages reuse the appliance's Email & SMS Twilio settings from appliance.env.",
   "image": {
     "server": "ghcr.io/kisaesdevlab/vibe-recap-api",
     "client": "ghcr.io/kisaesdevlab/vibe-recap-web",
@@ -18,6 +18,19 @@
   },
   "subdomain": "recap",
   "emergencyPort": 5183,
+  "subdomains": [
+    {
+      "name": "recap",
+      "audience": "staff",
+      "emergencyPort": 5183,
+      "target": "vibe-recap-web:8080"
+    },
+    {
+      "name": "watch",
+      "audience": "client watch page",
+      "target": "vibe-recap-api:3001"
+    }
+  ],
   "ports": {
     "server": 3000,
     "client": 8080
@@ -45,6 +58,11 @@
         "name": "auth",
         "path": "/auth/*",
         "upstream": "vibe-recap-api:3000"
+      },
+      {
+        "name": "watch",
+        "path": "/watch/*",
+        "upstream": "vibe-recap-api:3001"
       }
     ]
   },
@@ -68,46 +86,8 @@
       "/api/auth/password-reset/status",
       "/api/auth/forgot-password",
       "/api/auth/reset-password/*",
-      "/api/invite/*"
-    ],
-    "edgeGate": false,
-    "internalUrl": "http://vibe-recap-api:3000",
-    "breakglassService": "vibe-recap-api",
-    "breakglassCommand": [
-      "docker-entrypoint.sh",
-      "breakglass",
-      "ensure",
-      "--json"
-    ]
-  },
-  "depends": [
-    "postgres",
-    "redis"
-  ],
-  "requiredApps": [
-    "vibe-ai-router"
-  ],
-  "requires": [
-    "identity"
-  ],
-  "sso": {
-    "capable": true,
-    "redirectPaths": [
-      "/auth/oidc/callback"
-    ],
-    "logoutPaths": [
-      "/auth/oidc/backchannel"
-    ],
-    "publicPaths": [
-      "/healthz",
-      "/readyz",
-      "/api/v1/health",
-      "/api/setup/*",
-      "/api/auth/login",
-      "/api/auth/password-reset/status",
-      "/api/auth/forgot-password",
-      "/api/auth/reset-password/*",
-      "/api/invite/*"
+      "/api/invite/*",
+      "/watch/*"
     ],
     "edgeGate": false,
     "internalUrl": "http://vibe-recap-api:3000",
@@ -123,6 +103,13 @@
       "vibe-recap-api"
     ]
   },
+  "depends": [
+    "postgres",
+    "redis"
+  ],
+  "requiredApps": [
+    "vibe-ai-router"
+  ],
   "dataOwner": "1000:1000",
   "resources": {
     "cores": 4,
@@ -200,6 +187,24 @@
           "validate": "regex:^([a-z0-9][a-z0-9-]*)?$",
           "postSaveJob": "routing-reconcile"
         }
+      },
+      {
+        "name": "VIBE_APP_SUBDOMAIN_WATCH",
+        "doc": "Operator override for the client watch page's host label (the 'watch' entry in subdomains[], Vibe-Recap docs/sharing.md). Empty = the built-in default (watch), with the appliance Hostname tag applied. The appliance routes the whole host to vibe-recap-api:3001, the api's watch-only listener, which answers nothing but the client watch routes; it renders the host into SHARE_PUBLIC_URL (@SURFACE_URL_WATCH@) so share links carry it. Domain mode only: LAN and Tailscale have no public watch host, and Settings > Sharing then says why sharing is off. Single DNS label.",
+        "ui": {
+          "tier": 1,
+          "category": "Network",
+          "label": "Client watch subdomain",
+          "helpText": "The <subdomain> in <subdomain>.<your-domain> where clients open shared recap videos. Leave blank for the default (watch, plus the hostname tag if one is set). Lowercase letters, digits, and dashes; no dots. Saving re-renders routing and re-provisions the Cloudflare Tunnel; the app briefly restarts. Links already sent to clients keep the old host and stop working.",
+          "input": "text",
+          "appliance": "per-app",
+          "validate": "regex:^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)?$",
+          "postSaveJob": "routing-reconcile"
+        }
+      },
+      {
+        "name": "SHARE_PUBLIC_URL",
+        "doc": "https://<watch host>.<domain>, rendered by the appliance from the 'watch' surface (@SURFACE_URL_WATCH@); empty outside domain mode. Client sharing stays unavailable until it is set and an admin turns sharing on in Recap's Settings > Sharing."
       },
       {
         "name": "SEED_ADMIN_EMAIL",
