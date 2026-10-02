@@ -344,6 +344,15 @@ app's env file, Caddy and the Cloudflare Tunnel; `lib/settings-save.sh`
 reads it from the manifest. `tests/routing/hostnames.test.js` fails if an
 app declares a public surface without the matching field.
 
+An app learns an extra surface's public URL from its env template: the
+marker `@SURFACE_URL_<NAME>@` (same `<NAME>` derivation) becomes
+`https://<label>.<domain>` in domain mode and is blanked in LAN and
+Tailscale modes, where extra surfaces have no hostname. Vibe-Recap's
+`watch` surface reaches it as `SHARE_PUBLIC_URL=@SURFACE_URL_WATCH@`.
+`@CLIENT_PORTAL_URL@` remains for the `client` surface Vibe Connect and
+Vibe Time & Billing read. `tests/enable/surface-urls.test.js` fails if a
+template asks for a surface its manifest does not declare.
+
 No schema change is involved: these are ordinary `env` entries, so
 `console/manifest.schema.json` (the contract `vibe-sentinel-installer`
 vendors) is untouched. Units with `runtime` other than `appliance` are

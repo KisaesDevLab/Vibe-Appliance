@@ -781,6 +781,23 @@ PYEOF
 # Same as _manifest_field, for a JSON document held in a string (e.g. the
 # output of `lib/vibe_hosts.py plan-app`). Prints nothing when the string
 # is empty or not JSON.
+# {surface name: "https://<label>.<domain>"} for every extra surface in a
+# vibe_hosts.py plan-app document; "{}" when there is no plan or domain.
+# Feeds the @SURFACE_URL_<NAME>@ markers in _render_app_env.
+_surface_urls_json() {
+  local plan="$1" domain="$2"
+  if [[ -z "$plan" || -z "$domain" ]]; then
+    echo '{}'
+    return 0
+  fi
+  python3 -c 'import json, sys
+try:
+    extras = (json.loads(sys.argv[1]) or {}).get("extras") or {}
+except ValueError:
+    extras = {}
+print(json.dumps({n: "https://%s.%s" % (l, sys.argv[2]) for n, l in extras.items() if l}, sort_keys=True))' "$plan" "$domain" 2>/dev/null || echo '{}'
+}
+
 _json_field() {
   local doc="$1" expr="$2"
   [[ -n "$doc" ]] || return 0
@@ -1141,7 +1158,7 @@ _render_app_env() {
   local src="${5:-$4}"
 
   local mode domain tunnel_subdomain ip allowed_origin vite_base_path session_secure
-  local staff_app_url client_portal_url
+  local staff_app_url client_portal_url surface_urls_json="{}"
   mode="$(python3 -c "import json;print(json.load(open('${VIBE_STATE_FILE}')).get('config',{}).get('mode','lan'))")"
   domain="$(python3 -c "import json;print(json.load(open('${VIBE_STATE_FILE}')).get('config',{}).get('domain',''))")"
 
@@ -1285,6 +1302,13 @@ PYEOF
     else
       client_portal_url=""
     fi
+    # Every extra surface's public URL, for the generic @SURFACE_URL_<NAME>@
+    # marker (<NAME> derived like VIBE_APP_SUBDOMAIN_<NAME>). Lets an app
+    # whose extra surface is not the `client` portal learn its own host
+    # without a bespoke marker here: Vibe-Recap's `watch` surface lands in
+    # SHARE_PUBLIC_URL via @SURFACE_URL_WATCH@. Domain mode only; the
+    # renderer blanks the marker elsewhere, as it does CLIENT_PORTAL_URL.
+    surface_urls_json="$(_surface_urls_json "$host_plan" "$domain")"
   elif [[ "$root_served" == "true" ]]; then
     # LAN / Tailscale with no path mount available: the app is reachable
     # only at the root of its emergency port (HAProxy, UFW-gated), so
@@ -1571,6 +1595,7 @@ print(json.dumps(dict(zip(a[0::2], a[1::2]))))
   # does not need a bespoke stanza here. Passed via the environment so the
   # positional argv below stays untouched.
   VIBE_RENDER_ROUTING_MODE="$mode" VIBE_RENDER_DOMAIN_ROUTING_MODE="$routing_mode" \
+  VIBE_RENDER_SURFACE_URLS="$surface_urls_json" \
   python3 - "$tmpl" "$tmp" \
       "$allowed_origin" "$database_url" "$redis_url" \
       "${ENCRYPTION_KEY:-}" "${JWT_SECRET:-}" \
@@ -1628,6 +1653,16 @@ body = body.replace("@CLIENT_PORTAL_URL@",  client_portal_url)
 import os as _os
 body = body.replace("@ROUTING_MODE@",        _os.environ.get("VIBE_RENDER_ROUTING_MODE", "lan"))
 body = body.replace("@DOMAIN_ROUTING_MODE@", _os.environ.get("VIBE_RENDER_DOMAIN_ROUTING_MODE", "single-host"))
+# Extra-surface URLs (@SURFACE_URL_<NAME>@, <NAME> as in VIBE_APP_SUBDOMAIN_<NAME>):
+# filled in domain mode, blanked otherwise so no literal marker reaches an app.
+import re as _re
+try:
+    _surfaces = json.loads(_os.environ.get("VIBE_RENDER_SURFACE_URLS") or "{}") or {}
+except ValueError:
+    _surfaces = {}
+for _sname, _surl in _surfaces.items():
+    body = body.replace("@SURFACE_URL_%s@" % _re.sub(r"[^A-Z0-9]", "_", _sname.upper()), _surl)
+body = _re.sub(r"@SURFACE_URL_[A-Z0-9_]+@", "", body)
 # Manifest-declared generated secrets (env[].from = "generated:<shape>").
 # Applied last so a hand-written marker above always wins for a name both
 # describe - the bespoke blocks carry per-app caveats the generic pass
