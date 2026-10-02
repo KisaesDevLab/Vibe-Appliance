@@ -452,9 +452,14 @@ function _applyGhcrReport(report) {
   }
 }
 
-// One refresh at a time; concurrent callers share it.
-function refreshGhcrAccess() {
-  if (ghcrAccess.running) return ghcrAccess.running;
+// One refresh at a time; concurrent callers share it. `fresh` is for
+// callers that just changed the stored token (save, remove, Test): an
+// in-flight check started before the change would report the OLD
+// credential, so they wait for it and then run a new one.
+function refreshGhcrAccess(fresh = false) {
+  if (ghcrAccess.running) {
+    return fresh ? ghcrAccess.running.then(() => refreshGhcrAccess(true)) : ghcrAccess.running;
+  }
   ghcrAccess.running = (async () => {
     const r = await runGhcrAccessCheck(null);
     if (r.ok) {
@@ -7190,8 +7195,19 @@ app.post('/api/v1/admin/github-access', requireAdmin, testRateLimit, globalOp('G
   if (!token || /\s/.test(token) || token.length > 255) {
     return res.status(400).json({ ok: false, error: 'Paste the GitHub token you were given (one line, no spaces).' });
   }
-  const tmpDir = path.join(VIBE_DIR, 'data');
-  fs.mkdirSync(tmpDir, { recursive: true });
+  // The payload holds the raw token, so it goes next to where the token
+  // will live (/opt/vibe/docker, 700, outside Duplicati's sources) — not
+  // /opt/vibe/data, which is backed up and would keep a copy if the
+  // console died mid-verification before the finally below ran.
+  const tmpDir = REGISTRY_CONFIG_DIR;
+  fs.mkdirSync(tmpDir, { recursive: true, mode: 0o700 });
+  // A payload left by a console that died mid-check still holds a raw
+  // token. Nothing else ever writes these names; sweep them first.
+  try {
+    for (const f of fs.readdirSync(tmpDir)) {
+      if (f.startsWith('.github-access-')) { try { fs.unlinkSync(path.join(tmpDir, f)); } catch { /* gone */ } }
+    }
+  } catch { /* unreadable dir: the write below reports it */ }
   const payload = path.join(tmpDir, `.github-access-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.json`);
   try {
     fs.writeFileSync(payload, JSON.stringify({ token }), { mode: 0o600 });
@@ -7220,12 +7236,12 @@ app.post('/api/v1/admin/github-access', requireAdmin, testRateLimit, globalOp('G
     try { fs.unlinkSync(payload); } catch { /* already gone */ }
   }
   _auditGithubAccess('(set)', 'saved');
-  await refreshGhcrAccess();
+  await refreshGhcrAccess(true);
   res.json(_githubAccessView());
 });
 
 app.post('/api/v1/admin/github-access/test', requireAdmin, testRateLimit, async (_req, res) => {
-  const r = await refreshGhcrAccess();
+  const r = await refreshGhcrAccess(true);
   if (!r.ok) return res.status(502).json({ ok: false, error: r.error });
   res.json(_githubAccessView());
 });
@@ -7236,7 +7252,7 @@ app.delete('/api/v1/admin/github-access', requireAdmin, testRateLimit, globalOp(
     return res.status(500).json({ ok: false, error: 'Could not remove the token: ' + trim(r.stderr, 300) });
   }
   _auditGithubAccess('(removed)', 'removed');
-  await refreshGhcrAccess();
+  await refreshGhcrAccess(true);
   res.json(_githubAccessView());
 });
 
