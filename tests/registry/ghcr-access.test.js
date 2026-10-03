@@ -206,7 +206,9 @@ function stage() {
   const vibe = fs.mkdtempSync(path.join(os.tmpdir(), 'vibe-regauth-'));
   fs.mkdirSync(path.join(vibe, 'logs'));
   fs.writeFileSync(path.join(vibe, 'state.json'), JSON.stringify({ schemaVersion: 1, config: {}, apps: {} }));
-  const env = { ...process.env, VIBE_DIR: vibe, APPLIANCE_DIR: REPO, NO_COLOR: '1',
+  // HOME points at the scratch dir: `set` carries root's OTHER registry
+  // logins over from ~/.docker/config.json, and a CI runner has its own.
+  const env = { ...process.env, VIBE_DIR: vibe, APPLIANCE_DIR: REPO, NO_COLOR: '1', HOME: vibe,
                 VIBE_LOG_FILE: path.join(vibe, 'logs', 'registry-auth.log') };
   const sh = (...args) => spawnSync('bash', [path.join(LIB, 'registry-auth.sh'), ...args], { encoding: 'utf8', env });
   return { vibe, sh };
