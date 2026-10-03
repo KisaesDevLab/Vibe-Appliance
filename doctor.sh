@@ -272,23 +272,73 @@ check_host_outbound() {
   code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 https://ghcr.io/ 2>/dev/null)"
   [[ -z "$code" ]] && code="000"
   if [[ "$code" == "000" ]]; then
+    GHCR_REACHABLE=0
     _check_fail "ghcr.io is unreachable" \
       "Diagnose: curl -v https://ghcr.io 2>&1 | head
 Fix:      open egress 443 in your cloud firewall"
   else
+    GHCR_REACHABLE=1
     _check_pass "ghcr.io reachable (HTTP $code)"
   fi
 }
+# Set by check_host_outbound; check_github_access skips its sweep when 0
+# (every probe would only re-time-out against the same dead route).
+GHCR_REACHABLE=1
 
 # Private app images: is the saved GitHub token accepted, and can every
 # ENABLED app's images be pulled? lib/ghcr_access.py does the checking;
 # the token is read from the Docker config file and never printed.
 check_github_access() {
   _check_begin "GitHub access (app images)"
+  # No route to GHCR: every probe would time out (10 s each, 8 at a time)
+  # to re-learn what the Outbound HTTPS check just reported.
+  if (( GHCR_REACHABLE == 0 )); then
+    _check_warn "skipped: ghcr.io is unreachable (see Outbound HTTPS above); image access cannot be verified" \
+      "Fix:      restore outbound HTTPS, then re-run: sudo vibe doctor"
+    return
+  fi
+  # The token file is root-only (0600 in a 0700 dir). Unreadable here, the
+  # checker would report 'no token saved' and FAIL every private app.
+  local cfg="${VIBE_DIR}/docker/config.json"
+  if [[ -e "$cfg" && ! -r "$cfg" ]]; then
+    _check_warn "a GitHub token is saved but not readable by this user; run doctor as root to check it" \
+      "Fix:      sudo vibe doctor"
+    return
+  fi
+  # Only the ENABLED apps' images: a disabled app's private image is not
+  # a problem today, and probing it is the dominant cost on a slow link.
+  local enabled_refs
+  enabled_refs="$(python3 - "$VIBE_STATE_FILE" "${APPLIANCE_DIR}/console/manifests" <<'PYEOF' 2>/dev/null || true
+import json, os, sys
+try:
+    apps = (json.load(open(sys.argv[1])).get("apps") or {})
+except Exception:
+    apps = {}
+refs = set()
+for slug, e in apps.items():
+    if not (e or {}).get("enabled"):
+        continue
+    try:
+        m = json.load(open(os.path.join(sys.argv[2], slug + ".json")))
+    except Exception:
+        continue
+    if m.get("runtime", "appliance") != "appliance":
+        continue
+    i = m.get("image") or {}
+    for r in [i.get("server"), i.get("client")] + [(x or {}).get("image") for x in (i.get("extras") or []) if isinstance(x, dict)]:
+        if isinstance(r, str) and r.startswith("ghcr.io/"):
+            refs.add(r)
+print(",".join(sorted(refs)))
+PYEOF
+)"
+  local -a _only=()
+  [[ -n "$enabled_refs" ]] && _only=(--only "$enabled_refs")
+  local -a _timeout=()
+  command -v timeout >/dev/null 2>&1 && _timeout=(timeout 120)
   local report
-  report="$(python3 "${APPLIANCE_DIR}/lib/ghcr_access.py" check \
+  report="$("${_timeout[@]}" python3 "${APPLIANCE_DIR}/lib/ghcr_access.py" check \
       --manifests "${APPLIANCE_DIR}/console/manifests" \
-      --docker-config "${VIBE_DIR}/docker" 2>/dev/null)" || report=""
+      --docker-config "${VIBE_DIR}/docker" "${_only[@]}" 2>/dev/null)" || report=""
   if [[ -z "$report" ]]; then
     _check_warn "could not check image access" \
       "Diagnose: python3 ${APPLIANCE_DIR}/lib/ghcr_access.py check"
@@ -304,7 +354,7 @@ except Exception:
     apps = {}
 cred = (report.get("credential") or {}).get("status")
 images = report.get("images") or {}
-blocked = []
+blocked, unknown = [], []
 for slug, e in apps.items():
     if not (e or {}).get("enabled"):
         continue
@@ -313,17 +363,18 @@ for slug, e in apps.items():
     except Exception:
         continue
     i = m.get("image") or {}
-    refs = [i.get("server"), i.get("client")] + [(x or {}).get("image") for x in (i.get("extras") or [])]
-    for r in refs:
-        if r in images and images[r].get("access") in ("needs-token", "no-access"):
-            blocked.append(slug)
-            break
+    refs = [i.get("server"), i.get("client")] + [(x or {}).get("image") for x in (i.get("extras") or []) if isinstance(x, dict)]
+    states = [images[r].get("access") for r in refs if r in images]
+    if any(s in ("needs-token", "no-access") for s in states):
+        blocked.append(slug)
+    elif any(s == "unknown" for s in states):
+        unknown.append(slug)
 private = sum(1 for v in images.values() if v.get("access") == "private-ok")
-print("%s|%s|%d" % (cred, ",".join(sorted(set(blocked))), private))
+print("%s|%s|%d|%s" % (cred, ",".join(sorted(set(blocked))), private, ",".join(sorted(set(unknown)))))
 PYEOF
-)" || verdict="unknown||0"
-  local cred blocked private
-  IFS='|' read -r cred blocked private <<<"$verdict"
+)" || verdict="unknown||0|"
+  local cred blocked private unknown
+  IFS='|' read -r cred blocked private unknown <<<"$verdict"
   local fix="Fix:      Configuration → System → GitHub access (Save & verify, or Test)"
   if [[ "$cred" == "rejected" ]]; then
     _check_fail "GitHub rejects the saved token (revoked or expired)${blocked:+ — affects: ${blocked}}" \
@@ -335,6 +386,12 @@ ${fix}"
     _check_fail "enabled app(s) whose images cannot be pulled: ${blocked}" \
       "Their next update will fail; the running versions are unaffected.
 ${fix}"
+  elif [[ -n "$unknown" ]]; then
+    # GHCR answered oddly or not at all for these: nothing was verified,
+    # so this is not a pass.
+    _check_warn "could not verify image access for enabled app(s): ${unknown}" \
+      "Diagnose: python3 ${APPLIANCE_DIR}/lib/ghcr_access.py check --only ${enabled_refs}
+Fix:      retry in a minute (GHCR outage or rate limit), or check outbound HTTPS"
   elif [[ "$cred" == "not-set" ]]; then
     _check_pass "no GitHub token saved; every enabled app's images are public"
   elif [[ "$cred" == "ok" ]]; then

@@ -99,12 +99,28 @@ fi
 TUNNEL_ALREADY_GONE=0
 
 CF_API="https://api.cloudflare.com/client/v4"
+
+# Step 2 could not confirm which tunnel is ours (API down, token broken).
+# Deleting anything at Cloudflare would then be a guess, so steps 3/4 are
+# skipped — but the connector is already gone (step 1), so steps 5/6 MUST
+# still run or Caddy stays in tunnel mode (tls internal, auto_https off)
+# with nothing behind it. The recorded tunnel id is kept so the next run
+# finds the tunnel by id. The script exits 1 at the end with this message.
+CF_SIDE_SKIPPED=0
+CF_SIDE_SKIPPED_MSG=""
+_cf_side_skipped() {
+  CF_SIDE_SKIPPED=1
+  CF_SIDE_SKIPPED_MSG="$1"
+  log_error "$1"
+}
+
 cf_api() {
   local method="$1" path="$2"
   # `|| true` so a transport failure yields an empty body for the
   # caller's own success check, rather than aborting under `set -e`
   # with no diagnosis — teardown must always reach step 5/6 so the
-  # local state gets cleaned up even when Cloudflare is unreachable.
+  # local state gets cleaned up even when Cloudflare is unreachable
+  # (see _cf_side_skipped above for how a failed lookup gets there).
   # Bounded, like cloudflared-up.sh: a stalled connection must not hang
   # teardown (and the console's lock) forever.
   curl -sS -X "$method" --connect-timeout 10 --max-time 60 \
@@ -158,7 +174,7 @@ if (( LOCAL_ONLY == 0 )) && [[ -n "$RECORDED_TUNNEL_ID" ]]; then
       log_info "this appliance's tunnel is already deleted at Cloudflare; cleaning up its DNS records" id="$TUNNEL_ID"
       ;;
     *)
-      die "could not confirm this appliance's tunnel ($RECORDED_TUNNEL_ID) at Cloudflare, so nothing on the Cloudflare side was verified or deleted. The connector container is stopped; DNS records and the tunnel object remain.
+      _cf_side_skipped "could not confirm this appliance's tunnel ($RECORDED_TUNNEL_ID) at Cloudflare, so nothing on the Cloudflare side was verified or deleted. The connector container is stopped and the host side is cleaned up below; DNS records and the tunnel object remain, and the tunnel id stays recorded so the next Tear down (or re-provision) finds it.
 
   Refusing to fall back to a lookup by name: it could delete another appliance's tunnel that happens to share it.
 
@@ -172,8 +188,8 @@ if (( LOCAL_ONLY == 0 )) && [[ -n "$RECORDED_TUNNEL_ID" ]]; then
     Tunnel → Rotate token, then click Tear down again (idempotent).
     SSH equivalent: sudo bash $APPLIANCE_DIR/infra/cloudflared-down.sh
   If the token is gone for good (account closed, token unrecoverable),
-  clean up only the host side and handle Cloudflare in the dashboard:
-    sudo bash $APPLIANCE_DIR/infra/cloudflared-down.sh --local-only"
+  handle Cloudflare in the dashboard: delete the CNAMEs pointing at
+  ${RECORDED_TUNNEL_ID}.cfargotunnel.com, then the tunnel under Zero Trust → Networks → Tunnels."
       ;;
   esac
 fi
@@ -199,7 +215,8 @@ print(res[0].get('id', '') if res else '')
 " "$search" 2>/dev/null || echo LOOKUP_ERROR)"
 
 if [[ "$TUNNEL_ID" == "LOOKUP_ERROR" ]]; then
-  die "could not look up tunnel '$CF_TUNNEL_NAME' at Cloudflare — the API call failed or returned an error, so nothing on the Cloudflare side was verified or deleted. The connector container is stopped; DNS records and the tunnel object remain.
+  TUNNEL_ID=""
+  _cf_side_skipped "could not look up tunnel '$CF_TUNNEL_NAME' at Cloudflare — the API call failed or returned an error, so nothing on the Cloudflare side was verified or deleted. The connector container is stopped and the host side is cleaned up below; DNS records and the tunnel object remain.
 
   Common causes: expired/rotated API token, wrong CLOUDFLARE_ACCOUNT_ID, no network path to api.cloudflare.com.
 
@@ -211,11 +228,13 @@ if [[ "$TUNNEL_ID" == "LOOKUP_ERROR" ]]; then
     Tunnel → Rotate token, then click Tear down again (idempotent).
     SSH equivalent: sudo bash $APPLIANCE_DIR/infra/cloudflared-down.sh
   If the token is gone for good (account closed, token unrecoverable),
-  clean up only the host side and handle Cloudflare in the dashboard:
-    sudo bash $APPLIANCE_DIR/infra/cloudflared-down.sh --local-only"
+  handle Cloudflare in the dashboard: delete the CNAMEs pointing at
+  *.cfargotunnel.com for this appliance, then the tunnel under Zero Trust → Networks → Tunnels."
 fi
 
-if [[ -z "$TUNNEL_ID" ]]; then
+if (( CF_SIDE_SKIPPED == 1 )); then
+  :  # lookup failed: steps 3/4 are skipped, 5/6 below still run
+elif [[ -z "$TUNNEL_ID" ]]; then
   log_info "no tunnel named '$CF_TUNNEL_NAME' found at Cloudflare; nothing to delete on that side"
 else
   log_info "tunnel found" id="$TUNNEL_ID"
@@ -380,10 +399,14 @@ fi
 # The token is gone, so is the tunnel (or, with --local-only, the operator
 # is cleaning Cloudflare up by hand). The next cloudflared-up.sh starts
 # from a clean slate instead of insisting on a tunnel that no longer
-# exists. Empty value deletes the key.
-state_set_config_kv cloudflare_tunnel_id "" \
-  || log_warn "could not clear config.cloudflare_tunnel_id in $VIBE_STATE_FILE" \
-       "fix:remove the cloudflare_tunnel_id line from $VIBE_STATE_FILE (config section) as root"
+# exists. Empty value deletes the key. NOT when the Cloudflare side was
+# skipped: the tunnel is still there, and its id is the only thing that
+# lets the next Tear down delete it (or the next provision reuse it).
+if (( CF_SIDE_SKIPPED == 0 )); then
+  state_set_config_kv cloudflare_tunnel_id "" \
+    || log_warn "could not clear config.cloudflare_tunnel_id in $VIBE_STATE_FILE" \
+         "fix:remove the cloudflare_tunnel_id line from $VIBE_STATE_FILE (config section) as root"
+fi
 
 # --- 6. Clear CLOUDFLARE_TUNNEL_ENABLED + reload Caddy ---------------
 # render-caddyfile.sh switches every site block to `tls internal`
@@ -413,6 +436,12 @@ else
   log_warn "Caddyfile re-render or reload failed; Caddy may still be in tunnel-mode config" \
     "diagnose:sudo docker logs vibe-caddy --tail 30" \
     "fix:sudo bash $APPLIANCE_DIR/bootstrap.sh    # idempotent re-render path"
+fi
+
+if (( CF_SIDE_SKIPPED == 1 )); then
+  # Host side is clean; Cloudflare side is not. Exit non-zero so the
+  # console's Tear down button reports it, with the full message last.
+  die "the host side is torn down (connector removed, token stripped, Caddy back to direct mode), but the Cloudflare side was NOT: $CF_SIDE_SKIPPED_MSG"
 fi
 
 log_ok "Cloudflare Tunnel torn down. Re-run infra/cloudflared-up.sh to bring it back up."

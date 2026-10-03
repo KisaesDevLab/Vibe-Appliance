@@ -8,7 +8,7 @@
 #
 # The token lives in exactly one place: a Docker client config,
 #   /opt/vibe/docker/config.json   (directory 700, file 600, root)
-# holding only {"auths":{"ghcr.io":{"auth":"<base64 login:token>"}}}.
+# holding {"auths":{"ghcr.io":{"auth":"<base64 login:token>"}, ...}}.
 # It is deliberately NOT in /opt/vibe/env/*.env — those files are loaded
 # into every app container — and not in state.json, a log line, argv or
 # an API response. Docker reads it through DOCKER_CONFIG, which the
@@ -16,6 +16,13 @@
 # compose call (registry_auth_env). /opt/vibe/docker is outside the
 # Duplicati backup sources, so a restored appliance needs the token
 # entered again.
+#
+# DOCKER_CONFIG replaces root's ~/.docker for those calls rather than
+# adding to it, so `set` carries over the inline `auths` entries root's
+# config holds for OTHER registries (a `docker login` to Docker Hub to
+# lift anonymous pull limits). Nothing else is copied: a credsStore or
+# credHelpers entry would make docker ask a helper this file's inline
+# ghcr.io entry is not in.
 #
 # Non-secret status for display goes to state.config: ghcr_login and
 # ghcr_saved_at.
@@ -58,9 +65,9 @@ _ra_set() {
   chmod 600 "$tmp"
   # The token is read from the payload file and written to the config
   # inside python: it never passes through argv or the environment.
-  if ! login="$(python3 - "$payload" "$tmp" <<'PYEOF'
+  if ! login="$(python3 - "$payload" "$tmp" "${HOME:-/root}/.docker/config.json" <<'PYEOF'
 import base64, json, re, sys
-payload, out = sys.argv[1:3]
+payload, out, root_cfg = sys.argv[1:4]
 try:
     data = json.load(open(payload, encoding="utf-8"))
 except (OSError, ValueError) as e:
@@ -75,8 +82,19 @@ if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", login or "x"):
     print("payload login is not a GitHub username", file=sys.stderr)
     sys.exit(1)
 auth = base64.b64encode(("%s:%s" % (login or "token", token)).encode("utf-8")).decode("ascii")
+# Root's other registry logins (inline `auth` entries only) keep working
+# under DOCKER_CONFIG; the ghcr.io entry is always this token.
+auths = {}
+try:
+    with open(root_cfg, encoding="utf-8") as f:
+        for reg, entry in ((json.load(f).get("auths") or {}).items()):
+            if isinstance(entry, dict) and entry.get("auth") and reg not in ("ghcr.io", "https://ghcr.io"):
+                auths[reg] = {"auth": entry["auth"]}
+except (OSError, ValueError, AttributeError):
+    pass
+auths["ghcr.io"] = {"auth": auth}
 with open(out, "w", encoding="utf-8") as f:
-    json.dump({"auths": {"ghcr.io": {"auth": auth}}}, f)
+    json.dump({"auths": auths}, f)
     f.write("\n")
 print(login)
 PYEOF

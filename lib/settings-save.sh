@@ -328,8 +328,8 @@ keys = {c.get("key") for c in changes}
 out = []
 
 
-def declared_job(change):
-    """The `ui.postSaveJob` the owning manifest declares for this key:
+def declared_ui(change):
+    """The `ui` block the owning manifest declares for this key:
     _appliance.json for appliance scope, <slug>.json for per-app scope."""
     scope = change.get("scope", "")
     if scope == "appliance":
@@ -337,12 +337,12 @@ def declared_job(change):
     elif scope.startswith("per-app:"):
         name = scope[len("per-app:"):] + ".json"
     else:
-        return None
+        return {}
     try:
         with open(os.path.join(manifests_dir, name)) as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return None
+        return {}
     # App manifests list fields under env.required/optional; the
     # appliance-level manifest lists them under settings.
     env = data.get("env") or {}
@@ -350,14 +350,34 @@ def declared_job(change):
               + (env.get("required") or []) + (env.get("optional") or []))
     for field in fields:
         if isinstance(field, dict) and field.get("name") == change.get("key"):
-            return (field.get("ui") or {}).get("postSaveJob")
-    return None
+            return field.get("ui") or {}
+    return {}
+
+
+def declared_job(change):
+    return declared_ui(change).get("postSaveJob")
 
 
 if what == "routing-scopes":
+    # One line per routing change:
+    #   appliance                  an appliance-wide change that reaches
+    #                              every app's env (HOST_TAG, the routing
+    #                              layout) -> every enabled app re-enables
+    #   appliance-hosts:<KEY>      an appliance-wide change that moves only
+    #                              hosts no app owns (apex ownership, an
+    #                              infra host label; the manifest says so
+    #                              with ui.routingAffects "hosts") -> Caddy
+    #                              re-render + tunnel re-provision only
+    #   per-app:<slug>             that app re-enables
     for c in changes:
-        if declared_job(c) == "routing-reconcile":
-            print(c.get("scope", ""))
+        ui = declared_ui(c)
+        if ui.get("postSaveJob") != "routing-reconcile":
+            continue
+        scope = c.get("scope", "")
+        if scope == "appliance" and ui.get("routingAffects") == "hosts":
+            print("appliance-hosts:%s" % c.get("key", ""))
+        else:
+            print(scope)
     sys.exit(0)
 
 if "DNS_PROVIDER" in keys:
@@ -454,11 +474,22 @@ _post_save_routing_reconcile() {
 
   # Only the changes that move a hostname count. A save that also carries
   # an unrelated appliance setting (a DDNS interval, a time zone) must not
-  # turn one app's rename into a restart of every enabled app.
-  local routing_scopes appliance_changed="no"
+  # turn one app's rename into a restart of every enabled app. Nor must an
+  # appliance-wide change that no app's env reads — apex ownership, an
+  # infra host label (`appliance-hosts:<KEY>` lines) — those need only the
+  # Caddy re-render and tunnel re-provision at the end.
+  local routing_scopes appliance_changed="no" hosts_changed="no" cockpit_moved="no"
   routing_scopes="$(_settings_job_scan "$payload_file" routing-scopes)" || routing_scopes=""
   if grep -qx 'appliance' <<<"$routing_scopes"; then
     appliance_changed="yes"
+    hosts_changed="yes"
+    cockpit_moved="yes"   # the tag moves every default label, Cockpit's included
+  fi
+  if grep -q '^appliance-hosts:' <<<"$routing_scopes"; then
+    hosts_changed="yes"
+  fi
+  if grep -qx 'appliance-hosts:INFRA_SUBDOMAIN_COCKPIT' <<<"$routing_scopes"; then
+    cockpit_moved="yes"
   fi
 
   local slugs
@@ -527,7 +558,7 @@ PYEOF
   # An appliance-wide change (tag, apex ownership, an infra host label)
   # moves hosts no app owns, and there may be no enabled app to carry the
   # Caddy re-render — so render + reload once here, after the apps.
-  if [[ "$appliance_changed" == "yes" ]]; then
+  if [[ "$hosts_changed" == "yes" ]]; then
     log_step "routing-reconcile: re-rendering Caddyfile + reloading Caddy"
     if ! ( # shellcheck source=/dev/null
            . "${APPLIANCE_DIR}/lib/state.sh"
@@ -540,9 +571,14 @@ PYEOF
       rc=1
     fi
     # Cockpit's allowed Origins live in /etc/cockpit on the HOST, which
-    # this job (run from the console container) cannot rewrite.
-    log_warn "routing-reconcile: Cockpit's hostname may have changed, and its allowed origins live on the host where this job cannot reach — until they are refreshed Cockpit shows a blank page after login at its new name" \
-      "fix:sudo bash ${APPLIANCE_DIR}/bootstrap.sh"
+    # this job (run from the console container) cannot rewrite. Only when
+    # a change actually moved Cockpit's name (the tag, or its own label):
+    # a warning on every apex or Portainer save would be learned and
+    # ignored by the time it mattered.
+    if [[ "$cockpit_moved" == "yes" ]]; then
+      log_warn "routing-reconcile: Cockpit's hostname changed, and its allowed origins live on the host where this job cannot reach — until they are refreshed Cockpit shows a blank page after login at its new name" \
+        "fix:sudo bash ${APPLIANCE_DIR}/bootstrap.sh"
+    fi
   fi
 
   # Re-provision the tunnel so ingress rules + CNAMEs match the new

@@ -261,11 +261,16 @@ def manifest_images(manifests_dir):
     return out
 
 
-def check(manifests_dir, login, token):
+def check(manifests_dir, login, token, only=None):
+    """The access report. `only` (a set of image refs) narrows the sweep
+    to the images a caller cares about — doctor passes the enabled apps'
+    images so a LAN box does not time out probing 20 disabled ones."""
     credential = check_credential(token)
     if credential.get("login"):
         login = credential["login"]
     images = manifest_images(manifests_dir)
+    if only is not None:
+        images = {img: tag for img, tag in images.items() if img in only}
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {img: pool.submit(check_image, img, tag, login, token, credential["status"])
                    for img, tag in images.items()}
@@ -275,16 +280,29 @@ def check(manifests_dir, login, token):
 
 
 def digest(image, tag, login, token):
+    """The remote manifest digest, or None. With a saved credential the
+    authenticated request goes first: a token that pulls private images
+    pulls public ones too and the digest is identical, so the anonymous
+    attempt is only a fallback for a token GHCR rejects. A network-level
+    failure (status 0) ends the attempt — retrying with other credentials
+    would only multiply the timeout while update.sh holds the console's
+    global lock."""
     parsed = split_image(image, tag)
     if not parsed:
         return None
     repo, tag = parsed
-    for creds in ((None, None), (login, token)) if token else ((None, None),):
-        _s, bearer = _bearer(repo, *creds)
-        if bearer:
-            mstatus, d = _manifest(repo, tag, bearer)
-            if mstatus == 200 and d:
-                return d
+    attempts = ((login, token), (None, None)) if token else ((None, None),)
+    for creds in attempts:
+        status, bearer = _bearer(repo, *creds)
+        if status == 0:
+            return None
+        if not bearer:
+            continue
+        mstatus, d = _manifest(repo, tag, bearer)
+        if mstatus == 200 and d:
+            return d
+        if mstatus == 0:
+            return None
     return None
 
 
@@ -307,7 +325,7 @@ def _main(argv):
     args, opts = [], {}
     it = iter(argv)
     for a in it:
-        if a in ("--manifests", "--docker-config", "--token-file"):
+        if a in ("--manifests", "--docker-config", "--token-file", "--only"):
             opts[a] = next(it, "")
         elif a in ("-h", "--help"):
             sys.stdout.write(__doc__)
@@ -323,7 +341,10 @@ def _main(argv):
         login, token = credential_from_docker_config(opts.get("--docker-config") or _default_docker_config())
 
     if args[0] == "check":
-        report = check(opts.get("--manifests") or _default_manifests(), login, token)
+        only = None
+        if "--only" in opts:
+            only = set(x.strip() for x in opts["--only"].split(",") if x.strip())
+        report = check(opts.get("--manifests") or _default_manifests(), login, token, only=only)
         sys.stdout.write(json.dumps(report, sort_keys=True) + "\n")
         return 0
     if args[0] == "digest" and len(args) >= 3:

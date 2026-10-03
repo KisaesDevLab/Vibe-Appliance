@@ -328,8 +328,18 @@ test('an sso-capable manifest carries everything lib/identity.sh needs', () => {
       `${file}: sso.capable requires "identity" in requires[]`);
     const routing = data.routing || {};
     const matchers = routing.matchers || [];
-    // The tier lib/identity.sh resolves: the first matcher under /auth.
-    const auth = matchers.find((m) => String(m.path || '').startsWith('/auth'));
+    // The matchers under /auth (the path itself or a sub-path — /authors/*
+    // is not one). lib/identity.sh resolves the auth tier from
+    // sso.internalUrl first and only then from the first of these, so
+    // matcher ORDER is not load-bearing; what is asserted below is that
+    // every /auth matcher names ONE tier and it is the internalUrl tier.
+    const underAuth = (p) => p === '/auth' || p.startsWith('/auth/');
+    const authMatchers = matchers.filter((m) => underAuth(String(m.path || '')));
+    const auth = authMatchers[0];
+    for (const m of authMatchers) {
+      assert.strictEqual(m.upstream, auth.upstream,
+        `${file}: /auth matcher "${m.path}" routes to ${m.upstream} but "${auth.path}" routes to ${auth.upstream}; every engine route must reach the same tier`);
+    }
     if (sso.internalUrl !== undefined) {
       assert.match(sso.internalUrl, /^https?:\/\/[a-z0-9.-]+:\d+$/,
         `${file}: sso.internalUrl "${sso.internalUrl}" is not http://<service>:<port>`);
@@ -354,7 +364,13 @@ test('an sso-capable manifest carries everything lib/identity.sh needs', () => {
       assert.ok(auth, `${file}: sso.capable with an API tier (${apiTier}) behind a different default upstream (${routing.default_upstream}) needs routing matchers under /auth`);
       const registered = [...(sso.redirectPaths || []), ...(sso.logoutPaths || [])];
       assert.ok(registered.length > 0, `${file}: sso.capable needs redirectPaths / logoutPaths`);
-      for (const p of registered) {
+      // The engine's FIXED routes (docs/MANIFEST_SCHEMA.md, sso section)
+      // must reach the API tier too: lib/identity.sh probes /auth/status
+      // to detect SSO support, and the SPA's SSO button reads it. A
+      // product that routes /auth one path at a time can drop one of
+      // these and still pass every other assertion here.
+      const engineRoutes = ['/auth/status', '/auth/me', '/auth/settings', '/auth/settings/test'];
+      for (const p of [...registered, ...engineRoutes]) {
         const hit = matchers.find((m) => matcherCovers(String(m.path || ''), p));
         assert.ok(hit, `${file}: sso path "${p}" is not routed by any routing matcher — it would land on the default upstream (the SPA)`);
         assert.strictEqual(hit.upstream, auth.upstream,
@@ -699,15 +715,83 @@ test('bootOrder does not contradict requiredApps', () => {
   }
 });
 
+// A small JSON Schema (draft 2020-12 subset) walker: the keywords
+// console/manifest.schema.json actually uses \u2014 type, enum, const, pattern,
+// min/maxLength, minimum/maximum, minItems, uniqueItems, items, required,
+// properties, additionalProperties, anyOf, allOf/if/then, $ref into $defs.
+// Dependency-free on purpose (see the header): ajv would be more faithful
+// but the console image deliberately ships no extra packages. Returns a
+// list of "<path>: <problem>" strings.
+function schemaErrors(schema, value, root, at = '$') {
+  const errs = [];
+  const typeOf = (v) => Array.isArray(v) ? 'array' : v === null ? 'null' : typeof v;
+  const isType = (v, t) => t === 'integer' ? Number.isInteger(v) : t === 'number' ? typeof v === 'number' : typeOf(v) === t;
+  const resolve = (s) => (s && s.$ref) ? resolve(s.$ref.replace(/^#\//, '').split('/').reduce((o, k) => (o || {})[k], root)) : s;
+  const s = resolve(schema);
+  if (!s || typeof s !== 'object') return errs;
+  if (s.type !== undefined) {
+    const types = Array.isArray(s.type) ? s.type : [s.type];
+    if (!types.some((t) => isType(value, t))) { errs.push(`${at}: expected ${types.join('|')}, got ${typeOf(value)}`); return errs; }
+  }
+  if (s.enum !== undefined && !s.enum.some((e) => JSON.stringify(e) === JSON.stringify(value))) errs.push(`${at}: not one of ${JSON.stringify(s.enum)}`);
+  if (s.const !== undefined && JSON.stringify(s.const) !== JSON.stringify(value)) errs.push(`${at}: must be ${JSON.stringify(s.const)}`);
+  if (typeof value === 'string') {
+    if (s.pattern && !new RegExp(s.pattern).test(value)) errs.push(`${at}: "${value}" does not match ${s.pattern}`);
+    if (s.minLength !== undefined && value.length < s.minLength) errs.push(`${at}: shorter than ${s.minLength}`);
+    if (s.maxLength !== undefined && value.length > s.maxLength) errs.push(`${at}: longer than ${s.maxLength}`);
+  }
+  if (typeof value === 'number') {
+    if (s.minimum !== undefined && value < s.minimum) errs.push(`${at}: ${value} < ${s.minimum}`);
+    if (s.maximum !== undefined && value > s.maximum) errs.push(`${at}: ${value} > ${s.maximum}`);
+  }
+  if (Array.isArray(value)) {
+    if (s.minItems !== undefined && value.length < s.minItems) errs.push(`${at}: fewer than ${s.minItems} items`);
+    if (s.uniqueItems && new Set(value.map((v) => JSON.stringify(v))).size !== value.length) errs.push(`${at}: items are not unique`);
+    if (s.items) value.forEach((v, i) => errs.push(...schemaErrors(s.items, v, root, `${at}[${i}]`)));
+  }
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    for (const k of (s.required || [])) if (!(k in value)) errs.push(`${at}: missing required "${k}"`);
+    const props = s.properties || {};
+    for (const [k, v] of Object.entries(value)) {
+      if (k in props) errs.push(...schemaErrors(props[k], v, root, `${at}.${k}`));
+      else if (s.additionalProperties === false) errs.push(`${at}: additional property "${k}" is not allowed`);
+      else if (s.additionalProperties && typeof s.additionalProperties === 'object') errs.push(...schemaErrors(s.additionalProperties, v, root, `${at}.${k}`));
+    }
+  }
+  if (s.anyOf && !s.anyOf.some((alt) => schemaErrors(alt, value, root, at).length === 0)) errs.push(`${at}: matches none of the anyOf alternatives`);
+  for (const sub of (s.allOf || [])) {
+    if (sub.if) {
+      if (schemaErrors(sub.if, value, root, at).length === 0) { if (sub.then) errs.push(...schemaErrors(sub.then, value, root, at)); }
+      else if (sub.else) errs.push(...schemaErrors(sub.else, value, root, at));
+    } else {
+      errs.push(...schemaErrors(sub, value, root, at));
+    }
+  }
+  return errs;
+}
+
 test('every manifest validates against the published JSON Schema', () => {
-  // The other guards in this file cover the constraints that bite at runtime.
-  // This one is the backstop for everything else the schema declares \u2014 and
-  // it is the same file vibe-sentinel-installer vendors and CI-checks, so a
-  // change here is a change to a contract two repos depend on.
+  // The backstop for everything the schema declares beyond the runtime
+  // guards above \u2014 and the same check tests/federation/e2e-verify.sh runs
+  // with python-jsonschema on Linux. A nested "_doc" under routing or sso
+  // (additionalProperties: false) is the kind of drift this catches; the
+  // schema is the contract vibe-sentinel-installer vendors, so the fix is
+  // always in the manifest, never a wider schema.
+  for (const { file, data } of manifests) {
+    const errs = schemaErrors(schema, data, schema);
+    assert.deepStrictEqual(errs, [], `${file} does not validate against console/manifest.schema.json:\n  ${errs.join('\n  ')}`);
+  }
+  // The walker must actually reject things, or the loop above proves nothing.
+  const bad = JSON.parse(JSON.stringify(manifests[0].data));
+  bad.routing = { ...(bad.routing || {}), _doc: 'x' };
+  assert.ok(schemaErrors(schema, bad, schema).some((e) => /routing: additional property "_doc"/.test(e)),
+    'the schema walker must reject an unknown key under routing');
+});
+
+test('the published JSON Schema keeps the runtime-conditional required branch', () => {
+  // vibe-sentinel-installer relies on the exact shape of this branch.
   const schemaPath = path.join(__dirname, '..', '..', 'console', 'manifest.schema.json');
   const raw = JSON.parse(fs.readFileSync(schemaPath, 'utf8'));
-  // Dependency-free: assert the conditional-required branch is present and
-  // shaped the way both installers rely on, rather than pulling in ajv.
   assert.ok(Array.isArray(raw.allOf) && raw.allOf.length > 0,
     'schema must carry the runtime-conditional required branch');
   const branch = raw.allOf.find((b) => b.if && b.if.properties && b.if.properties.runtime);

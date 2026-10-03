@@ -175,6 +175,12 @@
     ],
     "optional": [
       {
+        "name":   "EMAILIT_API_KEY",
+        "from":   "appliance:EMAILIT_API_KEY",
+        "secret": true,
+        "doc":    "Inherited from appliance.env (set once under Configuration -> Email & SMS, declared by vibe-connect). Compose loads appliance.env before vibe-recap.env, so this app sees the firm-wide key with no line of its own; the env template keeps it commented out, and lib/enable-app.sh drops a stale blank `EMAILIT_API_KEY=` from an older render because THIS declaration says the key is inherited."
+      },
+      {
         "name": "VIBE_APP_SUBDOMAIN",
         "doc": "Operator override for this app's subdomain label. Empty = the manifest default (recap). Single DNS label.",
         "ui": {

@@ -22,7 +22,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawnSync } = require('node:child_process');
 
 const REPO = path.resolve(__dirname, '..', '..', '..');
 
@@ -160,10 +160,24 @@ test('tunnel ownership: lookalike domain does not read as ours', () => {
   assert.equal(foreignHosts(cfg(['vibe.evilfirm.com']), OURS), 'vibe.evilfirm.com');
 });
 
-test('tunnel ownership: fails OPEN on an unreadable config', () => {
-  // A permissions/transport failure must not block a legitimate
-  // provision — the same reasoning as the GET /accounts/{id} trap this
-  // repo hit before. Empty output => proceed (the DNS pre-flight still
-  // refuses to repoint another appliance's records).
-  assert.equal(foreignHosts({ success: false, errors: [{ code: 9109 }] }, OURS), '');
+test('tunnel ownership: fails CLOSED on an unreadable config', () => {
+  // Section 4 of cloudflared-up.sh PUTs this appliance's whole ingress
+  // over whatever tunnel is adopted, and the DNS pre-flight only inspects
+  // records at THIS appliance's hostnames — it cannot protect the other
+  // appliance's ingress. So an unreadable config is "may be someone's":
+  // the guard exits 3 (nothing printed) and the script refuses to adopt
+  // a tunnel it found only by name, exactly as it does for an unreadable
+  // tunnel-state in 2a.
+  for (const body of [{ success: false, errors: [{ code: 9109 }] }, 'not json', '']) {
+    const r = spawnSync('python3', [path.join(REPO, 'lib', 'cf_guard.py'), 'foreign-hosts', ...OURS],
+      { encoding: 'utf8', input: typeof body === 'string' ? body : JSON.stringify(body) });
+    assert.equal(r.status, 3, `unreadable config must exit 3, got ${r.status}: ${r.stderr}`);
+    assert.equal(r.stdout.trim(), '', 'nothing is printed, so the shell cannot mistake it for a host list');
+  }
+  // The script wires exit 3 to a refusal, not to `|| true`.
+  const up = fs.readFileSync(path.join(REPO, 'infra', 'cloudflared-up.sh'), 'utf8');
+  assert.match(up, /cf_check_success "\$existing_cfg" "tunnel configurations GET"/,
+    'the configurations GET is checked before the ownership decision');
+  assert.doesNotMatch(up, /foreign-hosts \$DESIRED_HOSTS 2>\/dev\/null \|\| true\)/,
+    'a guard failure must not read as "no foreign hosts"');
 });

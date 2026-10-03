@@ -233,7 +233,9 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
     return data;
   }
 
-  async function loadGithubAccess(section, data, notice) {
+  // `keepToken`: a token the operator pasted whose save just failed for a
+  // transient reason; it is put back into the rebuilt input.
+  async function loadGithubAccess(section, data, notice, keepToken) {
     const body = section.querySelector('[data-gh-body]');
     if (!body) return;
     if (!data) {
@@ -282,6 +284,7 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
       placeholder: 'ghp_…',
       style: 'padding:0.4rem 0.6rem;border:1px solid var(--border);border-radius:4px;background:var(--surface);font:inherit;',
     });
+    if (keepToken) input.value = keepToken;
     form.appendChild(input);
     body.appendChild(form);
 
@@ -297,8 +300,11 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
         input.value = '';
         loadGithubAccess(section, d, ['✓ Token verified and saved.', 'var(--good)']);
       } catch (err) {
-        input.value = '';
-        loadGithubAccess(section, data, ['✗ ' + err.message, 'var(--bad)']);
+        // Keep the paste: a transient failure (GitHub unreachable, the
+        // check timing out) should cost one more click, not a hunt for
+        // the token. The re-render below rebuilds the input, so the
+        // value is carried over explicitly.
+        loadGithubAccess(section, data, ['✗ ' + err.message, 'var(--bad)'], token);
       }
     });
     cta.appendChild(saveBtn);
@@ -839,6 +845,12 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
     if (!confirmTest(field)) return;
 
     const payload = collectCategoryValues();
+    // A per-app Test (Apps tab) must be answered from THAT app's saved
+    // secrets (/opt/vibe/env/<slug>.env), not the appliance-wide ones;
+    // withSavedSecrets on the server reads this to know which file.
+    if (state.activeTab === 'Apps' && state.activeAppSlug) {
+      payload._scope = 'app:' + state.activeAppSlug;
+    }
 
     // SMS test needs an explicit recipient that isn't in the form.
     // Prompt the operator for it and add to the payload. Validate E.164

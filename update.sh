@@ -539,9 +539,18 @@ cmd_update() {
 
   # Step 2: pull the new image(s).
   log_step "pulling new images for $slug"
-  if ! _do_pull "$slug" "$default_tag"; then
+  local _pull_rc=0
+  _do_pull "$slug" "$default_tag" || _pull_rc=$?
+  if (( _pull_rc != 0 )); then
     local _hint
-    _hint="$(pull_failure_hint "${_PULL_OUT:-}")"
+    if (( _pull_rc == 3 )); then
+      # Nothing was pulled: the manifest's routing names no compose
+      # service. A registry hint here would send the operator chasing
+      # their network for a manifest bug.
+      _hint="no compose services could be derived from console/manifests/${slug}.json (routing.default_upstream / routing.matchers[].upstream); the manifest needs fixing, not the network."
+    else
+      _hint="$(pull_failure_hint "${_PULL_OUT:-}")"
+    fi
     _state_app_set "$slug" status failed update_error "pull failed: ${_hint}"
     _state_app_history_append "$slug" "failed" "$current_tag" "$default_tag" "pull failed"
     die "Could not pull new images for $slug: ${_hint}" \
@@ -818,12 +827,17 @@ _do_pull() {
   # blast radius to images we genuinely expect to be on a registry.
   local manifest="$(_manifest_path "$slug")"
   local services
+  # Cleared first so a caller classifying THIS failure never reads the
+  # output of a previous slug's pull.
+  _PULL_OUT=""
   services="$(_app_services "$manifest")"
   # Empty list -> whole-project pull, which fails on build-only services.
+  # Exit 3 (not 1): nothing was pulled, so the caller must not classify
+  # the failure as a registry problem.
   if [[ -z "$services" ]]; then
     log_error "could not derive compose services for $slug from its manifest routing — refusing a whole-project pull."
     log_error "Fix routing.default_upstream / routing.matchers[].upstream in console/manifests/${slug}.json, then retry."
-    return 1
+    return 3
   fi
   # Captured as well as logged so the caller can classify a failure
   # (pull_failure_hint). The file is overwritten on every pull.

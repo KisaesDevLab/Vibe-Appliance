@@ -252,7 +252,8 @@
           { "value": "true",  "label": "Yes (default)" },
           { "value": "false", "label": "No — another appliance owns it" }
         ],
-        "postSaveJob":  "routing-reconcile"
+        "postSaveJob":  "routing-reconcile",
+        "routingAffects": "hosts"
       }
     },
     {
@@ -267,7 +268,8 @@
         "input":        "text",
         "appliance":    "shared",
         "validate":     "regex:^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)?$",
-        "postSaveJob":  "routing-reconcile"
+        "postSaveJob":  "routing-reconcile",
+        "routingAffects": "hosts"
       }
     },
     {
@@ -282,7 +284,8 @@
         "input":        "text",
         "appliance":    "shared",
         "validate":     "regex:^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)?$",
-        "postSaveJob":  "routing-reconcile"
+        "postSaveJob":  "routing-reconcile",
+        "routingAffects": "hosts"
       }
     },
     {
@@ -297,7 +300,8 @@
         "input":        "text",
         "appliance":    "shared",
         "validate":     "regex:^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)?$",
-        "postSaveJob":  "routing-reconcile"
+        "postSaveJob":  "routing-reconcile",
+        "routingAffects": "hosts"
       }
     },
     {

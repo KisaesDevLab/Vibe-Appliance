@@ -3,6 +3,7 @@
   "slug": "vibe-payroll",
   "displayName": "Vibe Time Keeper",
   "description": "Time tracking and payroll runs for small accounting practices.",
+  "_doc": "Mirrors KisaesDevLab/Vibe-Payroll-Time/.appliance/manifest.json. ROUTING: the single sign-on (Vibe Auth) engine routes go to the API tier ONE PATH AT A TIME, never as /auth/* like the other products. This SPA owns /auth/magic and /auth/reset (the emailed login-link and password-reset landing pages); a blanket /auth/* matcher would send every such link to the API, which 404s it. lib/identity.sh resolves the auth tier from sso.internalUrl (else the first matcher under /auth), so matcher order does not matter. Mirrors routing in Vibe-Payroll-Time: caddy/Caddyfile*, frontend/vite.config.ts, .appliance/manifest.json.",
   "logo": "vibe-payroll.svg",
 
   "image": {
@@ -18,7 +19,6 @@
 
   "routing": {
     "default_upstream": "vibe-payroll-web:8080",
-    "_doc": "Single sign-on (Vibe Auth) engine routes go to the API tier ONE PATH AT A TIME, never as /auth/* like the other products. This SPA owns /auth/magic and /auth/reset (the emailed login-link and password-reset landing pages); a blanket /auth/* matcher would send every such link to the API, which 404s it. lib/identity.sh finds the auth tier by the first matcher whose path starts with /auth — keep auth_oidc first among them. Mirrors routing in Vibe-Payroll-Time: caddy/Caddyfile*, frontend/vite.config.ts, .appliance/manifest.json.",
     "matchers": [
       { "name": "api",               "path": "/api/*",           "upstream": "vibe-payroll-api:4000" },
       { "name": "auth_oidc",         "path": "/auth/oidc/*",     "upstream": "vibe-payroll-api:4000" },

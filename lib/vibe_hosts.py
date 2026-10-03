@@ -40,9 +40,9 @@ does that for every enabled app).
 CLI (paths default from VIBE_DIR / VIBE_STATE_FILE / VIBE_ENV_DIR /
 APPLIANCE_DIR; override with --state / --env-dir / --manifests):
   vibe_hosts.py dump
-  vibe_hosts.py get main-host|main-url|main-label|domain|routing-mode|tag|apex-owned
+  vibe_hosts.py get main-url|main-label|routing-mode|tag|apex-owned
                     |cockpit-host|portainer-host|backup-host
-  vibe_hosts.py list caddy|tunnel|doctor|ddns [--slug SLUG] [--apps-only]
+  vibe_hosts.py list caddy|tunnel|doctor|ddns [--slug SLUG]
   vibe_hosts.py plan-app SLUG [--app-env FILE]
   vibe_hosts.py check-label LABEL
   vibe_hosts.py check-tag TAG
@@ -309,7 +309,10 @@ def resolve(state, manifests, env):
     """
     config = (state.get("config") or {})
     mode = config.get("mode", "lan")
-    domain = (config.get("domain") or "").strip()
+    # DNS is case-insensitive and Cloudflare returns names lowercased;
+    # bootstrap keeps --domain as typed, so normalise here, the one place
+    # every consumer gets the domain from.
+    domain = (config.get("domain") or "").strip().lower()
     in_domain = mode == "domain" and bool(domain)
     tag = host_tag(env)
     rmode = routing_mode(env)
@@ -349,7 +352,15 @@ def resolve(state, manifests, env):
         ours = is_appliance_app(manifest)
         desired = plan_app(manifest, env, {})
 
-        applied = (entry.get("subdomain") or "").strip() if ours else ""
+        # An APPLIED label is what the app's env file was last rendered
+        # for. It only means something while the app is enabled: a
+        # disabled app's env is re-rendered on enable, so its old label is
+        # history, not a claim (disable-app.sh does not clear it). Guard
+        # the type too — lib/enable-app.sh's state writer coerces the
+        # strings "true"/"false" to JSON booleans, and both are valid
+        # DNS labels an operator can type.
+        raw_applied = entry.get("subdomain") if (ours and enabled) else ""
+        applied = raw_applied.strip() if isinstance(raw_applied, str) else ""
         if applied:
             p_label = applied
             p_source = "applied"
@@ -360,15 +371,28 @@ def resolve(state, manifests, env):
         served = (ours and bool(p_label) and _primary_served_gate(manifest)
                   and (rmode == "subdomain-per-app" or manifest.get("rootServedOnly") is True))
 
-        applied_extras = entry.get("subdomains") if isinstance(entry.get("subdomains"), dict) else {}
+        raw_extras = entry.get("subdomains") if (ours and enabled) else None
+        applied_extras = raw_extras if isinstance(raw_extras, dict) else {}
+        # An app enabled before extra-surface labels were recorded has an
+        # applied primary but no `subdomains` map. Its env file was
+        # rendered with the manifest's literal surface names (no tag, no
+        # per-surface override existed then), so that is what it answers
+        # for — serving the TAGGED desired label instead would publish a
+        # host the app's own ALLOWED_ORIGIN never names.
+        legacy_applied = bool(applied) and not isinstance(raw_extras, dict)
         extras = []
         for s in (extra_entries(manifest) if ours else []):
             name = s["name"]
-            a = (applied_extras.get(name) or "").strip() if isinstance(applied_extras.get(name), str) else ""
-            label = a or desired["extras"][name]
+            a = applied_extras.get(name)
+            a = a.strip() if isinstance(a, str) else ""
+            if a:
+                label, source = a, "applied"
+            elif legacy_applied:
+                label, source = name, "applied"
+            else:
+                label, source = desired["extras"][name], desired["extraSources"][name]
             extras.append({"name": name, "label": label, "fqdn": fqdn(label),
-                           "source": "applied" if a else desired["extraSources"][name],
-                           "audience": s.get("audience") or ""})
+                           "source": source, "audience": s.get("audience") or ""})
 
         out["apps"][slug] = {
             "enabled": enabled,
@@ -407,7 +431,7 @@ def resolve(state, manifests, env):
     return out
 
 
-def hosts_for(resolved, purpose, slug=None, apps_only=False):
+def hosts_for(resolved, purpose, slug=None):
     """Host entries flagged for `purpose` (caddy|tunnel|doctor|ddns),
     de-duplicated by fqdn, optionally narrowed to one app."""
     seen, out = set(), []
@@ -415,8 +439,6 @@ def hosts_for(resolved, purpose, slug=None, apps_only=False):
         if not h.get(purpose):
             continue
         if slug is not None and h.get("slug") != slug:
-            continue
-        if apps_only and h["kind"] not in ("app", "extra"):
             continue
         if h["fqdn"] in seen:
             continue
@@ -475,12 +497,14 @@ def validate(state, manifests, env, app_envs):
         errors.append("HOST_TAG %s" % terr)
         tag = ""
 
-    claims = []  # (label, owner, setting-to-change)
+    # (label, owner, setting-to-change, sameProductAs-twin-or-None)
+    claims = []
     m_label, _src = main_label(config, tag)
-    claims.append((m_label, "the main host", "the main host label (Configuration → Network, or --tunnel-subdomain)"))
+    claims.append((m_label, "the main host",
+                   "the main host label (Configuration → Network, or --tunnel-subdomain)", None))
     for key in INFRA_KEYS:
         label, _src = infra_label(key, env, tag)
-        claims.append((label, "the %s host" % key, infra_env_key(key)))
+        claims.append((label, "the %s host" % key, infra_env_key(key), None))
 
     state_apps = (state.get("apps") or {})
     env_for_plan = dict(env)
@@ -506,15 +530,13 @@ def validate(state, manifests, env, app_envs):
         # apps — everything else is a path under the main host.
         if (plan["primary"] and _primary_served_gate(manifest)
                 and (per_app or manifest.get("rootServedOnly") is True)):
-            claims.append((plan["primary"], slug, "%s in %s.env" % (APP_SUBDOMAIN_KEY, slug)))
+            claims.append((plan["primary"], slug, "%s in %s.env" % (APP_SUBDOMAIN_KEY, slug), None))
         for name, label in plan["extras"].items():
             claims.append((label, "%s (%s)" % (slug, name),
-                           "%s in %s.env" % (extra_env_key(name), slug)))
+                           "%s in %s.env" % (extra_env_key(name), slug), None))
 
     seen = {}
-    for claim in claims:
-        label, owner, setting = claim[0], claim[1], claim[2]
-        twin = claim[3] if len(claim) > 3 else None
+    for label, owner, setting, twin in claims:
         lerr = label_error(label)
         if lerr:
             errors.append("%s: label '%s' %s. Change %s." % (owner, label, lerr, setting))
@@ -563,7 +585,7 @@ def _main(argv):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(newline="\n")
     paths = _default_paths()
-    sets, slug, apps_only, app_env_path = [], None, False, None
+    sets, slug, app_env_path = [], None, None
     args = []
     it = iter(argv)
     for a in it:
@@ -579,8 +601,6 @@ def _main(argv):
             slug = next(it)
         elif a == "--app-env":
             app_env_path = next(it)
-        elif a == "--apps-only":
-            apps_only = True
         elif a in ("-h", "--help"):
             _usage(0)
         else:
@@ -642,10 +662,8 @@ def _main(argv):
     if cmd == "get":
         what = args[1] if len(args) > 1 else ""
         values = {
-            "main-host": resolved["main"]["fqdn"],
             "main-url": ("https://" + resolved["main"]["fqdn"]) if resolved["main"]["fqdn"] else "",
             "main-label": resolved["main"]["label"],
-            "domain": resolved["domain"],
             "routing-mode": resolved["routingMode"],
             "tag": resolved["tag"],
             "apex-owned": "true" if resolved["apexOwned"] else "false",
@@ -660,7 +678,7 @@ def _main(argv):
         purpose = args[1] if len(args) > 1 else ""
         if purpose not in ("caddy", "tunnel", "doctor", "ddns"):
             _usage()
-        for h in hosts_for(resolved, purpose, slug=slug, apps_only=apps_only):
+        for h in hosts_for(resolved, purpose, slug=slug):
             # DDNS providers take the host label, not the FQDN.
             sys.stdout.write((h["label"] if purpose == "ddns" else h["fqdn"]) + "\n")
         return 0

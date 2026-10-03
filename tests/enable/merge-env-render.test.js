@@ -122,23 +122,56 @@ test('the sign-in mode and the broker registration block survive a template that
   assert.match(first, /^VIBE_AUTH_MODE=local$/m);
 });
 
-test('a blank key the template now documents as inherited is dropped, not carried forward', () => {
+test('a blank key the MANIFEST declares as inherited is dropped, not carried forward', () => {
   // vibe-recap.env.tmpl used to ship a live `EMAILIT_API_KEY=`. The app's
   // env file loads AFTER appliance.env, so that blank line replaced the key
-  // saved under Configuration -> Email & SMS with an empty one. The template
-  // now lists the key commented out; an existing install's leftover blank
-  // line must not survive as a "preserved" extra and keep masking it.
+  // saved under Configuration -> Email & SMS with an empty one. The
+  // manifest declares the key `from: "appliance:EMAILIT_API_KEY"`; an
+  // existing install's leftover blank line must not survive as a
+  // "preserved" extra and keep masking it.
+  const inheriting = { slug: 'x', env: { optional: [
+    ...MANIFEST.env.optional,
+    { name: 'EMAILIT_API_KEY', from: 'appliance:EMAILIT_API_KEY', secret: true },
+  ] } };
   const fresh = 'APP_URL=http://new\n# EMAILIT_API_KEY=\n';
-  let out = merge({ old: 'APP_URL=http://old\nEMAILIT_API_KEY=\n', fresh, manifest: MANIFEST });
+  let out = merge({ old: 'APP_URL=http://old\nEMAILIT_API_KEY=\n', fresh, manifest: inheriting });
   assert.doesNotMatch(out, /^EMAILIT_API_KEY=/m, 'the blank override is gone, so appliance.env is inherited');
 
   // A value the operator set by hand is their own override: keep it.
-  out = merge({ old: 'APP_URL=http://old\nEMAILIT_API_KEY=em_live_abc\n', fresh, manifest: MANIFEST });
+  out = merge({ old: 'APP_URL=http://old\nEMAILIT_API_KEY=em_live_abc\n', fresh, manifest: inheriting });
   assert.match(out, /^EMAILIT_API_KEY=em_live_abc$/m);
 
-  // A blank extra the template says nothing about is left alone.
-  out = merge({ old: 'APP_URL=http://old\nSOME_OTHER_KEY=\n', fresh, manifest: MANIFEST });
+  // A blank extra the manifest says nothing about is left alone — even
+  // when the template documents it as a `# KEY=` comment. A deliberate
+  // blank per-app `ANTHROPIC_API_KEY=` (this app gets no AI key while the
+  // appliance has one) is the operator's override, and compose honours a
+  // blank in a later env_file; the rule must not revert it.
+  out = merge({ old: 'APP_URL=http://old\nSOME_OTHER_KEY=\n', fresh, manifest: inheriting });
   assert.match(out, /^SOME_OTHER_KEY=$/m);
+  out = merge({ old: 'APP_URL=http://old\nANTHROPIC_API_KEY=\n', fresh: 'APP_URL=http://new\n# ANTHROPIC_API_KEY=\n', manifest: MANIFEST });
+  assert.match(out, /^ANTHROPIC_API_KEY=$/m, 'a template comment alone does not make a key inherited');
+});
+
+test('every env key an app template documents as `# KEY=` for an appliance value is declared inherited in its manifest', () => {
+  // The merge rule above is manifest-driven; a template that comments a
+  // shared Email & SMS key out without the manifest declaring
+  // `from: "appliance:<KEY>"` would carry a stale blank forward again.
+  const dir = path.join(REPO, 'env-templates', 'per-app');
+  const manifestsDir = path.join(REPO, 'console', 'manifests');
+  const shared = /^#\s*(EMAIL_PROVIDER|EMAIL_FROM|RESEND_API_KEY|POSTMARK_SERVER_TOKEN|EMAILIT_API_KEY|SMTP_HOST|SMTP_PORT|SMTP_USER|SMTP_PASSWORD|TEXTLINK_API_KEY)=\s*$/;
+  for (const f of fs.readdirSync(dir).filter((n) => n.endsWith('.env.tmpl'))) {
+    const slug = f.replace(/\.env\.tmpl$/, '');
+    const manifestPath = path.join(manifestsDir, slug + '.json');
+    if (!fs.existsSync(manifestPath)) continue;
+    const env = (JSON.parse(fs.readFileSync(manifestPath, 'utf8')).env || {});
+    const declared = new Set([...(env.required || []), ...(env.optional || [])]
+      .filter((e) => e && typeof e.from === 'string' && e.from.startsWith('appliance:'))
+      .map((e) => e.name));
+    for (const line of fs.readFileSync(path.join(dir, f), 'utf8').split('\n')) {
+      const m = shared.exec(line);
+      if (m) assert.ok(declared.has(m[1]), `${f} documents ${m[1]} as inherited but ${slug}.json does not declare it from appliance:${m[1]}`);
+    }
+  }
 });
 
 test('no per-app template blanks out a key the appliance Email & SMS settings save', () => {

@@ -406,9 +406,10 @@ const GHCR_TTL_MS = 10 * 60 * 1000;
 const GHCR_ACCESS_SCRIPT   = path.join(APPLIANCE_DIR, 'lib', 'ghcr_access.py');
 const REGISTRY_AUTH_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'registry-auth.sh');
 const REGISTRY_CONFIG_DIR  = path.join(VIBE_DIR, 'docker');
-// image (string) → { published: bool|null, access: string, checkedAt: ms }
+// image (string) → { access: string, checkedAt: ms } — the per-image view
+// of ghcrAccess.report, keyed for appImageAccess().
 const ghcrCache = new Map();
-const ghcrAccess = { report: null, checkedAt: 0, running: null, error: null };
+const ghcrAccess = { report: null, checkedAt: 0, running: null, error: null, gen: 0 };
 
 // Run lib/ghcr_access.py check. `tokenFile` verifies a NEW token from a
 // payload file instead of the stored one. Resolves { ok, report, error }.
@@ -430,7 +431,11 @@ function runGhcrAccessCheck(tokenFile) {
     child.stdout.on('data', (d) => { stdout += d.toString(); });
     child.stderr.on('data', (d) => { stderr += d.toString(); });
     child.on('error', (err) => finish({ ok: false, error: 'could not run the GHCR check: ' + err.message }));
-    child.on('exit', (code) => {
+    // 'close', not 'exit': the report is several KB and Node documents
+    // that stdio may still be open (data still pending) when 'exit'
+    // fires. Parsing there could truncate a good report into "unreadable
+    // output" and refuse a valid token.
+    child.on('close', (code) => {
       if (code !== 0) return finish({ ok: false, error: `GHCR check exited ${code}: ${trim(stderr, 300)}` });
       try { finish({ ok: true, report: JSON.parse(stdout) }); }
       catch { finish({ ok: false, error: 'GHCR check printed unreadable output' }); }
@@ -445,15 +450,21 @@ function _applyGhcrReport(report) {
   ghcrAccess.error = null;
   ghcrCache.clear();
   for (const [image, r] of Object.entries((report && report.images) || {})) {
-    const access = (r && r.access) || 'unknown';
-    const published = (access === 'public' || access === 'private-ok') ? true
-      : (access === 'needs-token' || access === 'no-access') ? false : null;
-    ghcrCache.set(image, { published, access, checkedAt: now });
+    ghcrCache.set(image, { access: (r && r.access) || 'unknown', checkedAt: now });
   }
 }
 
+// A report produced for a token the operator just saved supersedes any
+// sweep that started before the save (it would describe the OLD
+// credential). The generation counter lets refreshGhcrAccess discard such
+// a stale result instead of overwriting the newer report with it.
+function _applyGhcrReportNow(report) {
+  _applyGhcrReport(report);
+  ghcrAccess.gen = (ghcrAccess.gen || 0) + 1;
+}
+
 // One refresh at a time; concurrent callers share it. `fresh` is for
-// callers that just changed the stored token (save, remove, Test): an
+// callers that just changed the stored token (remove, Test): an
 // in-flight check started before the change would report the OLD
 // credential, so they wait for it and then run a new one.
 function refreshGhcrAccess(fresh = false) {
@@ -461,7 +472,13 @@ function refreshGhcrAccess(fresh = false) {
     return fresh ? ghcrAccess.running.then(() => refreshGhcrAccess(true)) : ghcrAccess.running;
   }
   ghcrAccess.running = (async () => {
+    const gen = ghcrAccess.gen || 0;
     const r = await runGhcrAccessCheck(null);
+    if (gen !== (ghcrAccess.gen || 0)) {
+      // A save applied a newer report while this sweep ran: keep that.
+      log('info', 'GHCR access check superseded by a token change; result discarded');
+      return r;
+    }
     if (r.ok) {
       _applyGhcrReport(r.report);
       const imgs = Object.values(r.report.images || {});
@@ -472,7 +489,11 @@ function refreshGhcrAccess(fresh = false) {
       });
     } else {
       ghcrAccess.error = r.error;
-      log('warn', 'GHCR access check failed', { err: r.error });
+      log('warn', 'GHCR access check failed', {
+        err: r.error,
+        diagnose: `python3 ${GHCR_ACCESS_SCRIPT} check --manifests ${MANIFESTS_DIR} --docker-config ${REGISTRY_CONFIG_DIR}`,
+        fix: 'check outbound HTTPS to github.com and ghcr.io, then Configuration → System → GitHub access → Test',
+      });
     }
     return r;
   })().finally(() => { ghcrAccess.running = null; });
@@ -876,13 +897,29 @@ async function ddnsUpdateCycle(force = false) {
   const state = readState();
   const hm = hostMap();
   const hosts = new Set();
-  if (hm && Array.isArray(hm.hosts) && hm.hosts.length) {
-    for (const h of hm.hosts) if (h.ddns) hosts.add(h.label);
+  if (hm) {
+    // The resolver answers for every mode. Outside domain mode it lists
+    // no hosts at all — there are no per-name A records to keep current —
+    // and that is the answer, not a reason to fall back: the built-in set
+    // below ignores HOST_TAG, APEX_DOMAIN_OWNED and INFRA_SUBDOMAIN_*, so
+    // a tagged second appliance would overwrite the first one's records.
+    for (const h of hm.hosts || []) if (h.ddns) hosts.add(h.label);
   } else {
-    // Resolver unavailable: the built-in set, so DDNS keeps the address
-    // current for the hosts every appliance has.
+    // Resolver unavailable (python3 or the script missing): the built-in
+    // set, so DDNS keeps the address current for the hosts every
+    // untagged appliance has.
     for (const h of ['@', 'www', 'cockpit', 'portainer', 'backup']) hosts.add(h);
     hosts.add((state.config && state.config.tunnel_subdomain) || 'vibe');
+  }
+  if (!hosts.size) {
+    // LAN / Tailscale: nothing to publish. Record the IP so the
+    // unchanged-IP short-circuit above holds, and clear any old error.
+    ddnsState.last_update_ts = new Date().toISOString();
+    ddnsState.last_results   = {};
+    ddnsState.last_ip        = ip;
+    ddnsState.last_error     = null;
+    log('info', 'ddns: no hostnames to publish in this mode', { ip, mode: (state.config || {}).mode || 'lan' });
+    return;
   }
 
   const results = {};
@@ -1839,28 +1876,6 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
     .map((m) => {
       const s = stateApps[m.slug] || {};
 
-      // Look up GHCR cache (populated by refreshGhcrAccess). If the
-      // server image isn't published, the app can't enable. Client
-      // image is optional in the schema, so absence of a cached entry
-      // for client (when manifest declares one) is treated as
-      // "unknown" rather than failure.
-      const serverImg = m.image && m.image.server;
-      const clientImg = m.image && m.image.client;
-      const serverPub = serverImg ? (ghcrCache.get(serverImg)?.published ?? null) : null;
-      const clientPub = clientImg ? (ghcrCache.get(clientImg)?.published ?? null) : null;
-
-      // image_published is true when every required tier we know about
-      // is confirmed published. null when we couldn't determine. false
-      // when at least one tier is confirmed not pullable.
-      let image_published;
-      if (serverPub === false || clientPub === false) {
-        image_published = false;
-      } else if (serverPub === true && (clientImg ? clientPub === true : true)) {
-        image_published = true;
-      } else {
-        image_published = null;
-      }
-
       return {
         slug: m.slug,
         displayName: m.displayName,
@@ -1996,15 +2011,10 @@ app.get('/api/v1/apps', requireAdmin, async (_req, res) => {
         update_available: !!s.update_available,
         update_error: s.update_error || null,
         update_history: (s.update_history || []).slice(-5),
-        image_published,
         // 'ok' | 'needs-token' | 'no-access' | 'token-rejected' | null
         // (not yet checked). Drives the card badge and the Enable gate;
         // see appImageAccess().
         image_access: appImageAccess(m),
-        image_server: serverImg || null,
-        image_client: clientImg || null,
-        image_server_published: serverPub,
-        image_client_published: clientPub,
         // Build identity of the RUNNING container — what the operator
         // actually sees serving traffic right now. Independent of the
         // registry tag (image_tag = "latest" is the same string before
@@ -4127,14 +4137,11 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, globa
     // an infra host, the reserved www). Same pre-flight the settings
     // save runs; a resolver that cannot run does not block the switch.
     if (tunnelSub) {
-      const check = spawnSync('python3', [VIBE_HOSTS_SCRIPT, '--state', STATE_PATH,
-        '--env-dir', ENV_DIR, '--manifests', MANIFESTS_DIR, 'validate',
-        '--set', `tunnel_subdomain=${tunnelSub}`], { encoding: 'utf8', timeout: 10000 });
-      if (check.status === 1) {
+      const check = validateHostnames([`tunnel_subdomain=${tunnelSub}`]);
+      if (!check.ok) {
         return res.status(400).json({
           ok: false,
-          error: String(check.stderr || '').split('\n').map((l) => l.trim()).filter(Boolean).join(' | ')
-            + ' — nothing was changed.',
+          error: check.problems.join(' | ') + ' — nothing was changed.',
         });
       }
     }
@@ -5245,26 +5252,17 @@ app.post('/api/v1/settings/save', requireAdmin, testRateLimit, globalOp('setting
       return field && field.postSaveJob === 'routing-reconcile';
     });
     if (routing.length) {
-      const args = [VIBE_HOSTS_SCRIPT, '--state', STATE_PATH, '--env-dir', ENV_DIR,
-                    '--manifests', MANIFESTS_DIR, 'validate'];
-      for (const c of routing) {
+      const sets = routing.map((c) => {
         const value = (c.op || 'set') === 'revert' || c.value == null ? '' : String(c.value);
         const slug = c.scope === 'appliance' ? null : c.scope.split(':')[1];
-        args.push('--set', `${slug ? slug + ':' : ''}${c.key}=${value}`);
-      }
-      const check = spawnSync('python3', args, { encoding: 'utf8', timeout: 10000 });
-      if (check.status === 1) {
-        const lines = String(check.stderr || '').split('\n').map((l) => l.trim()).filter(Boolean);
+        return `${slug ? slug + ':' : ''}${c.key}=${value}`;
+      });
+      const check = validateHostnames(sets);
+      if (!check.ok) {
         return res.status(400).json({
           error: 'invalid hostnames',
-          detail: lines.join(' | ') + ' — nothing was saved. Correct the field(s) and save again.',
-          problems: lines.map((message) => ({ message })),
-        });
-      }
-      if (check.status !== 0) {
-        log('warn', 'hostname pre-flight could not run; saving without it', {
-          err: (check.error && check.error.message) || trim(String(check.stderr || ''), 256),
-          diagnose: `python3 ${VIBE_HOSTS_SCRIPT} validate`,
+          detail: check.problems.join(' | ') + ' — nothing was saved. Correct the field(s) and save again.',
+          problems: check.problems.map((message) => ({ message })),
         });
       }
     }
@@ -5592,26 +5590,53 @@ function _probeTcp(host, port, timeoutMs = 5000) {
 //
 // A saved secret is only ever sent where the SAVED configuration sends it.
 // Several tests take their destination from the form (an SMTP host, an LLM
-// endpoint, an S3 endpoint). If the request names a destination that is
-// not the saved one, nothing is filled in: otherwise a request could point
-// the test at any host and have the server attach the stored key to it.
-// Testing a NEW destination therefore needs the key typed in, which is
-// what the operator is doing anyway when they change provider.
-const DESTINATION_KEY_RE = /(HOST|ENDPOINT|URL|SERVER|BUCKET|REGION)/;
+// endpoint, an S3 endpoint, a DDNS domain). If the request names a
+// destination that is not the saved one, nothing is filled in: otherwise a
+// request could point the test at any host and have the server attach the
+// stored key to it. Testing a NEW destination therefore needs the key
+// typed in, which is what the operator is doing anyway when they change
+// provider.
+//
+// The form posts a never-saved field with its manifest DEFAULT (TextLink's
+// API URL, for one), so a destination equal to the field's default while
+// nothing is saved is the saved destination, not a new one.
+//
+// Per-app Test buttons (the Apps tab) post `_scope: "app:<slug>"`; their
+// secrets live in /opt/vibe/env/<slug>.env and take precedence over the
+// appliance-wide value of the same key.
+const DESTINATION_KEY_RE = /(HOST|ENDPOINT|URL|SERVER|BUCKET|REGION|DOMAIN)/;
 function withSavedSecrets(body) {
   const out = { ...(body || {}) };
-  const saved = parseEnvFile(path.join(ENV_DIR, 'appliance.env'));
+  const scope = String(out._scope || '');
+  delete out._scope;
+  const slug = /^app:[a-z0-9-]+$/.test(scope) ? scope.slice(4) : null;
+  const savedAppliance = parseEnvFile(path.join(ENV_DIR, 'appliance.env'));
+  const savedApp = slug ? parseEnvFile(path.join(ENV_DIR, slug + '.env')) : {};
+  const fieldFor = (key) => (slug && SETTINGS_REGISTRY.allKeys.get(slug + '::' + key))
+    || SETTINGS_REGISTRY.allKeys.get(key) || null;
+  const savedFor = (key) => (savedApp[key] != null && savedApp[key] !== '') ? savedApp[key] : savedAppliance[key];
   for (const [key, value] of Object.entries(out)) {
     if (!DESTINATION_KEY_RE.test(key)) continue;
-    const field = SETTINGS_REGISTRY.allKeys.get(key);
+    const field = fieldFor(key);
     if (field && field.secret) continue;
-    if (String(value == null ? '' : value).trim() !== String(saved[key] == null ? '' : saved[key]).trim()) {
+    const saved = savedFor(key);
+    const base = saved != null ? saved : ((field && field.default) || '');
+    if (String(value == null ? '' : value).trim() !== String(base).trim()) {
       return out;
     }
   }
-  for (const [key, field] of SETTINGS_REGISTRY.allKeys) {
-    if (!field || !field.secret || key.includes('::')) continue;
-    if ((out[key] == null || out[key] === '') && saved[key]) out[key] = saved[key];
+  for (const [regKey, field] of SETTINGS_REGISTRY.allKeys) {
+    if (!field || !field.secret) continue;
+    let key = regKey;
+    if (regKey.includes('::')) {
+      const [s, k] = regKey.split('::');
+      if (s !== slug) continue;
+      key = k;
+    }
+    if (out[key] == null || out[key] === '') {
+      const v = savedFor(key);
+      if (v) out[key] = v;
+    }
   }
   return out;
 }
@@ -6410,9 +6435,17 @@ app.post('/api/v1/admin/test/ddns', requireAdmin, testRateLimit, async (req, res
   }
   const result = await ddnsUpdateOne('@', domain, password, ip);
   if (result.ok) {
+    // Name the hosts the cycle will actually publish — the resolver's
+    // labels (HOST_TAG, INFRA_SUBDOMAIN_* overrides, apex only when
+    // owned), not a built-in list. An operator who creates the wrong
+    // records sees 'A record not found' on every tick afterwards.
+    const hm = hostMap();
+    const labels = hm ? (hm.hosts || []).filter((h) => h.ddns).map((h) => h.label) : [];
+    const list = labels.length ? labels.join(', ') : '@, www, <tunnel_subdomain>, cockpit, portainer, backup';
+    const note = labels.length ? '' : ' (Domain mode publishes the appliance\'s hostnames; this list is the untagged default until the resolver answers.)';
     return res.json({
       ok: true,
-      message: `Namecheap accepted update: ${domain} A → ${ip}. Save these settings; the appliance will keep the apex, www, the tunnel subdomain, and the three infra subdomains (cockpit/portainer/backup) current going forward. Make sure A records exist at Namecheap for each (@, www, <tunnel_subdomain>, cockpit, portainer, backup) — DDNS only updates existing records.`,
+      message: `Namecheap accepted update: ${domain} A → ${ip}. Save these settings; the appliance will keep these A records current going forward: ${list}. Make sure each exists at Namecheap — DDNS only updates existing records.${note}`,
     });
   }
   // Surface Namecheap's <Err1> string + a recovery hint when we have
@@ -7065,7 +7098,8 @@ function applianceRoutingMode() {
 // resolver has never succeeded (python3 or the script missing) — callers
 // then fall back to the manifest's built-in labels.
 const VIBE_HOSTS_SCRIPT = path.join(APPLIANCE_DIR, 'lib', 'vibe_hosts.py');
-const _hostMapCache = { key: null, value: null, warned: false, failedKey: null };
+const HOST_MAP_RETRY_MS = 60_000;
+const _hostMapCache = { key: null, value: null, warned: false, failedKey: null, failedAt: 0 };
 function hostMap() {
   const mtime = (f) => { try { return fs.statSync(f).mtimeMs; } catch (_e) { return 0; } };
   const key = `${mtime(STATE_PATH)}|${mtime(path.join(ENV_DIR, 'appliance.env'))}`;
@@ -7073,9 +7107,13 @@ function hostMap() {
   // A failure is cached against the same inputs. This runs synchronously
   // on the request path, several times per app per request; re-spawning a
   // resolver that just failed would stall the console for seconds at a
-  // time, exactly when the operator needs it. It is retried as soon as
-  // state.json or appliance.env changes.
-  if (_hostMapCache.failedKey === key) return _hostMapCache.value;
+  // time, exactly when the operator needs it. It is retried when
+  // state.json or appliance.env changes — or after a minute regardless,
+  // because a transient failure (a 10 s timeout on a saturated host) must
+  // not pin the console to untagged labels until some unrelated write.
+  if (_hostMapCache.failedKey === key && Date.now() - _hostMapCache.failedAt < HOST_MAP_RETRY_MS) {
+    return _hostMapCache.value;
+  }
   try {
     const out = execFileSync('python3', [
       VIBE_HOSTS_SCRIPT, '--state', STATE_PATH, '--env-dir', ENV_DIR,
@@ -7087,6 +7125,7 @@ function hostMap() {
     _hostMapCache.failedKey = null;
   } catch (err) {
     _hostMapCache.failedKey = key;
+    _hostMapCache.failedAt = Date.now();
     if (!_hostMapCache.warned) {
       _hostMapCache.warned = true;
       log('warn', 'hostname resolver failed; showing built-in host labels until it recovers', {
@@ -7097,6 +7136,32 @@ function hostMap() {
     }
   }
   return _hostMapCache.value;
+}
+
+// Pre-flight the naming a change would produce, before anything is
+// written: `sets` are the resolver's `--set KEY=VALUE` /
+// `--set SLUG:KEY=VALUE` items. Returns { ok, problems, unavailable }.
+// Exit 1 = the operator must fix a label (problems lists them). Any other
+// non-zero exit = the checker could not run; that is logged and reads as
+// ok, because the Caddy renderer still refuses duplicate hosts on its own
+// and a broken checker must not block every save. Shared by the settings
+// save and the network-mode switch so the two cannot drift.
+function validateHostnames(sets) {
+  const args = [VIBE_HOSTS_SCRIPT, '--state', STATE_PATH, '--env-dir', ENV_DIR,
+                '--manifests', MANIFESTS_DIR, 'validate'];
+  for (const s of sets) args.push('--set', s);
+  const check = spawnSync('python3', args, { encoding: 'utf8', timeout: 10000 });
+  const lines = String(check.stderr || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  if (check.status === 1) return { ok: false, problems: lines, unavailable: false };
+  if (check.status !== 0) {
+    log('warn', 'hostname pre-flight could not run; continuing without it', {
+      err: (check.error && check.error.message) || trim(String(check.stderr || ''), 256),
+      diagnose: `python3 ${VIBE_HOSTS_SCRIPT} validate`,
+      fix: 'sudo bash /opt/vibe/appliance/bootstrap.sh',
+    });
+    return { ok: true, problems: [], unavailable: true };
+  }
+  return { ok: true, problems: [], unavailable: false };
 }
 
 // Effective primary subdomain label for an app: the label lib/enable-app.sh
@@ -7232,17 +7297,28 @@ app.post('/api/v1/admin/github-access', requireAdmin, testRateLimit, globalOp('G
     if (r.code !== 0) {
       return res.status(500).json({ ok: false, error: 'The token was valid but could not be stored: ' + trim(r.stderr, 300) });
     }
+    // The report just produced IS the state of the token now stored: apply
+    // it rather than sweeping GHCR a second time (55-80 requests) and —
+    // should that second sweep fail — leaving the cards gated on the
+    // pre-save 'needs-token' entries for the next ten minutes.
+    _applyGhcrReportNow(check.report);
   } finally {
     try { fs.unlinkSync(payload); } catch { /* already gone */ }
   }
   _auditGithubAccess('(set)', 'saved');
-  await refreshGhcrAccess(true);
   res.json(_githubAccessView());
 });
 
 app.post('/api/v1/admin/github-access/test', requireAdmin, testRateLimit, async (_req, res) => {
   const r = await refreshGhcrAccess(true);
-  if (!r.ok) return res.status(502).json({ ok: false, error: r.error });
+  if (!r.ok) {
+    return res.status(502).json({
+      ok: false,
+      error: 'Could not check GitHub access: ' + r.error
+        + '. Common causes: no outbound HTTPS to github.com or ghcr.io, or GitHub is slow right now.'
+        + ` Diagnose: python3 ${GHCR_ACCESS_SCRIPT} check — then try Test again in a minute.`,
+    });
+  }
   res.json(_githubAccessView());
 });
 

@@ -83,7 +83,10 @@ pull_failure_hint() {
     else
       printf '%s' "the registry refused the image: it is private (or not published yet). If your vendor sent you a GitHub token, add it in Configuration → System → GitHub access, then retry."
     fi
-  elif [[ -f "$out" ]] && grep -qiE 'manifest unknown|not found' "$out"; then
+  elif [[ -f "$out" ]] && grep -qiE 'manifest unknown|manifest for .* not found|repository does not exist|name unknown' "$out"; then
+    # Registry phrasings only. A bare 'not found' also matches compose's
+    # own 'env file ... not found' and a missing docker CLI, which would
+    # send the operator to the vendor for a host-side problem.
     printf '%s' "the image or tag does not exist in the registry yet; the app's maintainers owe a published build."
   elif [[ -f "$out" ]] && grep -qiE 'toomanyrequests|rate limit' "$out"; then
     printf '%s' "the registry is rate-limiting this host; wait a few minutes and retry."
@@ -101,6 +104,12 @@ pull_failure_hint() {
 # process runs `docker compose pull` / `up` — the console container or
 # the host (bootstrap, the `vibe` CLI). Without a stored token nothing is
 # exported and docker keeps its default (~/.docker), exactly as before.
+#
+# DOCKER_CONFIG REPLACES the default directory; docker does not merge the
+# two. registry-auth.sh therefore copies root's other registry logins
+# (a Docker Hub `docker login`, for example) into the appliance config
+# when the token is stored, so they keep working for every compose call.
+# A credential helper (credsStore) in root's config is not carried over.
 #
 # Idempotency: pure; only exports DOCKER_CONFIG. Reverse: remove the
 # token (registry-auth.sh remove) — the next call exports nothing.

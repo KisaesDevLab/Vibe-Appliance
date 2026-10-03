@@ -76,21 +76,36 @@ set -euo pipefail
 # appliance.env — this flag only flips the toggle, never invents the
 # token.
 AUTO_ENABLE=0
+ADOPT_TUNNEL_ID=""
+_prev_arg=""
 for arg in "$@"; do
+  if [[ "$_prev_arg" == "--adopt-tunnel" ]]; then
+    ADOPT_TUNNEL_ID="$arg"; _prev_arg=""; continue
+  fi
   case "$arg" in
     --auto-enable) AUTO_ENABLE=1 ;;
+    --adopt-tunnel) _prev_arg="$arg" ;;
+    --adopt-tunnel=*) ADOPT_TUNNEL_ID="${arg#*=}" ;;
     -h|--help)
       cat <<'HELP'
 infra/cloudflared-up.sh — provision and start the Cloudflare Tunnel.
 
 Usage:
-  sudo bash /opt/vibe/appliance/infra/cloudflared-up.sh [--auto-enable]
+  sudo bash /opt/vibe/appliance/infra/cloudflared-up.sh [--auto-enable] [--adopt-tunnel <id>]
 
 Flags:
   --auto-enable   Force CLOUDFLARE_TUNNEL_ENABLED=true in appliance.env
                   if it isn't already. The four Cloudflare API fields
                   must still be filled in via Settings → Network or
                   by hand-editing appliance.env.
+  --adopt-tunnel <id>
+                  Treat the tunnel with this id as THIS appliance's own
+                  (recorded in state.json once it is confirmed live).
+                  For an appliance that lost track of its tunnel — a
+                  `cloudflared-down.sh --local-only` followed by a
+                  hostname tag change — instead of creating a second
+                  tunnel and orphaning the first. Never adopt a tunnel
+                  another appliance is using.
 
 Reads from /opt/vibe/env/appliance.env:
   CLOUDFLARE_TUNNEL_ENABLED, CLOUDFLARE_TUNNEL_API_TOKEN,
@@ -521,6 +536,12 @@ RECORDED_TUNNEL_ID="$(state_get_config_kv cloudflare_tunnel_id 2>/dev/null || tr
 if [[ -z "$RECORDED_TUNNEL_ID" ]]; then
   RECORDED_TUNNEL_ID="$("${CF_GUARD[@]}" token-tunnel-id "$VIBE_ENV_SHARED" 2>/dev/null || true)"
 fi
+if [[ -n "$ADOPT_TUNNEL_ID" ]]; then
+  [[ "$ADOPT_TUNNEL_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+    || die "--adopt-tunnel: '$ADOPT_TUNNEL_ID' is not a tunnel id (a UUID). Find it under https://one.dash.cloudflare.com/${CF_ACCOUNT_ID}/networks/tunnels. Nothing has been changed."
+  log_warn "adopting tunnel $ADOPT_TUNNEL_ID as this appliance's own (--adopt-tunnel)" ${RECORDED_TUNNEL_ID:+previously_recorded="$RECORDED_TUNNEL_ID"}
+  RECORDED_TUNNEL_ID="$ADOPT_TUNNEL_ID"
+fi
 if [[ -n "$RECORDED_TUNNEL_ID" ]]; then
   log_step "looking up this appliance's tunnel by id" id="$RECORDED_TUNNEL_ID"
   _own_resp="$(cf_api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$RECORDED_TUNNEL_ID")"
@@ -615,6 +636,17 @@ except (KeyError, TypeError) as e:
     die "tunnel create returned no id; see stderr above"
   fi
   log_ok "tunnel created" id="$TUNNEL_ID"
+  # Claim it at once. The CNAME pre-flight (3b) can still abort this run,
+  # and a tunnel with NO ingress reads as "unclaimed" to the by-name
+  # adoption below — so a second appliance left at the same default
+  # tunnel name would take this one over, and the two would then rewrite
+  # each other's ingress on every re-run. A placeholder rule for the main
+  # host is harmless (no DNS points here yet) and is replaced wholesale by
+  # section 4. Best effort: the id is recorded in state below regardless.
+  _claim_resp="$(cf_api PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations" \
+    "{\"config\":{\"ingress\":[{\"hostname\":\"$TUNNEL_FQDN\",\"service\":\"https://caddy:443\",\"originRequest\":{\"noTLSVerify\":true,\"originServerName\":\"$TUNNEL_FQDN\"}},{\"service\":\"http_status:404\"}]}}")"
+  cf_check_success "$_claim_resp" "tunnel configurations PUT (claim)" \
+    || log_warn "could not write the placeholder ingress to the new tunnel; until section 4 succeeds it looks unclaimed to another appliance using the same tunnel name" id="$TUNNEL_ID"
 else
   # Reusing a tunnel found BY NAME. Cloudflare allows duplicate tunnel
   # names and this lookup takes the first match, so "same name" does not
@@ -630,17 +662,27 @@ else
   # is someone else's tunnel — refuse rather than adopt it. "Some
   # hostname under the same domain" is not ownership: that is exactly
   # what a second appliance on the domain looks like. A tunnel with no
-  # hostnames yet (freshly created, or never configured) is unclaimed
-  # and safe to take.
+  # hostnames yet (never configured) is unclaimed and safe to take; a
+  # tunnel this script created carries a placeholder rule from the
+  # moment it exists, so it never reads as unclaimed.
   #
-  # Fail-open if the config can't be read: same reasoning as the zone
-  # probe above — never brick a correctly-scoped token on a diagnostic.
-  # The DNS pre-flight in section 3b still protects the other appliance's
-  # records.
+  # Fail CLOSED if the config can't be read. Section 4 PUTs this
+  # appliance's whole ingress over whatever tunnel is adopted here, and
+  # the DNS pre-flight in 3b only inspects records at THIS appliance's
+  # hostnames — it cannot protect the other appliance's ingress. An
+  # unreadable config is "may be someone's": refuse, as 2a and 3b do.
   log_step "confirming tunnel '$CF_TUNNEL_NAME' belongs to this appliance"
   existing_cfg="$(cf_api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations")"
+  cf_check_success "$existing_cfg" "tunnel configurations GET" \
+    || die "could not read the configuration of tunnel '$CF_TUNNEL_NAME' ($TUNNEL_ID), so this run cannot tell whether it belongs to this appliance. Refusing to adopt a tunnel found only by name. Nothing has been changed.
+  Common causes: a transient Cloudflare API failure or rate limit; the token lost Account.Cloudflare Tunnel:Edit.
+  Diagnose: curl -sS -H 'Authorization: Bearer <token>' '${CF_API}/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}/configurations' | python3 -m json.tool
+  Fix: re-run in a minute: sudo bash $APPLIANCE_DIR/infra/cloudflared-up.sh (idempotent)"
   # shellcheck disable=SC2086  # DESIRED_HOSTS is a newline list of hostnames
-  foreign_hosts="$(printf '%s' "$existing_cfg" | "${CF_GUARD[@]}" foreign-hosts $DESIRED_HOSTS 2>/dev/null || true)"
+  foreign_hosts="$(printf '%s' "$existing_cfg" | "${CF_GUARD[@]}" foreign-hosts $DESIRED_HOSTS 2>/dev/null)" \
+    || die "lib/cf_guard.py could not classify tunnel '$CF_TUNNEL_NAME' ($TUNNEL_ID) from its configuration response. Refusing to adopt a tunnel found only by name. Nothing has been changed.
+  Diagnose: curl -sS -H 'Authorization: Bearer <token>' '${CF_API}/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}/configurations' | python3 $APPLIANCE_DIR/lib/cf_guard.py foreign-hosts $(printf '%s' "$DESIRED_HOSTS" | paste -sd' ' -)
+  Fix: re-run in a minute: sudo bash $APPLIANCE_DIR/infra/cloudflared-up.sh (idempotent)"
   if [[ -n "$foreign_hosts" ]]; then
     die "a tunnel named '$CF_TUNNEL_NAME' already exists in this Cloudflare account, but it belongs to a DIFFERENT appliance.
 
@@ -657,10 +699,17 @@ else
     - This appliance's hostnames were all renamed at once (a new hostname
       tag) and it lost track of its tunnel.
   Diagnose: https://one.dash.cloudflare.com/${CF_ACCOUNT_ID}/networks/tunnels
-  Fix — give this appliance its own tunnel name:
-    1. UI:   Configuration → Network → Cloudflare Tunnel → Set up →
+  Fix (any one):
+    1. Give this appliance its own tunnel name.
+       UI:   Configuration → Network → Cloudflare Tunnel → Set up →
              change 'Tunnel name' (e.g. vibe-appliance-${DOMAIN//./-}${HOST_TAG_VALUE:+-${HOST_TAG_VALUE}}-2).
-    2. Or:   set CLOUDFLARE_TUNNEL_NAME in $VIBE_ENV_APPLIANCE.
+       Or:   set CLOUDFLARE_TUNNEL_NAME in $VIBE_ENV_APPLIANCE.
+    2. If that tunnel IS this appliance's — its hostnames above are the
+       ones this appliance used to serve (a --local-only teardown, then a
+       hostname tag or label change) — take it back instead of leaving it
+       and its DNS records orphaned beside a new one:
+             sudo bash $APPLIANCE_DIR/infra/cloudflared-up.sh --adopt-tunnel $TUNNEL_ID
+       Only if no other appliance is using it.
   Then re-run: sudo bash $APPLIANCE_DIR/infra/cloudflared-up.sh (idempotent)"
   fi
   log_info "tunnel exists; reusing" id="$TUNNEL_ID"
@@ -672,7 +721,9 @@ TARGET_CONTENT="${TUNNEL_ID}.cfargotunnel.com"
 # Record the tunnel as this appliance's. Every later run — and
 # cloudflared-down.sh — finds it by this id instead of by name.
 state_set_config_kv cloudflare_tunnel_id "$TUNNEL_ID" \
-  || log_warn "could not record the tunnel id in $VIBE_STATE_FILE; the next run falls back to the id in the connector token"
+  || log_warn "could not record the tunnel id in $VIBE_STATE_FILE; the next run falls back to the id in the connector token" \
+       "diagnose:sudo python3 -m json.tool $VIBE_STATE_FILE" \
+       "fix:add \"cloudflare_tunnel_id\": \"$TUNNEL_ID\" under \"config\" in $VIBE_STATE_FILE as root, or re-run this script once the file is writable"
 
 # --- 3. Sanity-check the publish list, then build single-host ingress -
 
@@ -855,6 +906,12 @@ while IFS= read -r _fqdn; do
     check)
       # A CNAME at another tunnel. Dead tunnel -> a leftover we may
       # replace. Live, or not visible to this token -> not ours to take.
+      # (An empty id would be a fatal 'bad array subscript' below;
+      # cf_guard refuses malformed targets, this is the belt to it.)
+      if [[ -z "$_detail" ]]; then
+        CNAME_CONFLICTS+=("$_fqdn  ->  a Cloudflare Tunnel CNAME with no readable tunnel id")
+        continue
+      fi
       if [[ -z "${_other_tunnel_state[$_detail]:-}" ]]; then
         _oresp="$(cf_api GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$_detail")"
         _other_tunnel_state[$_detail]="$(printf '%s' "$_oresp" | "${CF_GUARD[@]}" tunnel-state 2>/dev/null || echo unknown)"
@@ -888,7 +945,8 @@ $(printf '    %s\n' "${CNAME_CONFLICTS[@]}")
 
   No ingress was pushed and no DNS record was written, so whatever answers
   those names today keeps working. (If this run created the tunnel object
-  '$CF_TUNNEL_NAME', it is empty and is reused on the next run.)
+  '$CF_TUNNEL_NAME', its id is recorded in state.json and it is reused on
+  the next run; it carries only a placeholder route that nothing points at.)
 
   Common causes:
     - Another appliance under $DOMAIN uses the same hostnames. Each

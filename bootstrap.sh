@@ -681,8 +681,10 @@ PYEOF
   # written when the flag was passed; otherwise appliance.env keeps what
   # a previous run or the console's Network settings put there. The
   # hostnames then follow in this same run: phase_caddy renders the main
-  # and infra hosts, and phase_apps re-enables every enabled app, which
-  # re-renders its env file for the new names.
+  # and infra hosts, and phase_apps re-enables every enabled app — on a
+  # naming change INCLUDING those whose last attempt failed (NAMING_CHANGED
+  # below), since their recorded labels would otherwise keep the old names
+  # claimed in Caddy and the tunnel.
   local _naming_changed="false"
   if [[ "$CONFIG_HOST_TAG_EXPLICIT" == "true" ]]; then
     if [[ "$(secrets_get_appliance HOST_TAG 2>/dev/null || true)" != "$CONFIG_HOST_TAG" ]]; then
@@ -695,6 +697,7 @@ PYEOF
     secrets_set_kv_appliance APEX_DOMAIN_OWNED "$CONFIG_APEX_OWNED"
     log_info "apex ownership persisted to appliance.env" apex_domain_owned="$CONFIG_APEX_OWNED"
   fi
+  NAMING_CHANGED="$_naming_changed"
 
   if [[ "$_naming_changed" == "true" && "$(secrets_get_appliance CLOUDFLARE_TUNNEL_ENABLED 2>/dev/null || true)" == "true" ]]; then
     log_warn "the hostname tag changed while the Cloudflare Tunnel is on — the tunnel still routes the old names until it is re-provisioned" \
@@ -1085,9 +1088,9 @@ phase_apps() {
   # tiebreak; a manifest cycle falls back to alphabetical rather than
   # hanging).
   local slugs
-  slugs="$(python3 - "$VIBE_STATE_FILE" "${APPLIANCE_DIR}/console/manifests" <<'PYEOF' || true
+  slugs="$(python3 - "$VIBE_STATE_FILE" "${APPLIANCE_DIR}/console/manifests" "${NAMING_CHANGED:-false}" <<'PYEOF' || true
 import json, os, sys
-state_path, manifests_dir = sys.argv[1:3]
+state_path, manifests_dir, naming_changed = sys.argv[1:4]
 try:
     with open(state_path) as f:
         s = json.load(f)
@@ -1098,7 +1101,12 @@ for slug, e in (s.get("apps", {}) or {}).items():
     if not e.get("enabled"):
         continue
     # Skip apps whose last attempt failed — operator decides when to retry.
-    if e.get("status") == "failed":
+    # EXCEPT when this run changed the hostname tag or apex ownership: a
+    # failed app is still enabled, so Caddy and the tunnel still serve it
+    # at the labels recorded in state, and only a re-enable re-renders
+    # those. Skipping it would leave the OLD names claimed — the very
+    # collision --host-tag was passed to end.
+    if e.get("status") == "failed" and naming_changed != "true":
         continue
     enabled.append(slug)
 # Units another orchestrator installs share the state.apps namespace
@@ -1378,6 +1386,14 @@ main() {
     # shellcheck source=/dev/null
     . "${lib}/${f}"
   done
+  # Python helpers the sourced scripts call (not sourced themselves). A
+  # partial checkout without them fails deep inside phase_caddy with a
+  # hint about manifests and state.json — the wrong trail entirely.
+  for f in vibe_hosts.py cf_guard.py ghcr_access.py; do
+    if [[ ! -f "${lib}/${f}" ]]; then
+      _pre_die "missing ${lib}/${f}. Is this a complete clone of the Vibe-Appliance repo?"
+    fi
+  done
 
   # Set up log + state. Initialise both before phase 1 so even pre-flight
   # failures land in the JSONL log.
@@ -1437,6 +1453,10 @@ main() {
   if [[ "$CONFIG_MODE" == "domain" && ( -z "$CONFIG_DOMAIN" || -z "$CONFIG_EMAIL" ) ]]; then
     die "mode is 'domain' but domain or ACME email is missing (from both flags and state.json)." "Re-run with the full identity: sudo bash bootstrap.sh --mode domain --domain YOUR.DOMAIN --email YOU@EXAMPLE.COM"
   fi
+  # DNS names are case-insensitive and every registrar API returns them
+  # lowercased; the resolver, the Cloudflare guards and the CNAME
+  # comparisons all expect one spelling.
+  CONFIG_DOMAIN="${CONFIG_DOMAIN,,}"
   if ! [[ "$CONFIG_TUNNEL_SUBDOMAIN" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
     die "effective tunnel subdomain '$CONFIG_TUNNEL_SUBDOMAIN' is not a valid DNS label." "Fix state.json's config.tunnel_subdomain, or pass --tunnel-subdomain."
   fi

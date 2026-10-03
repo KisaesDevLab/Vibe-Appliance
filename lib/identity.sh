@@ -119,11 +119,14 @@ PYEOF
 
 _id_sso_declared() { [[ "$(_id_sso_field "$1" 'sso.get("capable", False)' false)" == "true" ]]; }
 
-# host:port that serves the product's /auth/* — its /auth matcher, else
-# sso.internalUrl, else the routing default upstream. Empty when unknown.
+# host:port that serves the product's /auth/* — sso.internalUrl when the
+# manifest declares it (the same precedence the registration body uses,
+# so matcher ORDER is never load-bearing), else its first matcher under
+# /auth (the path itself or a sub-path: /authors/* is not /auth), else
+# the routing default upstream. Empty when unknown.
 _id_auth_upstream() {
   local v
-  v="$(_id_sso_field "$1" '(next((str(x.get("upstream","")) for x in ((data.get("routing") or {}).get("matchers") or []) if str(x.get("path","")).startswith("/auth")), "") or str(sso.get("internalUrl") or "").split("://")[-1].rstrip("/") or str((data.get("routing") or {}).get("default_upstream") or ""))' '')"
+  v="$(_id_sso_field "$1" '(str(sso.get("internalUrl") or "").split("://")[-1].rstrip("/") or next((str(x.get("upstream","")) for x in ((data.get("routing") or {}).get("matchers") or []) if str(x.get("path","")) == "/auth" or str(x.get("path","")).startswith("/auth/")), "") or str((data.get("routing") or {}).get("default_upstream") or ""))' '')"
   [[ "$v" == "null" ]] && v=""
   printf '%s' "$v"
 }
@@ -257,7 +260,8 @@ data = json.load(open(m)); sso = data.get("sso") or {}
 routing = data.get("routing") or {}
 # Back-channel logout target: the tier that serves /auth/* — an explicit matcher for it,
 # else sso.internalUrl, else the default upstream. Caddy strips the prefix, so no path.
-auth_matcher = next((x for x in (routing.get("matchers") or []) if str(x.get("path", "")).startswith("/auth")), None)
+auth_matcher = next((x for x in (routing.get("matchers") or [])
+                     if str(x.get("path", "")) == "/auth" or str(x.get("path", "")).startswith("/auth/")), None)
 internal = sso.get("internalUrl") or ("http://" + auth_matcher["upstream"] if auth_matcher else "http://" + routing.get("default_upstream", ""))
 print(json.dumps({
     "slug": slug,
@@ -324,7 +328,7 @@ _id_recreate() {
     2>&1 | tee -a "$VIBE_LOG_FILE" >&2 \
     || die "compose up failed for ${slug}; see ${VIBE_LOG_FILE}"
   _wait_for_app_health "$slug" "$m" \
-    || die "${slug} did not become healthy after recreate. Diagnose: docker logs ${slug}-server --tail 100 ; Fix: sudo vibe identity disable ${slug} to fall back to local sign-in"
+    || die "${slug} did not become healthy after recreate. Diagnose: docker logs $(_id_breakglass_container "$slug") --tail 100 ; Fix: sudo vibe identity disable ${slug} to fall back to local sign-in"
 }
 
 # ---------------------------------------------------------------- break-glass
@@ -785,7 +789,7 @@ id_register() {
     # for it even while its api is still starting.
     if ! _id_registered "$slug"; then
       _id_sso_detected "$slug" || die "${slug} is not SSO-capable: its manifest declares no sso block and its api does not answer /auth/status." \
-        "Diagnose: docker exec vibe-console curl -s -o /dev/null -w '%{http_code}\n' http://$(_id_auth_upstream "$slug")/auth/status ; docker logs ${slug}-server --tail 50. Fix: update the app (and then the appliance) to a release with Vibe Auth support, then retry Register."
+        "Diagnose: docker exec vibe-console curl -s -o /dev/null -w '%{http_code}\n' http://$(_id_auth_upstream "$slug")/auth/status ; docker logs $(_id_breakglass_container "$slug") --tail 50. Fix: update the app (and then the appliance) to a release with Vibe Auth support, then retry Register."
     fi
     log_warn "${slug} supports SSO (it answers /auth/status, or was registered before) but its vendored manifest predates SSO: registering with the package defaults (redirect /auth/oidc/callback, back-channel /auth/oidc/backchannel, no public paths). Update the appliance for the app's full sso block and break-glass command." slug="$slug"
   fi

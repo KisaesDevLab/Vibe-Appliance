@@ -538,6 +538,21 @@ SPA, so a blanket `/auth/*` matcher would break those pages. Set it only when
 the image really does that proxying — without it and without a matcher, the
 OIDC callback lands on the SPA and sign-in fails.
 
+A third layout exists for a product whose SPA owns some `/auth/*` pages but
+whose image does NOT proxy the engine routes itself: route the engine's paths
+to the api tier **one matcher at a time** — `/auth/oidc/*`, `/auth/status`,
+`/auth/me`, `/auth/settings`, `/auth/settings/*` — and leave the SPA's own
+pages (`/auth/magic`, `/auth/reset`, …) on the default upstream.
+`vibe-payroll` does this. The rules the manifest test enforces for it: every
+`sso.redirectPaths` / `logoutPaths` entry AND each engine route above is
+covered by some matcher; every matcher under `/auth` names the same upstream;
+and that upstream is the one `sso.internalUrl` names. `lib/identity.sh`
+resolves the auth tier from `sso.internalUrl` first, then from the first
+matcher under `/auth` (the path itself or a sub-path), then from
+`routing.default_upstream` — so matcher order never matters. Document the
+reason in the manifest's top-level `_doc`: `routing` and `sso` are closed
+objects in the schema and take no `_doc` of their own.
+
 When `vibe-auth` is enabled, `lib/identity.sh register <slug>` (run by
 `enable-app.sh` and by the console's Identity panel) registers the product
 with the broker, writes the returned `VIBE_OIDC_*` block into

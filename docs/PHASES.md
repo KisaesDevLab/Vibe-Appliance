@@ -2496,3 +2496,35 @@ Append to this list as phases complete. Format:
   real token, and a fresh-droplet install. Deferred: credentials for
   other registries; a command-line way to set the token for unattended
   installs.
+- 2026-10-02: three small joins. (1) `@SURFACE_URL_<NAME>@` env-template
+  marker: an app learns any extra surface's public URL without a bespoke
+  marker (MANIFEST_SCHEMA.md). (2) vibe-recap v0.6.1 manifest sync: the
+  client `watch` surface. (3) vibe-payroll declares single sign-on (Vibe
+  Auth Phase 8 step 13, PR #9): the engine routes are matched one path at
+  a time because the SPA owns /auth/magic and /auth/reset; documented as
+  the third SSO routing layout in MANIFEST_SCHEMA.md.
+- 2026-10-03: review of the week's changes (code-review, max). Fixes:
+  the Cloudflare guards fail closed on an unreadable tunnel config and on
+  a mixed-case domain (names compared lowercased everywhere; bootstrap
+  lowercases --domain); a freshly created tunnel is claimed with a
+  placeholder ingress so a second appliance cannot adopt it as empty;
+  `cloudflared-up.sh --adopt-tunnel <id>` takes an orphaned own tunnel
+  back; teardown always finishes the host side even when the Cloudflare
+  lookup fails. The resolver ignores a disabled app's stale applied label,
+  survives a label stored as a JSON boolean, and keeps pre-release extra
+  surfaces untagged while the primary is applied; applied labels are
+  recorded only after the app is healthy (enable step 6b). `--host-tag`
+  re-enables failed apps too. Template-comment inheritance became
+  manifest-driven (`from: appliance:<KEY>`; vibe-recap now declares
+  EMAILIT_API_KEY). Console: saved secrets reach per-app Tests and
+  default-valued destinations, DDNS respects the resolver outside domain
+  mode, hostMap retries a failed resolver after a minute, the GHCR check
+  reads on 'close', a token save applies its own report, the pasted token
+  survives a failed save. doctor skips the GHCR sweep offline and no
+  longer passes on "unknown". Infra-label/apex saves no longer recreate
+  every app (`ui.routingAffects: "hosts"`). The manifest test now really
+  validates against the schema (payroll's routing._doc and time-billing's
+  sso._doc moved to the top level). Left as follow-ups: one resolver spawn
+  per app render, a single Cloudflare DNS listing, a shared spawn helper
+  in the console, the main-host `vibe` sentinel, Cockpit reconfigure via
+  the host runner, a `dns-label` validator rule.

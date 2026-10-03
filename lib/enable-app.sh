@@ -306,6 +306,11 @@ print((json.load(open('${manifest}')).get('runtime') or 'appliance'))
   _run_app_seed_if_needed "$slug" "$manifest" \
     || log_warn "seed for $slug did not complete; check container logs and re-run manually if login fails" slug="$slug"
 
+  # 6b. The app is up and healthy on the env file step 1 rendered: its
+  # labels are now APPLIED. Record them so the Caddy render below, the
+  # tunnel and the console serve exactly these names.
+  _persist_applied_labels "$slug"
+
   # 7. Re-render Caddyfile and reload Caddy so the new vhost goes live.
   log_step "re-rendering Caddyfile to include $slug"
   render_caddyfile \
@@ -778,9 +783,6 @@ print(result)
 PYEOF
 }
 
-# Same as _manifest_field, for a JSON document held in a string (e.g. the
-# output of `lib/vibe_hosts.py plan-app`). Prints nothing when the string
-# is empty or not JSON.
 # {surface name: "https://<label>.<domain>"} for every extra surface in a
 # vibe_hosts.py plan-app document; "{}" when there is no plan or domain.
 # Feeds the @SURFACE_URL_<NAME>@ markers in _render_app_env.
@@ -798,6 +800,9 @@ except ValueError:
 print(json.dumps({n: "https://%s.%s" % (l, sys.argv[2]) for n, l in extras.items() if l}, sort_keys=True))' "$plan" "$domain" 2>/dev/null || echo '{}'
 }
 
+# Same as _manifest_field, for a JSON document held in a string (e.g. the
+# output of `lib/vibe_hosts.py plan-app`). Prints nothing when the string
+# is empty or not JSON.
 _json_field() {
   local doc="$1" expr="$2"
   [[ -n "$doc" ]] || return 0
@@ -1065,6 +1070,21 @@ _image_uid_gid() {
   printf '%s:%s' "$uid" "$gid"
 }
 
+# Env keys the manifest declares as inherited from appliance.env
+# (`from: "appliance:<KEY>"`), one per line. Empty for no manifest.
+_inherited_env_keys() {
+  local manifest="${1:-}"
+  [[ -n "$manifest" && -f "$manifest" ]] || return 0
+  python3 - "$manifest" <<'PYEOF' 2>/dev/null | tr -d '\r' || true
+import json, sys
+env = (json.load(open(sys.argv[1])).get("env") or {})
+for section in ("required", "optional"):
+    for e in (env.get(section) or []):
+        if isinstance(e, dict) and e.get("name") and str(e.get("from") or "").startswith("appliance:"):
+            print(e["name"])
+PYEOF
+}
+
 # _merge_env_render <existing-env> <new-render> <manifest>
 # Rewrites <new-render> in place. See the rules below.
 # Merge with the existing file:
@@ -1093,7 +1113,7 @@ _image_uid_gid() {
 _merge_env_render() {
   local src="$1" tmp="$2" manifest="$3"
   [[ -f "$src" ]] || return 0
-  python3 - "$src" "$tmp" "$(operator_owned_keys "$manifest")" <<'PYEOF'
+  python3 - "$src" "$tmp" "$(operator_owned_keys "$manifest")" "$(_inherited_env_keys "$manifest")" <<'PYEOF'
 import sys
 def parse(path):
     rows = {}
@@ -1120,22 +1140,21 @@ for line in open(sys.argv[2]).read().splitlines():
             line = f"{k}={old[k]}"
     merged_lines.append(line)
 new_keys = set(new.keys())
-# Keys the template lists COMMENTED OUT ("# KEY=") are documented as
-# inherited from appliance.env, which compose loads before this file. A
+# Keys the MANIFEST declares as inherited from appliance.env
+# (`from: "appliance:<KEY>"`, which compose loads before this file). A
 # blank value for such a key left over from an older template (where the
 # line was live) must not be carried forward: `KEY=` here would mask the
-# appliance's saved value with an empty one. A non-blank value is the
-# operator's own override and is preserved like any other extra.
-import re
-inherited = set()
-for line in merged_lines:
-    m = re.match(r"^#\s*([A-Z][A-Z0-9_]*)=", line.strip())
-    if m:
-        inherited.add(m.group(1))
+# appliance's saved value with an empty one. The set comes from the
+# manifest, not from `# KEY=` comment lines in the template: a template
+# documents many keys that way (ANTHROPIC_API_KEY, SMTP_PASS) for which a
+# blank per-app line is the operator's deliberate "not for this app"
+# override, and that must survive a re-render like any other value.
+inherited = set(k.strip() for k in (sys.argv[4] if len(sys.argv) > 4 else "").split("\n") if k.strip())
 extras = []
 for k, v in old.items():
     if k not in new_keys:
         if v == "" and k in inherited:
+            print("[merge] dropping blank %s from the previous render: the manifest inherits it from appliance.env, and a blank here would mask the appliance value" % k, file=sys.stderr)
             continue
         extras.append(f"{k}={v}")
 if extras:
@@ -1147,13 +1166,36 @@ with open(sys.argv[2], "w") as f:
 PYEOF
 }
 
+# Record the labels the last _render_app_env rendered for (its
+# APPLIED_PRIMARY_LABEL / APPLIED_EXTRAS_JSON) in state.apps.<slug>.
+# Called by enable_app once the app is healthy; never from a check-render.
+# The label is stored as a JSON string on purpose: _state_app_set turns the
+# bare words "true"/"false" into booleans, and both are valid DNS labels.
+APPLIED_PRIMARY_LABEL=""
+APPLIED_EXTRAS_JSON=""
+_persist_applied_labels() {
+  local slug="$1"
+  [[ -n "$APPLIED_PRIMARY_LABEL" ]] || return 0
+  _state_app_set_json "$slug" subdomain "\"${APPLIED_PRIMARY_LABEL}\"" 2>/dev/null || \
+    log_warn "could not persist the applied subdomain to state for $slug; the console and the next Caddy render use the desired label instead" \
+      "diagnose:sudo python3 -m json.tool ${VIBE_STATE_FILE}" \
+      "fix:sudo bash ${APPLIANCE_DIR}/lib/enable-app.sh $slug"
+  if [[ -n "$APPLIED_EXTRAS_JSON" ]]; then
+    _state_app_set_json "$slug" subdomains "$APPLIED_EXTRAS_JSON" 2>/dev/null || \
+      log_warn "could not persist extra-surface labels to state for $slug; the console and the next Caddy render use the desired labels instead" \
+        "diagnose:sudo python3 -m json.tool ${VIBE_STATE_FILE}" \
+        "fix:sudo bash ${APPLIANCE_DIR}/lib/enable-app.sh $slug"
+  fi
+}
+
 _render_app_env() {
   # $5 (src) is the EXISTING env file to preserve values from; defaults
   # to $out for the real enable path, where they are the same file. The
   # preflight check-render passes a temp $out plus the real file as src —
-  # with RENDER_CHECK_ONLY=1 so the render also skips its two side
-  # effects (persisting the effective subdomain to state, and minting a
-  # router token that would be discarded with the temp file).
+  # with RENDER_CHECK_ONLY=1 so the render also skips its side effect
+  # (minting a router token that would be discarded with the temp file);
+  # the applied labels are only ever persisted by enable_app itself, via
+  # _persist_applied_labels, once the app is healthy.
   local slug="$1" manifest="$2" tmpl="$3" out="$4"
   local src="${5:-$4}"
 
@@ -1209,13 +1251,17 @@ _render_app_env() {
     log_warn "could not resolve host labels for $slug; using the manifest default" \
       "diagnose:python3 ${APPLIANCE_DIR}/lib/vibe_hosts.py plan-app $slug"
   fi
-  if [[ "${RENDER_CHECK_ONLY:-0}" != "1" ]]; then
-    _state_app_set "$slug" subdomain "$eff_subdomain" 2>/dev/null || \
-      log_warn "could not persist effective subdomain to state for $slug"
-    if [[ -n "$host_plan" ]]; then
-      _state_app_set_json "$slug" subdomains "$(_json_field "$host_plan" 'json.dumps(data["extras"])')" 2>/dev/null || \
-        log_warn "could not persist extra-surface labels to state for $slug"
-    fi
+  # Handed to _persist_applied_labels, which enable_app calls only once
+  # the app is up and healthy on this env file — right before the Caddy
+  # re-render (step 7). Persisting here, in step 1, would record the new
+  # label as APPLIED before pull/up/health had run: a failed re-enable
+  # would then leave state (and every later Caddy render and tunnel
+  # provision) on a name the running container and the live Caddyfile
+  # do not serve.
+  APPLIED_PRIMARY_LABEL="$eff_subdomain"
+  APPLIED_EXTRAS_JSON=""
+  if [[ -n "$host_plan" ]]; then
+    APPLIED_EXTRAS_JSON="$(_json_field "$host_plan" 'json.dumps(data["extras"])')"
   fi
 
   # Domain-mode routing style — mirrors lib/render-caddyfile.sh. Read

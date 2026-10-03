@@ -22,8 +22,10 @@ CLI:
   cf_guard.py foreign-hosts HOST...   < GET /cfd_tunnel/<id>/configurations
       Prints the tunnel's ingress hostnames (comma-separated) when it
       serves hostnames and NONE of them is one of the given HOSTs — it is
-      somebody else's tunnel. Prints nothing when it is unconfigured, is
-      ours, or the response is unreadable.
+      somebody else's tunnel. Prints nothing when it is unconfigured or
+      ours. Exits 3 (printing nothing) when the response is unreadable:
+      the caller must then refuse to adopt, exactly as it does for an
+      unreadable tunnel-state.
   cf_guard.py record-action FQDN TARGET [OWN_TUNNEL_ID...]
                                       < GET /dns_records?name=<fqdn>
       ok | create | update | check <tunnel-id> | refuse <reason> | error <reason>
@@ -31,10 +33,15 @@ CLI:
 
 import base64
 import json
+import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import vibe_hosts  # noqa: E402  (same directory; the one env-file parser)
+
 TUNNEL_SUFFIX = ".cfargotunnel.com"
+EXIT_UNREADABLE = 3
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
@@ -55,14 +62,11 @@ def tunnel_id_from_token(token):
 
 
 def token_from_env_file(path):
-    try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("TUNNEL_TOKEN="):
-                    return line[len("TUNNEL_TOKEN="):].strip()
-    except OSError:
-        pass
-    return ""
+    """TUNNEL_TOKEN from shared.env, "" when absent. Goes through
+    vibe_hosts.read_env so a hand edit (leading space, quotes, a stray
+    non-UTF-8 byte elsewhere in the file) reads the same way everywhere
+    instead of silently turning into "no token" here."""
+    return vibe_hosts._clean(vibe_hosts.read_env(path).get("TUNNEL_TOKEN", ""))
 
 
 def _load(raw):
@@ -102,13 +106,17 @@ def foreign_hosts(raw, desired):
     hostname under the same domain" is not enough: that is exactly what a
     second appliance on the domain looks like.
 
-    Returns [] when the tunnel is unconfigured, ours, or the response is
-    unreadable (fail open on a diagnostic: the CNAME pre-flight still
-    protects the other appliance's records).
+    Returns [] when the tunnel is unconfigured or ours, and None when the
+    response is unreadable. None must fail CLOSED: section 4 of
+    cloudflared-up.sh PUTs the whole ingress of whatever tunnel it
+    adopts, and the CNAME pre-flight only inspects records at THIS
+    appliance's hostnames, so it cannot protect the other appliance's
+    ingress. An unreadable config is "may be someone's" — refuse, as
+    tunnel_state does.
     """
     d = _load(raw)
     if not d or not d.get("success"):
-        return []
+        return None
     cfg = ((d.get("result") or {}).get("config") or {})
     hosts = [r.get("hostname") for r in (cfg.get("ingress") or []) if r.get("hostname")]
     if not hosts:
@@ -139,14 +147,19 @@ def record_action(raw, fqdn, target, own_ids):
         msgs = "; ".join("code=%s %s" % (e.get("code"), e.get("message"))
                          for e in (d.get("errors") or []))
         return ("error", "the DNS lookup failed (%s)" % (msgs or "no error detail"))
-    records = [r for r in (d.get("result") or []) if r.get("name") == fqdn]
+    # DNS names are case-insensitive and Cloudflare returns them lowercased;
+    # the caller's fqdn may carry the operator's spelling (--domain Firm.com).
+    want = (fqdn or "").strip().lower()
+    records = [r for r in (d.get("result") or [])
+               if str(r.get("name") or "").strip().lower() == want]
     if not records:
         return ("create", "")
     own = set(i.lower() for i in own_ids if i)
+    target = (target or "").lower()
     verdict = None
     for r in records:
         rtype = r.get("type") or "?"
-        content = str(r.get("content") or "")
+        content = str(r.get("content") or "").strip().lower()
         if rtype != "CNAME":
             return ("refuse", "a %s record pointing at %s" % (rtype, content or "(empty)"))
         if content == target:
@@ -154,7 +167,11 @@ def record_action(raw, fqdn, target, own_ids):
             continue
         if not content.endswith(TUNNEL_SUFFIX):
             return ("refuse", "a CNAME pointing at %s (not a Cloudflare Tunnel)" % content)
-        tid = content[:-len(TUNNEL_SUFFIX)].lower()
+        tid = content[:-len(TUNNEL_SUFFIX)]
+        if not UUID_RE.match(tid):
+            # ".cfargotunnel.com" with no (or a garbled) tunnel id in front:
+            # not a record this script wrote and nothing it can look up.
+            return ("refuse", "a CNAME pointing at %s (malformed tunnel target)" % content)
         if tid in own:
             verdict = ("update", "")
         else:
@@ -181,6 +198,9 @@ def _main(argv):
         return 0
     if cmd == "foreign-hosts":
         hosts = foreign_hosts(sys.stdin.read(), args)
+        if hosts is None:
+            sys.stderr.write("foreign-hosts: the tunnel configurations response is unreadable\n")
+            return EXIT_UNREADABLE
         if hosts:
             sys.stdout.write(",".join(hosts) + "\n")
         return 0
