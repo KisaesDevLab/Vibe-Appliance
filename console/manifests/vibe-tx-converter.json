@@ -1,88 +1,133 @@
 {
-  "_doc": "Translated from Vibe-Transaction-Convertor/appliance.manifest.json (upstream uses an older flat schema and depends on a `llm-gateway` service the appliance does not yet ship). This manifest reroutes LLM access through the appliance's existing ANTHROPIC_API_KEY plumbing — operator picks the model via Settings → AI; no local LLM gateway required. OCR is no longer bundled (vibe-glm-ocr was removed from the appliance); set GLM_OCR_URL in the per-app env to a self-hosted OCR service to re-enable the OCR path. Open an upstream PR to align Vibe-Transaction-Convertor/appliance.manifest.json with this schema once the appliance side is verified.",
-
+  "_doc": "Source of truth for the Vibe Appliance console manifest (vendored to Vibe-Appliance/console/manifests/vibe-tx-converter.json). Adds the Vibe Auth single sign-on contract (ADR-027, docs/sso.md). vibe-app.yaml is the legacy boot-handshake manifest and is kept only for that runtime check.",
   "schemaVersion": 1,
   "slug": "vibe-tx-converter",
   "displayName": "Vibe Transactions Converter",
   "description": "Converts bank and credit-card PDF statements into CSV, OFX 2.x, QFX, and QBO Web Connect files for re-import into QuickBooks Online, QuickBooks Desktop, Quicken, and Xero.",
   "logo": "vibe-tx-converter.svg",
-
   "image": {
-    "server":     "ghcr.io/kisaesdevlab/vibe-tx-converter",
+    "server": "ghcr.io/kisaesdevlab/vibe-tx-converter",
     "defaultTag": "latest"
   },
-
-  "subdomain":     "vibetc",
+  "subdomain": "vibetc",
   "emergencyPort": 5175,
-  "ports":         { "server": 4000 },
-
+  "ports": {
+    "server": 4000
+  },
   "routing": {
     "default_upstream": "vibe-tx-converter:4000"
   },
-
-  "depends":         ["postgres", "redis"],
-
+  "depends": ["postgres", "redis"],
+  "requires": ["identity"],
   "env": {
     "required": [
-      { "name": "ALLOWED_ORIGIN",  "from": "subdomain-url" },
-      { "name": "WEB_BASE_URL",    "from": "subdomain-url" },
-      { "name": "DATABASE_URL",    "from": "database-url" },
-      { "name": "REDIS_URL",       "from": "redis-url" },
-      { "name": "SESSION_SECRET",  "from": "shared:JWT_SECRET" },
-      { "name": "SESSION_SECURE",  "from": "install-mode-tls" },
-      { "name": "MIGRATIONS_AUTO", "from": "static:true" }
+      {
+        "name": "ALLOWED_ORIGIN",
+        "from": "subdomain-url"
+      },
+      {
+        "name": "WEB_BASE_URL",
+        "from": "subdomain-url"
+      },
+      {
+        "name": "DATABASE_URL",
+        "from": "database-url"
+      },
+      {
+        "name": "REDIS_URL",
+        "from": "redis-url"
+      },
+      {
+        "name": "SESSION_SECRET",
+        "from": "shared:JWT_SECRET"
+      },
+      {
+        "name": "SESSION_SECURE",
+        "from": "install-mode-tls"
+      },
+      {
+        "name": "MIGRATIONS_AUTO",
+        "from": "static:true"
+      }
     ],
     "optional": [
       {
         "name": "VIBE_APP_SUBDOMAIN",
-        "doc":  "Operator override for this app's subdomain label. Empty = the manifest default. Consumed by the appliance routing (Caddy vhost + Cloudflare Tunnel CNAME/ingress) when DOMAIN_ROUTING_MODE=subdomain-per-app; ignored in single-host mode. Single DNS label — lowercase letters, digits, dashes, no dots.",
+        "doc": "Operator override for this app's subdomain label. Empty = the manifest default. Consumed by the appliance routing (Caddy vhost + Cloudflare Tunnel CNAME/ingress) when DOMAIN_ROUTING_MODE=subdomain-per-app; ignored in single-host mode. Single DNS label — lowercase letters, digits, dashes, no dots.",
         "ui": {
-          "tier":        1,
-          "category":    "Network",
-          "label":       "Subdomain",
-          "helpText":    "The <subdomain> in <subdomain>.<your-domain> for this app when routing is 'subdomain per app' (see Network settings). Leave blank to use the built-in default. Lowercase letters, digits, and dashes; no dots. Saving re-renders routing and re-provisions the Cloudflare Tunnel; the app briefly restarts.",
-          "input":       "text",
-          "appliance":   "per-app",
-          "validate":    "regex:^([a-z0-9][a-z0-9-]*)?$",
+          "tier": 1,
+          "category": "Network",
+          "label": "Subdomain",
+          "helpText": "The <subdomain> in <subdomain>.<your-domain> for this app when routing is 'subdomain per app' (see Network settings). Leave blank to use the built-in default. Lowercase letters, digits, and dashes; no dots. Saving re-renders routing and re-provisions the Cloudflare Tunnel; the app briefly restarts.",
+          "input": "text",
+          "appliance": "per-app",
+          "validate": "regex:^([a-z0-9][a-z0-9-]*)?$",
           "postSaveJob": "routing-reconcile"
         }
       },
       {
-        "name":   "ANTHROPIC_API_KEY",
-        "from":   "appliance:ANTHROPIC_API_KEY",
+        "name": "ANTHROPIC_API_KEY",
+        "from": "appliance:ANTHROPIC_API_KEY",
         "secret": true,
-        "doc":    "Claude API key. Required when LLM_PROVIDER=anthropic (the appliance default for this app). Inherited from appliance.env unless overridden.",
+        "doc": "Claude API key. Required when LLM_PROVIDER=anthropic (the appliance default for this app). Inherited from appliance.env unless overridden.",
         "ui": {
-          "tier":       2,
-          "category":   "AI",
-          "label":      "Anthropic API key",
-          "helpText":   "Required for the AI-assisted extraction path. The appliance-wide key is used unless overridden per-app.",
-          "input":      "password",
-          "appliance":  "both",
-          "validate":   "anthropic-api-key"
+          "tier": 2,
+          "category": "AI",
+          "label": "Anthropic API key",
+          "helpText": "Required for the AI-assisted extraction path. The appliance-wide key is used unless overridden per-app.",
+          "input": "password",
+          "appliance": "both",
+          "validate": "anthropic-api-key"
         }
       },
       {
-        "name":  "ANTHROPIC_MODEL",
-        "from":  "appliance:ANTHROPIC_MODEL",
-        "doc":   "Claude model used when LLM_PROVIDER=anthropic. Inherited from the appliance Settings → AI selection."
+        "name": "ANTHROPIC_MODEL",
+        "from": "appliance:ANTHROPIC_MODEL",
+        "doc": "Claude model used when LLM_PROVIDER=anthropic. Inherited from the appliance Settings → AI selection."
       }
     ]
   },
-
-  "database": { "name": "vibe_tx_converter_db", "user": "vibetc" },
-  "redis":    { "db": 6 },
-
+  "database": {
+    "name": "vibe_tx_converter_db",
+    "user": "vibetc"
+  },
+  "redis": {
+    "db": 6
+  },
   "firstLogin": {
     "type": "setup-wizard",
     "note": "First request lands on /register because no users exist; create the admin there.",
-    "url":  "/register"
+    "url": "/register"
   },
-
   "health": "/api/health/live",
-
   "migrations": {
-    "command":    ["node", "/app/apps/api/dist/db/migrate.js"],
+    "command": ["node", "/app/apps/api/dist/db/migrate.js"],
     "autoEnvVar": "MIGRATIONS_AUTO"
+  },
+  "sso": {
+    "capable": true,
+    "redirectPaths": ["/auth/oidc/callback"],
+    "logoutPaths": ["/auth/oidc/backchannel"],
+    "publicPaths": [
+      "/api/health/*",
+      "/api/version",
+      "/api/version/*",
+      "/api/auth/csrf",
+      "/api/auth/users-exist",
+      "/api/auth/login",
+      "/api/internal/appliance/*"
+    ],
+    "edgeGate": false,
+    "internalUrl": "http://vibe-tx-converter:4000",
+    "breakglassService": "vibe-tx-converter",
+    "breakglassCommand": [
+      "node",
+      "/app/apps/api/node_modules/@kisaesdevlab/vibe-auth/dist/cli.js",
+      "breakglass",
+      "ensure",
+      "--json"
+    ],
+    "breakglassIdentifier": "vibe-breakglass@vibe-tx-converter.local",
+    "recreate": ["vibe-tx-converter"]
   }
 }
