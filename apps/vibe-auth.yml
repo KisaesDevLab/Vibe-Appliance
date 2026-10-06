@@ -19,7 +19,13 @@ x-authentik: &authentik
   env_file:
     - /opt/vibe/env/vibe-auth.env
   volumes:
-    - /opt/vibe/data/apps/vibe-auth/media:/media
+    # authentik's file storage (brand logos, favicons, flow backgrounds) must be
+    # a MOUNT at /data: since 2025.12 it only offers uploads when /data or
+    # /data/media is a mount point. /data/media is a symlink to /media inside
+    # the image, so mounting at /media (or /data/media, which Docker resolves
+    # through the symlink) leaves uploads failing with "Response returned an
+    # error code". Same host folder as before; files land in media/public/.
+    - /opt/vibe/data/apps/vibe-auth/media:/data
     - /opt/vibe/data/apps/vibe-auth/templates:/templates
     - /opt/vibe/data/apps/vibe-auth/blueprints:/blueprints/vibe:ro
   networks:
@@ -65,7 +71,7 @@ services:
       vibe-auth-blueprints:
         condition: service_completed_successfully
     volumes:
-      - /opt/vibe/data/apps/vibe-auth/media:/media
+      - /opt/vibe/data/apps/vibe-auth/media:/data
       - /opt/vibe/data/apps/vibe-auth/templates:/templates
       - /opt/vibe/data/apps/vibe-auth/certs:/certs
       - /opt/vibe/data/apps/vibe-auth/blueprints:/blueprints/vibe:ro
