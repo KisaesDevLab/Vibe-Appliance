@@ -482,3 +482,52 @@ test('no drift → the field is absent (nothing to show)', async () => {
   const res = await call(app, 'GET /api/v1/identity', {});
   assert.equal(res.body.vibeAuth.addressDrift, undefined);
 });
+
+// ----- client portal (LANDING_REQUIRE_VIBE_AUTH) ---------------------------
+
+test('portal-gate routes: admin-gated, registered before the :slug routes, no slug in argv', async () => {
+  const { app, spawnScript } = setup({
+    'portal-gate status': { stdout: JSON.stringify({ slug: 'vibe-portal', required: true, state: 'on', problems: [] }) },
+    'portal-gate access': { stdout: JSON.stringify({ slug: 'vibe-portal', restricted: false }) },
+  });
+  for (const k of ['GET /api/v1/identity/portal-gate', 'GET /api/v1/identity/portal-gate/access', 'POST /api/v1/identity/portal-gate/access']) {
+    assert.ok(app.routes[k], 'missing ' + k);
+    assert.equal(app.routes[k][0], requireAdmin, k + ' must be admin-gated');
+  }
+  const keys = Object.keys(app.routes);
+  assert.ok(keys.indexOf('GET /api/v1/identity/portal-gate') < keys.indexOf('GET /api/v1/identity/:slug'),
+    '"portal-gate" must never be read as a slug');
+  assert.ok(keys.indexOf('POST /api/v1/identity/portal-gate/access') < keys.indexOf('POST /api/v1/identity/:slug/access'));
+
+  const st = await call(app, 'GET /api/v1/identity/portal-gate');
+  assert.equal(st.body.state, 'on');
+  assert.deepEqual(spawnScript.calls[0].slice(1), ['portal-gate', 'status']);
+
+  const read = await call(app, 'GET /api/v1/identity/portal-gate/access');
+  assert.equal(read.body.restricted, false);
+  assert.deepEqual(spawnScript.calls[1].slice(1), ['portal-gate', 'access']);
+});
+
+test('portal-gate access: restrict with a seed, open; bad bodies never reach the script', async () => {
+  const { app, spawnScript } = setup({
+    'portal-gate access': { stdout: JSON.stringify({ slug: 'vibe-portal', restricted: true, seeded: 0 }) },
+  });
+  const put = await call(app, 'POST /api/v1/identity/portal-gate/access', { body: { restricted: true, seed: 'none' } });
+  assert.equal(put.statusCode, 200);
+  assert.deepEqual(spawnScript.calls[0].slice(1), ['portal-gate', 'access', 'restricted', 'none']);
+  await call(app, 'POST /api/v1/identity/portal-gate/access', { body: { restricted: false } });
+  assert.deepEqual(spawnScript.calls[1].slice(1), ['portal-gate', 'access', 'open', 'none']);
+
+  const bad1 = await call(app, 'POST /api/v1/identity/portal-gate/access', { body: { restricted: 'yes' } });
+  assert.equal(bad1.statusCode, 400);
+  const bad2 = await call(app, 'POST /api/v1/identity/portal-gate/access', { body: { restricted: true, seed: 'all' } });
+  assert.equal(bad2.statusCode, 400);
+  assert.equal(spawnScript.calls.length, 2);
+});
+
+test('portal-gate status: a script failure is a 500 with the reason, not a crash', async () => {
+  const { app } = setup({ 'portal-gate status': { code: 1, stderr: 'boom' } });
+  const res = await call(app, 'GET /api/v1/identity/portal-gate');
+  assert.equal(res.statusCode, 500);
+  assert.match(res.body.detail, /boom/);
+});

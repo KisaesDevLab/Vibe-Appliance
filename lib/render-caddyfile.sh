@@ -289,8 +289,16 @@ def render_vhost(slug, manifest, host, tls_internal=False):
         lines.extend(mounts)
         lines.append("")
 
-    gate = edge_gate_lines(slug, manifest, "    ")
+    # The gate is site-wide on this host, so the outpost's own endpoints
+    # (the sign-in callback lands on THIS host) bypass it and go to
+    # authentik — unless the app mounts /auth/ itself (vibe-auth does).
+    own_auth = any(str(x.get("path", "")) in ("/auth", "/auth/*")
+                   for x in (routing.get("mounts") or []))
+    gate = edge_gate_lines(slug, manifest, "    ",
+                           extra_public=() if own_auth else (OUTPOST_PATH,))
     if gate:
+        if not own_auth:
+            lines.extend(outpost_handle_lines("    "))
         lines.extend(gate)
         lines.append("")
 
@@ -389,11 +397,7 @@ def render_apex_vhost(apex_hosts, main_host="", tls_internal=False):
         f"        respond \"ok\" 200\n"
         f"    }}\n"
         f"\n"
-        f"    handle {{\n"
-        f"        reverse_proxy console:3000 {{\n"
-        f"            header_up X-Real-IP {{remote_host}}\n"
-        f"        }}\n"
-        f"    }}\n"
+        + "\n".join(console_handle_lines("    ", "    ", "strip")) + "\n"
         f"}}\n"
     )
 
@@ -493,12 +497,9 @@ def render_domain_app_vhost(host, enabled, tls_internal=False):
         lines.append(render_path_handler(slug, manifest).rstrip("\n"))
         lines.append("")
 
-    # Default → console (landing + admin UI).
-    lines.append("\thandle {")
-    lines.append("\t\treverse_proxy console:3000 {")
-    lines.append("\t\t\theader_up X-Real-IP {remote_host}")
-    lines.append("\t\t}")
-    lines.append("\t}")
+    # Default → console (landing + admin UI). This host is where the
+    # client portal lives, so it carries the landing gate when one is on.
+    lines.extend(console_handle_lines("\t", "\t", "canonical"))
     lines.append("}")
     return "\n".join(lines) + "\n"
 
@@ -530,11 +531,14 @@ def render_console_host_vhost(host, tls_internal=False):
     lines.append("        respond \"ok\" 200")
     lines.append("    }")
     lines.append("")
-    lines.append("    handle {")
-    lines.append("        reverse_proxy console:3000 {")
-    lines.append("            header_up X-Real-IP {remote_host}")
-    lines.append("        }")
-    lines.append("    }")
+    # The client portal's host. With the landing gate on, the sign-in
+    # round trip ends on this host's /auth/outpost.goauthentik.io/
+    # callback, and nothing else here routes /auth/ (vibe-auth has its own
+    # host in this mode), so the outpost gets a handle of its own.
+    if landing_gate_active():
+        lines.extend(outpost_handle_lines("    "))
+        lines.append("")
+    lines.extend(console_handle_lines("    ", "    ", "canonical"))
     lines.append("}")
     return "\n".join(lines) + "\n"
 
@@ -744,7 +748,7 @@ def render_infra_vhost(svc, host, tls_internal=False):
     return "\n".join(lines) + "\n"
 
 
-def render_lan_gated_handlers(handlers_str):
+def render_lan_gated_handlers(handlers_str, main_host=""):
     """Wrap a tab-indented path-handler block in a `@lan` remote_ip
     matcher so direct host-IP traffic from the LAN / Tailscale CGNAT
     range reaches app + infra paths, while any external request that
@@ -768,10 +772,14 @@ def render_lan_gated_handlers(handlers_str):
     app path (e.g. `/admin`) drops into the void instead of reaching
     the console.
     """
+    # The console default inside @lan. With the landing gate on, the
+    # portal routes go to the main host, where the gate is.
+    console_default = "\n".join(console_handle_lines(
+        "\t", "\t", "redirect", redirect_host=main_host, suffix="_lan"))
     if not handlers_str.strip():
         # No apps + no infra rendered; @lan block still needs the
         # console default so LAN /admin keeps working.
-        inner = "\t# (no apps enabled)\n\thandle {\n\t\treverse_proxy console:3000 {\n\t\t\theader_up X-Real-IP {remote_host}\n\t\t}\n\t}"
+        inner = "\t# (no apps enabled)\n" + console_default
     else:
         indented = "\n".join(
             ("\t" + ln) if ln.strip() else ln
@@ -779,10 +787,7 @@ def render_lan_gated_handlers(handlers_str):
         )
         # Append a per-block console default INSIDE the @lan handle.
         # Outer console default exists for non-LAN traffic.
-        inner = (
-            indented +
-            "\n\n\thandle {\n\t\treverse_proxy console:3000 {\n\t\t\theader_up X-Real-IP {remote_host}\n\t\t}\n\t}"
-        )
+        inner = indented + "\n\n" + console_default
     return (
         "\t# LAN / Tailscale direct-IP access — path-routes apps so a\n"
         "\t# staff member on the office network can reach\n"
@@ -920,18 +925,63 @@ def render_path_handler(slug, manifest):
 IDENTITY_PROVIDER_ENABLED = False
 
 
-def edge_gate_lines(slug, manifest, indent):
+# Set by main() from appliance.env: LANDING_REQUIRE_VIBE_AUTH=true asks for
+# the console's public landing (the client portal at /) to sit behind the
+# Vibe Auth edge gate. See console_handle_lines.
+LANDING_GATE_REQUIRED = False
+
+AUTHENTIK_UPSTREAM = "vibe-auth-authentik-server:9000"
+# authentik's embedded outpost, served under AUTHENTIK_WEB__PATH=/auth/.
+# The sign-in round trip ends on <gated host>/auth/outpost.goauthentik.io/
+# callback, so every gated HOST must route this path to authentik.
+OUTPOST_PATH = "/auth/outpost.goauthentik.io/*"
+AUTHENTIK_HEADERS = ("X-Authentik-Username", "X-Authentik-Groups",
+                     "X-Authentik-Email", "X-Authentik-Uid")
+# The console routes that make up the client portal: the landing page, the
+# card API it fetches, and the public mini-apps. /admin and the admin API
+# keep their own login and are never gated (a second prompt in front of
+# HTTP Basic would only lock staff out when Vibe Auth is down).
+LANDING_GATED_PATHS = ("/", "/index.html", "/api/v1/public/*", "/tools/*")
+
+
+def forward_auth_lines(matcher, indent, step="\t"):
+    """The authentik forward_auth directive, scoped by `matcher` (a named
+    matcher reference like "@x", or "")."""
+    m = f"{matcher} " if matcher else ""
+    return [
+        f"{indent}forward_auth {m}{AUTHENTIK_UPSTREAM} {{",
+        f"{indent}{step}uri /auth/outpost.goauthentik.io/auth/caddy",
+        f"{indent}{step}copy_headers {' '.join(AUTHENTIK_HEADERS)}",
+        f"{indent}}}",
+    ]
+
+
+def outpost_handle_lines(indent, step="    "):
+    """`handle` for the outpost's own endpoints (start, callback, sign_out)
+    on a gated host that has no /auth mount of its own."""
+    return [
+        f"{indent}handle {OUTPOST_PATH} {{",
+        f"{indent}{step}reverse_proxy {AUTHENTIK_UPSTREAM}",
+        f"{indent}}}",
+    ]
+
+
+def edge_gate_lines(slug, manifest, indent, extra_public=()):
     """Vibe Auth D10 — opt-in Caddy forward_auth in front of a product via
     authentik's embedded outpost (served under /auth/ with
     AUTHENTIK_WEB__PATH=/auth/). sso.publicPaths (webhooks, health, API-key
     routes) bypass the gate. Emitted only when the product asks for it AND
     an identity provider is enabled; otherwise the product's own middleware
-    is the only gate, which is the D10 default."""
+    is the only gate, which is the D10 default.
+
+    extra_public: paths that bypass the gate on this host as well — the
+    outpost's own endpoints, on a vhost where the gate is site-wide."""
     sso = manifest.get("sso") or {}
     if not sso.get("edgeGate") or not IDENTITY_PROVIDER_ENABLED:
         return []
     out = []
     pub = [p for p in (sso.get("publicPaths") or []) if isinstance(p, str) and p]
+    pub += [p for p in extra_public if p not in pub]
     # Caddy sorts `forward_auth` ahead of every `handle` in a block, so a
     # public-path `handle` placed next to it never bypasses the gate — the
     # request is challenged first. The bypass has to live on the
@@ -941,11 +991,81 @@ def edge_gate_lines(slug, manifest, indent):
     if pub:
         gid = _matcher_id(slug, "gated")
         out.append(f"{indent}@{gid} not path {' '.join(pub)}")
-        gate_matcher = f"@{gid} "
+        gate_matcher = f"@{gid}"
     out.append(f"{indent}# vibe-auth edge gate (sso.edgeGate): authentik forward_auth")
-    out.append(f"{indent}forward_auth {gate_matcher}vibe-auth-authentik-server:9000 {{")
-    out.append(f"{indent}\turi /auth/outpost.goauthentik.io/auth/caddy")
-    out.append(f"{indent}\tcopy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Uid")
+    out.extend(forward_auth_lines(gate_matcher, indent))
+    return out
+
+
+def landing_gate_active():
+    """The landing gate can be rendered: it is required AND an identity
+    provider is enabled to answer it."""
+    return LANDING_GATE_REQUIRED and IDENTITY_PROVIDER_ENABLED
+
+
+def console_handle_lines(indent, step, entry="canonical", redirect_host="", suffix="",
+                         portal_origin=""):
+    """The default `handle` that proxies to the console (landing + admin).
+    `indent` is the handle's own indent, `step` one nesting level.
+
+    portal_origin (canonical entry on a site that answers any hostname —
+    the LAN catch-all): the scheme://host the portal is registered at. A
+    portal request for another name (<hostname>.local, a second address)
+    is sent there first, because the outpost matches on host and a
+    sign-in could never complete on any other name.
+
+    With LANDING_REQUIRE_VIBE_AUTH off this is the plain proxy every
+    caller used to emit inline, byte for byte. With it on:
+
+      * every entry strips client-supplied X-Authentik-* headers, so the
+        console's own check (console/server.js) only ever sees headers the
+        outpost set;
+      * entry="canonical" — the host the client portal is registered at
+        (the broker's `vibe-portal` edge registration, lib/identity.sh
+        portal-gate) — puts forward_auth on the portal routes while an
+        identity provider is enabled. When none is, nothing could answer
+        the gate, and the console refuses the portal routes itself (503):
+        the switch says "required", so the portal is closed, never
+        silently open;
+      * entry="redirect" — another way in (the :80 catch-all, the LAN
+        block in domain mode) — sends the portal routes to the canonical
+        host. The outpost matches on host, so a gate here could never
+        complete a sign-in;
+      * entry="strip" — header stripping only.
+
+    `suffix` keeps matcher names unique when two entries share a site.
+    """
+    out = [f"{indent}handle {{"]
+    inner = indent + step
+    if LANDING_GATE_REQUIRED:
+        out.append(f"{inner}# client portal requires Vibe Auth (LANDING_REQUIRE_VIBE_AUTH)")
+        # `route` runs its directives in the order written. In a plain
+        # handle Caddy sorts forward_auth AHEAD of request_header, so the
+        # strip would delete the very headers the outpost just set and
+        # every signed-in visitor would get the console's 503.
+        out.append(f"{inner}route {{")
+        inner += step
+        for h in AUTHENTIK_HEADERS:
+            out.append(f"{inner}request_header -{h}")
+        mid = f"landing_gated{suffix}"
+        if entry == "canonical" and landing_gate_active():
+            if portal_origin:
+                host = portal_origin.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+                out.append(f"{inner}@{mid}_offhost {{")
+                out.append(f"{inner}{step}path {' '.join(LANDING_GATED_PATHS)}")
+                out.append(f"{inner}{step}not host {host}")
+                out.append(f"{inner}}}")
+                out.append(f"{inner}redir @{mid}_offhost {portal_origin}{{uri}} 302")
+            out.append(f"{inner}@{mid} path {' '.join(LANDING_GATED_PATHS)}")
+            out.extend(forward_auth_lines(f"@{mid}", inner, step))
+        elif entry == "redirect" and redirect_host:
+            out.append(f"{inner}@{mid} path {' '.join(LANDING_GATED_PATHS)}")
+            out.append(f"{inner}redir @{mid} https://{redirect_host}{{uri}} 302")
+    out.append(f"{inner}reverse_proxy console:3000 {{")
+    out.append(f"{inner}{step}header_up X-Real-IP {{remote_host}}")
+    out.append(f"{inner}}}")
+    if LANDING_GATE_REQUIRED:
+        out.append(f"{indent}{step}}}")
     out.append(f"{indent}}}")
     return out
 
@@ -1116,8 +1236,10 @@ def main():
 
     enabled = list_enabled_apps(state, manifests_dir)
     _mount_paths_unique(enabled)
-    global IDENTITY_PROVIDER_ENABLED
+    global IDENTITY_PROVIDER_ENABLED, LANDING_GATE_REQUIRED
     IDENTITY_PROVIDER_ENABLED = any("identity" in (m.get("provides") or []) for _s, m in enabled)
+    LANDING_GATE_REQUIRED = (appliance_env.get("LANDING_REQUIRE_VIBE_AUTH", "")
+                             .strip().strip("\"'").lower() == "true")
 
     if mode == "domain" and domain:
         # Two routing styles, selected by DOMAIN_ROUTING_MODE:
@@ -1214,7 +1336,7 @@ def main():
             render_infra_path_handler(s) for s in INFRA_SERVICES
         )
         combined = (app_path_blocks + ("\n" if app_path_blocks and infra_path_blocks else "") + infra_path_blocks)
-        path_blocks = render_lan_gated_handlers(combined)
+        path_blocks = render_lan_gated_handlers(combined, main_host=main_host)
     elif mode in ("lan", "tailscale"):
         # rootServedOnly apps get no path mount here either. There is no
         # per-app hostname to give them in LAN/Tailscale mode (mDNS
@@ -1295,6 +1417,21 @@ def main():
     body = substitute_block(body, "@VIBE_GLOBAL_SNIPPET@", global_snippet)
     body = substitute_block(body, "@VIBE_VHOSTS@",         vhost_blocks)
     body = substitute_block(body, "@VIBE_PATH_HANDLERS@",  path_blocks)
+    # The catch-all's console default. LAN/Tailscale: this site IS the
+    # client portal's address, so it carries the gate. Domain mode: the
+    # portal lives on the main host; the catch-all only sends there.
+    if mode == "domain" and domain:
+        catchall_console = console_handle_lines("\t", "\t", "redirect",
+                                                redirect_host=main_host)
+    else:
+        # This site answers every hostname; in LAN mode the portal is
+        # registered at http://<host address> (lib/identity.sh
+        # _id_portal_base_url). Tailscale mode cannot register it at all.
+        host_ip = str(config.get("host_ip") or "").strip() if mode == "lan" else ""
+        catchall_console = console_handle_lines(
+            "\t", "\t", "canonical",
+            portal_origin=f"http://{host_ip}" if host_ip else "")
+    body = substitute_block(body, "@VIBE_CONSOLE_DEFAULT@", "\n".join(catchall_console))
 
     # Inline-substitutions (the placeholder is part of a directive line —
     # `@VIBE_LISTEN@ {`, `email @VIBE_ACME_EMAIL@`, etc.). These are

@@ -465,6 +465,11 @@ cmd_update() {
     if [[ -n "$_sso_both" ]]; then
       log_info "single sign-on will be down while $slug updates; these products keep working with local passwords: ${_sso_both}" slug="$slug"
     fi
+    # The client portal, when it requires Vibe Auth, has no local fallback:
+    # it is closed (the console answers 503) until sign-in is back.
+    if [[ "$(sed -n 's/^LANDING_REQUIRE_VIBE_AUTH=//p' "${VIBE_ENV_DIR:-/opt/vibe/env}/appliance.env" 2>/dev/null | tail -n 1 | tr -d "\"'[:space:]" | tr 'A-Z' 'a-z')" == "true" ]]; then
+      log_warn "the client portal requires Vibe Auth, so it is CLOSED to everyone while $slug updates; it reopens on its own once sign-in is healthy again. To keep it open during maintenance, turn 'Require Vibe Auth for the client portal' off in Settings → Landing page first." slug="$slug"
+    fi
   fi
 
   # Source shared.env so APP_TAG / db creds are available.

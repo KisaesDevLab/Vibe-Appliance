@@ -1052,6 +1052,65 @@ Then:     sudo vibe disable <slug> && sudo vibe enable <slug>   (re-render env)
 Note:     apps already running keep the weakened cookie until re-enabled."
 }
 
+# "Require Vibe Auth for the client portal" (LANDING_REQUIRE_VIBE_AUTH).
+# The property that matters: while the setting is on, an anonymous visitor
+# must NOT get the portal. So beyond the broker's view (lib/identity.sh
+# portal-gate status) this asks Caddy for / without a session and fails on
+# a 200. A 302 to sign-in is the healthy answer; a 503 from the console
+# means closed-but-broken, which the status problems explain.
+check_landing_gate() {
+  _check_begin "Client portal sign-in (Vibe Auth)"
+  local env="${VIBE_DIR}/env/appliance.env" required
+  required="$(sed -n 's/^LANDING_REQUIRE_VIBE_AUTH=//p' "$env" 2>/dev/null | tail -n1 | tr -d "\"' \r" | tr 'A-Z' 'a-z')"
+  if [[ "$required" != "true" ]]; then
+    _check_pass "not required: the client portal at / is open (Settings → Landing page)"
+    return
+  fi
+
+  local js state problems base
+  js="$(bash "${APPLIANCE_DIR}/lib/identity.sh" portal-gate status 2>/dev/null | tail -n1)"
+  state="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("state",""))' "$js" 2>/dev/null || true)"
+  problems="$(python3 -c 'import json,sys; print("\n".join(json.loads(sys.argv[1]).get("problems") or []))' "$js" 2>/dev/null || true)"
+  base="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("expectedBaseUrl") or "")' "$js" 2>/dev/null || true)"
+  if [[ -z "$state" ]]; then
+    _check_warn "required, but the sign-in gate's status could not be read" \
+      "Diagnose: sudo vibe identity portal-gate status"
+    return
+  fi
+
+  # Anonymous GET / through Caddy, addressed to the portal's own host.
+  local code="" target port host
+  if [[ -n "$base" ]]; then
+    host="${base#*://}"; host="${host%%/*}"
+    case "$base" in https://*) port=443 ;; *) port=80 ;; esac
+    if state_in_container 2>/dev/null; then target="vibe-caddy"; else target="127.0.0.1"; fi
+    code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
+      --connect-to "${host}:${port}:${target}:${port}" "${base}/" 2>/dev/null || true)"
+  fi
+  if [[ "$code" == "200" ]]; then
+    _check_fail "the client portal requires Vibe Auth, but ${base}/ is served WITHOUT sign-in" \
+      "Common causes: the Caddyfile was not re-rendered after the setting changed.
+Diagnose: grep -n landing_gated ${VIBE_DIR}/data/caddy/Caddyfile ; sudo vibe identity portal-gate status
+Fix:      sudo bash ${APPLIANCE_DIR}/bootstrap.sh   (re-renders and reloads Caddy)"
+    return
+  fi
+
+  if [[ "$state" != "on" ]]; then
+    _check_fail "the client portal requires Vibe Auth but nobody can sign in: the portal is closed" \
+      "${problems:-unknown cause}
+Diagnose: sudo vibe identity portal-gate status
+Fix:      the line above, or turn 'Require Vibe Auth for the client portal' off in Settings → Landing page to reopen it"
+    return
+  fi
+  case "$code" in
+    30[1278]) _check_pass "the client portal requires Vibe Auth: ${base}/ sends anonymous visitors to sign in" ;;
+    "")       _check_warn "the gate is registered, but ${base:-the portal}/ could not be probed through Caddy" \
+                "Diagnose: curl -skI ${base:-https://<host>}/   (expect a 302 to /auth/…)" ;;
+    *)        _check_warn "the gate is registered, but an anonymous ${base}/ answered HTTP ${code} instead of a redirect to sign-in" \
+                "Diagnose: curl -skI ${base}/ ; docker logs vibe-auth-authentik-server --tail 50" ;;
+  esac
+}
+
 check_settings_audit_db() {
   _check_begin "Settings audit DB"
   local db="${VIBE_DIR}/data/console/console.sqlite"
@@ -1196,6 +1255,7 @@ check_system_updates            # host OS update picture (attestation)
 check_host_runner               # console → host bridge for Sentinel actions
 check_settings_audit_db         # Workstream C
 check_cookie_policy             # security-gate drift
+check_landing_gate              # client portal requires Vibe Auth (when on)
 check_claude_code               # Workstream B
 
 # Mode-specific checks. We read state.config to know which mode this

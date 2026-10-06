@@ -25,6 +25,8 @@
 #   identity.sh reapply-address          → re-render + re-register vibe-auth and every registered product at the current address
 #   identity.sh register-all             → every enabled sso.capable product (run after enabling vibe-auth)
 #   identity.sh disable-all              → every registered product back to local (run before disabling vibe-auth)
+#   identity.sh portal-gate <status|on|off|access [open|restricted] [everyone|none]>
+#                                        → the client portal's sign-in gate (LANDING_REQUIRE_VIBE_AUTH; see below)
 #
 # Contract with the broker: docs in kisaes/vibe-auth COMPAT.md §2.3.
 # Secrets never appear on a command line: JSON bodies go over stdin to
@@ -663,14 +665,25 @@ for name, svc in (d.get("services") or {}).items():
 #   identity.sh access <slug> restricted [everyone|none]
 #   identity.sh access <slug> open
 id_access() {
-  local slug="$1" want="${2:-}" seed="${3:-none}" resp body
+  local slug="$1" want="${2:-}"
   _id_require_target "$slug"
   _id_require_va
   _id_require_broker "1.0.5" "per-product access"
   _id_registered "$slug" || die "${slug} is not registered with vibe-auth, so there is nothing to restrict. Fix: sudo vibe identity register ${slug}"
+  _id_access_core "$slug" "$want" "${3:-none}" "sudo vibe identity register ${slug}"
+  if [[ "$want" == "restricted" ]]; then
+    log_info "While ${slug} is in 'both' mode a local product password still signs in; switch it to oidc_only to make the restriction complete." slug="$slug"
+  fi
+}
+
+# The broker half of `access`: read (no <want>) or set it. Callers have
+# already checked that vibe-auth is up, new enough, and holds a
+# registration for <slug>. <fix> is the command that creates one.
+_id_access_core() {
+  local slug="$1" want="${2:-}" seed="${3:-none}" fix="$4" resp body
   if [[ -z "$want" ]]; then
     resp="$(_id_api GET "/registrations/${slug}/access" '')" \
-      || die "could not read access for ${slug}: vibe-auth has no registration for it. Fix: sudo vibe identity register ${slug}"
+      || die "could not read access for ${slug}: vibe-auth has no registration for it. Fix: ${fix}"
     python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"slug": sys.argv[1], "restricted": bool(d.get("restricted")), "updatedAt": d.get("updatedAt"), "updatedBy": d.get("updatedBy")}))' "$slug" <<< "$resp"
     return 0
   fi
@@ -680,11 +693,197 @@ id_access() {
   resp="$(_id_api PUT "/registrations/${slug}/access" "$body")" || die "could not change access for ${slug}. Diagnose: docker logs vibe-auth --tail 50"
   if [[ "$want" == "restricted" ]]; then
     log_ok "${slug}: single sign-on restricted to ticked users and vibe-admin members$( [[ "$seed" == "everyone" ]] && printf ' (started with every active user ticked)')"
-    log_info "Tick or untick people in Vibe Auth → Users. While ${slug} is in 'both' mode a local product password still signs in; switch it to oidc_only to make the restriction complete." slug="$slug"
+    log_info "Tick or untick people in Vibe Auth → Users." slug="$slug"
   else
     log_ok "${slug}: single sign-on open to every firm user again (the ticked list is kept)"
   fi
   python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"slug": sys.argv[1], "restricted": bool(d.get("restricted")), "seeded": d.get("seeded", 0)}))' "$slug" <<< "$resp"
+}
+
+# ---------------------------------------------------------------- client portal gate
+#
+# LANDING_REQUIRE_VIBE_AUTH (Settings → Landing page) puts the console's
+# public landing — /, /api/v1/public/*, /tools/*, the client portal — behind
+# Vibe Auth's edge gate (D10). The gate is an authentik forward_single proxy
+# provider, which the broker creates for any registration with
+# edgeGate: true, so the portal registers as the pseudo-product
+# "vibe-portal": no manifest, no env file, nothing to recreate and no
+# break-glass (the console's /admin keeps its own login). The broker also
+# mints an OAuth2 client for it that nothing uses; that is the price of
+# reusing the registration API unchanged. Access (open / restricted to
+# ticked people) works as for any product: the broker binds the
+# "<slug>-edge" application too.
+#
+# Clients never use firm sign-on (Vibe Auth D5): Vibe Auth accounts are firm
+# accounts, so a gated portal is a staff-only portal. The setting says so.
+#
+#   identity.sh portal-gate status                       → JSON
+#   identity.sh portal-gate on                           → pre-flight + register (upsert; idempotent)
+#   identity.sh portal-gate off                          → drop the registration (idempotent)
+#   identity.sh portal-gate access [open|restricted] [everyone|none]
+#
+# Reverse of `on` is `off`. Caddy is rendered separately (settings-save's
+# landing-gate job, or any render): the gate is in the Caddyfile only while
+# the setting is on AND vibe-auth is enabled.
+PG_SLUG="vibe-portal"
+
+_id_landing_required() {
+  local v; v="$(_extract_env_value "${VIBE_ENV_DIR}/appliance.env" LANDING_REQUIRE_VIBE_AUTH 2>/dev/null || true)"
+  v="${v//\"/}"; v="${v//\'/}"
+  [[ "${v,,}" == "true" ]]
+}
+
+_id_state_mode() {
+  python3 -c "import json,sys; print((json.load(open(sys.argv[1])).get('config') or {}).get('mode') or 'lan')" "$VIBE_STATE_FILE" 2>/dev/null | tr -d '\r'
+}
+
+# The portal's browser origin — the host Caddy gates (render-caddyfile.sh
+# console_handle_lines "canonical"): the main host in domain mode, the
+# host's address in LAN/Tailscale mode, scheme as apps render it.
+_id_portal_base_url() {
+  local mode url ip
+  mode="$(_id_state_mode)"
+  if [[ "$mode" == "domain" ]]; then
+    url="$(PYTHONDONTWRITEBYTECODE=1 python3 "${APPLIANCE_DIR}/lib/vibe_hosts.py" get main-url 2>/dev/null | tr -d '\r')"
+  else
+    ip="$(_host_ip_effective 2>/dev/null || true)"
+    [[ -n "$ip" ]] && url="http://${ip}"
+  fi
+  [[ -n "${url:-}" ]] || return 1
+  printf '%s' "$url"
+}
+
+# Enabled products whose own edge gate shares the portal's host. The
+# outpost matches a request to a provider by host alone, so two gates on
+# one host cannot both work. One slug per line.
+_id_portal_host_conflicts() {
+  local host="$1" slug base
+  while IFS= read -r slug; do
+    [[ -n "$slug" ]] || continue
+    [[ "$(_id_sso_field "$slug" 'sso.get("edgeGate", False)' false)" == "true" ]] || continue
+    [[ -f "${VIBE_ENV_DIR}/${slug}.env" ]] || continue
+    base="$(_id_product_base_url "$slug" 2>/dev/null)" || continue
+    [[ "$(_id_origin_host "$base")" == "$host" ]] && printf '%s\n' "$slug"
+  done < <(_id_enabled_sso_slugs)
+  return 0
+}
+
+# The broker's record for vibe-portal (JSON), or exit 1 when it has none.
+_id_portal_registration() {
+  _id_api GET "/registrations/${PG_SLUG}" '' 2>/dev/null
+}
+
+id_portal_gate_on() {
+  _id_require_va
+  _id_require_broker "$VA_MIN_VERSION" "the client portal's sign-in gate"
+  _id_require_named_host_broker
+  local va_mode; va_mode="$(_extract_env_value "$VA_ENV" VIBE_AUTH_APPLIANCE_MODE)"
+  if [[ "$va_mode" == tailscale* && "${VIBE_IDENTITY_ALLOW_TAILSCALE:-0}" != "1" ]]; then
+    die "the client portal cannot require Vibe Auth in Tailscale mode yet: browsers reach the appliance at its https tailnet name, which is not the address the sign-in gate would be registered at. Nothing was changed; the portal stays open." \
+        "Fix: use LAN or domain mode, then turn the setting on again."
+  fi
+  local base host conflicts body
+  base="$(_id_portal_base_url)" \
+    || die "cannot work out the client portal's address: no domain is configured and the host's LAN address is unknown. Nothing was changed." \
+           "Diagnose: sudo vibe doctor ; Fix: finish network setup (Settings → Network), then turn the setting on again."
+  host="$(_id_origin_host "$base")"
+  conflicts="$(_id_portal_host_conflicts "$host")"
+  if [[ -n "$conflicts" ]]; then
+    die "the client portal shares ${host} with $(tr '\n' ' ' <<< "$conflicts")which has its own Vibe Auth edge gate; the gate matches by hostname, so both cannot work on one host. Nothing was changed." \
+        "Fix: switch to subdomain-per-app routing (Settings → Network) so each gate has its own host, then turn the setting on again."
+  fi
+  body="$(python3 -c 'import json,sys; print(json.dumps({"slug": sys.argv[1], "displayName": "Client portal", "baseUrl": sys.argv[2], "internalUrl": "http://console:3000", "redirectPaths": ["/auth/oidc/callback"], "logoutPaths": [], "publicPaths": [], "edgeGate": True}))' "$PG_SLUG" "$base")"
+  log_step "registering the client portal's sign-in gate with vibe-auth" base_url="$base"
+  _id_api POST /registrations "$body" >/dev/null \
+    || die "vibe-auth refused the client portal's registration. Nothing else was changed." \
+           "Diagnose: docker logs vibe-auth --tail 50 ; Fix: once vibe-auth is healthy, turn the setting on again (or: sudo vibe identity portal-gate on)"
+  log_ok "client portal registered with vibe-auth at ${base}; Caddy gates it once the Caddyfile is re-rendered"
+}
+
+id_portal_gate_off() {
+  if ! _id_va_enabled || ! _id_va_healthy; then
+    # Nothing to reach. The record is harmless without the Caddy gate, and
+    # register-all drops it once vibe-auth is back and the switch is off.
+    log_info "vibe-auth is not running; the client portal's registration (if any) is dropped when it is back"
+    return 0
+  fi
+  if ! _id_portal_registration >/dev/null; then
+    log_ok "client portal: no Vibe Auth registration to drop"
+    return 0
+  fi
+  _id_api DELETE "/registrations/${PG_SLUG}" '' >/dev/null \
+    || die "could not drop the client portal's vibe-auth registration. Diagnose: docker logs vibe-auth --tail 50 ; Fix: sudo vibe identity portal-gate off"
+  log_ok "client portal: Vibe Auth registration dropped"
+}
+
+# Bring the broker in line with the switch: registered while required,
+# dropped while not. Used after vibe-auth (re)appears and after a rebase.
+_id_portal_converge() {
+  if _id_landing_required; then
+    ( id_portal_gate_on ) || { log_warn "the client portal requires Vibe Auth but could not be registered; it stays closed (503) until this is fixed. Fix: sudo vibe identity portal-gate on, or turn the setting off in Settings → Landing page"; return 1; }
+  else
+    ( id_portal_gate_off ) >/dev/null 2>&1 || true
+  fi
+}
+
+id_portal_gate_status() {
+  local required=false va_enabled=false va_healthy=false reg="" restricted="" expected=""
+  _id_landing_required && required=true
+  _id_va_enabled && va_enabled=true
+  [[ "$va_enabled" == true ]] && _id_va_healthy && va_healthy=true
+  expected="$(_id_portal_base_url 2>/dev/null || true)"
+  if [[ "$va_healthy" == true ]]; then
+    reg="$(_id_portal_registration || true)"
+    if [[ -n "$reg" ]]; then
+      restricted="$(_id_api GET "/registrations/${PG_SLUG}/access" '' 2>/dev/null \
+        | python3 -c 'import json,sys; print("true" if json.load(sys.stdin).get("restricted") else "false")' 2>/dev/null || true)"
+    fi
+  fi
+  python3 - "$required" "$va_enabled" "$va_healthy" "$expected" "$reg" "$restricted" "$(_id_state_mode)" <<'PYEOF'
+import json, sys
+required, va_enabled, va_healthy, expected, reg, restricted, mode = sys.argv[1:8]
+t = lambda s: s == "true"
+r = None
+if reg:
+    try:
+        r = (json.loads(reg) or {}).get("registration") or None
+    except Exception:
+        r = None
+registered = bool(r)
+edge = bool(r and r.get("edgeGate"))
+base = (r or {}).get("baseUrl")
+problems = []
+if t(required):
+    if not t(va_enabled):
+        problems.append("Vibe Auth is not enabled, so nobody can sign in: the client portal is closed. Enable Vibe Auth, or turn 'Require Vibe Auth for the client portal' off.")
+    elif not t(va_healthy):
+        problems.append("Vibe Auth is not healthy, so nobody can sign in: the client portal is closed until it recovers.")
+    elif not registered or not edge:
+        problems.append("the client portal is not registered with Vibe Auth: the portal is closed. Fix: sudo vibe identity portal-gate on")
+    elif expected and base != expected:
+        problems.append(f"the client portal is registered at {base} but is served at {expected}: sign-in fails. Fix: sudo vibe identity portal-gate on")
+    if mode == "tailscale":
+        problems.append("Tailscale mode is not supported for the client portal's sign-in gate.")
+state = "off"
+if t(required):
+    state = "on" if not problems else "unavailable"
+print(json.dumps({
+    "slug": "vibe-portal", "required": t(required), "state": state,
+    "vibeAuthEnabled": t(va_enabled), "vibeAuthHealthy": t(va_healthy),
+    "registered": registered, "edgeGate": edge, "baseUrl": base, "expectedBaseUrl": expected or None,
+    "restricted": None if restricted == "" else t(restricted),
+    "problems": problems,
+}))
+PYEOF
+}
+
+id_portal_gate_access() {
+  _id_require_va
+  _id_require_broker "1.0.5" "limiting who may open the client portal"
+  _id_portal_registration >/dev/null \
+    || die "the client portal is not registered with vibe-auth, so there is nothing to restrict." \
+           "Fix: turn on 'Require Vibe Auth for the client portal' in Settings → Landing page (or: sudo vibe identity portal-gate on)"
+  _id_access_core "$PG_SLUG" "${1:-}" "${2:-none}" "sudo vibe identity portal-gate on"
 }
 
 # ---------------------------------------------------------------- address drift
@@ -749,6 +948,9 @@ id_reapply_address() {
     ( bash "${APPLIANCE_DIR}/lib/enable-app.sh" "$slug" ) 2>&1 | tee -a "${VIBE_LOG_FILE:-/dev/null}" >&2 \
       || { log_warn "could not re-render ${slug}; it still points at the old address. Fix: sudo vibe enable ${slug}" slug="$slug"; rc=1; }
   done
+  # vibe-auth's enable hook already re-registered the portal (register-all);
+  # once more after every product, in case that ran before the address settled.
+  _id_portal_converge || rc=1
   [[ $rc -eq 0 ]] && log_ok "address re-applied; single sign-on now uses $(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("current"))' "$js")"
   return $rc
 }
@@ -972,6 +1174,9 @@ id_rebase() {
     ( _id_recreate "$slug" ) || log_warn "recreate failed for ${slug} after rebase. Fix: sudo vibe identity register ${slug}" slug="$slug"
   done < <(python3 -c 'import json,sys; d=json.load(sys.stdin); [print(p["slug"]) for p in d["products"] if p["slug"] in json.loads(sys.argv[1])]' "$products" <<< "$resp")
   log_ok "vibe-auth rebased for $(python3 -c 'import json,sys;print(len(json.loads(sys.argv[1])))' "$products") product(s)"
+  # The portal has no env file to rebase from; re-register it at the
+  # address it is served at now.
+  _id_portal_converge || true
 }
 
 id_register_all() {
@@ -983,6 +1188,10 @@ id_register_all() {
     # unregistered.
     ( id_register "$slug" ) || { log_warn "registration failed for ${slug}; continuing" slug="$slug"; rc=1; }
   done
+  # The client portal's gate follows LANDING_REQUIRE_VIBE_AUTH: this runs
+  # when vibe-auth is (re-)enabled, and the setting may have been turned on
+  # long before.
+  _id_portal_converge || rc=1
   return $rc
 }
 
@@ -992,6 +1201,11 @@ id_disable_all() {
     [[ -n "$(_extract_env_value "${VIBE_ENV_DIR}/${slug}.env" VIBE_OIDC_CLIENT_ID)" ]] || continue
     ( id_disable "$slug" ) || log_warn "could not disable SSO for ${slug}. Fix: sudo vibe identity disable ${slug}" slug="$slug"
   done
+  ( id_portal_gate_off ) || true
+  if _id_landing_required; then
+    # The setting stays on: the portal closes rather than opening silently.
+    log_warn "LANDING_REQUIRE_VIBE_AUTH is on but Vibe Auth is being disabled: the client portal is closed (503) until Vibe Auth is back. Fix: turn 'Require Vibe Auth for the client portal' off in Settings → Landing page, or re-enable vibe-auth."
+  fi
 }
 
 # ---------------------------------------------------------------- dispatch
@@ -1014,6 +1228,14 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     reapply-address)   id_reapply_address ;;
     register-all)      id_register_all ;;
     disable-all)       id_disable_all ;;
-    *) die "usage: identity.sh <status|register|rotate|disable|unregister|mode|rotate-breakglass|breakglass-status|access|setup-token|rebase|address-drift|reapply-address|register-all|disable-all> [slug] [arg]" ;;
+    portal-gate)
+      case "${2:-status}" in
+        status) id_portal_gate_status ;;
+        on)     id_portal_gate_on ;;
+        off)    id_portal_gate_off ;;
+        access) id_portal_gate_access "${3:-}" "${4:-none}" ;;
+        *) die "usage: identity.sh portal-gate <status|on|off|access [open|restricted] [everyone|none]>" ;;
+      esac ;;
+    *) die "usage: identity.sh <status|register|rotate|disable|unregister|mode|rotate-breakglass|breakglass-status|access|setup-token|rebase|address-drift|reapply-address|register-all|disable-all|portal-gate> [slug] [arg]" ;;
   esac
 fi

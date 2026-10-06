@@ -194,6 +194,8 @@ Three deployment modes, set by `CONFIG_MODE` at install. **As of 2026-05-12**, d
 
 This revises §4.1 below wherever it says `${tunnel_subdomain}.${domain}`: read that as "the main host as resolved by `lib/vibe_hosts.py`".
 
+**As of 2026-10-05**, the console's public landing (the "client portal" at `/`, its `/api/v1/public/*` card list and `/tools/*`) can require a Vibe Auth sign-in: `LANDING_REQUIRE_VIBE_AUTH` (Settings → Landing page). The landing registers with the broker as the edge-only pseudo-product `vibe-portal` (`lib/identity.sh portal-gate`), Caddy puts authentik `forward_auth` inside the console's catch-all `handle` on the main host (`console_handle_lines` in `lib/render-caddyfile.sh`), and the console itself refuses those routes without the outpost's identity header, so the portal fails closed whenever the gate is missing. Vibe Auth accounts are firm accounts (Vibe-Auth D5), so a gated portal is staff-only; the apps' own client portals are not affected. `/admin` keeps HTTP Basic. Not available in Tailscale mode.
+
 The effective subdomain is persisted to `state.apps.<slug>.subdomain` by `enable-app.sh`. **Caveat:** `subdomain-per-app` requires each app's web image to serve at a root base path (the `40-base-path.sh` entrypoint rewriting the bundle base to `/`); the same requirement the pre-2026-05-12 design relied on. Apps whose image can't serve at root need an upstream fix — not a workaround in the appliance (per CLAUDE.md "additive, never replacing").
 
 ### 4.1 Domain mode (`CONFIG_MODE=domain`)

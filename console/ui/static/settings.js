@@ -5401,6 +5401,7 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
         break;
       case 'rolled-back':
         html = `<strong>Rolled back.</strong> Reason: ${escapeHtml(data.reason || 'unknown')}.<br>` +
+               (data.detail ? `${escapeHtml(data.detail)}<br>` : '') +
                `Env files restored from ${escapeHtml(data.snapshot || 'snapshot')}. Original config running again.`;
         break;
       case 'degraded':

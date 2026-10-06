@@ -206,6 +206,18 @@ settings_save_apply() {
     return 1
   fi
 
+  # 3b. Pre-flight switches whose effect lives outside the env files.
+  # LANDING_REQUIRE_VIBE_AUTH=true registers the client portal with Vibe
+  # Auth before Caddy is told to gate it; a refusal (Vibe Auth not enabled
+  # or healthy, Tailscale mode, another gated product on the portal's
+  # host) restores the env and changes nothing.
+  local gate_detail=""
+  if ! gate_detail="$(_settings_landing_gate_preflight "$payload_file")"; then
+    settings_restore_env "$snap_dir"
+    _settings_emit_result "rolled-back" "client-portal-sign-in-refused" "$snap_dir" "" "$gate_detail"
+    return 1
+  fi
+
   # 4. Identify dependent apps — those that declare interest in any
   # changed key AND are currently enabled. Empty list means no restart
   # needed (e.g. a setting consumed only by Claude Code on the host).
@@ -301,6 +313,9 @@ _settings_run_post_save_jobs() {
         ;;
       routing-reconcile)
         _post_save_routing_reconcile "$payload_file" || rc=1
+        ;;
+      landing-gate)
+        _post_save_landing_gate "$payload_file" || rc=1
         ;;
       *)
         log_warn "unknown post-save job (skipping)" job="$job"
@@ -398,6 +413,10 @@ for c in changes:
 # to this script.
 if any(declared_job(c) == "routing-reconcile" for c in changes):
     out.append("routing-reconcile")
+# The client portal's Vibe Auth switch (LANDING_REQUIRE_VIBE_AUTH): Caddy
+# re-render + reload, and the broker registration dropped when it goes off.
+if any(declared_job(c) == "landing-gate" for c in changes):
+    out.append("landing-gate")
 # De-dupe, preserve order.
 seen = set(); deduped = []
 for j in out:
@@ -596,6 +615,79 @@ PYEOF
     fi
   fi
 
+  return "$rc"
+}
+
+# Internal: the value a payload sets for <key> at <scope>, on stdout.
+# Exit 1 when the payload does not touch that key. An appliance-scope
+# revert counts as "" (see _settings_apply_changes).
+_settings_payload_value() {
+  python3 - "$1" "$2" "$3" <<'PYEOF'
+import json, sys
+path, scope, key = sys.argv[1:4]
+with open(path) as f:
+    changes = json.load(f).get("changes", [])
+for c in changes:
+    if c.get("scope") == scope and c.get("key") == key:
+        print("" if c.get("op") == "revert" else str(c.get("value", "")).strip().lower())
+        sys.exit(0)
+sys.exit(1)
+PYEOF
+}
+
+# ---------------------------------------------------------------- client portal sign-in
+#
+# LANDING_REQUIRE_VIBE_AUTH (Settings → Landing page). Turning it on:
+#   1. pre-flight + broker registration (`identity.sh portal-gate on`) —
+#      before anything is restarted, and a refusal rolls the save back;
+#   2. post-save job `landing-gate`: Caddy re-render + reload, which puts
+#      forward_auth in front of /, /api/v1/public/* and /tools/*.
+# Turning it off: the re-render drops the gate first, then the broker
+# registration is removed. Reverse of on is off; both are idempotent.
+
+# Exit 0: nothing to do, or the portal is registered. Exit 1: refused, with
+# the reason on stdout for the Settings page (the full output goes to the
+# log and to stderr, which the console returns with the save result).
+_settings_landing_gate_preflight() {
+  local payload_file="$1" want out rc=0 why
+  want="$(_settings_payload_value "$payload_file" appliance LANDING_REQUIRE_VIBE_AUTH)" || return 0
+  [[ "$want" == "true" ]] || return 0
+  log_step "client portal: registering the Vibe Auth sign-in gate"
+  out="$(bash "${APPLIANCE_DIR}/lib/identity.sh" portal-gate on 2>&1 </dev/null)" || rc=$?
+  printf '%s\n' "$out" >&2
+  [[ $rc -eq 0 ]] && return 0
+  # The pretty log's failure lines: "<ts> [fail] <message>".
+  why="$(sed -n 's/^.*\[fail\] //p' <<<"$out" | tr '\n' ' ')"
+  log_warn "client portal: Vibe Auth sign-in refused; the setting was not saved" \
+    "diagnose:sudo vibe identity portal-gate status"
+  printf '%s' "${why:-identity.sh portal-gate on failed (exit ${rc}). Diagnose: sudo vibe identity portal-gate status}"
+  return 1
+}
+
+_post_save_landing_gate() {
+  local payload_file="$1" want rc=0
+  want="$(_settings_payload_value "$payload_file" appliance LANDING_REQUIRE_VIBE_AUTH)" || want=""
+  log_step "client portal: re-rendering Caddyfile + reloading Caddy"
+  if ! ( # shellcheck source=/dev/null
+         . "${APPLIANCE_DIR}/lib/state.sh"
+         # shellcheck source=/dev/null
+         . "${APPLIANCE_DIR}/lib/render-caddyfile.sh"
+         render_caddyfile && reload_caddyfile ) >>"$VIBE_LOG_FILE" 2>&1; then
+    # On: the console refuses the portal routes itself until Caddy gates
+    # them (the portal is closed, not open). Off: the old gate stays, so
+    # signed-in visitors still get through.
+    log_warn "client portal: Caddyfile re-render or reload failed; the previous routing is still being served" \
+      "diagnose:sudo tail -50 $VIBE_LOG_FILE" \
+      "fix:sudo bash ${APPLIANCE_DIR}/bootstrap.sh"
+    rc=1
+  fi
+  if [[ "$want" != "true" ]]; then
+    if ! bash "${APPLIANCE_DIR}/lib/identity.sh" portal-gate off >>"$VIBE_LOG_FILE" 2>&1 </dev/null; then
+      log_warn "client portal: could not drop its Vibe Auth registration (harmless while the gate is off)" \
+        "fix:sudo vibe identity portal-gate off"
+      rc=1
+    fi
+  fi
   return "$rc"
 }
 
@@ -883,20 +975,25 @@ PYEOF
 # included so the operator can manually restore from a known-good
 # point if the rollback itself failed (DEGRADED state).
 _settings_emit_result() {
-  local result="$1" reason="$2" snapshot="$3" affected="$4"
+  local result="$1" reason="$2" snapshot="$3" affected="$4" detail="${5:-}"
   # affected is newline-separated from the bash here-string. Split on
   # newlines explicitly (not whitespace) so multi-word entries — though
   # slug regex prevents them today — would survive intact.
-  python3 - "$result" "$reason" "$snapshot" "$affected" <<'PYEOF'
+  # detail (optional): an operator-facing sentence the Settings page shows
+  # under the result (what failed and how to fix it).
+  python3 - "$result" "$reason" "$snapshot" "$affected" "$detail" <<'PYEOF'
 import json, sys
-result, reason, snapshot, affected = sys.argv[1:5]
+result, reason, snapshot, affected, detail = sys.argv[1:6]
 slugs = [s for s in (affected.split('\n') if affected else []) if s]
-print(json.dumps({
+out = {
   'result':        result,
   'reason':        reason,
   'snapshot':      snapshot,
   'affected_apps': slugs,
-}))
+}
+if detail.strip():
+  out['detail'] = detail.strip()
+print(json.dumps(out))
 PYEOF
 }
 

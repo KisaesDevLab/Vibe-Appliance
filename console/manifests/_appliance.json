@@ -536,6 +536,25 @@
           { "value": "false", "label": "Hide" }
         ]
       }
+    },
+    {
+      "name":  "LANDING_REQUIRE_VIBE_AUTH",
+      "value": "false",
+      "doc":   "Whether the client portal at / (the landing page, its app list at /api/v1/public/apps and the /tools/* mini-apps) requires a Vibe Auth sign-in. On: the landing page is registered with the broker as the edge-only product 'vibe-portal' (lib/identity.sh portal-gate), then Caddy puts the Vibe Auth edge gate in front of those routes (lib/render-caddyfile.sh console_handle_lines; postSaveJob landing-gate in lib/settings-save.sh). Saving 'on' is refused unless Vibe Auth is enabled and healthy and the appliance is in LAN or domain mode. Vibe Auth accounts are firm accounts — clients have none — so this makes the portal staff-only. If Vibe Auth later stops or is disabled while this is on, the portal is closed (the console answers 503), never silently open. /admin keeps its own login and is never gated.",
+      "ui": {
+        "tier":        1,
+        "category":    "Landing page",
+        "label":       "Require Vibe Auth for the client portal",
+        "helpText":    "Visitors must sign in with Vibe Auth before they see the portal at /. Vibe Auth accounts are firm accounts — your clients do not have one, so this makes the portal staff-only. Needs Vibe Auth enabled. Limit it to chosen people under Admin → Single sign-on → Client portal.",
+        "input":       "toggle",
+        "appliance":   "shared",
+        "validate":    "enum",
+        "postSaveJob": "landing-gate",
+        "options": [
+          { "value": "true",  "label": "Required" },
+          { "value": "false", "label": "Open" }
+        ]
+      }
     }
   ]
 }

@@ -2528,3 +2528,72 @@ Append to this list as phases complete. Format:
   per app render, a single Cloudflare DNS listing, a shared spawn helper
   in the console, the main-host `vibe` sentinel, Cockpit reconfigure via
   the host runner, a `dns-label` validator rule.
+- 2026-10-05: "Require Vibe Auth for the client portal" — Claude (Opus 5.5)
+  on the Windows dev host. A Settings → Landing page switch,
+  `LANDING_REQUIRE_VIBE_AUTH` (`console/manifests/_appliance.json`), puts the
+  console's public landing — `/`, `/api/v1/public/*`, `/tools/*` — behind the
+  Vibe Auth edge gate (D10). Scope is the appliance landing page only; the
+  in-app client portals (Connect, Practice Management, MyBooks, 1099) are
+  untouched, because gating them would reverse Vibe-Auth D5/D29/I11 and the
+  broker has no client identities. Vibe Auth accounts are firm accounts, so
+  a gated portal is a staff-only portal; the setting's help text says so.
+  Pieces:
+  - `lib/identity.sh portal-gate status|on|off|access`: the portal registers
+    with the broker as the edge-only pseudo-product `vibe-portal`
+    (`edgeGate: true`, no manifest/env/recreate/break-glass). Refused in
+    Tailscale mode, while vibe-auth is down, or when an `sso.edgeGate`
+    product shares the portal's host (the outpost matches by host).
+    `register-all`, `rebase` and `reapply-address` converge it to the
+    switch; `disable-all` drops it. `id_access` split into checks +
+    `_id_access_core`, which the portal reuses.
+  - `lib/settings-save.sh`: saving "on" registers the portal during
+    pre-flight and rolls the save back with an operator-facing `detail`
+    when refused; the `landing-gate` post-save job re-renders/reloads Caddy
+    and, on "off", drops the registration afterwards. (Deviation from the
+    plan: a dedicated job instead of `routing-reconcile`, which would have
+    re-provisioned the tunnel and could not order register → render.)
+  - `lib/render-caddyfile.sh` `console_handle_lines`: the gate lives inside
+    the console's catch-all `handle` on the portal's host (main host in
+    domain modes, the catch-all site in LAN/Tailscale). The header strip and
+    `forward_auth` sit in a `route` block — in a plain handle Caddy sorts
+    `forward_auth` ahead of `request_header`, so the strip would delete the
+    outpost's headers (seen in `caddy adapt`). Other ways in (the `:80`
+    catch-all, the `@lan` block in domain mode) redirect the portal routes
+    to the main host. Subdomain-per-app: the console host routes
+    `/auth/outpost.goauthentik.io/*` itself. The same gap existed for a
+    per-app `sso.edgeGate` vhost in subdomain-per-app mode (the sign-in
+    callback hit the gate); fixed, dormant until a manifest sets it.
+    Switch off: rendered output unchanged apart from a template comment.
+  - `console/lib/landing-gate.js`: while the switch is on, the portal routes
+    refuse (503) a request without the outpost's `X-Authentik-Uid` — the
+    portal fails CLOSED whenever the Caddy gate is missing (vibe-auth
+    disabled, render pending, another way in). The landing page now
+    fetches its card list with `credentials: 'same-origin'` (`omit` dropped
+    the sign-in cookie) and shows "Signed in as … · Sign out".
+  - Admin → Single sign-on gains a "Client portal" card: state, problems,
+    and Open/Restricted access (`/api/v1/identity/portal-gate[/access]`).
+  - `doctor.sh check_landing_gate` fails if the switch is on and an
+    anonymous `GET /` is served (200); `update.sh` warns that the portal is
+    closed while vibe-auth updates.
+  Verified on the dev host: rendered Caddyfiles for LAN, Tailscale,
+  single-host and subdomain-per-app (switch on, plus a per-app edge gate)
+  pass `caddy validate` (caddy:2-alpine); `caddy adapt` shows strip →
+  forward_auth → proxy in that order. New tests: routing/landing-gate,
+  console/identity-portal-gate, console/settings-landing-gate,
+  landing/landing-gate, and portal-gate routes in console/identity.test.js.
+  Suite 379/380 (the one failure is the pre-existing Windows-only
+  `subdomain-per-app` matcher case, also failing on `main`).
+  **Owed before this is trusted** (4 GB Ubuntu 24.04 host, vibe-auth
+  enabled): (1) an anonymous visit to `/` lands on authentik and returns to
+  the portal with cards after sign-in, in LAN, single-host and
+  subdomain-per-app — this is the first real run of the D10 edge gate and
+  of authentik's `/auth/outpost.goauthentik.io/` callback under
+  `AUTHENTIK_WEB__PATH=/auth/`; (2) `/admin` still answers HTTP Basic only;
+  (3) Restricted + seed `none` refuses a non-admin user and admits a
+  vibe-admin member; (4) stop vibe-auth → portal 502/503 and doctor FAIL;
+  start it → portal back without a manual step; disable vibe-auth → closed
+  with the warning; switch off → open; (5) save "on" twice and run
+  `vibe identity register-all` → one `vibe-edge:vibe-portal` provider in
+  authentik. Also owed: a one-line note in `../Vibe-Auth` (COMPAT.md or
+  QUESTIONS.md) that the appliance registers the pseudo-slug `vibe-portal`
+  — no broker change is needed.

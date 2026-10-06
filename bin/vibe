@@ -30,7 +30,9 @@ COMMANDS
                                breakglass-status|rotate-breakglass <slug>,
                                access <slug> [open|restricted] [everyone|none],
                                setup-token, rebase, address-drift,
-                               reapply-address, register-all, disable-all.
+                               reapply-address, register-all, disable-all,
+                               portal-gate status|on|off|access (the client
+                               portal's Vibe Auth sign-in).
   prune-orphans [--dry-run]    Remove containers no enabled app defines any
                                more (leftovers from a disabled app or a
                                renamed service). --dry-run only lists them.
@@ -82,6 +84,7 @@ case "$cmd" in
     #   vibe identity access <slug> [open|restricted] [everyone|none]
     #   vibe identity setup-token | rebase | address-drift | reapply-address
     #   vibe identity register-all | disable-all
+    #   vibe identity portal-gate status|on|off|access [open|restricted] [everyone|none]
     exec /bin/bash "${APPLIANCE_DIR}/lib/identity.sh" "$@"
     ;;
   prune-orphans)

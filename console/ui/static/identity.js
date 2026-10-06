@@ -33,6 +33,13 @@
   const _bg        = new Map(); // slug -> break-glass verification from the product ({loading} | {error} | status)
   const _access    = new Map(); // slug -> {restricted} from the broker ({loading} | {error})
   let _data = null;
+  // The client portal's sign-in gate (GET /api/v1/identity/portal-gate):
+  // null while loading, {error} when the status could not be read.
+  let _portal = null;
+  // Key for the portal's in-flight action and output in _inflight/_lastOut.
+  const PORTAL_KEY = 'vibe-portal';
+  // Dropdowns whose unapplied choice a background reload must not reset.
+  const EDITABLE_SELECTS = 'select[data-mode-select], select[data-portal-access-select]';
 
   function esc(s) {
     return String(s == null ? '' : s)
@@ -246,6 +253,69 @@
       '</div>';
   }
 
+  // "Require Vibe Auth for the client portal": switched in Settings → Landing
+  // page; shown here with its state and who may sign in. The portal is the
+  // broker's edge-only "vibe-portal" registration (lib/identity.sh portal-gate).
+  function portalHtml(v) {
+    if (!v || !v.installed) return '';
+    const p = _portal;
+    const busy = _inflight.get(PORTAL_KEY);
+    const out = _lastOut.get(PORTAL_KEY);
+    const settingsLink = '<a href="/admin/settings">Settings → Landing page</a>';
+    let pill, body = '';
+    if (!p) {
+      pill = '<span class="badge badge--muted">checking…</span>';
+    } else if (p.error) {
+      pill = '<span class="badge badge--warn" title="' + esc(p.error) + '">status unknown</span>';
+      body = '<p class="muted small" style="margin:0.4rem 0 0">' + esc(p.error) + '</p>';
+    } else if (!p.required) {
+      pill = '<span class="badge badge--muted">open — no sign-in</span>';
+      body = '<p class="muted small" style="margin:0.4rem 0 0">Anyone who can reach the appliance sees the portal at ' +
+        '<span class="mono">/</span>. To require a Vibe Auth sign-in first, turn on “Require Vibe Auth for the client portal” in ' +
+        settingsLink + '. Vibe Auth accounts are firm accounts — your clients do not have one, so this makes the portal staff-only.</p>';
+    } else if (p.state === 'on') {
+      pill = '<span class="badge badge--good">requires Vibe Auth</span>';
+    } else {
+      pill = '<span class="badge badge--bad">closed — sign-in unavailable</span>';
+    }
+    if (p && !p.error && p.required) {
+      if ((p.problems || []).length) {
+        body += '<div class="small" style="margin:0.5rem 0 0;padding:0.5rem 0.6rem;border-left:3px solid #dc2626">' +
+          '<strong>Nobody can open the portal right now.</strong> It requires Vibe Auth, and:' +
+          '<ul style="margin:0.3rem 0 0 1rem;padding:0">' + p.problems.map(x => '<li>' + esc(x) + '</li>').join('') + '</ul>' +
+          'To reopen it without sign-in, turn the setting off in ' + settingsLink + '.</div>';
+      } else {
+        body += '<p class="muted small" style="margin:0.4rem 0 0">Visitors to <span class="mono">' + esc(p.baseUrl || '/') +
+          '</span> sign in with Vibe Auth before they see the portal. ' + settingsLink + ' turns this off.</p>';
+      }
+      if (p.registered) {
+        const known = p.restricted === true || p.restricted === false;
+        body += '' +
+          '<label class="muted small" style="display:block;margin:0.6rem 0 0.3rem">Who can open the portal' +
+            '<select class="btn btn--ghost" style="display:block;width:100%;margin-top:0.25rem" data-portal-access-select="1"' +
+              (busy || !known ? ' disabled' : '') + '>' +
+              '<option value="open"' + (p.restricted === false ? ' selected' : '') + '>Everyone in the firm</option>' +
+              '<option value="restricted"' + (p.restricted === true ? ' selected' : '') + '>Only people ticked for “Client portal” in Vibe Auth → Users (and administrators)</option>' +
+            '</select>' +
+          '</label>' +
+          '<div class="app-card__actions">' +
+            '<button class="btn btn--ghost" type="button" data-id-action="portal-access" data-slug="' + PORTAL_KEY + '"' +
+              (busy || !known || !(v.enabled && v.healthy) ? ' disabled' : '') + '>' +
+              (busy ? 'Applying…' : 'Apply access') + '</button>' +
+          '</div>';
+      }
+    }
+    return '' +
+      '<article class="app-card" id="identity-portal" style="margin-top:0.8rem">' +
+        '<header class="app-card__head">' +
+          '<h3 class="app-card__title">Client portal</h3>' +
+          '<div class="app-card__badges">' + pill + '</div>' +
+        '</header>' +
+        body +
+        (out != null ? '<pre class="app-card__output">' + esc(out) + '</pre>' : '') +
+      '</article>';
+  }
+
   function render() {
     const d = _data;
     if (!d) return;
@@ -261,7 +331,7 @@
       : !v.enabled
         ? 'Vibe Auth is not installed. ' + live.length + ' enabled app(s) can use it once it is.' + more
         : reg + ' of ' + live.length + ' enabled SSO-capable app(s) registered with Vibe Auth.' + more;
-    els.broker.innerHTML = brokerHtml(v) + driftHtml(v);
+    els.broker.innerHTML = brokerHtml(v) + driftHtml(v) + portalHtml(v);
     els.list.innerHTML = live.length || pending.length
       ? live.map(a => appCardHtml(a, v)).join('') +
         (pending.length
@@ -271,7 +341,7 @@
       : '<p class="muted">No app on this appliance supports single sign-on yet. Apps appear here automatically ' +
         'when their manifest declares SSO or their running api answers <span class="mono">/auth/status</span>.</p>';
     els.rebase.disabled = !(v.installed && v.enabled);
-    for (const sel of section.querySelectorAll('select[data-mode-select]')) sel.dataset.rendered = sel.value;
+    for (const sel of section.querySelectorAll(EDITABLE_SELECTS)) sel.dataset.rendered = sel.value;
   }
 
   // ---------- data ----------
@@ -285,10 +355,25 @@
       els.error.textContent = '';
       render();
       void loadDetails();
+      void loadPortal();
     } catch (err) {
       els.error.hidden = false;
       els.error.textContent = 'Could not load SSO status: ' + err.message;
     }
+  }
+
+  // The portal gate's status asks the broker, so it fills in after the list.
+  async function loadPortal() {
+    try {
+      const r = await fetch('/api/v1/identity/portal-gate', { credentials: 'same-origin' });
+      let data = {};
+      try { data = await r.json(); } catch { /* non-JSON */ }
+      if (!r.ok) throw new Error(data.detail || data.error || ('HTTP ' + r.status));
+      _portal = data;
+    } catch (err) {
+      _portal = { error: 'Could not read the client portal’s sign-in status: ' + err.message };
+    }
+    render();
   }
 
   // Break-glass verification and access are asked of the product / broker per
@@ -420,6 +505,21 @@
         return;
       }
       body = { restricted: want === 'restricted', seed };
+    } else if (action === 'portal-access') {
+      url = '/api/v1/identity/portal-gate/access';
+      const sel = section.querySelector('select[data-portal-access-select]');
+      const want = sel && sel.value;
+      const cur = _portal || {};
+      if (!want) return;
+      if ((want === 'restricted') === (cur.restricted === true)) { flash(slug, 'access is already ' + (cur.restricted ? 'restricted' : 'open to everyone in the firm')); return; }
+      let seed = 'none';
+      if (want === 'restricted') {
+        if (!window.confirm('Restrict the client portal?\n\nOnly people ticked for “Client portal” in Vibe Auth → Users, and vibe-admin members, will be able to open it. Everyone else sees “Permission denied” after signing in.')) return;
+        seed = window.confirm('Start with everyone who has an active account ticked, then untick people?\n\nOK = start with everyone\nCancel = start with administrators only') ? 'everyone' : 'none';
+      } else if (!window.confirm('Open the client portal to every firm user again?\n\nThe ticked list is kept in case you restrict it later.')) {
+        return;
+      }
+      body = { restricted: want === 'restricted', seed };
     } else if (action === 'rotate-breakglass') {
       if (!confirmFor(action, a)) return;
       body = { confirm: true };
@@ -530,7 +630,7 @@
   // not applied yet. They are skipped while any mode dropdown differs
   // from what it showed at render or has focus, and never overlap.
   function editing() {
-    for (const sel of section.querySelectorAll('select[data-mode-select]')) {
+    for (const sel of section.querySelectorAll(EDITABLE_SELECTS)) {
       if (sel === document.activeElement && document.hasFocus()) return true;
       // Compare with what the dropdown showed right after render, not with
       // the loaded mode: an env value outside the three options (hand edit,

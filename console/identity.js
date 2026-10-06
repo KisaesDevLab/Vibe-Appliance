@@ -329,6 +329,71 @@ module.exports = function registerIdentityRoutes(app, deps) {
     sendResult(res, 'reapply-address', null, r);
   });
 
+  // ----- client portal (LANDING_REQUIRE_VIBE_AUTH) ------------------------
+  //
+  // The landing page registers with the broker as the edge-only
+  // pseudo-product "vibe-portal" (lib/identity.sh portal-gate). It has no
+  // manifest, so these routes take no :slug and never consult MANIFESTS.
+  // Turning the gate on or off is the Settings → Landing page toggle (the
+  // save runs `portal-gate on` / the landing-gate job); here: its status,
+  // and who may sign in. Registered before the /:slug routes so
+  // "portal-gate" is never read as a slug.
+  const PORTAL_LOCK = 'vibe-portal';
+
+  app.get('/api/v1/identity/portal-gate', requireAdmin, async (_req, res) => {
+    const r = await runIdentity(['portal-gate', 'status'], 'sso-portal-status');
+    if (r.spawnError) return sendResult(res, 'portal-gate-status', null, r);
+    const parsed = r.code === 0 ? parseJsonOutput(r.stdout) : null;
+    if (!parsed) {
+      return res.status(500).json({
+        error: 'client portal status unavailable',
+        detail: trim(r.stderr) || 'identity.sh portal-gate status printed no JSON — diagnose: sudo vibe identity portal-gate status',
+        exit_code: r.code,
+      });
+    }
+    res.json(parsed);
+  });
+
+  app.get('/api/v1/identity/portal-gate/access', requireAdmin, async (_req, res) => {
+    const r = await runIdentity(['portal-gate', 'access'], 'sso-portal-access-read');
+    if (r.spawnError) return sendResult(res, 'portal-gate-access', null, r);
+    const parsed = r.code === 0 ? parseJsonOutput(r.stdout) : null;
+    if (!parsed) {
+      return res.status(500).json({
+        error: 'access unavailable',
+        detail: trim(r.stderr) || 'identity.sh portal-gate access printed no JSON',
+        exit_code: r.code,
+      });
+    }
+    res.json(parsed);
+  });
+
+  app.post('/api/v1/identity/portal-gate/access', requireAdmin, testRateLimit, async (req, res) => {
+    const body = (req.body && typeof req.body === 'object') ? req.body : {};
+    if (typeof body.restricted !== 'boolean') {
+      return res.status(400).json({
+        error: 'invalid access',
+        detail: 'body must be { restricted: true | false, seed?: "everyone" | "none" }',
+      });
+    }
+    const seed = body.seed === undefined ? 'none' : body.seed;
+    if (!ACCESS_SEEDS.includes(seed)) {
+      return res.status(400).json({
+        error: 'invalid seed',
+        detail: `seed must be one of: ${ACCESS_SEEDS.join(', ')}`,
+      });
+    }
+    if (!acquireSlugLock(PORTAL_LOCK, 'sso-portal-access', res)) return;
+    try {
+      const r = await runIdentity(['portal-gate', 'access', body.restricted ? 'restricted' : 'open', seed], 'sso-portal-access');
+      releaseSlugLock(PORTAL_LOCK);
+      if (!res.headersSent) sendResult(res, 'portal-gate-access', null, r);
+    } catch (err) {
+      releaseSlugLock(PORTAL_LOCK);
+      if (!res.headersSent) res.status(500).json({ error: 'spawn failed', detail: err.message });
+    }
+  });
+
   app.get('/api/v1/identity/:slug', requireAdmin, async (req, res) => {
     const m = ssoManifestOr4xx(req.params.slug, res);
     if (!m) return;

@@ -26,6 +26,7 @@ const Database    = require('better-sqlite3');
 // endpoints like cf-helpers) because the PUBLIC landing payload above
 // those endpoints uses it too, and a const require is not hoisted.
 const landingOrderLib = require('./lib/landing-order');
+const landingGate = require('./lib/landing-gate');
 const { validateSettingValue } = require('./lib/settings-validate');
 
 // ----- config -----------------------------------------------------------
@@ -1219,7 +1220,15 @@ app.use('/static', express.static(path.join(__dirname, 'ui', 'static'), {
   },
 }));
 
-app.get('/', (_req, res) => {
+// "Require Vibe Auth for the client portal" (Settings → Landing page): the
+// portal routes — /, /api/v1/public/*, /tools/* — refuse a request the Vibe
+// Auth edge gate did not let through. Caddy is the gate; this keeps the
+// portal closed whenever the gate is missing. See console/lib/landing-gate.js.
+const readApplianceEnv = () => parseEnvFile(path.join(ENV_DIR, 'appliance.env'));
+const portalPageGate = landingGate.middleware(readApplianceEnv);
+const portalApiGate = landingGate.middleware(readApplianceEnv, { json: true });
+
+app.get('/', portalPageGate, (_req, res) => {
   res.sendFile(path.join(__dirname, 'ui', 'index.html'));
 });
 
@@ -1275,9 +1284,10 @@ app.get('/api/v1/admin/status', requireAdmin, async (_req, res) => {
 // are admin-only. Every field returned here is information a visitor
 // can already infer from being able to load the app's public URL.
 //
-// No auth required.
+// No auth required — unless the client portal requires Vibe Auth, when
+// portalApiGate refuses a request the edge gate did not let through.
 
-app.get('/api/v1/public/apps', async (_req, res) => {
+app.get('/api/v1/public/apps', portalApiGate, async (req, res) => {
   const state = readState();
   const config = state.config || {};
   const stateApps = state.apps || {};
@@ -1424,7 +1434,13 @@ app.get('/api/v1/public/apps', async (_req, res) => {
     Array.isArray(state.landingOrder) ? state.landingOrder : [],
   );
 
-  res.json({ apps: items, customCards, tools, cardOrder, firmName, showStaffSignin });
+  // Who Vibe Auth signed in, when the portal requires it (the landing page
+  // shows "Signed in as … · Sign out"). Null on an open portal: the header
+  // only means something behind the edge gate, which strips client copies.
+  const who = landingGate.isRequired(appliance) ? landingGate.signedInUser(req) : null;
+  const signedInAs = who ? (who.username || 'your firm account') : null;
+
+  res.json({ apps: items, customCards, tools, cardOrder, firmName, showStaffSignin, signedInAs });
 });
 
 // --- Landing card order ------------------------------------------------
@@ -1817,14 +1833,14 @@ function _toolNotFoundPage(res) {
 `);
 }
 
-app.get('/tools/:id', (req, res) => {
+app.get('/tools/:id', portalPageGate, (req, res) => {
   const row = _publicToolRow(req);
   if (!row) return _toolNotFoundPage(res);
   res.setHeader('Cache-Control', 'no-store');
   res.type('html').send(customTools.buildShellHtml({ id: row.id, title: row.title }));
 });
 
-app.get('/tools/:id/frame', (req, res) => {
+app.get('/tools/:id/frame', portalPageGate, (req, res) => {
   const row = _publicToolRow(req);
   if (!row) return _toolNotFoundPage(res);
   // The load-bearing header: `sandbox` without allow-same-origin gives

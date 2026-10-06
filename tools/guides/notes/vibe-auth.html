@@ -51,6 +51,23 @@ during its own enable. It still starts in <code>local</code> mode; switch it whe
 If a card shows <em>not registered</em> even though Vibe Auth is healthy, click
 <strong>Fix registration</strong> — it is safe to repeat.</p>
 
+<h3>Requiring sign-in for the client portal</h3>
+<p><strong>Settings → Landing page → Require Vibe Auth for the client portal</strong> makes
+visitors sign in with Vibe Auth before they see the portal page at <code>/</code> (and its app
+list and mini-tools). Vibe Auth accounts are firm accounts — your clients do not have one — so
+this turns the portal into a staff-only page. The apps' own client portals (Vibe Connect's client
+site, MyBooks' portal and the like) are not affected; clients keep signing in to those as before.
+The admin console at <code>/admin</code> keeps its own login.</p>
+<p>Saving it is refused, with the reason, until Vibe Auth is enabled and healthy; it is not
+available in Tailscale mode. To let only some staff in, use the <strong>Client portal</strong>
+card in the Single sign-on panel and tick people for “Client portal” in Vibe Auth → Users.</p>
+<div class="callout--warn callout">
+<p><strong>While it is on, the portal closes whenever Vibe Auth is down</strong> — during a
+Vibe Auth update, or if Vibe Auth is disabled. Visitors see “sign-in not available” rather than
+an open portal. To reopen it without sign-in, turn the setting off.
+<code>sudo vibe doctor</code> reports which case you are in.</p>
+</div>
+
 <h3>Things that happen rarely</h3>
 <ul>
 <li><strong>The server's name, IP, domain or routing mode changed.</strong> Click
