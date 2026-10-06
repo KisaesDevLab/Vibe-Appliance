@@ -109,14 +109,26 @@ services:
         reservations: { memory: 128m }
 
   # Copies the pinned blueprints out of the broker image into the bind mount
-  # authentik reads, so blueprints and broker always match versions.
+  # authentik reads, so blueprints and broker always match versions. Also the
+  # broker's email templates (broker >= 1.0.16: the invitation email) into
+  # /templates/vibe; a broker image without /app/templates/vibe skips that
+  # step rather than failing, because authentik waits on this one-shot.
   vibe-auth-blueprints:
     image: ghcr.io/kisaesdevlab/vibe-auth:${APP_TAG:-latest}
     container_name: vibe-auth-blueprints
     restart: "no"
     user: "0:0"
-    entrypoint: ["sh", "-c", "cp -f /app/blueprints/*.yaml /out/ && chmod 644 /out/*.yaml && echo blueprints synced"]
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        cp -f /app/blueprints/*.yaml /out/ && chmod 644 /out/*.yaml && echo blueprints synced &&
+        if [ -d /app/templates/vibe ]; then
+        mkdir -p /templates-out/vibe && cp -f /app/templates/vibe/* /templates-out/vibe/ &&
+        chmod 755 /templates-out/vibe && chmod 644 /templates-out/vibe/* && echo email templates synced;
+        else echo "no email templates in this broker image (older than 1.0.16); authentik's built-in welcome email is used"; fi
     volumes:
       - /opt/vibe/data/apps/vibe-auth/blueprints:/out
+      - /opt/vibe/data/apps/vibe-auth/templates:/templates-out
     networks:
       vibe_net: {}
