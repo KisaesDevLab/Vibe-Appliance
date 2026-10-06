@@ -151,3 +151,32 @@ test('an app whose manifest cannot be read is treated as live', () => {
   });
   assert.equal(dirSafe.replace(/\r/g, '').trim(), 'vibe-broken');
 });
+
+test('the Cloudflare Tunnel connector (infra/cloudflared.yml) is never swept', () => {
+  // vibe-cloudflared lives in project `vibe` but comes from an infra overlay, not
+  // from core or an app. When the sweep left infra overlays out of its compose
+  // model, every bootstrap deleted the running tunnel. The stub below only
+  // reports the cloudflared service when that overlay is actually passed.
+  const running = 'vibe-caddy\tcaddy\nvibe-cloudflared\tcloudflared\nvibe-old-server\tvibe-old-server\n';
+  const out = run({
+    state: STATE, services: SERVICES, running, manifests: MANIFESTS,
+    snippet: `
+mkdir -p "$APPLIANCE_DIR/infra" && printf 'name: vibe\n' > "$APPLIANCE_DIR/infra/cloudflared.yml"
+docker() {
+  case "$*" in
+    *"config --profiles"*) printf '\n' ;;
+    *"config --services"*)
+      printf '%b' ${JSON.stringify(SERVICES + '\n')}
+      [[ "$*" == *"/infra/cloudflared.yml"* ]] && echo cloudflared
+      ;;
+    "ps -a "*) printf '%b' "$RUNNING" ;;
+    "rm -f "*) echo "REMOVED $2" >&2 ;;
+    *) return 1 ;;
+  esac
+}
+RUNNING=${JSON.stringify(running)}
+prune_orphans`,
+  });
+  assert.doesNotMatch(out, /removing orphan container vibe-cloudflared/, 'the tunnel connector must survive');
+  assert.match(out, /step: removing orphan container vibe-old-server/, 'real leftovers are still swept');
+});

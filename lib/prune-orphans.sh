@@ -71,6 +71,15 @@ _prune_compose_files() {
       [[ "${COMPOSE_FILES[$i]}" == *"/apps/${slug}."* ]] && all+=( -f "${COMPOSE_FILES[$i]}" )
     done
   done < <(_prune_enabled_slugs)
+  # Infra overlays started outside the app lifecycle but in the same compose
+  # project — infra/cloudflared.yml (vibe-cloudflared, the Cloudflare Tunnel
+  # connector, brought up by infra/cloudflared-up.sh). Leaving them out made
+  # a running tunnel look like an orphan: every bootstrap deleted it and took
+  # a tunnel-fronted appliance off the internet.
+  local f
+  for f in "${APPLIANCE_DIR}"/infra/*.yml; do
+    [[ -f "$f" ]] && all+=( -f "$f" )
+  done
   PRUNE_COMPOSE_FILES=( "${all[@]}" )
 }
 
