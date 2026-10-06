@@ -132,7 +132,7 @@ test('switch on (lan): the catch-all site — the portal address — carries the
   const s = site(caddy, ':80, :443');
   assert.match(s, /@landing_gated path \/ \/index\.html \/api\/v1\/public\/\* \/tools\/\*/);
   assert.match(s, GATE);
-  assert.match(s, /handle \/auth\/\* \{/, 'the outpost callback is served by the vibe-auth mount');
+  assert.match(s, /handle \/outpost\.goauthentik\.io\/\* \{\s*reverse_proxy vibe-auth-authentik-server:9000/, 'the sign-in callback returns to the ROOT /outpost.goauthentik.io/ path, which the /auth/* mount does not cover');
   // The site answers any name (<hostname>.local too); the outpost only
   // knows the address the portal is registered at.
   assert.match(s, /@landing_gated_offhost \{\s*path [^\n]+\s*not host 192\.168\.1\.50\s*\}/);
@@ -145,7 +145,7 @@ test('switch on (single-host): the main host gates; the :80 catch-all and @lan r
   const caddy = render({ required: 'true', mode: 'single' });
   const main = site(caddy, 'vibe.firm.com');
   assert.match(main, GATE);
-  assert.match(main, /handle \/auth\/\* \{/, 'the outpost callback is served by the vibe-auth mount');
+  assert.match(main, /handle \/outpost\.goauthentik\.io\/\* \{\s*reverse_proxy vibe-auth-authentik-server:9000/, 'the sign-in callback returns to the ROOT /outpost.goauthentik.io/ path, which the /auth/* mount does not cover');
 
   const catchall = site(caddy, ':80');
   assert.doesNotMatch(catchall, /forward_auth/, 'the outpost matches on host; a gate here could never complete');
@@ -157,7 +157,7 @@ test('switch on (subdomain-per-app): the console host gates and routes the outpo
   const caddy = render({ required: 'true', mode: 'perapp' });
   const main = site(caddy, 'vibe.firm.com');
   assert.match(main, GATE);
-  assert.match(main, /handle \/auth\/outpost\.goauthentik\.io\/\* \{\s*reverse_proxy vibe-auth-authentik-server:9000/);
+  assert.match(main, /handle \/outpost\.goauthentik\.io\/\* \{\s*reverse_proxy vibe-auth-authentik-server:9000/);
   assert.doesNotMatch(site(caddy, ':80'), /forward_auth/);
 });
 
@@ -184,6 +184,18 @@ test('switch on: /admin and app paths are never inside the gated matcher', () =>
 test('per-app edge gate (subdomain-per-app): the outpost endpoints bypass the gate and reach authentik', () => {
   const caddy = render({ mode: 'perapp', edgeGate: true });
   const tb = site(caddy, 'tb.firm.com');
-  assert.match(tb, /@vibe_tb_gated not path \/api\/v1\/health \/auth\/outpost\.goauthentik\.io\/\*/);
-  assert.match(tb, /handle \/auth\/outpost\.goauthentik\.io\/\* \{/);
+  assert.match(tb, /@vibe_tb_gated not path \/api\/v1\/health \/outpost\.goauthentik\.io\/\*/);
+  assert.match(tb, /handle \/outpost\.goauthentik\.io\/\* \{/);
+});
+
+test('the gate asks authentik at the ROOT outpost path, never under /auth/', () => {
+  // authentik's embedded outpost answers /outpost.goauthentik.io/* at the root
+  // even with AUTHENTIK_WEB__PATH=/auth/ (verified against 2026.8). Asking it
+  // under /auth/ returned authentik's 404 page for every gated request — the
+  // client portal showed "Not Found" on a live box.
+  for (const mode of Object.keys(MODES)) {
+    const caddy = render({ required: 'true', mode, edgeGate: true });
+    assert.doesNotMatch(caddy, /\/auth\/outpost\.goauthentik\.io/, mode);
+    assert.match(caddy, /uri \/outpost\.goauthentik\.io\/auth\/caddy/, mode);
+  }
 });

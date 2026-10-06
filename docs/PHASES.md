@@ -2560,7 +2560,7 @@ Append to this list as phases complete. Format:
     outpost's headers (seen in `caddy adapt`). Other ways in (the `:80`
     catch-all, the `@lan` block in domain mode) redirect the portal routes
     to the main host. Subdomain-per-app: the console host routes
-    `/auth/outpost.goauthentik.io/*` itself. The same gap existed for a
+    `/outpost.goauthentik.io/*` itself (root path — see the 2026-10-06 outpost fix below). The same gap existed for a
     per-app `sso.edgeGate` vhost in subdomain-per-app mode (the sign-in
     callback hit the gate); fixed, dormant until a manifest sets it.
     Switch off: rendered output unchanged apart from a template comment.
@@ -2587,7 +2587,7 @@ Append to this list as phases complete. Format:
   enabled): (1) an anonymous visit to `/` lands on authentik and returns to
   the portal with cards after sign-in, in LAN, single-host and
   subdomain-per-app — this is the first real run of the D10 edge gate and
-  of authentik's `/auth/outpost.goauthentik.io/` callback under
+  of authentik's `/outpost.goauthentik.io/` callback (root path) alongside
   `AUTHENTIK_WEB__PATH=/auth/`; (2) `/admin` still answers HTTP Basic only;
   (3) Restricted + seed `none` refuses a non-admin user and admits a
   vibe-admin member; (4) stop vibe-auth → portal 502/503 and doctor FAIL;
@@ -2611,3 +2611,21 @@ Append to this list as phases complete. Format:
   publish template `docs/templates/publish-ghcr.yml` to checkout v7,
   setup-qemu v4, setup-buildx v4, login v4, metadata v6, build-push v7.
   Owed: run `bootstrap.sh --with-claude-code` on a host that has Node 20.
+- 2026-10-06: edge gate outpost path (live box: the client portal showed
+  authentik's "Not Found" with LANDING_REQUIRE_VIBE_AUTH on). authentik's
+  embedded outpost answers `/outpost.goauthentik.io/*` at the ROOT even with
+  `AUTHENTIK_WEB__PATH=/auth/` (2026.8: `/outpost.goauthentik.io/ping` 204,
+  the `/auth/`-prefixed path authentik's 404). The gate asked
+  `/auth/outpost.goauthentik.io/auth/caddy`, so every gated request got the
+  404 page. Now: `uri /outpost.goauthentik.io/auth/caddy`, and every gated
+  host routes the root `/outpost.goauthentik.io/*` to authentik (the sign-in
+  callback returns there; the `/auth/*` mount never covered it) — console
+  host (subdomain-per-app), main host (single-host), the LAN/Tailscale
+  catch-all, and per-app `sso.edgeGate` vhosts. Sign-out link fixed to match.
+  Verified end to end: the rendered single-host Caddyfile in a Caddy
+  container on the Vibe-Auth test network with a real `vibe-portal` edge
+  registration — `/` and `/api/v1/public/apps` 302 to authentik's authorize
+  endpoint with `redirect_uri=https://<host>/outpost.goauthentik.io/callback`,
+  the callback reaches authentik, `/admin` is not gated, a client-supplied
+  `X-Authentik-Uid` does not bypass. Still owed on the box: one complete
+  browser sign-in to the portal.

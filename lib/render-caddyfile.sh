@@ -290,15 +290,11 @@ def render_vhost(slug, manifest, host, tls_internal=False):
         lines.append("")
 
     # The gate is site-wide on this host, so the outpost's own endpoints
-    # (the sign-in callback lands on THIS host) bypass it and go to
-    # authentik — unless the app mounts /auth/ itself (vibe-auth does).
-    own_auth = any(str(x.get("path", "")) in ("/auth", "/auth/*")
-                   for x in (routing.get("mounts") or []))
-    gate = edge_gate_lines(slug, manifest, "    ",
-                           extra_public=() if own_auth else (OUTPOST_PATH,))
+    # (the sign-in callback lands on THIS host, at the root path) bypass
+    # it and go to authentik.
+    gate = edge_gate_lines(slug, manifest, "    ", extra_public=(OUTPOST_PATH,))
     if gate:
-        if not own_auth:
-            lines.extend(outpost_handle_lines("    "))
+        lines.extend(outpost_handle_lines("    "))
         lines.extend(gate)
         lines.append("")
 
@@ -497,6 +493,11 @@ def render_domain_app_vhost(host, enabled, tls_internal=False):
         lines.append(render_path_handler(slug, manifest).rstrip("\n"))
         lines.append("")
 
+    # The outpost's root path, when anything on this host is gated (the
+    # client portal, or a path-mounted app with sso.edgeGate): the
+    # sign-in callback returns to <this host>/outpost.goauthentik.io/.
+    if gated_host_needs_outpost(enabled):
+        lines.extend(outpost_handle_lines("\t", "\t"))
     # Default → console (landing + admin UI). This host is where the
     # client portal lives, so it carries the landing gate when one is on.
     lines.extend(console_handle_lines("\t", "\t", "canonical"))
@@ -532,9 +533,8 @@ def render_console_host_vhost(host, tls_internal=False):
     lines.append("    }")
     lines.append("")
     # The client portal's host. With the landing gate on, the sign-in
-    # round trip ends on this host's /auth/outpost.goauthentik.io/
-    # callback, and nothing else here routes /auth/ (vibe-auth has its own
-    # host in this mode), so the outpost gets a handle of its own.
+    # round trip ends on this host's /outpost.goauthentik.io/callback, so
+    # the outpost gets a handle of its own.
     if landing_gate_active():
         lines.extend(outpost_handle_lines("    "))
         lines.append("")
@@ -931,10 +931,15 @@ IDENTITY_PROVIDER_ENABLED = False
 LANDING_GATE_REQUIRED = False
 
 AUTHENTIK_UPSTREAM = "vibe-auth-authentik-server:9000"
-# authentik's embedded outpost, served under AUTHENTIK_WEB__PATH=/auth/.
-# The sign-in round trip ends on <gated host>/auth/outpost.goauthentik.io/
-# callback, so every gated HOST must route this path to authentik.
-OUTPOST_PATH = "/auth/outpost.goauthentik.io/*"
+# authentik's embedded outpost. It answers at the ROOT path even though the
+# rest of authentik is served under AUTHENTIK_WEB__PATH=/auth/ (verified
+# against 2026.8: /outpost.goauthentik.io/ping is 204, the same path under
+# /auth/ is authentik's 404 page — which is what every gated request got
+# when the gate asked /auth/outpost.goauthentik.io/auth/caddy). After
+# sign-in the browser returns to <gated host>/outpost.goauthentik.io/
+# callback, so every gated HOST routes this root path to authentik; the
+# /auth/* mount does not cover it.
+OUTPOST_PATH = "/outpost.goauthentik.io/*"
 AUTHENTIK_HEADERS = ("X-Authentik-Username", "X-Authentik-Groups",
                      "X-Authentik-Email", "X-Authentik-Uid")
 # The console routes that make up the client portal: the landing page, the
@@ -950,7 +955,7 @@ def forward_auth_lines(matcher, indent, step="\t"):
     m = f"{matcher} " if matcher else ""
     return [
         f"{indent}forward_auth {m}{AUTHENTIK_UPSTREAM} {{",
-        f"{indent}{step}uri /auth/outpost.goauthentik.io/auth/caddy",
+        f"{indent}{step}uri /outpost.goauthentik.io/auth/caddy",
         f"{indent}{step}copy_headers {' '.join(AUTHENTIK_HEADERS)}",
         f"{indent}}}",
     ]
@@ -1001,6 +1006,18 @@ def landing_gate_active():
     """The landing gate can be rendered: it is required AND an identity
     provider is enabled to answer it."""
     return LANDING_GATE_REQUIRED and IDENTITY_PROVIDER_ENABLED
+
+
+def gated_host_needs_outpost(enabled):
+    """A host that path-mounts apps (single-host, LAN, Tailscale) needs the
+    outpost's root path when the client portal or any path-mounted app on it
+    is behind the edge gate."""
+    if not IDENTITY_PROVIDER_ENABLED:
+        return False
+    if LANDING_GATE_REQUIRED:
+        return True
+    return any((m.get("sso") or {}).get("edgeGate") and not root_served_only(m)
+               for _s, m in enabled)
 
 
 def console_handle_lines(indent, step, entry="canonical", redirect_host="", suffix="",
@@ -1370,6 +1387,10 @@ def main():
             render_infra_path_handler(s) for s in INFRA_SERVICES
         )
         path_blocks = app_path_blocks + "\n" + infra_path_blocks
+        # This site is the client portal's (and every path-mounted app's)
+        # address in LAN/Tailscale mode: the sign-in callback returns here.
+        if gated_host_needs_outpost(enabled):
+            path_blocks += "\n" + "\n".join(outpost_handle_lines("\t", "\t"))
         vhost_blocks = "# (non-domain mode: see path handlers in the :80 site)\n"
     else:
         vhost_blocks = "# (no apps enabled yet)\n"

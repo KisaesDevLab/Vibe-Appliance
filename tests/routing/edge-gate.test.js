@@ -100,7 +100,7 @@ for (const mode of ['lan', 'single', 'perapp']) {
       'public paths are excluded on the matcher, not via a sibling handle');
     assert.match(caddy, /forward_auth @vibe_tb_gated vibe-auth-authentik-server:9000 \{/,
       'the gate is scoped by that matcher');
-    assert.match(caddy, /uri \/auth\/outpost\.goauthentik\.io\/auth\/caddy/);
+    assert.match(caddy, /uri \/outpost\.goauthentik\.io\/auth\/caddy/);
     assert.doesNotMatch(caddy, /handle @vibe_tb_public/,
       'the old public-path handle is gone (it never bypassed the gate)');
   });
