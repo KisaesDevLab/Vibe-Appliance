@@ -124,6 +124,27 @@ def _clean(value):
     return v
 
 
+def _label_clean(value):
+    """A host label as written in an env file or state.json, reduced to
+    what can be in a hostname. Quotes and backslashes never can, but they
+    have reached labels — wrapped once by a quoted env value, escaped
+    (`\\"auth\\"`), or nested — and a label like `"auth"` became the
+    hostname `"auth".vcpa.app`: an invalid Caddyfile site address, so
+    every Caddy render failed and the tunnel published quoted names.
+    Strip them all, wherever they came from."""
+    v = re.sub(r"[\s\"'\\]+", "", value if isinstance(value, str) else "")
+    return v.lower()
+
+
+def _state_label(raw):
+    """An APPLIED label read back from state.json, or "" when it is not a
+    usable host label (the caller then serves the desired label, which is
+    computed fresh and always clean). Guards the type too: the state
+    writer coerces "true"/"false" to JSON booleans."""
+    v = _label_clean(raw)
+    return v if v and label_error(v) is None else ""
+
+
 def load_manifests(manifests_dir):
     """{slug: manifest} for every app manifest (files starting with `_`
     are appliance-level settings, not apps). Keyed by filename stem — the
@@ -267,8 +288,7 @@ def plan_app(manifest, env, app_env):
     `client` or whose audience mentions "client")."""
     tag = host_tag(env)
     default = manifest.get("subdomain", "") or ""
-    override = re.sub(r"\s+", "", app_env.get(APP_SUBDOMAIN_KEY, "") or "").lower()
-    override = _clean(override)
+    override = _label_clean(app_env.get(APP_SUBDOMAIN_KEY, ""))
     if override:
         primary, source = override, "override"
     else:
@@ -277,7 +297,7 @@ def plan_app(manifest, env, app_env):
     extras, sources, client = {}, {}, ""
     for s in extra_entries(manifest):
         name = s["name"]
-        ov = _clean(re.sub(r"\s+", "", app_env.get(extra_env_key(name), "") or "").lower())
+        ov = _label_clean(app_env.get(extra_env_key(name), ""))
         if ov:
             extras[name], sources[name] = ov, "override"
         else:
@@ -360,7 +380,7 @@ def resolve(state, manifests, env):
         # strings "true"/"false" to JSON booleans, and both are valid
         # DNS labels an operator can type.
         raw_applied = entry.get("subdomain") if (ours and enabled) else ""
-        applied = raw_applied.strip() if isinstance(raw_applied, str) else ""
+        applied = _state_label(raw_applied)
         if applied:
             p_label = applied
             p_source = "applied"
@@ -383,8 +403,7 @@ def resolve(state, manifests, env):
         extras = []
         for s in (extra_entries(manifest) if ours else []):
             name = s["name"]
-            a = applied_extras.get(name)
-            a = a.strip() if isinstance(a, str) else ""
+            a = _state_label(applied_extras.get(name))
             if a:
                 label, source = a, "applied"
             elif legacy_applied:

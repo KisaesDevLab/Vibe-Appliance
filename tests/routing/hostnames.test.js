@@ -454,3 +454,28 @@ test('every copy of the DNS-label pattern accepts and rejects the same labels', 
     }
   }
 });
+
+test('quotes and backslashes never reach a hostname (state or env overrides)', () => {
+  // Seen on a live box: applied labels recorded as `"auth"` became the hostname
+  // `"auth".vcpa.app` — every Caddy render failed validation, and the tunnel
+  // tried to publish quoted names (Cloudflare: "DNS name is invalid").
+  const fx = mkFixture({
+    applianceEnv: 'DOMAIN_ROUTING_MODE=subdomain-per-app\n',
+    apps: {
+      'vibe-tb':      { enabled: true, subdomain: '"tb"' },
+      'vibe-mybooks': { enabled: true, subdomain: '\\"books\\"' },
+      'vibe-connect': { enabled: true, subdomain: "'connect'", subdomains: { client: '"client"' } },
+      'vibe-1040':    { enabled: true, subdomain: 'not a label!' },
+    },
+    appEnvs: { 'vibe-1040': 'VIBE_APP_SUBDOMAIN=\\"tax1040\\"\n' },
+  });
+  const tunnel = list(fx, 'tunnel');
+  for (const h of tunnel) assert.doesNotMatch(h, /["'\\]/, `no quote or backslash in ${h}`);
+  assert.ok(tunnel.includes('tb.firm.com'));
+  assert.ok(tunnel.includes('books.firm.com'));
+  assert.ok(tunnel.includes('connect.firm.com'));
+  assert.ok(tunnel.includes('client.firm.com'));
+  // An applied label that is still unusable after cleaning is ignored; the
+  // app is served at its desired label until enable-app re-records one.
+  assert.ok(tunnel.includes('1040.firm.com'), JSON.stringify(tunnel));
+});

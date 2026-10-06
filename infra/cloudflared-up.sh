@@ -892,6 +892,25 @@ fi
 #
 # Fail closed: a lookup that cannot be read counts as a conflict. The
 # alternative is overwriting a record we could not inspect.
+# Every hostname must be a valid DNS name before anything is pushed. A
+# corrupted label (seen live: applied labels recorded as `"auth"`) produced
+# ingress rules for `"auth".vcpa.app`, every CNAME create failed, and the
+# stale-record sweep then deleted the working records for those apps.
+# Nothing has been written to Cloudflare yet at this point.
+_bad_hosts="$(python3 -c "
+import json, re, sys
+d = json.loads(sys.argv[1])
+ok = re.compile(r'^(?=.{1,253}\$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*\$')
+for e in d['config']['ingress']:
+    h = e.get('hostname')
+    if h and not ok.match(h):
+        print(h)
+" "$INGRESS_JSON")"
+if [[ -n "$_bad_hosts" ]]; then
+  die "refusing to publish invalid hostname(s): $(tr '\n' ' ' <<<"$_bad_hosts")— nothing was changed at Cloudflare." \
+      "Common cause: an app label recorded with quotes or other characters a hostname cannot hold. Diagnose: python3 ${APPLIANCE_DIR}/lib/vibe_hosts.py list tunnel ; sudo grep -H '^VIBE_APP_SUBDOMAIN' ${VIBE_DIR:-/opt/vibe}/env/*.env. Fix: update the appliance (Settings → Maintenance → Update the appliance; its resolver discards such labels), then re-run: sudo bash ${APPLIANCE_DIR}/infra/cloudflared-up.sh"
+fi
+
 log_step "checking the tunnel hostnames are free to use"
 CNAME_CONFLICTS=()
 declare -A _other_tunnel_state=()
@@ -1084,6 +1103,15 @@ done
 # tunnel's hostname and whose name is NOT in the current publish
 # list, then delete them.
 log_step "removing stale CNAMEs no longer in publish list"
+# Only when every record in the publish list was written. A failed create or
+# update means this run's view of the publish list is suspect (a bad label, a
+# Cloudflare error), and deleting "stale" records on that basis removed the
+# working CNAMEs of every affected app. Keeping a stale record is harmless.
+if (( ${#CNAME_FAILED_HOSTS[@]} > 0 )); then
+  log_warn "skipping stale-CNAME cleanup: ${#CNAME_FAILED_HOSTS[@]} record(s) failed to write this run, so no existing record is deleted" \
+    "fix:resolve the DNS failures reported above, then re-run: sudo bash ${APPLIANCE_DIR}/infra/cloudflared-up.sh"
+  SKIP_STALE_CLEANUP=1
+fi
 current_fqdns="$(python3 -c "
 import json, sys
 d = json.loads(sys.argv[1])
@@ -1163,6 +1191,8 @@ if (( _prune_ok == 0 )); then
 elif (( _hit_cap == 1 )); then
   log_warn "hit the ${CF_DNS_PAGE_LIMIT}-page cap while enumerating CNAMEs; records beyond the first $(( CF_DNS_PAGE_LIMIT * CF_DNS_PAGE_SIZE )) were not checked for staleness"
 fi
+# See the guard above: with any write failed this run, delete nothing.
+[[ "${SKIP_STALE_CLEANUP:-0}" == "1" ]] && stale_pairs=""
 while IFS=' ' read -r rid rname; do
   if [[ -z "$rid" ]]; then continue; fi
   r="$(cf_api DELETE "/zones/$CF_ZONE_ID/dns_records/$rid")"
