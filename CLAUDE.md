@@ -29,7 +29,7 @@ See `docs/PLAN.md` §1 for the canonical file tree. Key anchors:
 - `docker-compose.yml` — core only (Caddy, Postgres, Redis, Console).
 - `apps/<slug>.yml` — per-app compose overlays. Use GHCR images. Do not duplicate per-app Postgres/Redis services — point them at the shared instances.
 - `caddy/Caddyfile.tmpl` + `caddy/snippets/{domain,lan,tailscale}.conf` — templated; rendered by bootstrap.
-- `console/` — Node 20 + Express + SQLite. Reads manifests. Renders landing + admin pages.
+- `console/` — Node 24 + Express + SQLite. Reads manifests. Renders landing + admin pages.
 - `env-templates/` — env templates per app. Bootstrap renders to `/opt/vibe/env/<slug>.env`.
 - `infra/` — `tailscale-up.sh`, `portainer-up.sh`, `cockpit-install.sh`, `duplicati-up.sh`.
 

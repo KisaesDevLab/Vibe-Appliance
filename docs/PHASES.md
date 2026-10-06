@@ -2597,3 +2597,17 @@ Append to this list as phases complete. Format:
   authentik. Also owed: a one-line note in `../Vibe-Auth` (COMPAT.md or
   QUESTIONS.md) that the appliance registers the pseudo-slug `vibe-portal`
   — no broker change is needed.
+- 2026-10-06: Node 24 everywhere the appliance installs or builds Node. The
+  console image was already `node:24-bookworm-slim`; the host install for
+  Claude Code (`infra/claude-code-install.sh`, `--with-claude-code`) moved
+  from NodeSource `node_20.x` (end of life 2026-04-30) to `node_24.x`
+  (`NODE_MAJOR`, the Active LTS). Existing hosts converge on the next run:
+  a NodeSource list naming another major is rewritten and apt upgrades the
+  package; the script then health-checks the installed major and fails with
+  a recovery hint (held/pinned package, NodeSource unreachable) instead of
+  reporting success. Verified with stubbed apt: a Node 20 host upgrades, a
+  Node 24 host is a no-op, a held package fails with the hint. CI actions
+  moved to their Node 24 majors (checkout v7, setup-node v7), and the app
+  publish template `docs/templates/publish-ghcr.yml` to checkout v7,
+  setup-qemu v4, setup-buildx v4, login v4, metadata v6, build-push v7.
+  Owed: run `bootstrap.sh --with-claude-code` on a host that has Node 20.

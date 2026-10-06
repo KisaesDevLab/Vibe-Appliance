@@ -8,9 +8,12 @@
 # state.
 #
 # Idempotency:
-#   - NodeSource apt repo: added only if /etc/apt/sources.list.d/nodesource.list
-#     is missing (skipped otherwise).
-#   - Node install: skipped if `node -v` reports major ≥ 20.
+#   - NodeSource apt repo: written when /etc/apt/sources.list.d/nodesource.list
+#     is missing or names another major (a host installed with node_20.x is
+#     moved to node_${NODE_MAJOR}.x); skipped otherwise.
+#   - Node install: skipped if `node -v` reports major ≥ NODE_MAJOR (24, the
+#     Active LTS); an older Node (20 reached end of life 2026-04-30) is
+#     upgraded in place by apt.
 #   - npm install -g @anthropic-ai/claude-code: npm reports "up to date"
 #     on a no-op re-run (idempotent by spec).
 #   - Auth detection: read-only; never modifies credentials.
@@ -52,39 +55,53 @@ fi
 VIBE_DIR="${VIBE_DIR:-/opt/vibe}"
 VIBE_ENV_APPLIANCE="${VIBE_ENV_APPLIANCE:-${VIBE_DIR}/env/appliance.env}"
 
-# ---- Node 20 via NodeSource --------------------------------------------
+# ---- Node LTS via NodeSource -------------------------------------------
+# The Active LTS line. Change it here only; the console image follows the
+# same line (console/Dockerfile node:24-bookworm-slim).
+NODE_MAJOR="${NODE_MAJOR:-24}"
+NODESOURCE_LIST="/etc/apt/sources.list.d/nodesource.list"
+
 node_install() {
   if command -v node >/dev/null 2>&1; then
     local major
     major="$(node --version 2>/dev/null | sed 's/^v//' | cut -d. -f1)"
-    if [[ -n "$major" && "$major" -ge 20 ]]; then
+    if [[ -n "$major" && "$major" -ge "$NODE_MAJOR" ]]; then
       log_info "node already installed: $(node --version)"
       return 0
     fi
-    log_info "node $(node --version) detected; upgrading to ≥20"
+    log_info "node $(node --version) detected; upgrading to Node.js ${NODE_MAJOR}"
   fi
 
-  log_step "installing Node.js 20 via NodeSource"
+  log_step "installing Node.js ${NODE_MAJOR} via NodeSource"
   export DEBIAN_FRONTEND=noninteractive
   {
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends curl ca-certificates gnupg
 
-    # NodeSource signing key + repo (modern form; setup_20.x scripts are
-    # discouraged upstream).
+    # NodeSource signing key + repo (modern form; the setup_NN.x scripts are
+    # discouraged upstream). A list naming another major — every host
+    # installed before Node 24 has node_20.x — is rewritten, or apt would
+    # keep "upgrading" to the old line.
     if [[ ! -f /usr/share/keyrings/nodesource.gpg ]]; then
       curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
         | gpg --dearmor -o /usr/share/keyrings/nodesource.gpg
     fi
-    if [[ ! -f /etc/apt/sources.list.d/nodesource.list ]]; then
-      echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
-        > /etc/apt/sources.list.d/nodesource.list
+    if ! grep -qs "/node_${NODE_MAJOR}\.x " "$NODESOURCE_LIST"; then
+      echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
+        > "$NODESOURCE_LIST"
     fi
 
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends nodejs
   } >>"$VIBE_LOG_FILE" 2>&1
 
+  # Health-check: apt can "succeed" while keeping a held or pinned older Node.
+  local now
+  now="$(node --version 2>/dev/null | sed 's/^v//' | cut -d. -f1)"
+  if [[ -z "$now" || "$now" -lt "$NODE_MAJOR" ]]; then
+    die "Node.js ${NODE_MAJOR} did not install (node reports '$(node --version 2>/dev/null || echo none)')." \
+        "Common causes: the nodejs package is held (apt-mark showhold) or pinned, or deb.nodesource.com is unreachable. Diagnose: apt-cache policy nodejs ; cat ${NODESOURCE_LIST} ; tail -50 ${VIBE_LOG_FILE}. Fix: sudo apt-mark unhold nodejs, then re-run: sudo bash ${APPLIANCE_DIR}/infra/claude-code-install.sh"
+  fi
   log_ok "node installed: $(node --version)"
 }
 

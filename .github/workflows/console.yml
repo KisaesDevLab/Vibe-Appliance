@@ -45,8 +45,8 @@ jobs:
     name: unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
       - name: Install console dependencies
@@ -62,7 +62,7 @@ jobs:
     name: image starts and reports healthy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build console image
         run: docker build -t vibe-appliance/console:ci console
       - name: Start container

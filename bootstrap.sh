@@ -177,7 +177,7 @@ FLAGS
   --with-claude-code              [Phase 8.5] Install Claude Code on the host
                                   for operator-driven troubleshooting (opt-in;
                                   reachable only via SSH or Cockpit Terminal).
-                                  Pulls Node 20 from NodeSource and installs
+                                  Pulls Node 24 (LTS) from NodeSource and installs
                                   @anthropic-ai/claude-code via npm.
   --anthropic-api-key KEY         API key persisted to /opt/vibe/env/appliance.env.
                                   Used by Claude Code (with --with-claude-code)
@@ -785,7 +785,7 @@ _apply_cookie_policy() {
 #                        into caddy/Dockerfile.cloudflare manually
 #                        (out-of-band; not part of bootstrap).
 #   - BUILD_SERVICES:    built locally from Dockerfiles in this repo
-#                        (console — Node 20 + Express + better-sqlite3).
+#                        (console — Node 24 + Express + better-sqlite3).
 phase_pull() {
   log_phase_banner 5 "Pull and build images" "pull"
   state_set_phase pull running
@@ -1040,7 +1040,7 @@ phase_infra() {
 }
 
 # --- Phase 7+ — install Claude Code on the host (opt-in) -------------
-# Phase 8.5 Workstream B. Adds Node 20 + @anthropic-ai/claude-code for
+# Phase 8.5 Workstream B. Adds Node 24 (LTS) + @anthropic-ai/claude-code for
 # operator-driven troubleshooting via SSH / Cockpit Terminal. Skipped
 # unless the operator passes --with-claude-code. Failure here is
 # non-fatal — the appliance core works without it.
