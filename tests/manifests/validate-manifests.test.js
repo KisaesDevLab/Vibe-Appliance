@@ -245,12 +245,29 @@ test('a rootServedOnly app declares a subdomain and an emergency port', () => {
   // a per-app hostname in domain mode, and the emergency port everywhere
   // else. A manifest missing either one describes an app the operator
   // simply cannot open in one of the appliance's modes.
+  //
+  // The one exception is an app that declares routing.clientIpHeader: it
+  // must have NO emergency port (next test), so it is domain-mode only.
   for (const { file, data } of applianceManifests()) {
     if (data.rootServedOnly !== true) continue;
     assert.ok(data.subdomain, `${file}: rootServedOnly needs a subdomain to be served at`);
+    if ((data.routing || {}).clientIpHeader) continue;
     const ports = [data.emergencyPort, ...(data.subdomains || []).map((s) => s && s.emergencyPort)];
     assert.ok(ports.some(Number.isInteger),
       `${file}: rootServedOnly with no emergencyPort is unreachable in LAN/Tailscale mode`);
+  }
+});
+
+test('an app that trusts routing.clientIpHeader declares no emergency port', () => {
+  // Caddy sets that header itself on the app's vhost; HAProxy's emergency
+  // frontend proxies straight to the app and would pass a client's own value
+  // through, letting it dodge the app's per-address sign-in limits
+  // (vibe-files-portal: CF-Connecting-IP).
+  for (const { file, data } of applianceManifests()) {
+    if (!(data.routing || {}).clientIpHeader) continue;
+    const ports = [data.emergencyPort, ...(data.subdomains || []).map((s) => s && s.emergencyPort)];
+    assert.ok(!ports.some(Number.isInteger),
+      `${file}: routing.clientIpHeader with an emergencyPort lets a LAN client forge ${data.routing.clientIpHeader}`);
   }
 });
 

@@ -187,6 +187,94 @@ def list_enabled_apps(state, manifests_dir):
     return out
 
 
+# Set by main(): True when CLOUDFLARE_TUNNEL_ENABLED=true, and the source
+# ranges a request from the tunnel connector (vibe-cloudflared, on vibe_net)
+# arrives from. Consulted by client_ip_lines.
+TUNNEL_ACTIVE = False
+TUNNEL_PEER_RANGES = []
+
+# Docker's default address pool for bridge networks. Used only when vibe_net's
+# own subnet cannot be read (no docker CLI where the renderer runs).
+DOCKER_DEFAULT_POOL = "172.16.0.0/12"
+
+
+def vibe_net_ranges():
+    """vibe_net's subnet(s), the addresses vibe-cloudflared can come from.
+
+    VIBE_NET_SUBNETS (space-separated) overrides, for tests. Otherwise ask
+    docker; on any failure fall back to Docker's default bridge pool and say
+    so — wider than vibe_net, but still never an office or internet address
+    on a normal LAN."""
+    override = os.environ.get("VIBE_NET_SUBNETS", "").split()
+    if override:
+        return override
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["docker", "network", "inspect", "vibe_net",
+             "-f", "{{range .IPAM.Config}}{{.Subnet}} {{end}}"],
+            capture_output=True, text=True, timeout=10)
+        subnets = r.stdout.split() if r.returncode == 0 else []
+    except (OSError, ValueError):
+        subnets = []
+    subnets = [s for s in subnets if re.match(r"^[0-9a-fA-F:.]+/[0-9]+$", s)]
+    if subnets:
+        return subnets
+    print(f"# WARNING: could not read vibe_net's subnet; trusting the tunnel "
+          f"connector's client-address header from {DOCKER_DEFAULT_POOL}",
+          file=sys.stderr)
+    return [DOCKER_DEFAULT_POOL]
+
+
+def client_ip_lines(manifest, indent):
+    """`routing.clientIpHeader` (e.g. "CF-Connecting-IP"): the header the app
+    reads the visitor's address from, for per-address sign-in limits.
+
+    Caddy makes the header trustworthy on every path into the vhost:
+      - tunnel off: always overwritten with the connecting address, so a
+        client can't send its own value;
+      - tunnel on: overwritten unless the request comes from vibe_net (the
+        tunnel connector), where Cloudflare set it and a client cannot.
+    An app that sets this should declare no emergencyPort: HAProxy goes
+    straight to the app and would pass a client's header through."""
+    header = (manifest.get("routing") or {}).get("clientIpHeader")
+    if not header or not re.match(r"^[A-Za-z][A-Za-z0-9-]*$", header):
+        return []
+    out = [f"{indent}# The visitor's address for the app's sign-in limits "
+           f"(routing.clientIpHeader)."]
+    if TUNNEL_ACTIVE and TUNNEL_PEER_RANGES:
+        out.append(f"{indent}@direct_client not remote_ip {' '.join(TUNNEL_PEER_RANGES)}")
+        out.append(f"{indent}request_header @direct_client {header} {{remote_host}}")
+    else:
+        out.append(f"{indent}request_header {header} {{remote_host}}")
+    return out
+
+
+def access_log_lines(manifest, indent):
+    """The vhost's access log. `routing.logRedact` drops query parameters and
+    request headers that carry client data (file names, notes) from it."""
+    redact = (manifest.get("routing") or {}).get("logRedact") or {}
+    query = [q for q in (redact.get("query") or []) if re.match(r"^[A-Za-z0-9_.-]+$", q)]
+    headers = [h for h in (redact.get("headers") or []) if re.match(r"^[A-Za-z][A-Za-z0-9-]*$", h)]
+    i2, i3, i4, i5 = indent * 2, indent * 3, indent * 4, indent * 5
+    out = [f"{indent}log {{", f"{i2}output stdout"]
+    if not (query or headers):
+        out.append(f"{i2}format console")
+    else:
+        out.append(f"{i2}format filter {{")
+        out.append(f"{i3}wrap console")
+        out.append(f"{i3}fields {{")
+        if query:
+            out.append(f"{i4}request>uri query {{")
+            out.extend(f"{i5}delete {q}" for q in query)
+            out.append(f"{i4}}}")
+        out.extend(f"{i4}request>headers>{h} delete" for h in headers)
+        out.append(f"{i3}}}")
+        out.append(f"{i2}}}")
+    out.append(f"{indent}}}")
+    return out
+
+
 def render_vhost(slug, manifest, host, tls_internal=False):
     """
     Emit a Caddy site block serving the app at the ROOT of `host`
@@ -229,11 +317,12 @@ def render_vhost(slug, manifest, host, tls_internal=False):
     if tls_internal:
         lines.append("    tls internal")
     lines.append("    encode gzip zstd")
-    lines.append("    log {")
-    lines.append("        output stdout")
-    lines.append("        format console")
-    lines.append("    }")
+    lines.extend(access_log_lines(manifest, "    "))
     lines.append("")
+    client_ip = client_ip_lines(manifest, "    ")
+    if client_ip:
+        lines.extend(client_ip)
+        lines.append("")
     lines.append("    handle /caddy-health {")
     lines.append("        respond \"ok\" 200")
     lines.append("    }")
@@ -1198,6 +1287,11 @@ def main():
     appliance_env = _read_appliance_env("/opt/vibe/env/appliance.env")
     tunnel_active = (appliance_env.get("CLOUDFLARE_TUNNEL_ENABLED", "")
                      .strip().lower() == "true")
+    global TUNNEL_ACTIVE, TUNNEL_PEER_RANGES
+    TUNNEL_ACTIVE = tunnel_active
+    if tunnel_active and any((m.get("routing") or {}).get("clientIpHeader")
+                             for _s, m in list_enabled_apps(state, manifests_dir)):
+        TUNNEL_PEER_RANGES = vibe_net_ranges()
 
     # Every hostname this render emits comes from lib/vibe_hosts.py — the
     # main host (state.config.tunnel_subdomain, default 'vibe'), each

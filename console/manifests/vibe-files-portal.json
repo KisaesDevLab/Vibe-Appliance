@@ -1,0 +1,126 @@
+{
+  "schemaVersion": 1,
+  "slug": "vibe-files-portal",
+  "displayName": "Vibe Portal",
+  "description": "Client file portal for firms that use Vibe Files: staff share files with clients from Vibe Files, and clients sign in to download them and send documents back into Vibe Files' Intake.",
+  "_doc": "In-tree manifest for KisaesDevLab/Vibe-Portal (github.com/KisaesDevLab/Vibe-Portal). SLUG: `vibe-files-portal`, not `vibe-portal`. The appliance already uses `vibe-portal` as the broker key of its own landing-page sign-in gate (lib/identity.sh portal-gate, console/identity.js PORTAL_LOCK), so the app takes a distinct slug; the image is still ghcr.io/kisaesdevlab/vibe-portal. ONE container from one GHCR image: the Express API on :3101 serves the built client portal, the staff page (/staff) and /health, and applies its own migrations at boot. Shared Postgres only; no Redis. /data/portal holds the encrypted files AND the key file .firm-key.seal (Vibe-Portal QUESTIONS P28): every stored file is unreadable without it, so it is bind-mounted under /opt/vibe/data/apps/vibe-files-portal/ where the appliance backup covers it, and disable never deletes it. ROOT-SERVED at files.<domain> in both routing modes (rootServedOnly): the SPA is built with base '/'. NO emergencyPort, on purpose: session cookies are Secure (PORTAL_URL is https), so sign-in cannot work over the plain-HTTP LAN port, and HAProxy would pass a client's own CF-Connecting-IP through to the app's per-address sign-in limits. routing.clientIpHeader makes Caddy set that header itself (TRUST_CF_CONNECTING_IP=true in the env template); routing.logRedact keeps file names and notes (X-Vibe-Name / X-Vibe-Note, older Vibe Files: ?name= / ?note=) out of Caddy's access log (Vibe-Portal P47). EMAIL: the app refuses to start in production without SMTP (sign-in links and codes go by email), so SMTP is per-app here, independent of the appliance-wide Email & SMS provider. Texts are optional (Twilio). FIRST STAFF ACCOUNT: a one-time setup link printed by a command inside the container (firstLogin.note); later staff, portal keys for Vibe Files, firm name, logo and limits are on the app's own staff page.",
+
+  "image": {
+    "server":     "ghcr.io/kisaesdevlab/vibe-portal",
+    "defaultTag": "latest"
+  },
+
+  "subdomain": "files",
+  "ports":     { "server": 3101 },
+  "rootServedOnly": true,
+
+  "routing": {
+    "default_upstream": "vibe-files-portal:3101",
+    "clientIpHeader":   "CF-Connecting-IP",
+    "logRedact": {
+      "query":   ["name", "note"],
+      "headers": ["X-Vibe-Name", "X-Vibe-Note"]
+    }
+  },
+
+  "depends": ["postgres"],
+
+  "env": {
+    "required": [
+      { "name": "NODE_ENV",               "from": "static:production" },
+      { "name": "DATABASE_URL",           "from": "database-url" },
+      { "name": "PORTAL_URL",             "from": "subdomain-url" },
+      { "name": "DATA_DIR",               "from": "static:/data/portal" },
+      { "name": "TRUST_CF_CONNECTING_IP", "from": "static:true",
+        "doc": "Count sign-in limits by CF-Connecting-IP. Safe only because Caddy sets that header itself on this app's vhost (routing.clientIpHeader) and the app has no emergency port." },
+      { "name": "EMAIL_PROVIDER",         "from": "static:smtp",
+        "doc": "The app accepts only smtp in production." }
+    ],
+    "optional": [
+      {
+        "name": "VIBE_APP_SUBDOMAIN",
+        "doc":  "Operator override for this app's subdomain label. Empty = the manifest default (files). Consumed by the appliance routing (Caddy vhost + Cloudflare Tunnel CNAME/ingress). Single DNS label — lowercase letters, digits, dashes, no dots.",
+        "ui": {
+          "tier":        1,
+          "category":    "Network",
+          "label":       "Subdomain",
+          "helpText":    "The <subdomain> in <subdomain>.<your-domain> clients use for the portal. Clients see it in every email, so pick something they will trust. Leave blank for 'files'. Lowercase letters, digits, and dashes; no dots. Saving re-renders routing and re-provisions the Cloudflare Tunnel; the portal briefly restarts.",
+          "input":       "text",
+          "appliance":   "per-app",
+          "validate":    "regex:^([a-z0-9][a-z0-9-]*)?$",
+          "postSaveJob": "routing-reconcile"
+        }
+      },
+      {
+        "name": "SMTP_HOST",
+        "doc":  "SMTP server hostname. REQUIRED: the portal will not start without it, because client and staff sign-in links and codes go by email.",
+        "ui": { "tier": 1, "category": "Email & SMS", "label": "SMTP host", "helpText": "Required — the portal does not start without email. Hostname only, e.g. smtp.office365.com. The mailbox must be allowed to send by SMTP (Office 365: SMTP AUTH on for that user).", "input": "text", "appliance": "per-app", "validate": "non-empty" }
+      },
+      {
+        "name":  "SMTP_PORT",
+        "value": "587",
+        "doc":   "SMTP port. 587 (STARTTLS) is typical; 465 for TLS from the start.",
+        "ui": { "tier": 1, "category": "Email & SMS", "label": "SMTP port", "helpText": "587 for STARTTLS (most providers), 465 for TLS from the start.", "input": "number", "appliance": "per-app", "validate": "number-range:1:65535" }
+      },
+      {
+        "name": "SMTP_USER",
+        "doc":  "SMTP username.",
+        "ui": { "tier": 1, "category": "Email & SMS", "label": "SMTP username", "helpText": "Usually the sending mailbox, e.g. portal@yourfirm.com. Leave blank for an unauthenticated relay.", "input": "text", "appliance": "per-app" }
+      },
+      {
+        "name":   "SMTP_PASS",
+        "secret": true,
+        "doc":    "SMTP password.",
+        "ui": { "tier": 1, "category": "Email & SMS", "label": "SMTP password", "helpText": "The mailbox password or an app password. Stored in the per-app env file (mode 600). A wrong password shows in the portal's container log at start.", "input": "password", "appliance": "per-app" }
+      },
+      {
+        "name": "SMTP_SECURE",
+        "doc":  "true = TLS from the first byte. Blank = true on port 465, otherwise STARTTLS.",
+        "ui": { "tier": 1, "category": "Email & SMS", "label": "TLS from the start", "helpText": "Leave blank unless your provider says otherwise: port 465 then uses TLS from the start and 587 uses STARTTLS.", "input": "dropdown", "appliance": "per-app", "validate": "enum", "options": [ { "value": "", "label": "Automatic (by port)" }, { "value": "true", "label": "Yes" }, { "value": "false", "label": "No (STARTTLS)" } ] }
+      },
+      {
+        "name": "EMAIL_FROM",
+        "doc":  "From header for the portal's emails. REQUIRED, like SMTP_HOST.",
+        "ui": { "tier": 1, "category": "Email & SMS", "label": "From address", "helpText": "Required. e.g. Your Firm CPA <portal@yourfirm.com> — an address the SMTP mailbox may send as.", "input": "text", "appliance": "per-app", "validate": "non-empty" }
+      },
+      {
+        "name":  "SMS_PROVIDER",
+        "value": "none",
+        "doc":   "Texts for phone sign-in codes. none = clients sign in by email only.",
+        "ui": { "tier": 1, "category": "Email & SMS", "label": "Text messages", "helpText": "Optional. Twilio lets clients sign in with a code sent to their phone (US/Canada numbers). US numbers need A2P 10DLC registration with Twilio first.", "input": "dropdown", "appliance": "per-app", "validate": "enum", "options": [ { "value": "none", "label": "None (email sign-in only)" }, { "value": "twilio", "label": "Twilio" } ] }
+      },
+      {
+        "name": "TWILIO_ACCOUNT_SID",
+        "doc":  "Twilio Account SID (starts with AC).",
+        "ui": { "tier": 1, "category": "Email & SMS", "label": "Twilio account SID", "helpText": "34 characters, starts with AC.", "input": "text", "appliance": "per-app", "dependsOnFields": ["SMS_PROVIDER"], "showIf": { "SMS_PROVIDER": "twilio" } }
+      },
+      {
+        "name":   "TWILIO_AUTH_TOKEN",
+        "secret": true,
+        "doc":    "Twilio auth token.",
+        "ui": { "tier": 1, "category": "Email & SMS", "label": "Twilio auth token", "helpText": "Paired with the account SID. Stored in the per-app env file (mode 600).", "input": "password", "appliance": "per-app", "dependsOnFields": ["SMS_PROVIDER"], "showIf": { "SMS_PROVIDER": "twilio" } }
+      },
+      {
+        "name": "TWILIO_FROM_NUMBER",
+        "doc":  "Sending number in E.164 form (+15551234567). This or TWILIO_MESSAGING_SERVICE_SID.",
+        "ui": { "tier": 1, "category": "Email & SMS", "label": "Twilio from number", "helpText": "e.g. +15551234567. Leave blank if you use a messaging service SID instead.", "input": "text", "appliance": "per-app", "dependsOnFields": ["SMS_PROVIDER"], "showIf": { "SMS_PROVIDER": "twilio" } }
+      },
+      {
+        "name": "TWILIO_MESSAGING_SERVICE_SID",
+        "doc":  "Twilio messaging service SID (starts with MG). This or TWILIO_FROM_NUMBER.",
+        "ui": { "tier": 1, "category": "Email & SMS", "label": "Twilio messaging service SID", "helpText": "Starts with MG. Leave blank if you set a from number.", "input": "text", "appliance": "per-app", "dependsOnFields": ["SMS_PROVIDER"], "showIf": { "SMS_PROVIDER": "twilio" } }
+      }
+    ]
+  },
+
+  "database": { "name": "vibe_files_portal_db", "user": "vibefilesportal" },
+
+  "firstLogin": {
+    "type": "setup-wizard",
+    "url":  "/staff",
+    "note": "The portal does not start without email. The FIRST Enable therefore stops with 'SMTP_HOST: required when EMAIL_PROVIDER=smtp' in the container log — expected: fill in SMTP host, port, username, password and From address under Settings → Vibe Portal → Email & SMS, Save, and the portal starts (or set them in /opt/vibe/env/vibe-files-portal.env and Enable again). Then make the first staff account from a one-time link (works once, for 3 days) — copy-paste on the appliance: sudo docker exec vibe-files-portal node_modules/.bin/tsx src/scripts/staff-setup.ts link — open it, set a 12+ character password and add the portal to an authenticator app. More staff, the portal key Vibe Files needs (Settings → Portal keys), the firm name, logo and limits are on the staff page. Locked out: sudo docker exec vibe-files-portal node_modules/.bin/tsx src/scripts/staff-setup.ts reset <email> (add --admin when no admin can sign in). Domain mode only: the portal lives at files.<domain> and has no LAN port. Behind the Cloudflare Tunnel it needs no DNS step; with Let's Encrypt, point files.<domain> at the appliance first."
+  },
+
+  "health": "/health",
+  "health_timeout_s": 120
+}
