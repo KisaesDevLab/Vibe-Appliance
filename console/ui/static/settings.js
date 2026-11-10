@@ -5056,6 +5056,145 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
     }
     panelEl.appendChild(form);
     updateConditionals();
+
+    // Manifest-declared actions (manifest.adminActions), loaded after the
+    // form so a slow `docker inspect` never delays the settings.
+    const actionsWrap = el('section', { 'data-admin-actions': slug });
+    panelEl.appendChild(actionsWrap);
+    renderAppActions(slug, actionsWrap);
+  }
+
+  // ---------- app actions (manifest.adminActions) ----------------------
+  // Fixed commands the console runs in the app's own container. A SECRET
+  // result (a setup or reset link) is shown once in this panel with a
+  // Copy button and kept nowhere else: not in state, not in localStorage,
+  // and it is cleared when the operator leaves the tab.
+  async function renderAppActions(slug, wrap) {
+    let data;
+    try {
+      const r = await fetchWithTimeout('/api/v1/apps/' + encodeURIComponent(slug) + '/admin-actions',
+        { credentials: 'same-origin' }, 20000);
+      if (!r.ok) return;
+      data = await r.json();
+    } catch { return; }
+    if (!data || !Array.isArray(data.actions) || !data.actions.length) return;
+    if (state.activeAppSlug !== slug || !wrap.isConnected) return;
+
+    wrap.textContent = '';
+    wrap.appendChild(el('h3', {
+      style: 'margin: 1.6rem 0 0.4rem; font-size: 1rem; color: #6b4423;',
+    }, ['Actions']));
+    for (const a of data.actions) {
+      wrap.appendChild(renderAppAction(slug, a, !!(data.running || {})[a.service],
+        () => renderAppActions(slug, wrap)));
+    }
+  }
+
+  function renderAppAction(slug, action, running, recheck) {
+    const box = el('div', { class: 'settings-field', 'data-action': action.id });
+    box.appendChild(el('label', null, [action.label]));
+    if (action.helpText) box.appendChild(el('p', { class: 'help' }, [action.helpText]));
+
+    const inputs = {};
+    for (const p of action.params || []) {
+      const id = 'act-' + slug + '-' + action.id + '-' + p.name;
+      box.appendChild(el('label', { for: id, style: 'font-weight:normal;' }, [p.label]));
+      const input = el('input', {
+        id, type: p.validate === 'email' ? 'email' : 'text',
+        placeholder: p.placeholder || '', autocomplete: 'off', spellcheck: 'false',
+      });
+      inputs[p.name] = input;
+      box.appendChild(input);
+    }
+
+    const row = el('div', { class: 'cta-row', style: 'margin-top:0.4rem;gap:0.5rem;' });
+    const btn = el('button', { type: 'button', class: 'btn' }, [action.label]);
+    row.appendChild(btn);
+    box.appendChild(row);
+    const out = el('div', { 'aria-live': 'polite' });
+    box.appendChild(out);
+
+    if (!running) {
+      btn.setAttribute('disabled', 'disabled');
+      out.appendChild(el('p', { class: 'help' }, [
+        'Available once the app is enabled and running. ',
+        el('button', {
+          type: 'button', class: 'btn btn--ghost',
+          style: 'padding:0.1rem 0.5rem;font-size:0.85em;',
+          onclick: () => recheck(),
+        }, ['Check again']),
+      ]));
+    }
+
+    btn.addEventListener('click', async () => {
+      const params = {};
+      for (const [name, input] of Object.entries(inputs)) params[name] = input.value.trim();
+      if (action.confirm && !window.confirm(action.confirm)) return;
+      out.textContent = '';
+      btn.setAttribute('disabled', 'disabled');
+      const orig = btn.textContent;
+      btn.textContent = 'Working…';
+      try {
+        const r = await fetchWithTimeout(
+          '/api/v1/apps/' + encodeURIComponent(slug) + '/admin-actions/' + encodeURIComponent(action.id),
+          {
+            method: 'POST', credentials: 'same-origin', cache: 'no-store',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ params }),
+          }, 330000);
+        const body = await r.json().catch(() => ({}));
+        if (r.ok && body.ok) {
+          if (body.secret) {
+            renderSecretResult(out, body.stdout, body.stderr);
+          } else {
+            out.appendChild(el('p', { class: 'help', style: 'color:var(--ok, #2f7a3b);white-space:pre-wrap;' },
+              ['✓ ' + (body.stdout || 'Done.')]));
+          }
+        } else {
+          const msg = body.stderr || body.hint || body.detail || body.message || body.error || ('HTTP ' + r.status);
+          out.appendChild(el('p', { class: 'help', style: 'color:var(--bad, #a04040);white-space:pre-wrap;' },
+            ['✗ ' + msg]));
+          if (body.hint && body.stderr) out.appendChild(el('p', { class: 'help' }, [body.hint]));
+        }
+      } catch (err) {
+        out.appendChild(el('p', { class: 'help', style: 'color:var(--bad, #a04040);' },
+          ['✗ ' + _friendlyError(err)]));
+      } finally {
+        btn.removeAttribute('disabled');
+        btn.textContent = orig;
+      }
+    });
+    return box;
+  }
+
+  function renderSecretResult(out, link, note) {
+    if (note) out.appendChild(el('p', { class: 'help', style: 'white-space:pre-wrap;' }, [note]));
+    const field = el('input', {
+      type: 'text', readonly: 'readonly', class: 'mono', value: link,
+      'aria-label': 'One-time link', style: 'width:100%;',
+    });
+    out.appendChild(field);
+    const row = el('div', { class: 'cta-row', style: 'margin-top:0.4rem;gap:0.5rem;' });
+    row.appendChild(el('button', {
+      type: 'button', class: 'btn btn--ghost',
+      onclick: async (e) => {
+        try {
+          await navigator.clipboard.writeText(link);
+          e.target.textContent = 'Copied';
+        } catch {
+          field.select();
+          e.target.textContent = 'Press Ctrl+C to copy';
+        }
+      },
+    }, ['Copy']));
+    row.appendChild(el('button', {
+      type: 'button', class: 'btn btn--ghost',
+      onclick: () => { out.textContent = ''; },
+    }, ['Hide']));
+    out.appendChild(row);
+    out.appendChild(el('p', { class: 'help' }, [
+      'This link is a password: send it only to that person, and do not paste it into tickets or chat. It is not saved anywhere; it disappears when you leave this page.',
+    ]));
   }
 
   // Per-app field renderer. For 'both'-scope fields, distinguishes

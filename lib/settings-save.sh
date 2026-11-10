@@ -82,6 +82,30 @@ settings_restore_env() {
   log_ok "env restored from $snap"
 }
 
+# _settings_rollback_env <snapshot_dir>
+# Rollback INSIDE one save: restore the snapshot, then remove the env files
+# THIS save created (_SETTINGS_CREATED, one path per line, set by
+# _settings_apply_changes: a per-app file for an app that has never been
+# enabled, so its settings can be entered before the first Enable).
+# settings_restore_env alone would leave such a file behind. Only the
+# recorded paths go: a file another writer created meanwhile (a `vibe
+# enable` over SSH is outside the console's locks) is left alone. Known
+# gap: if such an enable REPLACES a file this save created, within the same
+# few seconds, and the save then rolls back, that render is removed too.
+# The next Enable renders it again; nothing else is lost. Not used by
+# `settings-save.sh restore <snap>`.
+_SETTINGS_CREATED=""
+_settings_rollback_env() {
+  local snap="$1" f
+  settings_restore_env "$snap"
+  while IFS= read -r f; do
+    [[ -n "$f" && -e "$f" ]] || continue
+    rm -f -- "$f"
+    log_info "removed $(basename "$f"): this save created it" path="$f"
+  done <<<"$_SETTINGS_CREATED"
+  _SETTINGS_CREATED=""
+}
+
 # settings_audit_log <user> <category> <setting> <old> <new> <result> [details_json]
 # Append a row to console.sqlite's settings_audit table. Secrets MUST
 # already be redacted by the caller — this function does not know which
@@ -192,8 +216,11 @@ settings_save_apply() {
   # 2. Apply each change to the right env file. Returns non-zero if any
   # write fails. _settings_apply_changes does NOT touch the audit log;
   # that's done at the end based on success/failure.
-  if ! _settings_apply_changes "$payload_file"; then
-    settings_restore_env "$snap_dir"
+  # Its stdout is the list of env files it created (see _settings_rollback_env);
+  # captured on failure too, since a file may be created before a later
+  # file's write fails.
+  if ! _SETTINGS_CREATED="$(_settings_apply_changes "$payload_file")"; then
+    _settings_rollback_env "$snap_dir"
     _settings_emit_result "rolled-back" "apply-changes-failed" "$snap_dir" ""
     return 1
   fi
@@ -201,7 +228,7 @@ settings_save_apply() {
   # 3. Validate the resulting compose state. Catches missing-required-
   # var errors before we try to restart any container.
   if ! _settings_validate_compose; then
-    settings_restore_env "$snap_dir"
+    _settings_rollback_env "$snap_dir"
     _settings_emit_result "rolled-back" "compose-validation-failed" "$snap_dir" ""
     return 1
   fi
@@ -213,7 +240,7 @@ settings_save_apply() {
   # host) restores the env and changes nothing.
   local gate_detail=""
   if ! gate_detail="$(_settings_landing_gate_preflight "$payload_file")"; then
-    settings_restore_env "$snap_dir"
+    _settings_rollback_env "$snap_dir"
     _settings_emit_result "rolled-back" "client-portal-sign-in-refused" "$snap_dir" "" "$gate_detail"
     return 1
   fi
@@ -255,7 +282,7 @@ settings_save_apply() {
 
   if [[ "$rollback" == "true" ]]; then
     log_warn "rolling back settings save" failed_on="$fail_slug" reason="$fail_reason"
-    settings_restore_env "$snap_dir"
+    _settings_rollback_env "$snap_dir"
 
     # Re-restart with old config. If THIS also fails health, the
     # appliance is in a degraded state — surface it to the operator
@@ -523,9 +550,11 @@ enabled = [slug for slug, e in (s.get("apps") or {}).items() if e.get("enabled")
 if appliance_changed == "yes":
     out = enabled
 else:
+    # Only apps that are enabled: renaming a disabled or never-enabled
+    # app must not enable it. Its next Enable renders the new name.
     out = sorted({scope[len("per-app:"):]
                   for scope in routing_scopes.split("\n")
-                  if scope.startswith("per-app:")})
+                  if scope.startswith("per-app:")} & set(enabled))
 
 
 def is_identity(slug):
@@ -695,9 +724,9 @@ _post_save_landing_gate() {
 # Atomic per-file: read, modify, .tmp + rename. Mode 600 enforced.
 _settings_apply_changes() {
   local payload_file="$1"
-  python3 - "$payload_file" "$VIBE_ENV_DIR" <<'PYEOF'
+  python3 - "$payload_file" "$VIBE_ENV_DIR" "${APPLIANCE_DIR}/console/manifests" <<'PYEOF'
 import json, os, sys
-payload_path, env_dir = sys.argv[1:3]
+payload_path, env_dir, manifests_dir = sys.argv[1:4]
 with open(payload_path) as f:
     payload = json.load(f)
 
@@ -745,8 +774,29 @@ for target, kv_map in changes_by_file.items():
             # nothing to delete, treat as no-op.
             if all(v["op"] == "revert" for v in kv_map.values()):
                 continue
-            print(f"per-app env missing: {target}", file=sys.stderr)
-            sys.exit(2)
+            # An app that has never been enabled has no env file yet. Its
+            # Settings fields must still be savable BEFORE the first Enable
+            # (an app that refuses to start without email needs its SMTP
+            # settings first). Start the file with just these keys:
+            # enable-app's render merges them in and keeps them
+            # (_merge_env_render: operator-owned keys keep a saved value).
+            # Only for an installable app with a manifest; anything else
+            # is still an error.
+            slug = os.path.basename(target)[:-len(".env")]
+            manifest = os.path.join(manifests_dir, slug + ".json")
+            try:
+                runtime = json.load(open(manifest)).get("runtime", "appliance")
+            except (OSError, ValueError):
+                runtime = None
+            if runtime != "appliance":
+                print(f"per-app env missing: {target} (and {slug} has no appliance manifest to start one from)", file=sys.stderr)
+                sys.exit(2)
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(f"# {slug}.env: started by a Settings save before the app's first Enable.\n"
+                        "# Enable renders the rest from the template and keeps these values.\n")
+            print(f"created {target} (the app has not been enabled yet)", file=sys.stderr)
+            print(target, flush=True)
 
     with open(target) as f:
         existing = f.read().splitlines()

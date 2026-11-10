@@ -5152,6 +5152,127 @@ app.get('/api/v1/settings/values', requireAdmin, (_req, res) => {
   res.json({ appliance: applianceVals, perApp: perAppVals });
 });
 
+// --- App actions (manifest.adminActions) ---------------------------------
+//
+// Fixed commands an app declares, run with `docker exec` INSIDE its own
+// running container behind a button on Settings → Apps → <app> (Vibe
+// Portal: send a test email, get the first staff setup link, reset a staff
+// member's sign-in). Rule 4 click-to-execute: argv comes from the manifest,
+// parameters are validated and substituted as whole argv elements only
+// (console/lib/admin-actions.js), and there is no shell. No HTTP admin API
+// on the app itself: its host may be internet-facing.
+//
+// SECRET output (a setup or reset link is a password): stdout goes to this
+// HTTP response only, with Cache-Control: no-store. It is never passed to
+// log(), never stored in state.json, the audit table or a job file, and
+// the log line for the run carries the slug, action id and exit code only.
+const adminActions = require('./lib/admin-actions');
+const ADMIN_ACTION_OUTPUT_MAX = 16 * 1024;
+
+function containerRunning(name) {
+  return new Promise((resolve) => {
+    let out = '';
+    const child = spawn('docker', ['inspect', '-f', '{{.State.Running}}', name],
+      { stdio: ['ignore', 'pipe', 'ignore'] });
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 10000);
+    child.stdout.on('data', (d) => { out += d.toString(); });
+    child.on('error', () => { clearTimeout(timer); resolve(false); });
+    child.on('exit', (code) => { clearTimeout(timer); resolve(code === 0 && out.trim() === 'true'); });
+  });
+}
+
+app.get('/api/v1/apps/:slug/admin-actions', requireAdmin, async (req, res) => {
+  const slug = req.params.slug;
+  if (!SLUG_RE.test(slug) || !MANIFESTS[slug]) return res.status(404).json({ error: 'unknown app' });
+  const actions = adminActions.publicActions(MANIFESTS[slug]);
+  const running = {};
+  for (const svc of new Set(actions.map((a) => a.service))) running[svc] = await containerRunning(svc);
+  res.json({ actions, running });
+});
+
+app.post('/api/v1/apps/:slug/admin-actions/:id', requireAdmin, testRateLimit, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  // JSON only. The page always sends application/json; a cross-site HTML
+  // form can only send form or text/plain bodies, and Basic auth would
+  // ride along, so this refuses a forged click of a parameterless action.
+  if (!req.is('application/json')) {
+    return res.status(415).json({ error: 'expected a JSON request body' });
+  }
+  const slug = req.params.slug;
+  if (!SLUG_RE.test(slug) || !MANIFESTS[slug]) return res.status(404).json({ error: 'unknown app' });
+  if ((MANIFESTS[slug].runtime || 'appliance') !== 'appliance') {
+    return res.status(404).json({ error: 'unknown action' });
+  }
+  const action = adminActions.findAction(MANIFESTS[slug], String(req.params.id || ''));
+  if (!action) return res.status(404).json({ error: 'unknown action' });
+  const declared = adminActions.declarationProblems(action);
+  if (declared.length) {
+    log('error', 'admin action: manifest declaration invalid', { slug, action: action.id, problems: declared });
+    return res.status(500).json({ error: 'this action is declared wrongly in the app manifest', detail: declared.join(' | ') });
+  }
+  const checked = adminActions.validateParams(action, (req.body || {}).params);
+  if (!checked.ok) {
+    return res.status(400).json({ error: 'invalid value', detail: checked.problems.join(' | ') });
+  }
+  if (!acquireSlugLock(slug, action.label, res)) return;
+  let released = false;
+  const release = () => { if (!released) { released = true; releaseSlugLock(slug); } };
+  try {
+    if (!(await containerRunning(action.service))) {
+      release();
+      return res.status(409).json({
+        error: 'app not running',
+        detail: `${MANIFESTS[slug].displayName || slug} is not running, so this cannot run yet. ` +
+                'Enable it (or wait for it to finish starting) from the Apps page, then try again.',
+      });
+    }
+    const argv = adminActions.dockerArgv(action, checked.values);
+    const secret = action.output === 'secret';
+    const result = await new Promise((resolve) => {
+      let stdout = '', stderr = '', timedOut = false, done = false;
+      const child = trackChild(spawn('docker', argv, { stdio: ['ignore', 'pipe', 'pipe'] }));
+      const cap = (buf, d) => (buf.length >= ADMIN_ACTION_OUTPUT_MAX ? buf : (buf + d.toString()).slice(0, ADMIN_ACTION_OUTPUT_MAX));
+      child.stdout.on('data', (d) => { stdout = cap(stdout, d); });
+      child.stderr.on('data', (d) => { stderr = cap(stderr, d); });
+      const timer = setTimeout(() => { timedOut = true; try { child.kill('SIGKILL'); } catch { /* gone */ } }, adminActions.timeoutMs(action));
+      const finish = (code, err) => {
+        if (done) return; done = true; clearTimeout(timer);
+        resolve({ code, stdout, stderr: err ? `${stderr}${err.message}` : stderr, timedOut });
+      };
+      child.on('error', (err) => finish(null, err));
+      child.on('close', (code) => finish(code));
+    });
+    release();
+    // Slug, action and exit code only: never parameters or output.
+    log(result.code === 0 ? 'info' : 'warn', 'admin action ran',
+      { slug, action: action.id, exit_code: result.code, timed_out: result.timedOut });
+    const ok = result.code === 0 && !result.timedOut;
+    const missing = ok ? null : adminActions.missingCommandHint(result.code, result.stderr, action);
+    // Killing the local `docker exec` client does not stop the process in
+    // the container: the command may still finish (a reset may complete
+    // with its link printed to nobody). Say so, and how to recover.
+    const hint = result.timedOut
+      ? `It did not answer within ${adminActions.timeoutMs(action) / 1000} seconds. It may still have ` +
+        'completed inside the app. Wait a minute and run it again' +
+        (secret ? ': that shows a fresh link and replaces any link from this attempt.' : '.')
+      : missing;
+    const parts = secret && ok ? adminActions.splitSecret(result.stdout) : null;
+    res.status(ok ? 200 : 422).json({
+      ok,
+      exitCode: result.code,
+      secret,
+      stdout: parts ? parts.secret : result.stdout.trim(),
+      // A missing command's stack trace is replaced by the hint alone.
+      stderr: missing ? '' : [result.stderr.trim(), parts ? parts.note : ''].filter(Boolean).join('\n'),
+      hint,
+    });
+  } catch (err) {
+    release();
+    log('error', 'admin action failed to start', { slug, action: action.id, err: err.message });
+    if (!res.headersSent) res.status(500).json({ error: 'could not run the action', detail: err.message });
+  }
+});
+
 // Settings save — atomic write + restart + rollback per addendum §6.1.
 // Body: { changes: [{ scope, key, value, category, secret }, ...] }.
 // Server writes payload to a tempfile (mode 600) so secrets never

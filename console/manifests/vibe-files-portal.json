@@ -54,7 +54,7 @@
       {
         "name": "SMTP_HOST",
         "doc":  "SMTP server hostname. REQUIRED: the portal will not start without it, because client and staff sign-in links and codes go by email.",
-        "ui": { "tier": 1, "category": "Email & SMS", "label": "SMTP host", "helpText": "Required — the portal does not start without email. Hostname only, e.g. smtp.office365.com. The mailbox must be allowed to send by SMTP (Office 365: SMTP AUTH on for that user).", "input": "text", "appliance": "per-app", "validate": "non-empty" }
+        "ui": { "tier": 1, "category": "Email & SMS", "label": "SMTP host", "helpText": "Required — the portal does not start without email. Hostname only, e.g. smtp.office365.com. The mailbox must be allowed to send by SMTP (Office 365: SMTP AUTH on for that user).", "input": "text", "appliance": "per-app", "validate": "non-empty", "requiredBeforeEnable": true }
       },
       {
         "name":  "SMTP_PORT",
@@ -81,7 +81,12 @@
       {
         "name": "EMAIL_FROM",
         "doc":  "From header for the portal's emails. REQUIRED, like SMTP_HOST.",
-        "ui": { "tier": 1, "category": "Email & SMS", "label": "From address", "helpText": "Required. e.g. Your Firm CPA <portal@yourfirm.com> — an address the SMTP mailbox may send as.", "input": "text", "appliance": "per-app", "validate": "non-empty" }
+        "ui": { "tier": 1, "category": "Email & SMS", "label": "From address", "helpText": "Required. e.g. Your Firm CPA <portal@yourfirm.com> — an address the SMTP mailbox may send as.", "input": "text", "appliance": "per-app", "validate": "non-empty", "requiredBeforeEnable": true }
+      },
+      {
+        "name": "FIRST_ADMIN_EMAIL",
+        "doc":  "While the portal has no staff account, it emails this address a one-time link to make the first one (Vibe Portal 0.2.0+; older images ignore it). Sent once per address: a restart does not resend, a changed address or a failed send does. The staff sign-in page has a Send again button (this address only, 3 an hour).",
+        "ui": { "tier": 1, "category": "Application", "label": "First admin's email", "helpText": "The portal emails this person a link to make the first staff account. They become the portal's first admin. Fill it in with the email settings before the first Enable; once that account exists, add more staff on the portal's own staff page.", "input": "text", "appliance": "per-app", "validate": "email" }
       },
       {
         "name":  "SMS_PROVIDER",
@@ -118,8 +123,41 @@
   "firstLogin": {
     "type": "setup-wizard",
     "url":  "/staff",
-    "note": "The portal does not start without email. The FIRST Enable therefore stops with 'SMTP_HOST: required when EMAIL_PROVIDER=smtp' in the container log — expected: fill in SMTP host, port, username, password and From address under Settings → Vibe Portal → Email & SMS, Save, and the portal starts (or set them in /opt/vibe/env/vibe-files-portal.env and Enable again). Then make the first staff account from a one-time link (works once, for 3 days) — copy-paste on the appliance: sudo docker exec vibe-files-portal node_modules/.bin/tsx src/scripts/staff-setup.ts link — open it, set a 12+ character password and add the portal to an authenticator app. More staff, the portal key Vibe Files needs (Settings → Portal keys), the firm name, logo and limits are on the staff page. Locked out: sudo docker exec vibe-files-portal node_modules/.bin/tsx src/scripts/staff-setup.ts reset <email> (add --admin when no admin can sign in). Domain mode only: the portal lives at files.<domain> and has no LAN port. Behind the Cloudflare Tunnel it needs no DNS step; with Let's Encrypt, point files.<domain> at the appliance first."
+    "note": "Before the first Enable: open Settings → Apps → Vibe Portal, fill in Email & SMS (SMTP host, port, username, password, From address) and First admin's email, and Save. Enable refuses until the SMTP host and From address are set. Then Enable; the portal emails the first admin a one-time link (works once, for 3 days): open it, set a 12+ character password and add the portal to an authenticator app. No email? On the same Settings page: Send a test email shows what the mail server said, and Get a staff setup link shows the link to copy instead. Locked out later: Reset a staff member's sign-in on that page. More staff, the portal key Vibe Files needs (Settings → Portal keys), the firm name, logo and limits are on the portal's staff page. Fallback, copy-paste on the appliance: sudo docker exec vibe-files-portal node_modules/.bin/tsx src/scripts/staff-setup.ts link (or: reset <email> --admin, when no admin can sign in). Domain mode only: the portal lives at files.<domain> and has no LAN port. Behind the Cloudflare Tunnel, click Re-provision after the first Enable; with Let's Encrypt, point files.<domain> at the appliance first."
   },
+
+  "adminActions": [
+    {
+      "id":       "test-email",
+      "label":    "Send a test email",
+      "helpText": "Sends a test message with the portal's saved email settings and shows what the mail server said. Save the settings first. Needs Vibe Portal 0.2.0 or later.",
+      "service":  "vibe-files-portal",
+      "command":  ["node_modules/.bin/tsx", "src/scripts/test-email.ts", "{address}"],
+      "params":   [ { "name": "address", "label": "Send to", "placeholder": "you@yourfirm.com", "validate": "email" } ],
+      "output":   "text",
+      "timeoutSeconds": 60
+    },
+    {
+      "id":       "setup-link",
+      "label":    "Get a staff setup link",
+      "helpText": "Shows the one-time link that makes the FIRST staff account (works once, for 3 days). It is a password: send it only to that person. Once a staff account exists, add staff on the portal's staff page instead.",
+      "service":  "vibe-files-portal",
+      "command":  ["node_modules/.bin/tsx", "src/scripts/staff-setup.ts", "link"],
+      "output":   "secret",
+      "timeoutSeconds": 60
+    },
+    {
+      "id":       "reset-staff",
+      "label":    "Reset a staff member's sign-in",
+      "helpText": "For a staff member who is locked out: their password and authenticator app stop working, and this shows a one-time link (works once, for 3 days) where they set new ones. If no other admin can sign in, they also become an admin. The link is a password: give it only to that person.",
+      "service":  "vibe-files-portal",
+      "command":  ["node_modules/.bin/tsx", "src/scripts/staff-setup.ts", "reset", "{email}"],
+      "params":   [ { "name": "email", "label": "Staff member's email", "placeholder": "name@yourfirm.com", "validate": "email" } ],
+      "output":   "secret",
+      "confirm":  "Reset this staff member's sign-in? Their current password and authenticator stop working until they use the new link.",
+      "timeoutSeconds": 60
+    }
+  ],
 
   "health": "/health",
   "health_timeout_s": 120
