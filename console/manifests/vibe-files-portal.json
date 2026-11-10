@@ -14,6 +14,18 @@
   "ports":     { "server": 3101 },
   "rootServedOnly": true,
 
+  "requires": ["identity"],
+  "sso": {
+    "capable": true,
+    "redirectPaths": ["/api/staff/sso/auth/oidc/callback"],
+    "logoutPaths": ["/api/staff/sso/auth/oidc/backchannel"],
+    "edgeGate": false,
+    "internalUrl": "http://vibe-files-portal:3101",
+    "breakglassService": "vibe-files-portal",
+    "breakglassCommand": ["node_modules/.bin/tsx", "node_modules/@kisaesdevlab/vibe-auth/dist/cli.js", "breakglass", "ensure", "--json"],
+    "recreate": ["vibe-files-portal"]
+  },
+
   "routing": {
     "default_upstream": "vibe-files-portal:3101",
     "clientIpHeader":   "CF-Connecting-IP",
@@ -30,6 +42,8 @@
       { "name": "NODE_ENV",               "from": "static:production" },
       { "name": "DATABASE_URL",           "from": "database-url" },
       { "name": "PORTAL_URL",             "from": "subdomain-url" },
+      { "name": "ALLOWED_ORIGIN",         "from": "subdomain-url",
+        "doc": "Read by nothing inside the app. lib/identity.sh builds the base URL it registers with Vibe Auth from this key (the same value as PORTAL_URL)." },
       { "name": "DATA_DIR",               "from": "static:/data/portal" },
       { "name": "TRUST_CF_CONNECTING_IP", "from": "static:true",
         "doc": "Count sign-in limits by CF-Connecting-IP. Safe only because Caddy sets that header itself on this app's vhost (routing.clientIpHeader) and the app has no emergency port." },
