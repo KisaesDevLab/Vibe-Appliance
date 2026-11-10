@@ -2629,3 +2629,27 @@ Append to this list as phases complete. Format:
   the callback reaches authentik, `/admin` is not gated, a client-supplied
   `X-Authentik-Uid` does not bypass. Still owed on the box: one complete
   browser sign-in to the portal.
+- 2026-11-10: Vibe Portal (KisaesDevLab/Vibe-Portal) as an installable app,
+  slug `vibe-files-portal` (`vibe-portal` is already the broker key of the
+  landing-page gate). Manifest, overlay and env template. It is one container
+  (`ghcr.io/kisaesdevlab/vibe-portal`, :3101) on the shared Postgres with no
+  Redis, root-served at `files.<domain>`. Its data dir holds `.firm-key.seal`;
+  Duplicati backs up `/opt/vibe/data`. Email is per-app SMTP: the app accepts
+  only smtp in production, and its overlay loads no shared/appliance env.
+  New manifest fields, used by the root-served vhost only:
+  `routing.clientIpHeader` (Caddy sets CF-Connecting-IP itself and keeps it
+  from the tunnel connector on vibe_net) and `routing.logRedact` (file names
+  and notes out of the access log, Vibe-Portal P47). No emergency port, on
+  purpose: the cookies are Secure, and HAProxy would let a LAN client forge
+  the header. Verified: Caddy 2.11 `validate` on renders with the tunnel on and
+  off; a live Caddy check (forged header overwritten from outside the docker
+  range, kept from inside it, `?name=` and `X-Vibe-Name` absent from the log);
+  the test suite in a Linux container. Deviations: TODO(preflight) — the
+  first Enable stops on the app's own "SMTP_HOST: required" until SMTP is
+  saved, because Settings can only write a per-app env file once it exists.
+  Owed: the GHCR image is not published or public yet (anonymous pull is
+  denied), so Enable stays disabled; then a fresh-droplet enable, the
+  idempotency re-run, and a phone sign-in over the tunnel. Not done on a
+  host. Vibe-Portal's docs/firm-setup.md describes vibe-installer commands
+  (`vibe install portal`, `vibe portal setup-link`); on this appliance the
+  equivalents are in the manifest's firstLogin note.

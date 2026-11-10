@@ -236,6 +236,21 @@
           "items": { "type": "string", "pattern": "^/.*$", "maxLength": 200 },
           "description": "Paths Caddy answers with 404 instead of proxying, emitted ahead of every other handler for this app. For endpoints an app serves that are fine on vibe_net and on the UFW-gated emergency port but should not be world-readable once the app is fronted by Caddy — vibe-ai-router's unauthenticated /metrics (per-task-class request counts, provider names, breaker state) is the motivating case. NOT an authorization mechanism: it only closes the public edge, so anything reachable from inside vibe_net stays reachable there."
         },
+        "clientIpHeader": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9-]*$",
+          "maxLength": 64,
+          "description": "Request header the app reads the visitor's address from (e.g. CF-Connecting-IP), for per-address limits. Emitted only on the app's ROOT-SERVED vhost: Caddy overwrites the header with the connecting address, except behind the Cloudflare Tunnel for requests from the connector on vibe_net, where Cloudflare set it and a client cannot. Declare no emergencyPort with it: HAProxy proxies straight to the app and would pass a client's own header through. Vibe-Portal is the motivating case."
+        },
+        "logRedact": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "query":   { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+$" } },
+            "headers": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9-]*$" } }
+          },
+          "description": "Query parameters and request headers dropped from the access log of the app's ROOT-SERVED vhost, for values that carry client data (Vibe-Portal sends file names and notes in X-Vibe-Name / X-Vibe-Note, older clients as ?name= / ?note=)."
+        },
         "matchers": {
           "type": "array",
           "items": {

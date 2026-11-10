@@ -475,6 +475,32 @@ unchanged. vibe-auth is the case: the broker serves `/vibe-auth/setup`
 and `/vibe-auth/admin` from `VIBE_AUTH_BASE_PATH`. Ignored in
 subdomain-per-app mode (root-served, no prefix).
 
+### `routing.clientIpHeader` and `routing.logRedact`
+
+```jsonc
+"routing": {
+  "default_upstream": "vibe-files-portal:3101",
+  "clientIpHeader":   "CF-Connecting-IP",
+  "logRedact": { "query": ["name", "note"], "headers": ["X-Vibe-Name", "X-Vibe-Note"] }
+}
+```
+
+Both apply to the app's **root-served** vhost only (`render_vhost`).
+
+`clientIpHeader` names the header the app reads the visitor's address from
+(for per-address sign-in limits). Caddy overwrites it with the connecting
+address, so a client cannot choose it. With the Cloudflare Tunnel on,
+requests from vibe_net (the `vibe-cloudflared` connector) keep the header
+Cloudflare set. The renderer reads vibe_net's subnet from docker and falls
+back to Docker's default pool `172.16.0.0/12`, with a warning. An app that
+declares it must have **no** `emergencyPort`, because HAProxy proxies
+straight to the app and would pass a client's own header through. A test
+enforces this, and such an app is reachable in domain mode only.
+
+`logRedact` drops the listed query parameters and request headers from
+that vhost's access log (Caddy `format filter`), for values that carry
+client data such as file names.
+
 ### `routing.mounts`
 
 ```jsonc

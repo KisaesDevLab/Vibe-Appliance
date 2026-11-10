@@ -1,0 +1,44 @@
+# apps/vibe-files-portal.yml — Vibe Portal overlay (KisaesDevLab/Vibe-Portal).
+#
+# Idempotency: `docker compose up -d` converges; enable-app re-renders the env
+# file without overwriting values already set.
+# Reverse: lib/disable-app.sh vibe-files-portal (stops and removes the
+# container; the data directory and the database are kept).
+#
+# ONE container: the API on :3101 serves the client portal, the staff page and
+# /health, and applies its own migrations at boot. It uses the shared
+# Postgres (vibe_files_portal_db) and no Redis. Upstream's standalone compose
+# (vibe-installer apps/portal) runs its own Postgres; that is deliberately not
+# composed here. No host ports: Caddy reaches it on vibe_net.
+#
+# DATA: /opt/vibe/data/apps/vibe-files-portal/data holds the encrypted files
+# AND .firm-key.seal, the key that unlocks them (Vibe-Portal QUESTIONS P28).
+# Back it up together with the database; without the seal file no stored file
+# can be read again. The image runs as `node` (uid 1000); enable-app chowns
+# the directory to the image's user.
+
+name: vibe
+
+services:
+  vibe-files-portal:
+    image: ghcr.io/kisaesdevlab/vibe-portal:${APP_TAG:-latest}
+    container_name: vibe-files-portal
+    restart: unless-stopped
+    init: true
+    env_file:
+      # Only the app's own file: see env-templates/per-app/vibe-files-portal.env.tmpl.
+      - /opt/vibe/env/vibe-files-portal.env
+    volumes:
+      - /opt/vibe/data/apps/vibe-files-portal/data:/data/portal
+    networks:
+      - vibe_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # The same /health manifest.health uses; the image has node, no curl.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3101/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 30s

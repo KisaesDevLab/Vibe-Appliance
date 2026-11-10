@@ -183,6 +183,11 @@ test('no per-app template blanks out a key the appliance Email & SMS settings sa
   const dir = path.join(__dirname, '..', '..', 'env-templates', 'per-app');
   const shared = /^(EMAIL_PROVIDER|EMAIL_FROM|RESEND_API_KEY|POSTMARK_SERVER_TOKEN|EMAILIT_API_KEY|SMTP_HOST|SMTP_PORT|SMTP_USER|SMTP_PASSWORD|TEXTLINK_API_KEY|TWILIO_[A-Z_]+)=\s*$/;
   for (const f of fs.readdirSync(dir).filter((n) => n.endsWith('.tmpl'))) {
+    // An overlay that does not load appliance.env (vibe-files-portal keeps
+    // per-app email settings, in names the shared ones share) has nothing
+    // for a blank to override.
+    const overlay = path.join(__dirname, '..', '..', 'apps', f.replace(/\.env\.tmpl$/, '.yml'));
+    if (fs.existsSync(overlay) && !fs.readFileSync(overlay, 'utf8').includes('/opt/vibe/env/appliance.env')) continue;
     const hits = fs.readFileSync(path.join(dir, f), 'utf8').split('\n').filter((l) => shared.test(l));
     assert.deepEqual(hits, [], `${f}: blank shared key(s) would override appliance.env: ${hits.join(', ')}`);
   }
