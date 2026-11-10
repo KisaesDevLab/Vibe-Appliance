@@ -674,6 +674,39 @@ except Exception:
       log_error "         renderer, or remove the marker from the template."
       ((errors++)) || true
     fi
+    # 8b. Settings the app cannot start without (ui.requiredBeforeEnable).
+    # Checked against what the app WOULD start with: this dry-run render
+    # (template + values already saved in Settings), then appliance.env for
+    # a field that lives there. Refusing here, before any image pull or
+    # container start, replaces a container that throws "X: required" and
+    # restarts forever (Vibe Portal without SMTP_HOST / EMAIL_FROM). A
+    # field hidden by its showIf / hideIf does not count.
+    # Fail CLOSED: errexit is off inside this function (it runs under
+    # `if ! _preflight_enable`), so a crashed check must count as a failure
+    # rather than read as "nothing missing".
+    local missing_required=""
+    if ! missing_required="$(_required_before_enable_missing "$manifest" "$check_path" "${VIBE_ENV_DIR}/appliance.env")"; then
+      log_error "preflight FAIL: could not check the settings $slug needs before it can start (its manifest's env / ui block could not be read)"
+      log_error "         This is a packaging bug, not something you can fix on the host."
+      log_error "         Diagnose: python3 -m json.tool ${manifest} >/dev/null"
+      ((errors++)) || true
+    elif [[ -n "$missing_required" ]]; then
+      local _rbe_name _rbe_cat
+      _rbe_name="$(_manifest_field "$manifest" 'data.get("displayName") or data.get("slug")')"
+      log_error "preflight FAIL: $_rbe_name cannot start until these settings are filled in:"
+      local _rbe_label _rbe_key
+      while IFS=$'\t' read -r _rbe_cat _rbe_label _rbe_key; do
+        [[ -n "$_rbe_label" ]] && log_error "         - ${_rbe_label} (Settings → Apps → ${_rbe_name} → ${_rbe_cat})"
+      done <<<"$missing_required"
+      log_error "         Common cause: this is the first Enable and they have not been saved yet."
+      log_error "         Fix: open Settings → Apps → ${_rbe_name}, fill them in, Save, then Enable again."
+      if [[ -f "${VIBE_ENV_DIR}/${slug}.env" ]]; then
+        log_error "         Diagnose: sudo grep -E '^($(cut -f3 <<<"$missing_required" | paste -sd'|' -))=' ${VIBE_ENV_DIR}/${slug}.env"
+      else
+        log_error "         (No settings have been saved for it yet: ${VIBE_ENV_DIR}/${slug}.env does not exist.)"
+      fi
+      ((errors++)) || true
+    fi
   else
     log_error "preflight FAIL: env template render produced no output"
     ((errors++)) || true
@@ -681,6 +714,74 @@ except Exception:
   rm -f "$check_path"
 
   return "$errors"
+}
+
+# _required_before_enable_missing <manifest> <rendered-env> <appliance-env>
+# Prints one line per env entry the manifest marks ui.requiredBeforeEnable
+# whose value is empty in what the app would start with:
+#   <category> TAB <label> TAB <KEY>
+# The value comes from the rendered per-app env, then (for a field that
+# lives in appliance.env: ui.appliance "shared" / "both") appliance.env.
+# A field whose showIf does not match, or whose hideIf does, is skipped:
+# the page hides it, so it cannot be required. Prints nothing when every
+# required field is set.
+_required_before_enable_missing() {
+  python3 - "$1" "$2" "$3" <<'PYEOF'
+import json, sys
+manifest_path, rendered_path, appliance_path = sys.argv[1:4]
+def parse(path):
+    rows = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#") or "=" not in s:
+                    continue
+                k, v = s.split("=", 1)
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+                    v = v[1:-1]
+                rows[k] = v
+    except OSError:
+        pass
+    return rows
+m = json.load(open(manifest_path))
+rendered, appliance = parse(rendered_path), parse(appliance_path)
+env = m.get("env") or {}
+entries = [e for e in (env.get("required") or []) + (env.get("optional") or [])
+           if isinstance(e, dict) and e.get("name")]
+by_name = {e["name"]: e for e in entries}
+# What the app starts with: compose loads appliance.env first and the
+# per-app file last, so a per-app line wins even when blank. A shared /
+# both field falls back to appliance.env only when the per-app file has no
+# line for it.
+def value(e):
+    k, ui = e["name"], e.get("ui") or {}
+    if k in rendered or ui.get("appliance") not in ("shared", "both"):
+        return (rendered.get(k) or "").strip()
+    return (appliance.get(k) or "").strip()
+# A dependency resolves like the Settings page: this app's value, then
+# appliance.env (a per-app field may depend on an appliance-wide toggle).
+def dep(k):
+    e = by_name.get(k)
+    v = value(e) if e else (rendered.get(k) or "").strip()
+    return v or (appliance.get(k) or "").strip()
+# JSON true/false compare as "true"/"false", as on the page.
+def norm(w):
+    return ("true" if w else "false") if isinstance(w, bool) else str(w)
+def match(got, want):
+    return got in [norm(w) for w in want] if isinstance(want, list) else got == norm(want)
+for e in entries:
+    ui = e.get("ui") or {}
+    if not ui.get("requiredBeforeEnable"):
+        continue
+    if any(not match(dep(k), w) for k, w in (ui.get("showIf") or {}).items()):
+        continue
+    if any(match(dep(k), w) for k, w in (ui.get("hideIf") or {}).items()):
+        continue
+    if not value(e):
+        print("\t".join([ui.get("category") or "Application", ui.get("label") or e["name"], e["name"]]))
+PYEOF
 }
 
 # Service names this app declares — same shape as update.sh's

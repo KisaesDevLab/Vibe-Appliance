@@ -99,5 +99,7 @@ test('settings_save_apply runs the pre-flight before restarting anything and rol
   const pre = fn.indexOf('_settings_landing_gate_preflight');
   assert.ok(pre > 0);
   assert.ok(pre < fn.indexOf('_settings_dependent_apps'), 'pre-flight comes before any restart');
-  assert.match(fn.slice(pre, pre + 400), /settings_restore_env "\$snap_dir"/);
+  // _settings_rollback_env: settings_restore_env plus removing a per-app
+  // env file this save created (tests/console/settings-preenable.test.js).
+  assert.match(fn.slice(pre, pre + 400), /_settings_rollback_env "\$snap_dir"/);
 });

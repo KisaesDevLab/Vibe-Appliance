@@ -2653,3 +2653,74 @@ Append to this list as phases complete. Format:
   host. Vibe-Portal's docs/firm-setup.md describes vibe-installer commands
   (`vibe install portal`, `vibe portal setup-link`); on this appliance the
   equivalents are in the manifest's firstLogin note.
+- 2026-11-10 (later): Vibe Portal first-time setup without a command line,
+  requested by the Vibe-Portal session (Vibe-Portal P52, branch
+  `first-admin-email`). Closes the TODO(preflight) above.
+  - **Settings before the first Enable** (`lib/settings-save.sh`). Saving a
+    per-app field of a never-enabled app starts its env file (mode 600)
+    with just those keys; the first Enable's render keeps them. Allowed
+    only for a slug with an appliance manifest. A rollback inside the save
+    removes the file it created (`_settings_rollback_env`).
+  - **Routing fix** found on the way. Saving a never-enabled or disabled
+    app's subdomain no longer enables it: the reconcile now re-enables
+    enabled apps only. Until now the "per-app env missing" refusal was all
+    that prevented this.
+  - **`ui.requiredBeforeEnable`** (new, optional schema field). Enable's
+    pre-flight (step 8b) refuses before any pull or start while such a
+    value is empty in the dry-run render. It names each field and where to
+    fill it in. Vibe Portal's SMTP host and From address carry it.
+  - **`adminActions`** (new, optional schema field). Fixed in-container
+    commands behind console buttons on Settings → Apps → *app*: `docker
+    exec`, argv from the manifest, whole-element `{param}` substitution, no
+    shell. Values are validated and can't start with `-`. The run holds the
+    app's lock. Secret output (a sign-in link) goes to the HTTP response
+    only (`no-store`); the log records slug, action and exit code only.
+  - **Vibe Portal manifest.** `FIRST_ADMIN_EMAIL` (Application category,
+    since the category enum has no "First admin"). Three actions: Send a
+    test email, Get a staff setup link, Reset a staff member's sign-in.
+    Reset never passes `--admin`; granting admin stays copy-paste (rule 4).
+    The firstLogin note now leads with Settings; the `docker exec` commands
+    remain as the fallback.
+  - **Verified.** The full suite (418) in a node:24-bookworm container;
+    new tests: required-before-enable, settings-preenable, admin-actions.
+  - **QA fixes** (independent review):
+    - The required-settings check fails closed when it can't read the
+      manifest.
+    - A blank per-app line counts as empty, and JSON booleans in showIf
+      compare as "true" / "false".
+    - The action route accepts JSON only, which blocks cross-site form
+      posts.
+    - A timeout says the command may still have completed.
+    - A secret output with exactly one URL shows that URL alone.
+    - The missing-command check is generic (any script file in the
+      action's command).
+    - "Check again" refreshes the running state.
+  - **Smoke test, second run.** Against the published 0.2.0 image with a
+    TLS mail catcher: Send a test email returns "sent" and the message
+    arrives; a form-encoded POST gets 415; the setup link still appears in
+    neither the console log nor its data directory.
+  - **Smoke test.** The console built from this branch, with Postgres and
+    Vibe-Portal's local `vibe-portal:p52-test` (c47f5e0) as
+    `vibe-files-portal`, driven over HTTP:
+    - The setup link returns 200, `no-store`.
+    - Test email with a bad SMTP host returns 422 with the portal's
+      "The SMTP host name was not found".
+    - Reset of an unknown email returns 422 "No staff account with that
+      email".
+    - `--admin` as a value returns 400.
+    - A stopped container returns 409 and the button greys out.
+    - The `:latest` image gives the missing-command hint.
+    - The link appeared in neither the console log nor its data
+      directory.
+    - Not run: a successful test email, since no TLS mail catcher was set
+      up.
+  - **Vibe Portal 0.2.0** is published (`:latest` = `:0.2.0` =
+    `sha-c47f5e0`, digest `sha256:f155bf5db6c2…`, anonymous pull) and has
+    `FIRST_ADMIN_EMAIL` and `test-email.ts`. Against an older image
+    (783b3fd) the test-email command exits 1 with `ERR_MODULE_NOT_FOUND`
+    (checked); the button shows "this version of the app does not have
+    this command yet" instead of the stack trace.
+  - **Not verified.** No fresh-droplet run.
+  - **Owed.** Sync the schema (`requiredBeforeEnable`, `adminActions`, and
+    the earlier `clientIpHeader` and `logRedact`) to
+    vibe-sentinel-installer.

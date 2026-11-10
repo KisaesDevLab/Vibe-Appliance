@@ -458,6 +458,54 @@
       }
     },
 
+    "adminActions": {
+      "type": "array",
+      "maxItems": 8,
+      "description": "Fixed commands the console may run INSIDE one of this app's running containers (docker exec, no shell), each behind a button on Settings → Apps → <app>. Rule 4's click-to-execute: the operator picks from this list and fills in the declared parameters; nothing else reaches the command line. A command element that is exactly \"{name}\" is replaced by that parameter's value as ONE argv element; no other substitution happens. Values are validated (params[].validate), may not contain line breaks, and may not start with '-'. Output 'secret' (a sign-in link, a reset link) is returned to the browser only, with Cache-Control: no-store, and never logged. See docs/MANIFEST_SCHEMA.md.",
+      "items": {
+        "type": "object",
+        "required": ["id", "label", "service", "command"],
+        "additionalProperties": false,
+        "properties": {
+          "id":       { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,39}$" },
+          "label":    { "type": "string", "minLength": 1, "maxLength": 60 },
+          "helpText": { "type": "string", "maxLength": 400 },
+          "service":  { "type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,62}$", "description": "Container name the command runs in (the overlay's container_name). The button is disabled while it is not running." },
+          "command":  {
+            "type": "array", "minItems": 1, "maxItems": 16,
+            "items": { "type": "string", "minLength": 1, "maxLength": 200 }
+          },
+          "params": {
+            "type": "array", "maxItems": 3,
+            "items": {
+              "type": "object",
+              "required": ["name", "label"],
+              "additionalProperties": false,
+              "properties": {
+                "name":        { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,30}$" },
+                "label":       { "type": "string", "minLength": 1, "maxLength": 80 },
+                "placeholder": { "type": "string", "maxLength": 80 },
+                "validate": {
+                  "type": "string",
+                  "description": "Same validator names as ui.validate. A value is always required.",
+                  "anyOf": [
+                    { "enum": ["non-empty", "url", "email"] },
+                    { "pattern": "^regex:.+$" }
+                  ]
+                }
+              }
+            }
+          },
+          "output": {
+            "enum": ["text", "secret"],
+            "description": "text (default): stdout and stderr are shown and the exit code is logged. secret: stdout is a credential; shown once with a Copy button, never logged or stored."
+          },
+          "confirm": { "type": "string", "maxLength": 300, "description": "Question the page asks before running." },
+          "timeoutSeconds": { "type": "integer", "minimum": 5, "maximum": 300 }
+        }
+      }
+    },
+
     "health": {
       "description": "How readiness is decided. A PATH (the appliance convention) is probed over HTTP and must return 200 only when the unit is fully ready - DB migrated, dependencies up. A SCRIPT is run instead, exit 0 meaning healthy; Sentinel modules use this because several of them have no HTTP surface to probe at all, and because a probe of Uptime Kuma has to assert the pinned build is the one running, not merely that something answered.",
       "oneOf": [
@@ -725,6 +773,10 @@
         "postSaveJob": {
           "type": "string",
           "description": "Background job triggered after save. e.g. 'corpus-sync' for Tax-Research-Chat ENABLED_STATES."
+        },
+        "requiredBeforeEnable": {
+          "type": "boolean",
+          "description": "The app does not start without this value. Enable's pre-flight refuses, before any image pull or container start, while it is empty in what the app would start with (the rendered per-app env, then appliance.env for a shared field), and names the field. Skipped while the field's showIf / hideIf hides it. Saving the field before the app's first Enable is supported."
         },
         "healthCheckTimeout": {
           "type": "integer",

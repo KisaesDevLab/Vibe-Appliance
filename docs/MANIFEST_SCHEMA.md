@@ -54,6 +54,7 @@ document is the human-readable companion.
   "requiredExtensions": ["vector"],         // optional; PG extensions the app's migrations need
 
   "firstLogin": { ... },                    // optional, default credentials surfaced in admin
+  "adminActions": [ ... ],                  // optional, fixed in-container commands behind console buttons
   "health":     "/api/v1/health",           // required, path that returns 200 only when fully up
   "migrations": { ... }                     // optional; how the appliance runs migrations
 }
@@ -740,6 +741,96 @@ the env var is **Tier 3** — appliance-internal, not surfaced. See
 The Settings page reads/writes through `lib/settings-save.sh` with atomic
 write + restart + rollback (Phase 8.5 Workstream C). Test buttons are
 gated behind admin basic auth and rate-limited 10 req/min/endpoint.
+
+### Settings before the first Enable, and `requiredBeforeEnable`
+
+A per-app field can be saved before the app has ever been enabled. The
+save starts `/opt/vibe/env/<slug>.env` (mode 600) holding just the saved
+keys, and the first Enable renders the rest from the template and keeps
+them (`_merge_env_render`: a Tier-1 per-app key keeps a saved non-empty
+value). This works only for a slug with an appliance manifest. If a later
+step of the same save rolls back, the file is removed again. Saving a
+never-enabled or disabled app's subdomain does not enable it: the routing
+reconcile re-enables enabled apps only, and the next Enable uses the new
+name.
+
+`"requiredBeforeEnable": true` marks a value the app cannot start without.
+Enable's pre-flight (`lib/enable-app.sh`, step 8b) checks it against what
+the app would start with: the dry-run render (template plus saved
+values), then `appliance.env` for a `shared` / `both` field. While it is
+empty, Enable refuses before any image pull or container start and names
+the field and where to fill it in. A field its `showIf` / `hideIf` hides
+is not required. Use it for settings whose absence makes the app exit at
+boot (Vibe Portal's `SMTP_HOST` and `EMAIL_FROM`), not for settings an app
+only needs later. `validate: "non-empty"` is separate: it governs what a
+save accepts, not whether Enable may start.
+
+---
+
+## `adminActions`
+
+Fixed commands the console may run inside one of the app's running
+containers, each behind a button in an **Actions** section of Settings →
+Apps → *app*. This is rule 4's click-to-execute: the operator picks from
+this list and fills in the declared parameters, and nothing else reaches
+the command line. Use it for routine operations an app ships as a CLI
+inside its image. It is not for secret rotation, env edits or anything
+that grants extra rights; those stay copy-paste.
+
+```jsonc
+"adminActions": [
+  {
+    "id":       "reset-staff",                       // ^[a-z][a-z0-9-]{1,39}$, unique per app
+    "label":    "Reset a staff member's sign-in",    // button text and heading
+    "helpText": "…",                                 // what it does, in the operator's words
+    "service":  "vibe-files-portal",                 // container_name from apps/<slug>.yml
+    "command":  ["node_modules/.bin/tsx", "src/scripts/staff-setup.ts", "reset", "{email}"],
+    "params":   [ { "name": "email", "label": "Staff member's email", "placeholder": "name@yourfirm.com", "validate": "email" } ],
+    "output":   "secret",                            // "text" (default) or "secret"
+    "confirm":  "Reset this staff member's sign-in? …",  // optional question before running
+    "timeoutSeconds": 60                             // 5..300, default 60
+  }
+]
+```
+
+- **How it runs.** The console runs `docker exec <service> <command…>`
+  with no shell and no TTY. The button is disabled while the container
+  isn't running. The run holds the app's lock, so it can't overlap an
+  Enable, Update or Disable of the same app, and it is refused during
+  appliance-wide operations. The route accepts JSON requests only, so a
+  cross-site form cannot trigger an action. On timeout the console stops
+  waiting, but `docker exec` does not stop the command inside the
+  container. The operator is therefore told it may still have completed,
+  and to run it again for a fresh result.
+- **Parameters.** A command element that is exactly `"{name}"` is replaced
+  by that parameter's value, as one argv element. A placeholder inside a
+  longer string is a declaration error and is never expanded. Every
+  parameter is required and is checked by its `validate` rule: `email`,
+  `url`, `non-empty` or `regex:…`. It is limited to 254 characters and
+  may not contain a line break or start with `-`, so the program cannot
+  read it as an option. A request carrying an undeclared parameter is
+  refused.
+- **Output.** With `text`, stdout is shown on success and stderr on failure
+  (the app's own plain-words reason). When the image lacks the command
+  (an app older than the action), the operator sees "this version of the
+  app does not have this command yet" instead of a stack trace. That
+  covers exit 126/127 (no such program) and Node's
+  a "not found" error naming a script file from the action's own
+  `command`, such as Node's `ERR_MODULE_NOT_FOUND` (exit 1). A secret
+  output that holds exactly one URL is shown as that URL alone, with any
+  other stdout text shown as a note.
+  With `secret` (a sign-in or
+  reset link), stdout goes to the HTTP response only, with
+  `Cache-Control: no-store`. The page shows it once, with a Copy button.
+  It is never logged or stored in `state.json`, the audit table or a job
+  file. For every action, the console log records the slug, action id
+  and exit code only, never parameters or output.
+- **Tests.** `tests/console/admin-actions.test.js` checks every shipped
+  declaration: each placeholder is declared and used, and each `service`
+  is a `container_name` in the app's own overlay.
+
+This field is part of the schema contract `vibe-sentinel-installer`
+vendors. It is optional, and a unit that doesn't declare it is unaffected.
 
 ---
 
