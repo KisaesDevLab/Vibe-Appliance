@@ -2724,3 +2724,21 @@ Append to this list as phases complete. Format:
   - **Owed.** Sync the schema (`requiredBeforeEnable`, `adminActions`, and
     the earlier `clientIpHeader` and `logRedact`) to
     vibe-sentinel-installer.
+- 2026-11-10 (latest): Vibe Portal staff sign-in through Vibe Auth
+  (Vibe-Portal P44, image 0.3.0, engine @kisaesdevlab/vibe-auth 1.0.21).
+  - `requires: ["identity"]` and an `sso` block in
+    `console/manifests/vibe-files-portal.json`: callback and back-channel
+    under `/api/staff/sso`, break-glass via the package CLI in the one
+    container, `breakglassIdentifier` vibe-breakglass@vibe-auth.local,
+    `minBroker` 1.0.20 (older brokers end Test connection / step-up on
+    authentik's "Not Found", so oidc_only could never be chosen).
+  - `ALLOWED_ORIGIN` (same value as `PORTAL_URL`) added to the template and
+    env.required: lib/identity.sh registers from it. An already-installed
+    portal gets it on its next Enable / update.
+  - The portal answers the appliance's fixed paths at its root:
+    `/auth/status` (registration probe), `/auth/oidc/logged-out`, and
+    `/login/local` (302 to `/staff/login?local=1`). No schema change.
+  - **Verified.** Manifest/console tests; 0.3.0 image contains the CLI and
+    vibe-auth 1.0.21. Peer session tested registration, sign-in, logout and
+    break-glass against the real Vibe Auth stack. **Not verified** on an
+    appliance.

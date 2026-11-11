@@ -14,6 +14,20 @@
   "ports":     { "server": 3101 },
   "rootServedOnly": true,
 
+  "requires": ["identity"],
+  "sso": {
+    "capable": true,
+    "redirectPaths": ["/api/staff/sso/auth/oidc/callback"],
+    "logoutPaths": ["/api/staff/sso/auth/oidc/backchannel"],
+    "edgeGate": false,
+    "internalUrl": "http://vibe-files-portal:3101",
+    "breakglassService": "vibe-files-portal",
+    "breakglassIdentifier": "vibe-breakglass@vibe-auth.local",
+    "breakglassCommand": ["node_modules/.bin/tsx", "node_modules/@kisaesdevlab/vibe-auth/dist/cli.js", "breakglass", "ensure", "--json"],
+    "recreate": ["vibe-files-portal"],
+    "minBroker": "1.0.20"
+  },
+
   "routing": {
     "default_upstream": "vibe-files-portal:3101",
     "clientIpHeader":   "CF-Connecting-IP",
@@ -30,6 +44,8 @@
       { "name": "NODE_ENV",               "from": "static:production" },
       { "name": "DATABASE_URL",           "from": "database-url" },
       { "name": "PORTAL_URL",             "from": "subdomain-url" },
+      { "name": "ALLOWED_ORIGIN",         "from": "subdomain-url",
+        "doc": "Read by nothing inside the app. lib/identity.sh builds the base URL it registers with Vibe Auth from this key (the same value as PORTAL_URL)." },
       { "name": "DATA_DIR",               "from": "static:/data/portal" },
       { "name": "TRUST_CF_CONNECTING_IP", "from": "static:true",
         "doc": "Count sign-in limits by CF-Connecting-IP. Safe only because Caddy sets that header itself on this app's vhost (routing.clientIpHeader) and the app has no emergency port." },
@@ -123,7 +139,7 @@
   "firstLogin": {
     "type": "setup-wizard",
     "url":  "/staff",
-    "note": "Before the first Enable: open Settings → Apps → Vibe Portal, fill in Email & SMS (SMTP host, port, username, password, From address) and First admin's email, and Save. Enable refuses until the SMTP host and From address are set. Then Enable; the portal emails the first admin a one-time link (works once, for 3 days): open it, set a 12+ character password and add the portal to an authenticator app. No email? On the same Settings page: Send a test email shows what the mail server said, and Get a staff setup link shows the link to copy instead. Locked out later: Reset a staff member's sign-in on that page. More staff, the portal key Vibe Files needs (Settings → Portal keys), the firm name, logo and limits are on the portal's staff page. Fallback, copy-paste on the appliance: sudo docker exec vibe-files-portal node_modules/.bin/tsx src/scripts/staff-setup.ts link (or: reset <email> --admin, when no admin can sign in). Domain mode only: the portal lives at files.<domain> and has no LAN port. Behind the Cloudflare Tunnel, click Re-provision after the first Enable; with Let's Encrypt, point files.<domain> at the appliance first."
+    "note": "Before the first Enable: open Settings → Apps → Vibe Portal, fill in Email & SMS (SMTP host, port, username, password, From address) and First admin's email, and Save. Enable refuses until the SMTP host and From address are set. Then Enable; the portal emails the first admin a one-time link (works once, for 3 days): open it, set a 12+ character password and add the portal to an authenticator app. No email? On the same Settings page: Send a test email shows what the mail server said, and Get a staff setup link shows the link to copy instead. Locked out later: Reset a staff member's sign-in on that page. More staff, the portal key Vibe Files needs (Settings → Portal keys), the firm name, logo and limits are on the portal's staff page. Fallback, copy-paste on the appliance: sudo docker exec vibe-files-portal node_modules/.bin/tsx src/scripts/staff-setup.ts link (or: reset <email> --admin, when no admin can sign in). Signed in through Vibe Auth and Vibe Auth is down: the break-glass account (vibe-breakglass@vibe-auth.local, password in /opt/vibe/CREDENTIALS.txt) signs in at files.<domain>/staff/login?local=1, or switch back to local sign-in with: sudo vibe identity mode vibe-files-portal local. Domain mode only: the portal lives at files.<domain> and has no LAN port. Behind the Cloudflare Tunnel, click Re-provision after the first Enable; with Let's Encrypt, point files.<domain> at the appliance first."
   },
 
   "adminActions": [
