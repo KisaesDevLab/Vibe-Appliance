@@ -24,7 +24,8 @@
     "breakglassService": "vibe-files-portal",
     "breakglassIdentifier": "vibe-breakglass@vibe-auth.local",
     "breakglassCommand": ["node_modules/.bin/tsx", "node_modules/@kisaesdevlab/vibe-auth/dist/cli.js", "breakglass", "ensure", "--json"],
-    "recreate": ["vibe-files-portal"]
+    "recreate": ["vibe-files-portal"],
+    "minBroker": "1.0.20"
   },
 
   "routing": {
