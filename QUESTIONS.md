@@ -174,6 +174,7 @@ Together with Q14, Q15 and Q18 this makes Vibe Standby independent of Vibe Backu
 | Q34 | Drill | v1, built last. |
 | Q35 | New tunnel token at promote | No, keep the same token. |
 | Q36 | Old primary boots and finds it was replaced | Holds at boot until an admin confirms. |
+| Q39 | Keep the old primary's data aside before it rejoins as standby? | Yes: local read-only archive, 14 days. |
 
 Earlier questions now settled by these: Q1 (direct transport is restic `rest-server` over LAN or Tailscale, pending the Phase 0 spike), Q2, Q3, Q6 (admin creates the standby's read-only key), Q7 (no retention; latest only), Q22 (Vibe Backup is simply set up again on the new primary).
 

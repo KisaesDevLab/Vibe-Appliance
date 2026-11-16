@@ -185,7 +185,8 @@ Guided failover on the standby console. Resumable.
 Two paths, chosen in the console of the current primary.
 
 **A. Swap roles**
-- Old primary (now `demoted`, or reinstalled) uses "Rejoin as standby": re-pairs with the current primary, confirms that its data will be overwritten, runs a first sync.
+- Old primary (now `replaced`, or reinstalled) uses "Rejoin as standby": re-pairs with the current primary, confirms that its data will be overwritten, runs a first sync.
+- **Pre-rejoin archive:** before anything is overwritten, the box's current databases (dumped) and files (hard-link snapshot) are set aside under `/opt/vibe/standby/local/archive/<date>/`, read-only, for 14 days (setting). The wizard shows its size, refuses to continue if it does not fit, and offers "skip the archive" behind a typed confirmation. The panel lists the archive with its expiry, a "delete now" button, and plain steps for looking up a record in it. It is never restored automatically and never replicated.
 
 **B. Guided failback (planned switchover)**
 - Preconditions: the other box is paired as standby, healthy, versions in step.
@@ -195,7 +196,8 @@ Two paths, chosen in the console of the current primary.
 - If any step fails before the lease moves, restart apps on the current primary and report.
 
 **Acceptance (two VMs):**
-- Path A: demoted box rejoins and reaches `healthy`.
+- Path A: replaced box rejoins and reaches `healthy`.
+- A record entered on the old primary after its last capture is readable in the archive after rejoin; the archive is removed at expiry and survives every later sync until then.
 - Path B: a record written just before switchover is present on the other box afterwards; downtime is measured and recorded in STATE.md.
 - Inject a failure in the sync step of path B; service resumes on the current primary.
 

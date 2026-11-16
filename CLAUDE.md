@@ -26,7 +26,7 @@ Read this file, then PHASES.md, STATE.md and QUESTIONS.md before doing any work.
 | Domain mode without tunnel | Promote repoints public DNS automatically using the firm's saved DNS credential; falls back to showing manual steps if none is saved or the call fails. |
 | LAN / Tailscale modes | Promote shows the standby's address; users switch manually. |
 | Redis | Starts empty on Promote. Staff sign in again; jobs queued on the old primary are lost and the Done screen says so. Nothing is sent twice. |
-| Failback | Admin chooses: swap roles, or guided planned switchover back. |
+| Failback | Admin chooses: swap roles, or guided planned switchover back. Whole-box replacement, never a merge. Before a box rejoins as standby, its old data is archived locally, read-only, for 14 days so that work entered only on that box can be looked up and re-keyed. |
 | Monitoring | Status panel on both consoles (the primary's shows less in bucket mode), email on failed or stale sync, scheduled test promote in isolation (v1, built last). |
 | Pairing | One-time code, no secrets in it. Direct mode: generated on the primary, entered on the standby. Bucket mode: generated on the standby (it carries the standby's public key), entered on the primary, which then leaves the sealed pairing bundle in the bucket. |
 | Stack | TypeScript on Node 24, Fastify, zod, SQLite. Follow the appliance console's conventions. |
