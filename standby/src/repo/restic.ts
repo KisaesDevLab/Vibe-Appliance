@@ -29,6 +29,7 @@ export interface ResticOptions {
 
 const TAG_SNAPSHOT = "vs-snapshot=";
 const TAG_NODE = "vs-node=";
+const TAG_STAGE = "vs-stage=";
 
 interface ResticSnapshot { id: string; time: string; tags?: string[] }
 
@@ -84,7 +85,7 @@ export class ResticRepository implements Repository {
 
   async backup(req: BackupRequest): Promise<BackupResult> {
     this.#requireWrite("backup");
-    const args = ["backup", "--json", "--host", "vibe-standby", "--tag", `${TAG_SNAPSHOT}${req.snapshotId}`, "--tag", `${TAG_NODE}${req.sourceNodeId}`];
+    const args = ["backup", "--json", "--host", "vibe-standby", "--tag", `${TAG_SNAPSHOT}${req.snapshotId}`, "--tag", `${TAG_NODE}${req.sourceNodeId}`, "--tag", `${TAG_STAGE}${req.stagePath}`];
     for (const x of req.excludes ?? []) args.push("--exclude", x);
     if (this.#o.limitUploadKib) args.push("--limit-upload", String(this.#o.limitUploadKib));
     args.push(...req.paths);
@@ -109,20 +110,21 @@ export class ResticRepository implements Repository {
     return { ...info, files: summary.total_files_processed ?? 0, bytes: summary.total_bytes_processed ?? 0, unreadable };
   }
 
-  async #snapshots(): Promise<Array<ResticSnapshot & { vsId: string; node: string }>> {
+  async #snapshots(): Promise<Array<ResticSnapshot & { vsId: string; node: string; stage: string }>> {
     const { stdout } = await this.#restic(["snapshots", "--json", ...this.#readFlags()]);
     const all = JSON.parse(stdout || "[]") as ResticSnapshot[];
     const out = [];
     for (const s of all) {
       const vsId = s.tags?.find((t) => t.startsWith(TAG_SNAPSHOT))?.slice(TAG_SNAPSHOT.length);
       const node = s.tags?.find((t) => t.startsWith(TAG_NODE))?.slice(TAG_NODE.length);
-      if (vsId && node) out.push({ ...s, vsId, node });
+      const stage = s.tags?.find((t) => t.startsWith(TAG_STAGE))?.slice(TAG_STAGE.length);
+      if (vsId && node && stage) out.push({ ...s, vsId, node, stage });
     }
     return out.sort((a, b) => b.time.localeCompare(a.time));
   }
 
   async listSnapshots(): Promise<SnapshotInfo[]> {
-    return (await this.#snapshots()).map((s) => ({ id: s.vsId, createdAt: new Date(s.time).toISOString(), sourceNodeId: s.node }));
+    return (await this.#snapshots()).map((s) => ({ id: s.vsId, createdAt: new Date(s.time).toISOString(), sourceNodeId: s.node, stagePath: s.stage }));
   }
 
   async #resticId(snapshotId: string): Promise<string> {

@@ -86,7 +86,7 @@ export class PairingService {
 
   /** Primary, called by the peer server when a standby presents a code's token. */
   async acceptDirect(body: unknown, fingerprint: string, remoteAddress: string): Promise<{ nodeId: string; repoPassword: string; lease: Lease }> {
-    const b = (body ?? {}) as { token?: string; nodeId?: string; addresses?: string[] };
+    const b = (body ?? {}) as { token?: string; nodeId?: string; addresses?: string[]; port?: number };
     const pending = this.#d.store.get<PendingDirect>("pendingDirect");
     const given = Buffer.from(String(b.token ?? "")), want = Buffer.from(pending?.token ?? "");
     const tokenOk = !!pending && given.length === want.length && timingSafeEqual(given, want);
@@ -100,7 +100,9 @@ export class PairingService {
     this.#d.store.unset("pendingDirect");
     const at = this.#now().toISOString();
     const addresses = [...new Set([remoteAddress, ...(b.addresses ?? [])].filter((a) => /^[A-Za-z0-9.:-]{1,253}$/.test(a)))];
-    setPairing(this.#d.store, { mode: "direct", peerNodeId: b.nodeId, repoPassword: pending!.repoPassword, pairedAt: at, peerFingerprint: fingerprint, peerAddresses: addresses, peerPort: this.#d.peerPort });
+    setPairing(this.#d.store, { mode: "direct", peerNodeId: b.nodeId, repoPassword: pending!.repoPassword, pairedAt: at, peerFingerprint: fingerprint, peerAddresses: addresses,
+      // The standby's own peer port, as it told us; normally the same as ours.
+      peerPort: Number.isInteger(b.port) && b.port! > 0 && b.port! < 65536 ? b.port! : this.#d.peerPort });
     const lease = firstLease(this.#d.store.nodeId, at);
     rememberLease(this.#d.store, lease);
     this.#d.store.setRole("primary", "admin", "paired in direct mode");
@@ -121,7 +123,7 @@ export class PairingService {
     const target = { addresses: code.addresses, port: code.port, fingerprint: code.fingerprint };
     const client = new PeerClient(() => target, this.#d.identity);
     const res = await client.request<{ nodeId: string; repoPassword: string; lease: Lease }>("POST", "/peer/pair", {
-      token: code.token, nodeId: this.#d.store.nodeId, addresses: await this.#d.ownAddresses(),
+      token: code.token, nodeId: this.#d.store.nodeId, addresses: await this.#d.ownAddresses(), port: this.#d.peerPort,
     });
     // Find which address actually answered, so it is tried first from now on.
     const working: string[] = [];

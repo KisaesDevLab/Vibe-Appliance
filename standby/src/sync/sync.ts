@@ -140,7 +140,7 @@ export async function runSync(d: SyncDeps): Promise<SyncOutcome> {
     }
 
     await enter("manifest");
-    const manifest: SnapshotManifest = await readManifest(d.repo, latest.id, d.paths.stage);
+    const manifest: SnapshotManifest = await readManifest(d.repo, latest);
 
     // Images first: slow, harmless, and a registry problem must not block the data.
     const versionIssues: string[] = [];
@@ -154,7 +154,7 @@ export async function runSync(d: SyncDeps): Promise<SyncOutcome> {
     await d.repo.restore(latest.id, d.paths.mirror);
 
     await enter("verify-files");
-    const stage = join(d.paths.mirror, d.paths.stage);
+    const stage = join(d.paths.mirror, latest.stagePath);
     const fileProblems = [...(await verifySeal(stage)), ...(await verifyFiles(d, latest.id))];
     d.store.recordVerification(runId, { kind: "files", subject: "mirror", expected: "matches snapshot", actual: fileProblems.length ? fileProblems[0]! : "matches snapshot", ok: fileProblems.length === 0 });
     if (fileProblems.length) throw new Error(`restored files do not match the snapshot: ${fileProblems.join("; ")}`);

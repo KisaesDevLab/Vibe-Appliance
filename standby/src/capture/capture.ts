@@ -103,7 +103,7 @@ export async function runCapture(d: CaptureDeps): Promise<CaptureResult> {
     await d.repo.init();
     const paths = [d.paths.stage, ...CAPTURED.map((p) => join(d.paths.appliance, p)).filter((p) => existsSync(p))];
     const excludes = NOT_REPLICATED.map((p) => join(d.paths.appliance, p));
-    const saved: BackupResult = await d.repo.backup({ snapshotId, sourceNodeId: d.store.nodeId, paths, excludes });
+    const saved: BackupResult = await d.repo.backup({ snapshotId, sourceNodeId: d.store.nodeId, stagePath: d.paths.stage, paths, excludes });
 
     if (d.pruneAfter) {
       const keep = (await d.repo.listSnapshots()).slice(0, 2).map((s) => s.id);

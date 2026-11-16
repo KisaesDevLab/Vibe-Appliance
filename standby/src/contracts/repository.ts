@@ -33,11 +33,15 @@ export interface SnapshotInfo {
   id: string;
   createdAt: string;
   sourceNodeId: string;
+  /** Absolute path of the stage directory inside this snapshot (where its manifest and dumps are). */
+  stagePath: string;
 }
 
 export interface BackupRequest {
   snapshotId: string;
   sourceNodeId: string;
+  /** The stage directory; must be one of `paths`. Recorded so the reader need not guess it. */
+  stagePath: string;
   /** Absolute paths to store. They keep their absolute paths inside the snapshot. */
   paths: string[];
   /** Absolute paths (or glob patterns) to leave out. */
@@ -93,11 +97,11 @@ export interface Repository {
   check(): Promise<void>;
 }
 
-/** Fixed location of the stage directory, and so of the manifest inside every snapshot. */
 export function manifestPath(stageDir: string): string { return `${stageDir}/manifest.json`; }
 
-export async function readManifest(repo: Repository, snapshotId: string, stageDir: string): Promise<SnapshotManifest> {
-  const raw = await repo.readFile(snapshotId, manifestPath(stageDir));
+export async function readManifest(repo: Repository, snap: SnapshotInfo): Promise<SnapshotManifest> {
+  const snapshotId = snap.id;
+  const raw = await repo.readFile(snapshotId, manifestPath(snap.stagePath));
   const m = JSON.parse(raw.toString("utf8")) as SnapshotManifest;
   if (m.schemaVersion !== 1) throw new Error(`snapshot ${snapshotId} has manifest schema ${String(m.schemaVersion)}; this version understands 1. Update this box to the primary's version.`);
   if (m.snapshotId !== snapshotId) throw new Error(`snapshot ${snapshotId} carries a manifest for ${m.snapshotId}; refusing to use it`);

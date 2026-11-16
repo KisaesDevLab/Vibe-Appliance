@@ -73,7 +73,7 @@ export class FakeRepository implements Repository {
     const files = new Map<string, Buffer>();
     for (const p of req.paths) await collect(p, req.excludes ?? [], files);
     const createdAt = new Date(Date.UTC(2026, 0, 1) + this.backend.clock++ * 1000).toISOString();
-    const info: SnapshotInfo = { id: req.snapshotId, createdAt, sourceNodeId: req.sourceNodeId };
+    const info: SnapshotInfo = { id: req.snapshotId, createdAt, sourceNodeId: req.sourceNodeId, stagePath: req.stagePath };
     this.backend.snapshots.unshift({ info, files });
     let bytes = 0;
     for (const b of files.values()) bytes += b.length;

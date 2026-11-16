@@ -6,7 +6,7 @@ import type { Store } from "../overlay/store.ts";
 import { highest, isLease, leaseObjectName, type Lease } from "./lease.ts";
 import type { S3Client } from "./s3.ts";
 
-export interface PrimarySighting { at: string; nodeId: string; via: "peer" | "bucket" }
+export interface PrimarySighting { at: string; nodeId: string; via: "peer" | "bucket"; /** Final snapshot of a planned switchover the primary has announced, if any. */ switchover?: string | null }
 
 export interface StatusReport { nodeId: string; at: string; health: string; verifiedSnapshotId: string | null; dataAt: string | null; lastError: string | null }
 
@@ -18,8 +18,8 @@ export interface Link {
   writeLease(l: Lease): Promise<string[]>;
   /** Standby: the latest sign of life from the primary, or null if none can be found. */
   primarySighting(): Promise<PrimarySighting | null>;
-  /** Primary: leave a sign of life. */
-  heartbeat(nodeId: string, at: string): Promise<void>;
+  /** Primary: leave a sign of life, and announce (or withdraw) a planned switchover. */
+  heartbeat(nodeId: string, at: string, switchover?: string | null): Promise<void>;
   /** Primary: tell the standby a snapshot is ready (direct mode only). */
   notifySnapshot(snapshotId: string): Promise<void>;
   /** Standby: tell the primary how the last sync went (direct mode only). */
@@ -58,8 +58,8 @@ export class DirectLink implements Link {
   }
   async primarySighting(): Promise<PrimarySighting | null> {
     try {
-      const h = await this.#peer.request<{ nodeId: string; role: string }>("GET", "/peer/hello");
-      return h.role === "primary" ? { at: new Date().toISOString(), nodeId: h.nodeId, via: "peer" } : null;
+      const h = await this.#peer.request<{ nodeId: string; role: string; switchover?: string | null }>("GET", "/peer/hello");
+      return h.role === "primary" ? { at: new Date().toISOString(), nodeId: h.nodeId, via: "peer", switchover: h.switchover ?? null } : null;
     } catch { return null; }
   }
   async heartbeat() { /* the peer channel answering is the sign of life */ }
@@ -92,11 +92,11 @@ export class BucketLink implements Link {
     try {
       const raw = await this.#s3.get("control/heartbeat.json");
       if (!raw) return null;
-      const h = JSON.parse(raw) as { nodeId: string; at: string };
-      return { at: h.at, nodeId: h.nodeId, via: "bucket" };
+      const h = JSON.parse(raw) as { nodeId: string; at: string; switchover?: string | null };
+      return { at: h.at, nodeId: h.nodeId, via: "bucket", switchover: h.switchover ?? null };
     } catch { return null; }
   }
-  async heartbeat(nodeId: string, at: string) { await this.#s3.put("control/heartbeat.json", JSON.stringify({ nodeId, at })); }
+  async heartbeat(nodeId: string, at: string, switchover: string | null = null) { await this.#s3.put("control/heartbeat.json", JSON.stringify({ nodeId, at, switchover })); }
   async notifySnapshot() { /* one-way: the standby polls */ }
   async report() { /* one-way: the standby cannot write */ }
 }

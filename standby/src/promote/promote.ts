@@ -107,6 +107,7 @@ export async function runPromote(d: PromoteDeps, opts: { confirm?: string; actor
     runId = now().toISOString();
     d.store.set("operation", "promote");
     d.store.set("promoteRunId", runId);
+    d.store.set("lastPromoteRunId", runId); // kept after the run ends, so the Done screen can show its steps
     d.store.audit("promote-start", opts.actor, true, { dataAt: checks.dataAt, primarySeen: checks.primary?.at ?? null, planned: checks.plannedSwitchover });
   }
   const done = new Map(d.store.wizardSteps(WIZARD, runId).filter((s) => s.status === "done").map((s) => [s.step, s.detail]));

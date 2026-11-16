@@ -81,9 +81,9 @@ test("direct mode end to end: the primary backs up through the channel; the stan
   const pw = "direct-mode-repo-password";
   const fromPrimary = new ResticRepository({ location: { kind: "rest", url: `http://127.0.0.1:${FWD}/` }, password: pw, access: "read-write", bin, cacheDir: join(root, "cp") });
   await fromPrimary.init();
-  await fromPrimary.backup({ snapshotId: "s1", sourceNodeId: "a".repeat(32), paths: [src] });
+  await fromPrimary.backup({ snapshotId: "s1", sourceNodeId: "a".repeat(32), stagePath: src, paths: [src] });
   writeFileSync(join(src, "ledger.txt"), "night two");
-  await fromPrimary.backup({ snapshotId: "s2", sourceNodeId: "a".repeat(32), paths: [src] });
+  await fromPrimary.backup({ snapshotId: "s2", sourceNodeId: "a".repeat(32), stagePath: src, paths: [src] });
 
   // The standby reads the repository straight from its own disk, without a lock.
   const onStandby = new ResticRepository({ location: { kind: "local", path: join(root, "hosted") }, password: pw, access: "read-only", bin, cacheDir: join(root, "cs") });

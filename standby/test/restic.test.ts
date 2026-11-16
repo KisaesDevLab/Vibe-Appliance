@@ -31,12 +31,12 @@ test("restic: init is idempotent; backup honours excludes; snapshots list newest
   const { src, rw } = setup();
   await rw.init();
   await rw.init();
-  const r = await rw.backup({ snapshotId: "s1", sourceNodeId: "node-a", paths: [src], excludes: [join(src, "data/redis")] });
+  const r = await rw.backup({ snapshotId: "s1", sourceNodeId: "node-a", stagePath: src, paths: [src], excludes: [join(src, "data/redis")] });
   assert.equal(r.id, "s1");
   assert.equal(r.sourceNodeId, "node-a");
   assert.equal(r.files, 2);
   writeFileSync(join(src, "data/apps/tb/a.txt"), "alpha2");
-  await rw.backup({ snapshotId: "s2", sourceNodeId: "node-a", paths: [src], excludes: [join(src, "data/redis")] });
+  await rw.backup({ snapshotId: "s2", sourceNodeId: "node-a", stagePath: src, paths: [src], excludes: [join(src, "data/redis")] });
   assert.deepEqual((await rw.listSnapshots()).map((s) => s.id), ["s2", "s1"]);
   assert.equal((await rw.readFile("s1", join(src, "data/apps/tb/a.txt"))).toString(), "alpha");
   const seen: string[] = [];
@@ -47,7 +47,7 @@ test("restic: init is idempotent; backup honours excludes; snapshots list newest
 test("restic: incremental restore rewrites only changed files and leaves a hard-linked previous copy intact (invariant 5)", { skip }, async () => {
   const { root, src, rw } = setup();
   await rw.init();
-  await rw.backup({ snapshotId: "s1", sourceNodeId: "n", paths: [src] });
+  await rw.backup({ snapshotId: "s1", sourceNodeId: "n", stagePath: src, paths: [src] });
   const mirror = join(root, "mirror");
   await rw.restore("s1", mirror);
   const prev = join(root, "prev");
@@ -60,7 +60,7 @@ test("restic: incremental restore rewrites only changed files and leaves a hard-
   writeFileSync(join(src, "data/apps/tb/a.txt"), "alpha-changed");
   rmSync(join(src, "data/apps/tb/b.txt"));
   writeFileSync(join(src, "data/apps/tb/c.txt"), "charlie");
-  await rw.backup({ snapshotId: "s2", sourceNodeId: "n", paths: [src] });
+  await rw.backup({ snapshotId: "s2", sourceNodeId: "n", stagePath: src, paths: [src] });
   await rw.restore("s2", mirror);
 
   const m = (p: string) => join(mirror, src, p);
@@ -76,13 +76,13 @@ test("restic: incremental restore rewrites only changed files and leaves a hard-
 test("restic: a read-only instance reads without locking and refuses every write (invariant 3)", { skip }, async () => {
   const { root, src, rw, ro } = setup();
   await rw.init();
-  await rw.backup({ snapshotId: "s1", sourceNodeId: "n", paths: [src] });
+  await rw.backup({ snapshotId: "s1", sourceNodeId: "n", stagePath: src, paths: [src] });
   await ro.init();
   assert.deepEqual((await ro.listSnapshots()).map((s) => s.id), ["s1"]);
   await ro.restore("s1", join(root, "out"));
   await ro.check();
   assert.ok(!existsSync(join(root, "repo/locks")) || (await import("node:fs")).readdirSync(join(root, "repo/locks")).length === 0, "no lock file may be left behind");
-  await assert.rejects(ro.backup({ snapshotId: "s2", sourceNodeId: "n", paths: [src] }), RepositoryReadOnlyError);
+  await assert.rejects(ro.backup({ snapshotId: "s2", sourceNodeId: "n", stagePath: src, paths: [src] }), RepositoryReadOnlyError);
   await assert.rejects(ro.prune([]), RepositoryReadOnlyError);
 });
 
@@ -91,7 +91,7 @@ test("restic: prune keeps only the listed snapshots and the repository stays sou
   await rw.init();
   for (const id of ["s1", "s2", "s3"]) {
     writeFileSync(join(src, "data/apps/tb/a.txt"), `v-${id}`);
-    await rw.backup({ snapshotId: id, sourceNodeId: "n", paths: [src] });
+    await rw.backup({ snapshotId: id, sourceNodeId: "n", stagePath: src, paths: [src] });
   }
   await rw.prune(["s3", "s2"]);
   assert.deepEqual((await rw.listSnapshots()).map((s) => s.id), ["s3", "s2"]);
@@ -102,7 +102,7 @@ test("restic: prune keeps only the listed snapshots and the repository stays sou
 test("restic: a wrong password fails without echoing the password", { skip }, async () => {
   const { root, src, rw } = setup();
   await rw.init();
-  await rw.backup({ snapshotId: "s1", sourceNodeId: "n", paths: [src] });
+  await rw.backup({ snapshotId: "s1", sourceNodeId: "n", stagePath: src, paths: [src] });
   const bad = new ResticRepository({ location: { kind: "local", path: join(root, "repo") }, password: "wrong-password-xyz", access: "read-only", bin: bin! });
   await assert.rejects(bad.listSnapshots(), (err: Error) => { assert.ok(!err.message.includes("wrong-password-xyz")); return true; });
 });

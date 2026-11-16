@@ -16,7 +16,7 @@ function stage(files: Record<string, string>): string {
   }
   return dir;
 }
-const req = (id: string, dir: string, excludes: string[] = []) => ({ snapshotId: id, sourceNodeId: "n1", paths: [dir], excludes });
+const req = (id: string, dir: string, excludes: string[] = []) => ({ snapshotId: id, sourceNodeId: "n1", stagePath: dir, paths: [dir], excludes });
 
 test("fake repository: backup with excludes, list newest first, read, restore, prune", async () => {
   const repo = new FakeRepository();

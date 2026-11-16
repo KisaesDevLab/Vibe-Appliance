@@ -13,7 +13,7 @@ test("health answers 200 and reports role unpaired on a fresh box", async () => 
   const { app } = make();
   const res = await app.inject({ method: "GET", url: "/api/health" });
   assert.equal(res.statusCode, 200);
-  assert.deepEqual(res.json(), { status: "ok", version: "0.1.0", role: "unpaired" });
+  assert.deepEqual(res.json(), { status: "ok", version: "0.2.0", role: "unpaired" });
 });
 
 test("health answers 503 when the local store is unusable", async () => {
