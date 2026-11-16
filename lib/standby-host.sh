@@ -21,6 +21,8 @@
 #   the admin's Promote; the previous contents of each replaced directory
 #   are kept beside it as <name>.pre-promote until the action succeeds.
 #   `archive` is reversed by deleting the archive directory.
+#   A finished `place` leaves place.done, so a repeat request for the
+#   same copy is answered "already done" rather than failing.
 #
 # Secrets: nothing here echoes an env value. Passwords are passed to psql
 # through a file inside the postgres container, never argv.
@@ -41,6 +43,7 @@ MIRROR_ROOT="${SB_DIR}/mirror"
 # every snapshot and therefore inside the mirror.
 SRC="${MIRROR_ROOT}/host/vibe"
 READY="${SB_DIR}/place.ready"
+DONE="${SB_DIR}/place.done"
 PG_CONTAINER="${VIBE_PG_CONTAINER:-vibe-postgres}"
 
 # Never placed (standby/src/paths.ts NOT_REPLICATED — keep the two in step).
@@ -97,6 +100,9 @@ PYEOF
 }
 
 action_mode_on() {
+  # A box entering standby mode starts a new life as a standby: a record
+  # of an earlier promote on it no longer describes anything.
+  rm -f "$DONE"
   _set_mode true
   _stop_non_core
   log_ok "standby mode is on: this box will not run apps, Redis or the tunnel"
@@ -116,8 +122,14 @@ _place_children() { # <src> <dst>
   shopt -s dotglob nullglob
   for child in "$src"/*; do
     name="$(basename "$child")"
-    rm -rf "${dst:?}/${name}.pre-promote"
-    [[ -e "$dst/$name" || -L "$dst/$name" ]] && mv "$dst/$name" "$dst/${name}.pre-promote"
+    if [[ -e "$dst/${name}.pre-promote" || -L "$dst/${name}.pre-promote" ]]; then
+      # A re-run: the aside copy is this box's ORIGINAL data from the
+      # first attempt and must survive until the action succeeds. What
+      # sits at the live name now is only an earlier attempt's link.
+      rm -rf "${dst:?}/${name}"
+    elif [[ -e "$dst/$name" || -L "$dst/$name" ]]; then
+      mv "$dst/$name" "$dst/${name}.pre-promote"
+    fi
     cp -al "$child" "$dst/$name"
   done
   shopt -u dotglob nullglob
@@ -127,7 +139,26 @@ _drop_pre_promote() {
   find "${VIBE_DIR}/data" -maxdepth 4 -name '*.pre-promote' -prune -exec rm -rf {} + 2>/dev/null || true
 }
 
+# Snapshot ID recorded in a marker file ("" if absent or unreadable).
+_marker_snapshot() { # <file>
+  python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('snapshotId',''))" "$1" 2>/dev/null || true
+}
+
 action_place() {
+  # ---- already done? ----------------------------------------------------
+  # Placement removes the mirror when it succeeds. If the Standby service
+  # restarted before it recorded that success, it asks again for the SAME
+  # snapshot; answer "done" instead of failing on the missing mirror.
+  if [[ -f "$DONE" && -f "$READY" ]]; then
+    local done_id want_id
+    done_id="$(_marker_snapshot "$DONE")"; want_id="$(_marker_snapshot "$READY")"
+    if [[ -n "$done_id" && "$done_id" == "$want_id" ]]; then
+      rm -f "$READY"
+      log_ok "this copy was already placed; nothing to do" snapshot="$done_id"
+      return 0
+    fi
+  fi
+
   # ---- pre-flight: do nothing unless everything is in order -------------
   [[ -f "$READY" ]] || die "no verified copy is marked ready to place ($READY is missing)" \
     "run Promote from the Standby panel; it marks the verified copy before asking for this step"
@@ -179,7 +210,10 @@ action_place() {
   log_step "aligning the database password with the restored settings"
   local pwfile="/tmp/.vibe-standby-pw.$$"
   printf '%s' "$new_pg_pass" | docker exec -i "$PG_CONTAINER" sh -c "umask 077; cat > $pwfile"
-  docker exec "$PG_CONTAINER" sh -c "psql -U '$pg_user' -d postgres -v ON_ERROR_STOP=1 -q -v pw=\"\$(cat $pwfile)\" <<'SQL'
+  # psql reads the password from the file itself (\set with backticks),
+  # so it appears in no process's argument list, here or in the container.
+  docker exec "$PG_CONTAINER" sh -c "psql -U '$pg_user' -d postgres -v ON_ERROR_STOP=1 -q <<'SQL'
+\\set pw \`cat $pwfile\`
 ALTER ROLE CURRENT_USER PASSWORD :'pw';
 SQL
 rc=\$?; rm -f $pwfile; exit \$rc" || die "could not set the database password" \
@@ -225,6 +259,9 @@ PYEOF
   ( cd "$APPLIANCE_DIR" && docker compose up -d --force-recreate caddy console ) >>"$VIBE_LOG_FILE" 2>&1 || true
 
   _drop_pre_promote
+  # Record success BEFORE the mirror goes, so a repeat request is answered
+  # from this marker rather than by looking for a mirror that is gone.
+  cp -f "$READY" "$DONE"
   rm -f "$READY"
   # The mirror's files are now also the live files (hard links). Removing
   # the mirror removes only its names, not the data.
@@ -237,8 +274,9 @@ action_tunnel_up() {
   token="$(_env_get "${VIBE_DIR}/env/shared.env" TUNNEL_TOKEN)"
   [[ -n "$token" ]] || die "there is no tunnel token in shared.env" \
     "this firm does not use a Cloudflare tunnel, or the snapshot predates it; check Configuration → Network"
-  [[ "$(state_get_path config.standby_mode 2>/dev/null || true)" != "True" && "$(state_get_path config.standby_mode 2>/dev/null || true)" != "true" ]] \
-    || die "this box is in standby mode; the tunnel must not start" "promote this box first"
+  if state_standby_mode; then
+    die "this box is in standby mode; the tunnel must not start" "promote this box first"
+  fi
   ( cd "$APPLIANCE_DIR" && docker compose -f docker-compose.yml -f infra/cloudflared.yml up -d cloudflared ) \
     || die "cloudflared did not start" "sudo docker logs vibe-cloudflared --tail 50"
   log_ok "tunnel started"
@@ -259,6 +297,9 @@ action_follow_version() {
   git -C "$APPLIANCE_DIR" reset --hard --quiet "$ref"
   bash "${APPLIANCE_DIR}/bootstrap.sh" || die "bootstrap failed on the new version" \
     "to go back: cd $APPLIANCE_DIR && sudo git reset --hard $have && sudo bash bootstrap.sh"
+  # bootstrap itself skips apps and stops Redis on a standby; this is the
+  # second lock on the same door, in case an older bootstrap just ran.
+  if state_standby_mode; then _stop_non_core; fi
   log_ok "now on the primary's appliance version"
 }
 
@@ -281,12 +322,22 @@ action_archive() {
       [[ -n "$db" ]] || continue
       docker exec "$PG_CONTAINER" pg_dump -U "$pg_user" -Fc "$db" > "$dest/db/${db}.dump"
     done
-  # Files as hard links: no extra disk until the live copy changes.
+  # App files are archived as HARD LINKS: no copy, no extra disk. A hard
+  # link is the same file under a second name, which has two consequences
+  # this script must respect:
+  #   - Permissions belong to the file, not the name. A `chmod -R a-w` on
+  #     the archive would also take write access away from the live app
+  #     data. So the linked tree is never chmod-ed.
+  #   - The archive keeps its content only because nothing writes to these
+  #     files in place afterwards: the apps are stopped, and Promote
+  #     replaces live entries by rename-aside, never by overwriting.
   [[ -d "${VIBE_DIR}/data/apps" ]] && cp -al "${VIBE_DIR}/data/apps" "$dest/apps"
   cp -a "${VIBE_DIR}/env" "$dest/env"
   cp -a "$VIBE_STATE_FILE" "$dest/state.json"
   date -u +%Y-%m-%dT%H:%M:%SZ > "$dest/ARCHIVED_AT"
-  chmod -R a-w "$dest" 2>/dev/null || true
+  # Read-only where the archive owns the bytes (real copies); the archive
+  # directory itself is root-only, which is what keeps people out of it.
+  chmod -R a-w "$dest/db" "$dest/env" "$dest/state.json" "$dest/ARCHIVED_AT" 2>/dev/null || true
   printf '%s\n' "$dest" > "${SB_DIR}/local/archive/LATEST"
   log_ok "archive written" dest="$dest"
 }

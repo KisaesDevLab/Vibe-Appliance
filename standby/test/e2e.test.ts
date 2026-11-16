@@ -129,4 +129,41 @@ test("e2e direct mode: pair, nightly copy, sync, then promote after the primary 
   assert.match((await call(S, "POST", "/api/pair/direct/start")).body.code, /^VS1D\./);
   // A sync must never run on the promoted box.
   assert.equal((await S.rt.syncNow()).status, "skipped");
+
+  // --- the old primary is repaired and switched back on ---
+  // It was down during the promote, so the new lease never reached it. It must
+  // still find out — by asking the box that replaced it — and hold.
+  assert.equal(P.store.role, "primary", "it still believes it is the primary");
+  const back = new Runtime({ config: P.rt.config, store: P.store, identity: P.rt.identity, appliance: P.box, peerHost: "127.0.0.1" });
+  boxes.push({ ...P, rt: back });
+  await back.start();
+  await back.tick(new Date());
+  assert.equal(P.store.role, "replaced", "the returning primary learned it was replaced and held at boot");
+  assert.equal(P.box.standbyMode, true);
+  assert.deepEqual((await P.box.listServices()).filter((x) => x.running && x.kind !== "core"), [], "its apps and tunnel are stopped");
+  assert.equal(P.box.calls.indexOf("stopTunnel") < P.box.calls.indexOf("stopApps"), true, "tunnel first");
+  assert.equal((await call({ ...P, api: buildServer({ config: P.rt.config, store: P.store, runtime: back, quiet: true }) }, "GET", "/api/status")).body.health, "replaced");
+  // The new primary answers the old one about the lease and nothing else.
+  assert.equal(S.store.get<{ leaseDelivered: boolean }>("formerPeer")!.leaseDelivered, true);
+});
+
+test("the peer channel listens only when direct mode gives it a reason to", { skip }, async () => {
+  const net = await import("node:net");
+  const open = (port: number) => new Promise<boolean>((resolve) => {
+    const s = net.connect(port, "127.0.0.1");
+    s.once("connect", () => { s.destroy(); resolve(true); });
+    s.once("error", () => resolve(false));
+  });
+  const fresh = await mkBox("fresh", []);
+  const port = fresh.rt.config.peerPort;
+  assert.equal(await open(port), false, "an unpaired box accepts no peer connections");
+  await call(fresh, "POST", "/api/pair/direct/start");
+  assert.equal(await open(port), true, "a pending pairing code opens the channel");
+  // A box paired in bucket mode never listens.
+  const bucketBox = await mkBox("bucket", []);
+  bucketBox.store.setRole("primary", "t", "t");
+  const { setPairing } = await import("../src/pairing/state.ts");
+  setPairing(bucketBox.store, { mode: "bucket", peerNodeId: "c".repeat(32), repoPassword: "pw-pw-pw-pw", pairedAt: new Date().toISOString(), bucket: { endpoint: "http://127.0.0.1:1", bucket: "b", prefix: "", keyId: "k", key: "kkkkkkkk" } });
+  await bucketBox.rt.rebuild();
+  assert.equal(await open(bucketBox.rt.config.peerPort), false, "bucket mode opens no port");
 });

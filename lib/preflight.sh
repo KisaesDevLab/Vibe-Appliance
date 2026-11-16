@@ -628,6 +628,9 @@ preflight_run_all() {
   if ! preflight_dns;      then ((errors++)) || true; fi
   if ! preflight_port 80;  then ((errors++)) || true; fi
   if ! preflight_port 443; then ((errors++)) || true; fi
+  # Vibe Standby's peer channel (direct mode), published by the `standby`
+  # core service. A conflict here would fail `compose up` for the whole stack.
+  if ! preflight_port 4480 vibe-standby; then ((errors++)) || true; fi
   # Phase 8.5 Workstream D — emergency-access ports. Loops 7 ports,
   # each with vibe-emergency-proxy as the expected idempotent owner.
   preflight_emergency_ports

@@ -305,6 +305,72 @@ test("rejoin: skipping the archive needs its own typed phrase; a failed archive 
   assert.equal(w.pBox.archived, 0);
 });
 
+test("rejoin: if preparing fails on a box that was live, its apps and tunnel are started again", async () => {
+  const w = pair();
+  w.pBox.failNext.set("archive", new Error("not enough free disk"));
+  await assert.rejects(prepareRejoin({ store: w.ps, appliance: w.pBox }, { confirm: REJOIN_PHRASE, actor: "a" }), /not enough free disk[\s\S]*apps have been started again/);
+  assert.equal((await w.pBox.listServices()).find((s) => s.name === "vibe-tb")!.running, true, "the firm is back on this box");
+  assert.equal(w.pBox.standbyMode, false);
+  assert.ok(w.pBox.calls.includes("startTunnel"));
+  const rec = w.ps.auditRecords().find((a) => a.kind === "rejoin-prepare")!;
+  assert.deepEqual([rec.ok, (rec.detail as { appsRestarted: boolean }).appsRestarted], [false, true]);
+});
+
+test("rejoin: a failure on a box that was already held does NOT start its apps", async () => {
+  const w = pair();
+  w.ps.set("lastBootId", "boot-1");
+  promotedElsewhere(w);
+  await checkRole({ store: w.ps, link: w.pLink, appliance: w.pBox, bootId: "boot-2", now: w.now });
+  assert.equal(w.ps.role, "replaced");
+  w.pBox.failNext.set("archive", new Error("host runner not answering"));
+  await assert.rejects(prepareRejoin({ store: w.ps, appliance: w.pBox }, { confirm: REJOIN_PHRASE, actor: "a" }), /host runner not answering/);
+  assert.deepEqual((await w.pBox.listServices()).filter((s) => s.running && s.kind !== "core"), [], "a replaced box must stay dormant");
+  assert.ok(!w.pBox.calls.includes("startApps"));
+});
+
+test("planned switchover: once the other box is promoted, the old primary becomes 'replaced' and can rejoin", async () => {
+  const w = pair();
+  const sw = { store: w.ps, appliance: w.pBox, capture: async () => "snap-final", announce: async () => {}, now: w.now };
+  await startSwitchover(sw, { confirm: SWITCHOVER_PHRASE, actor: "admin" });
+  const g = { store: w.ps, link: w.pLink, appliance: w.pBox, bootId: "boot-1", now: w.now };
+  w.ps.set("lastBootId", "boot-1"); // same boot: this is a running box, not a fresh start
+  assert.equal(await checkRole(g), "ok", "nothing has moved yet");
+  assert.equal(activeOperation(w.ps), "switchover");
+
+  promotedElsewhere(w); // the admin promoted the standby
+  assert.equal(await checkRole(g), "switchover-completed");
+  assert.equal(w.ps.role, "replaced");
+  assert.equal(w.pBox.standbyMode, true);
+  assert.equal(activeOperation(w.ps), undefined, "the switchover no longer blocks other operations");
+  assert.equal(computeStatus(w.ps, cfg, w.now()).conflict, null, "a completed switchover is not a two-primaries conflict");
+  assert.ok(!w.pBox.calls.slice(w.pBox.calls.lastIndexOf("stopApps") + 1).some((c) => /^stop/.test(c)), "nothing further was stopped");
+
+  // Its data equals the final copy, so the archive may be skipped; either way rejoin now works.
+  assert.deepEqual(await prepareRejoin({ store: w.ps, appliance: w.pBox }, { confirm: REJOIN_PHRASE, actor: "admin" }), { archived: true });
+  assert.equal(w.ps.role, "unpaired");
+});
+
+test("planned switchover: rejoin is not blocked even before this box has seen the new lease", async () => {
+  const w = pair();
+  await startSwitchover({ store: w.ps, appliance: w.pBox, capture: async () => "snap-final", announce: async () => {}, now: w.now }, { confirm: SWITCHOVER_PHRASE, actor: "admin" });
+  w.bucket.down = true; // this box cannot reach the lease store
+  await prepareRejoin({ store: w.ps, appliance: w.pBox }, { confirm: REJOIN_PHRASE, actor: "admin" });
+  assert.equal(w.ps.role, "unpaired");
+  assert.equal(activeOperation(w.ps), undefined);
+  assert.equal(w.ps.get("switchover"), undefined);
+  assert.ok(!w.pBox.calls.includes("startApps"), "apps stay stopped: the firm has moved");
+});
+
+test("promote records how to recognise and reach the box it replaced (direct mode)", async () => {
+  const w = pair("direct");
+  setPairing(w.ss, { ...getPairing(w.ss)!, peerFingerprint: "ab".repeat(32), peerAddresses: ["10.0.0.10"], peerPort: 4480 });
+  const r = await runPromote(w.promoteDeps(), { confirm: "PROMOTE", actor: "admin" });
+  assert.equal(r.ok, true, r.error);
+  const f = w.ss.get<{ fingerprint: string; addresses: string[]; port: number; mode: string; leaseDelivered: boolean }>("formerPeer")!;
+  assert.deepEqual([f.mode, f.fingerprint, f.addresses, f.port], ["direct", "ab".repeat(32), ["10.0.0.10"], 4480]);
+  assert.equal(f.leaseDelivered, false, "the test link reaches the bucket, not the peer");
+});
+
 test("archives: listed with their expiry and removed when it passes, never before", async () => {
   const dir = mkdtempSync(join(tmpdir(), "vs-arch-"));
   mkdirSync(join(dir, "20261101-020000/db"), { recursive: true });

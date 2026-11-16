@@ -14,7 +14,7 @@ import type { ApplianceControl } from "./contracts/appliance.ts";
 import type { Repository } from "./contracts/repository.ts";
 import type { Identity } from "./crypto/identity.ts";
 import { isLease } from "./link/lease.ts";
-import { BucketLink, DirectLink, rememberLease, type Link, type StatusReport } from "./link/link.ts";
+import { BucketLink, DirectLink, knownLease, rememberLease, type Link, type StatusReport } from "./link/link.ts";
 import { S3Client } from "./link/s3.ts";
 import type { Store } from "./overlay/store.ts";
 import { PairingService } from "./pairing/service.ts";
@@ -44,6 +44,9 @@ export interface RuntimeOptions {
 }
 
 const FIVE_MIN = 5 * 60 * 1000;
+
+/** The box this one replaced at a promote (direct mode), kept until it has learned of the new lease. */
+interface FormerPeer { nodeId: string | null; mode: string | null; promotedAt: string; fingerprint: string | null; addresses: string[]; port: number | null; leaseDelivered: boolean }
 
 export class Runtime {
   readonly config: Config;
@@ -142,23 +145,47 @@ export class Runtime {
   async start(): Promise<void> {
     this.#bootId = await readBootId();
     await mkdir(this.config.dataDir, { recursive: true });
-    this.#peerServer = await startPeerServer({
-      identity: this.identity, port: this.config.peerPort, host: this.#o.peerHost,
-      handle: (r) => this.#peerHandle(r),
-      repoUpstream: (fp) => {
-        const p = getPairing(this.store);
-        return this.store.role === "standby" && p?.mode === "direct" && fp === p.peerFingerprint && this.#receiver ? this.#receiver.port : null;
-      },
-    });
     await this.rebuild();
     if (this.store.role === "standby" && !activePromote(this.store)) {
       await recover(await this.#syncDeps()).catch((e: Error) => this.#log("warn", "recovery after restart will be retried", { error: e.message }));
     }
   }
 
-  /** Start or stop the direct-mode helpers to match the current role. */
+  /**
+   * Does the peer channel have a reason to listen? Only in direct mode: a
+   * pairing code waiting to be used, an existing direct pairing, or a former
+   * peer that may still need to learn it was replaced. An unpaired box and a
+   * bucket-mode box accept no connections at all.
+   */
+  #wantPeerServer(): boolean {
+    const p = getPairing(this.store);
+    if (p?.mode === "direct") return true;
+    const pending = this.store.get<{ expiresAt: number }>("pendingDirect");
+    if (pending && pending.expiresAt > Date.now()) return true;
+    return this.#formerPeer() !== undefined;
+  }
+  #formerPeer(): FormerPeer | undefined {
+    const f = this.store.get<FormerPeer>("formerPeer");
+    return f?.mode === "direct" && f.fingerprint ? f : undefined;
+  }
+
+  /** Start or stop the direct-mode helpers to match the current role. Idempotent. */
   async rebuild(): Promise<void> {
     const p = getPairing(this.store);
+    // A new pairing closes the chapter with the previous peer.
+    if (p && this.store.get("formerPeer")) this.store.unset("formerPeer");
+    const wantPeer = this.#wantPeerServer();
+    if (wantPeer && !this.#peerServer) {
+      this.#peerServer = await startPeerServer({
+        identity: this.identity, port: this.config.peerPort, host: this.#o.peerHost,
+        handle: (r) => this.#peerHandle(r),
+        repoUpstream: (fp) => {
+          const cur = getPairing(this.store);
+          return this.store.role === "standby" && cur?.mode === "direct" && fp === cur.peerFingerprint && this.#receiver ? this.#receiver.port : null;
+        },
+      });
+    }
+    if (!wantPeer && this.#peerServer) { this.#peerServer.close(); this.#peerServer = undefined; }
     const wantReceiver = this.store.role === "standby" && p?.mode === "direct";
     const wantForwarder = this.store.role === "primary" && p?.mode === "direct";
     if (wantReceiver && !this.#receiver) this.#receiver = await startReceiver(this.paths.hostedRepo, this.#receiverPort);
@@ -187,8 +214,20 @@ export class Runtime {
       catch (e) { return { status: 403, body: { error: (e as Error).message } }; }
     }
     const p = getPairing(this.store);
-    if (!p || p.mode !== "direct" || r.fingerprint !== p.peerFingerprint) return { status: 403, body: { error: "this box is not paired with you" } };
     const key = `${r.method} ${r.path}`;
+    if (!p || p.mode !== "direct" || r.fingerprint !== p.peerFingerprint) {
+      // The box this one replaced may ask exactly one thing: who holds the
+      // role now. Without an answer it could not know it was replaced.
+      const former = this.#formerPeer();
+      if (former && r.fingerprint === former.fingerprint) {
+        if (key === "GET /peer/hello") return { body: { nodeId: this.store.nodeId, role: this.store.role, switchover: null } };
+        if (key === "GET /peer/leases") {
+          if (!former.leaseDelivered) this.store.set("formerPeer", { ...former, leaseDelivered: true });
+          return { body: this.store.get("leases") ?? [] };
+        }
+      }
+      return { status: 403, body: { error: "this box is not paired with you" } };
+    }
     switch (key) {
       case "GET /peer/hello":
         return { body: { nodeId: this.store.nodeId, role: this.store.role, switchover: this.store.get<{ snapshotId: string }>("switchover")?.snapshotId ?? null } };
@@ -329,11 +368,15 @@ export class Runtime {
     // Idempotent: also retries a receiver or forwarder that failed to start earlier.
     if (slow) await this.rebuild().catch((e: Error) => this.#log("error", "could not start the direct-mode helper", { error: e.message }));
 
+    // A promoted box keeps trying to tell the box it replaced, until that box has heard.
+    if (role === "primary" && !p && slow) await this.#tellFormerPeer();
+
     if (role === "primary" && p) {
       if (slow) {
         const sw = this.store.get<{ snapshotId: string }>("switchover")?.snapshotId ?? null;
         await this.link(p).heartbeat(this.store.nodeId, now.toISOString(), sw).catch(() => {});
         const g = await checkRole(this.#guardDeps()).catch(() => "unreachable" as const);
+        if (g === "switchover-completed") { this.#log("info", "the planned switchover completed on the other box; this box is ready to rejoin as its standby"); await this.rebuild(); }
         if (g === "held-at-boot") { this.#log("warn", "this box was replaced while it was off; holding until an admin decides"); await this.rebuild(); }
       }
       const last = this.store.get<LastCapture>("lastCapture");
@@ -378,6 +421,18 @@ export class Runtime {
         },
       }, this.status(now)).catch(() => "failed");
     }
+  }
+
+  async #tellFormerPeer(): Promise<void> {
+    const former = this.#formerPeer();
+    const lease = knownLease(this.store);
+    if (!former || former.leaseDelivered || !lease || !former.addresses.length) return;
+    const client = new PeerClient(() => ({ addresses: former.addresses, port: former.port ?? this.config.peerPort, fingerprint: former.fingerprint! }), this.identity);
+    try {
+      await client.request("POST", "/peer/leases", lease);
+      this.store.set("formerPeer", { ...former, leaseDelivered: true });
+      this.store.audit("lease-delivered", "schedule", true, { to: former.nodeId, epoch: lease.epoch });
+    } catch { /* still down, or it will ask us itself when it boots */ }
   }
 
   /** Invariant 1: a standby or replaced box runs no app, Redis or tunnel. If one is found, stop it and record it. */

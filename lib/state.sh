@@ -215,6 +215,23 @@ except Exception:
 PYEOF
 }
 
+# state_standby_mode
+#   Exit 0 when this box is a Vibe Standby in standby mode (config.standby_mode
+#   is true): it must not run apps, Redis or the Cloudflare tunnel. Exit 1
+#   otherwise, including when the state file is missing or unreadable — a
+#   box that cannot tell is treated as a normal box, so a damaged state
+#   file never takes a live primary down.
+state_standby_mode() {
+  python3 - "$VIBE_STATE_FILE" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        sys.exit(0 if json.load(f).get("config", {}).get("standby_mode") is True else 1)
+except Exception:
+    sys.exit(1)
+PYEOF
+}
+
 # state_set_config_kv <key> <value>
 #   Sets state.config[key] = value (string). Pass "" to clear.
 state_set_config_kv() {

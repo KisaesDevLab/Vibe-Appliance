@@ -23,8 +23,16 @@ export async function prepareRejoin(d: RejoinDeps, opts: { confirm: string; skip
   if (opts.confirm !== REJOIN_PHRASE) throw new Error(`Type ${REJOIN_PHRASE} to confirm that this box's data will be replaced.`);
   const skip = opts.skipArchive === SKIP_ARCHIVE_PHRASE;
   if (opts.skipArchive && !skip) throw new Error(`To skip the archive, type ${SKIP_ARCHIVE_PHRASE}.`);
-  if (d.store.get<string>("operation")) throw new Error("Another operation is in progress on this box.");
+  // A planned switchover that the other box completed leaves this box
+  // stopped with "switchover" still recorded; rejoining is its natural next
+  // step, so that one operation does not block it.
+  const op = d.store.get<string>("operation");
+  if (op && op !== "switchover") throw new Error("Another operation is in progress on this box.");
+  // Was this box serving the firm when the admin clicked Rejoin? If so and
+  // the preparation fails, it must go back to serving.
+  const wasLive = d.store.role === "primary" && op !== "switchover";
   d.store.set("operation", "rejoin");
+  let roleChanged = false;
   try {
     // Stop first so the archive is of data that is no longer changing.
     await d.appliance.stopTunnel().catch(() => {});
@@ -34,15 +42,27 @@ export async function prepareRejoin(d: RejoinDeps, opts: { confirm: string; skip
     clearPairing(d.store);
     for (const k of ["leases", "verifiedCopy", "versionIssues", "peerReport", "roleConflict", "replacedBy", "switchover", "lastCapture"]) d.store.unset(k);
     d.store.setRole("unpaired", opts.actor, "rejoin as standby");
+    roleChanged = true;
     d.store.set("rejoining", { at: (d.now ?? (() => new Date()))().toISOString(), archived: !skip });
     d.store.audit("rejoin-prepare", opts.actor, true, { archived: !skip });
     await d.onChange?.();
     return { archived: !skip };
   } catch (err) {
-    d.store.audit("rejoin-prepare", opts.actor, false, { error: (err as Error).message });
-    throw err;
+    // Nothing has been replaced yet. If this box was live, put the firm back
+    // on it: the apps and tunnel were stopped only to take a settled archive.
+    let restarted = false;
+    if (wasLive && !roleChanged) {
+      await d.appliance.setStandbyMode(false).catch(() => {});
+      await d.appliance.startApps().then(() => { restarted = true; }, () => {});
+      await d.appliance.startTunnel().catch(() => { /* no tunnel in this deployment mode */ });
+    }
+    d.store.audit("rejoin-prepare", opts.actor, false, { error: (err as Error).message, appsRestarted: restarted });
+    const e = err as Error;
+    if (wasLive && !roleChanged) e.message += restarted ? " This box's apps have been started again; nothing was changed." : " This box's apps could NOT be started again automatically. Start them from the console's Apps page, or run: sudo bash /opt/vibe/appliance/bootstrap.sh";
+    throw e;
   } finally {
-    d.store.unset("operation");
+    // Leave a completed switchover's marker alone if we never got going.
+    if (op === "switchover" && !roleChanged) d.store.set("operation", "switchover"); else { d.store.unset("operation"); d.store.unset("switchover"); }
   }
 }
 

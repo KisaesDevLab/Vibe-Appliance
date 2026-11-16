@@ -17,5 +17,5 @@ Points that touch the rest of the appliance:
 
 - It is independent of Vibe Backup and Duplicati. It is not a backup: it keeps only the latest copy.
 - The `standby` container has no Docker socket. It controls containers, the tunnel and images only through console routes under `/api/v1/standby-control/` and host-runner actions.
-- A box in standby mode must not start its apps, Redis or `cloudflared` at boot. That is enforced on the host, not by the container.
-- Direct mode publishes one host port, 4480 (mutual TLS), restrictable with `STANDBY_PEER_BIND`.
+- A box in standby mode (`config.standby_mode` in `state.json`) must not run apps, Redis or `cloudflared`. This is enforced on the host in three places, all through `state_standby_mode` in `lib/state.sh`: `bootstrap.sh` skips the app re-enable phase and stops Redis again after `compose up`; `lib/enable-app.sh` refuses; `lib/standby-host.sh` stops anything left after following the primary's version. The `standby` service also sweeps every five minutes as a last check.
+- Direct mode publishes one host port, 4480 (mutual TLS). It is an exception to "only Caddy publishes ports", handled like the emergency-access ports: preflighted, firewalled to private networks and the tailnet in both UFW and `DOCKER-USER`, and the service listens on it only while direct mode needs it. `STANDBY_PEER_BIND` narrows it further.

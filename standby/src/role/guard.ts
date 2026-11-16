@@ -18,7 +18,7 @@ export async function readBootId(): Promise<string> {
 
 export interface GuardDeps { store: Store; link: Link; appliance: ApplianceControl; bootId: string; now?: () => Date }
 
-export type GuardResult = "not-applicable" | "ok" | "conflict-warned" | "held-at-boot" | "unreachable";
+export type GuardResult = "not-applicable" | "ok" | "conflict-warned" | "held-at-boot" | "switchover-completed" | "unreachable";
 
 export async function checkRole(d: GuardDeps): Promise<GuardResult> {
   const now = (d.now ?? (() => new Date()))();
@@ -43,6 +43,17 @@ export async function checkRole(d: GuardDeps): Promise<GuardResult> {
     d.store.set("replacedBy", top);
     d.store.setRole("replaced", "boot-check", `the other box was promoted (lease ${top.epoch}, written ${top.writtenAt})`);
     return done("held-at-boot");
+  }
+  // This box stopped its own apps for a planned switchover and the other box
+  // has now been promoted: that is the switchover completing, not a conflict.
+  // Nothing is running here, so nothing is being stopped; the box simply
+  // takes the "replaced" role, from which the admin rejoins it as a standby.
+  if (d.store.get<string>("operation") === "switchover") {
+    await d.appliance.setStandbyMode(true).catch(() => {});
+    d.store.unset("roleConflict"); d.store.unset("operation"); d.store.unset("switchover");
+    d.store.set("replacedBy", top);
+    d.store.setRole("replaced", "lease-check", `planned switchover completed (lease ${top.epoch})`);
+    return done("switchover-completed");
   }
   const conflict: RoleConflict = { epoch: top.epoch, holderNodeId: top.holderNodeId, writtenAt: top.writtenAt, seenAt: now.toISOString() };
   if (d.store.get<RoleConflict>("roleConflict")?.epoch !== top.epoch) {

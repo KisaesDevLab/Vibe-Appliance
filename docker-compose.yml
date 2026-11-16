@@ -269,9 +269,17 @@ services:
       - /opt/vibe/standby:/opt/vibe/standby
     ports:
       # Peer channel for direct mode (mutual TLS, pinned certificates).
-      # Nothing listens on it until pairing starts. Bucket mode never
-      # uses it. Restrict with STANDBY_PEER_BIND (a LAN or Tailscale
-      # address) to keep it off other interfaces.
+      # The one core port besides Caddy's and the emergency proxy's, and
+      # treated the same way as the emergency ports:
+      #   - The service LISTENS only while direct mode needs it (a pairing
+      #     code is waiting, or the box is paired in direct mode). An
+      #     unpaired box and a bucket-mode box accept nothing here.
+      #   - lib/ufw-rules.sh allows it from private networks and the
+      #     tailnet only, in UFW and in DOCKER-USER (Docker-published
+      #     ports bypass plain UFW rules).
+      #   - lib/preflight.sh checks the port is free before `compose up`.
+      # Narrow it further with STANDBY_PEER_BIND (a LAN or Tailscale
+      # address) in docker-compose.override.yml or the environment.
       - "${STANDBY_PEER_BIND:-0.0.0.0}:4480:4480"
     networks:
       - vibe_net

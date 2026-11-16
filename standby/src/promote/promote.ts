@@ -175,7 +175,15 @@ export async function runPromote(d: PromoteDeps, opts: { confirm?: string; actor
       d.store.setRole("primary", opts.actor, "promote");
       // The old primary is no longer this box's peer. Pairing a new standby starts fresh.
       const was = getPairing(d.store);
-      d.store.set("formerPeer", { nodeId: was?.peerNodeId ?? null, mode: was?.mode ?? null, promotedAt: now().toISOString() });
+      // Direct mode: remember how to recognise and reach it. If it was down
+      // during this promote it never received the new lease; when it comes
+      // back it must be able to ask this box "who holds the role?" and be
+      // answered, or its hold-at-boot check has nothing to go on.
+      d.store.set("formerPeer", {
+        nodeId: was?.peerNodeId ?? null, mode: was?.mode ?? null, promotedAt: now().toISOString(),
+        fingerprint: was?.peerFingerprint ?? null, addresses: was?.peerAddresses ?? [], port: was?.peerPort ?? null,
+        leaseDelivered: result.leaseWrittenTo.includes("peer"),
+      });
       clearPairing(d.store);
       for (const k of ["verifiedCopy", "versionIssues", "switchoverAnnounced", "swapPending"]) d.store.unset(k);
       return {};

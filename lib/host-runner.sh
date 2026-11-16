@@ -62,8 +62,8 @@ if ! flock -n 9; then
   exit 0
 fi
 
-# Parse + validate one request file. Prints TAB-separated validated
-# fields (id, action, slug, modules, reason, approver, ref) or exits 1.
+# Parse + validate one request file. Prints the validated fields joined
+# by the ASCII Unit Separator (0x1f) (id, action, slug, modules, reason, approver, ref) or exits 1.
 _ha_parse() { # <file>
   python3 - "$1" <<'PYEOF'
 import json, re, sys
@@ -93,9 +93,13 @@ if action in STANDBY_ACTIONS and slug != "vibe-standby":
     print("invalid slug for a standby action", file=sys.stderr); sys.exit(1)
 if ref and not re.fullmatch(r"[0-9a-f]{7,40}", ref):
     print("invalid ref", file=sys.stderr); sys.exit(1)
-reason   = str(args.get("reason", ""))[:500].replace("\t", " ").replace("\n", " ")
-approver = str(args.get("approver", ""))[:200].replace("\t", " ").replace("\n", " ")
-print("\t".join([rid, action, slug, modules, reason, approver, ref]))
+reason   = str(args.get("reason", ""))[:500].replace("\x1f", " ").replace("\t", " ").replace("\n", " ")
+approver = str(args.get("approver", ""))[:200].replace("\x1f", " ").replace("\t", " ").replace("\n", " ")
+# Unit Separator, not TAB: bash treats TAB as IFS *whitespace* and
+# collapses a run of them, so an empty field in the middle shifted every
+# later field left (an empty modules/reason/approver put `ref` into
+# `modules`). A non-whitespace separator keeps empty fields in place.
+print("\x1f".join([rid, action, slug, modules, reason, approver, ref]))
 PYEOF
 }
 
@@ -147,7 +151,7 @@ _ha_run_one() { # <queue-file>
     return 0
   fi
   local rid action slug modules reason approver ref
-  IFS=$'\t' read -r rid action slug modules reason approver ref <<<"$parsed"
+  IFS=$'\x1f' read -r rid action slug modules reason approver ref <<<"$parsed"
 
   # The request file name must match its inner id, or a crafted file
   # could overwrite another request's result.

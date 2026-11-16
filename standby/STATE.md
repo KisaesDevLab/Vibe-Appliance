@@ -10,7 +10,7 @@ Update this file at the end of every work session.
 
 ### Built and tested automatically
 
-Standby service (`standby/`, 87 tests; real restic, rest-server, Postgres and TLS where noted):
+Standby service (`standby/`, 93 tests; real restic, rest-server, Postgres and TLS where noted):
 
 | Area | What is covered |
 | --- | --- |
@@ -26,7 +26,7 @@ Standby service (`standby/`, 87 tests; real restic, rest-server, Postgres and TL
 | Two boxes, whole flow | `test/e2e.test.ts`: pair → copy → sync → second night → promote refused → primary stops → promote, all through the HTTP API. |
 | Panel | Loaded in Chromium in each role at desktop and phone width: no script errors, no horizontal scroll, buttons work. Not an automated test in the repo. |
 
-Appliance side (431 tests in the appliance suite, 13 new):
+Appliance side (442 tests in the appliance suite, 24 new):
 
 | Piece | What is covered |
 | --- | --- |
@@ -57,9 +57,27 @@ Treat each of these as untested until it passes on real boxes:
 
 ### Known gaps to decide or fix
 
-- Port 4480 is published on all interfaces unless `STANDBY_PEER_BIND` is set. Docker-published ports bypass UFW. It is mutual-TLS only, but on a public VPS it is reachable from the internet.
-- `tests/federation/host-runner.sh` fails in the build container before and after this change (exit 127, a missing tool there), so the new host-runner branch has not been exercised by that script.
+- The firewall rules for port 4480 apply only where UFW is active. On a box without UFW the port is reachable from wherever the box is; it accepts connections only while direct mode needs it and only speaks mutual TLS, but set `STANDBY_PEER_BIND` on a public VPS.
+- The pre-rejoin archive shares its app files with the live tree by hard link (no extra disk). Its content is stable because apps on a standby are stopped and promote replaces entries rather than overwriting them; a box that is unpaired and run again would change those shared files.
+- `tests/federation/host-runner.sh` fails in the build container with and without these changes (exit 127). The new host-runner branch is covered instead by `tests/standby/host-runner-standby.test.js`, which runs the real `lib/host-runner.sh`.
 - A promoted box keeps Vibe Backup unconfigured by design (Q22); the Done screen says so.
+
+### Review fixes (2026-11-16)
+
+A code review of the branch found ten defects; all are fixed, each with a test that reproduces it:
+
+| Finding | Fix |
+| --- | --- |
+| Host-runner dropped the commit id for follow-version (empty fields collapsed) | Fields are joined with a non-whitespace separator. Tested through the real runner. |
+| An old primary that was down during a direct-mode promote could never learn it was replaced | The promoted box remembers the box it replaced, answers its lease question, and keeps trying to deliver the lease. Tested end to end: the returning primary holds at boot. |
+| `bootstrap.sh` started Redis and re-enabled apps on a standby | Host-side standby-mode gate in bootstrap, enable-app and the host script. |
+| A completed planned switchover left the old primary unable to rejoin | The old primary recognises the completed switchover and takes the `replaced` role; rejoin is not blocked. |
+| The archive's `chmod` removed write permission from live app data | The hard-linked tree is no longer chmod-ed. |
+| A finished `place` could not be asked for again after a service restart | `place.done` marker; a repeat request for the same copy answers "already placed". |
+| A failed rejoin left a live box's apps and tunnel stopped | They are started again, and the error says so. |
+| Re-running `place` destroyed the box's original data | The first aside copy is kept until the action succeeds. |
+| The database password appeared on a command line | psql reads it from a file. Verified against a real Postgres with an awkward password. |
+| Port 4480 listened on every box by default | Listens only when direct mode needs it; preflighted; firewalled to private networks and the tailnet. |
 
 - **Next action:** Kurt tests on two boxes. Then: spikes 1 and 2, the drill, DNS update, image pin.
 

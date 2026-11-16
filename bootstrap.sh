@@ -910,6 +910,14 @@ phase_core_up() {
       vibe-console 2>/dev/null || true)"
     if [[ "$health" == "healthy" ]]; then
       log_ok "console healthy"
+      # `compose up` starts every core service, Redis included. A standby
+      # must not run Redis (queued jobs would run against copied data),
+      # so stop it again here; `unless-stopped` then keeps it down.
+      if state_standby_mode; then
+        docker stop -t 10 vibe-redis >>"$VIBE_LOG_FILE" 2>&1 || true
+        docker stop -t 5 vibe-cloudflared >>"$VIBE_LOG_FILE" 2>&1 || true
+        log_info "standby mode: Redis and the tunnel are kept stopped"
+      fi
       _check_core_image_drift
       state_set_phase core ok
       return 0
@@ -1073,6 +1081,16 @@ phase_claude_code() {
 # admin URL still need to come up so the operator can investigate.
 phase_apps() {
   log_set_phase "apps"
+
+  # A box in standby mode (Vibe Standby) holds a copy of the firm's data
+  # and must not run apps against it. Its state.json may still list apps
+  # as enabled (a former primary that rejoined), so skip the re-enable
+  # entirely rather than trusting that list. Promote clears the mode
+  # before it runs bootstrap.
+  if state_standby_mode; then
+    log_info "this box is a standby — apps are not re-enabled (promote from the Standby panel to make it live)"
+    return 0
+  fi
 
   # Re-enable apps the operator marked enabled. Skip ones with
   # status=failed: those failed before, would fail again on the same

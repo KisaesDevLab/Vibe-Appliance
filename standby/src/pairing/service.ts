@@ -78,6 +78,9 @@ export class PairingService {
     const pending: PendingDirect = { token: randomBytes(24).toString("base64url"), expiresAt: this.#now().getTime() + CODE_TTL_MS, repoPassword: randomBytes(32).toString("base64url") };
     this.#d.store.set("pendingDirect", pending);
     this.#d.store.audit("pairing-code", "admin", true, { mode: "direct" });
+    // The peer channel listens only while it has a reason to. A code waiting
+    // to be used is one.
+    await this.#d.onChange?.();
     return {
       code: encodeCode({ kind: "direct", addresses, port: this.#d.peerPort, fingerprint: this.#d.identity.fingerprint, token: pending.token }),
       expiresAt: new Date(pending.expiresAt).toISOString(),
