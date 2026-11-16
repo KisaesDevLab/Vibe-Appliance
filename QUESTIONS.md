@@ -153,3 +153,32 @@ Together with Q14, Q15 and Q18 this makes Vibe Standby independent of Vibe Backu
 1. Vibe Backup's own state (Recovery Kit generation, B2 write key) is not replicated. **Default:** after Promote the Done screen tells the admin to set up Vibe Backup on the new primary; no automatic takeover of the backup schedule.
 2. The standby-hosted repository is now the default and is on the same box as the restored copy. **Default:** the panel states it is not a backup, and pairing warns if Vibe Backup is not active on the primary.
 3. Two nightly capture jobs run on the primary. **Default:** Vibe Standby captures at 02:30 local and skips with a warning if a Vibe Backup run is still in progress.
+
+---
+
+## Deep review Q&A — 2026-11-16 (all answered by Kurt)
+
+| # | Question | Answer |
+| --- | --- | --- |
+| Q23 | Must bucket mode work with no network path between the boxes? | Yes, bucket only. |
+| Q24 | Network paths for direct mode | LAN and Tailscale only. The Cloudflare transfer path is dropped, which closes Q1's Cloudflare question. |
+| Q25 | Which bucket in bucket mode | Its own bucket; the admin creates it and its keys in Backblaze. |
+| Q26 | Keep earlier nights? | Latest only. |
+| Q27 | Typical data size | 50–500 GB. Sync must be incremental. |
+| Q28 | Redis | Not replicated; starts empty on promote. Supersedes Q2. |
+| Q29 | Running primary loses contact with the lease store | Nothing automatic. The admin makes the switch. Supersedes Q3. |
+| Q30 | Standby reports back in bucket mode | No, one-way only. |
+| Q31 | Old primary sees it was replaced while running | Warn only; it does not stop itself. |
+| Q32 | Extras to replicate | Console settings and audit log only. Not the GitHub image token, Vibe Backup state, or Sentinel. |
+| Q33 | Domain mode without tunnel | Promote updates DNS automatically. |
+| Q34 | Drill | v1, built last. |
+| Q35 | New tunnel token at promote | No, keep the same token. |
+| Q36 | Old primary boots and finds it was replaced | Holds at boot until an admin confirms. |
+
+Earlier questions now settled by these: Q1 (direct transport is restic `rest-server` over LAN or Tailscale, pending the Phase 0 spike), Q2, Q3, Q6 (admin creates the standby's read-only key), Q7 (no retention; latest only), Q22 (Vibe Backup is simply set up again on the new primary).
+
+## Still open
+
+- **Q4, Q5, Q8, Q9, Q10, Q11, Q12** keep their defaults. Q8's ratios need re-measuring for the hard-link approach.
+- **Q37 — GitHub image token on the standby.** Not replicated, so the standby cannot pull private images without it. **Default:** pairing checks that the standby can pull every image the primary runs and asks for the token on the standby if it cannot.
+- **Q38 — Spikes that gate the build** (see PHASES.md Phase 0): restic with a read-only B2 key; restore time for ParadeDB search indexes at 50–500 GB; `rest-server` behaviour on a dropped Tailscale link.

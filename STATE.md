@@ -6,7 +6,7 @@ Update this file at the end of every work session.
 
 - **Phase:** 0 — in progress (reconciliation done; scaffold not started)
 - **Last session:** 2026-11-16 — read `Vibe-Backup` @ `cc7c984` and `Vibe-Appliance` @ `cb10091`; filled the contract table below; opened Q13–Q20.
-- **Next action:** scaffold (TypeScript service, contracts and fakes, overlay, config, health, logger, harness). Q13–Q21 answered; Q22 open with defaults.
+- **Next action:** run the three Phase 0 spikes (Q38), then scaffold. Design is revision 3 in CLAUDE.md after the deep-review Q&A (Q23–Q36).
 
 ## Headline findings
 
@@ -90,6 +90,8 @@ Status is `exists`, `differs` or `missing`.
 
 - 2026-11-16 — Independent of Vibe Backup (Q14, Q18, Q21). Reason: today's Vibe Backup snapshot lacks most of the replicated set and has no restore-to-staging or read-only mode.
 - 2026-11-16 — restic as the transfer engine, run by vibe-standby (Q15). Reason: dedup, encryption, resume, native B2/S3/rest backends, already proven in the suite.
+- 2026-11-16 — Deep review (Q23–Q36): bucket mode works with no peer link and is one-way; direct mode is LAN/Tailscale only; own admin-created bucket; latest snapshot only; Redis not replicated; role conflict is admin-controlled with hold-at-boot only; DNS updated automatically at promote; same tunnel token kept. Accepted risks are listed in CLAUDE.md.
+- 2026-11-16 — Design choices made from the source review: logical `pg_dump` over the network (no appliance change, proves restorability nightly); databases captured before files; incremental restore with a hard-link previous copy (data is 50–500 GB); bucket-mode pairing code generated on the standby; the console image is built locally, so version mirroring checks out the primary's appliance commit.
 - 2026-11-16 — TypeScript (Q13); console routes plus host-runner for appliance control (Q16); harness on MinIO or B2 (Q17); append-only leases (Q19); tunnel token sealed until promote (Q20).
 
 ## Measurements

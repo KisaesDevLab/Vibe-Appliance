@@ -13,7 +13,12 @@ Every phase ends with its acceptance criteria passing and STATE.md updated. Do t
 - Config schema (zod): stale threshold, sync fallback time, drill schedule, alert email.
 - Appliance manifest entry and compose service.
 - Health endpoint; logger with secret redaction.
-- Two-node compose test harness; repository backend selectable (MinIO or B2).
+- Two-node compose test harness; repository backend selectable (standby-hosted, MinIO or B2).
+- **Spikes, before any pipeline code (QUESTIONS Q38):**
+  1. restic `snapshots`, `restore` and `check` with a read-only B2 key (`--no-lock`), against real B2.
+  2. `pg_dump` and restore of a ParadeDB database with search indexes at realistic size; record restore time.
+  3. `rest-server` append-only over Tailscale with the link dropped mid-upload.
+  Record results in STATE.md. A failed spike reopens the design before Phase 2.
 
 **Acceptance:**
 - Service starts in the appliance stack on both harness nodes and reports role `unpaired`.
@@ -60,16 +65,15 @@ Every phase ends with its acceptance criteria passing and STATE.md updated. Do t
 
 The standby hosts the repository on its own disk; the primary's `vibe-standby` writes to it over the peer channel.
 
-- Spike first (QUESTIONS Q1): pick the transport that works unchanged over LAN, Tailscale and a Cloudflare tunnel hostname. Record the result before building.
+- Transport: restic `rest-server`, append-only, over LAN or Tailscale (Phase 0 spike 3).
 - Standby: receiver service with storage under `/var/lib/vibe-standby/repo`, authenticated with credentials issued at pairing, reachable only on the peer path.
 - Primary: point its restic repository at the standby's receiver.
-- Cloudflare path: a separate, always-on sync hostname on the standby. It is not the app tunnel and exposes only the receiver.
-- Retention on the hosted repo follows the firm's policy; no Object Lock.
+- Retention: latest snapshot plus the last verified one.
 - Disk check at pairing and nightly: hosted repo plus restored data plus staging must fit; warn at 80%.
 - Resume interrupted uploads; bandwidth limit setting.
 
 **Acceptance:**
-- Harness: backup on the primary lands in the standby-hosted repo over each of the three paths (Cloudflare path may use a recorded-traffic or staging tunnel test, noted in STATE.md).
+- Harness: backup on the primary lands in the standby-hosted repo over LAN and over Tailscale.
 - An unauthenticated client cannot read or write the receiver.
 - An interrupted push resumes without corrupting the repository.
 
@@ -80,9 +84,9 @@ The standby hosts the repository on its own disk; the primary's `vibe-standby` w
 The core restore loop. Each step is idempotent and recorded.
 
 - Orchestrator with a single-run lock; skips if a promote, failback or drill is in progress.
-- Volumes: restore to a staging path, verify, swap into place; keep the previous copy until the new one verifies.
+- Files: incremental restore into a persistent mirror; previous good copy kept as a hard-link snapshot until the new one verifies, then swap.
 - Postgres: restore each product database into `<db>__incoming`, verify, swap by rename, drop the old copy afterwards. Extensions (ParadeDB, pgvector, pg_search) must match the primary's versions before restore.
-- Redis: restore the snapshot into the stopped Redis data path.
+- Redis is not replicated; its data path on the standby is emptied at promote.
 - Config, `.env`, secrets, Caddy data, license file and tunnel token: restore with the local overlay and host identity excluded.
 - On any failure: stop, keep the previous good copy, mark the run failed with the step and reason.
 - First sync after pairing runs immediately and shows progress.
@@ -131,19 +135,21 @@ The core restore loop. Each step is idempotent and recorded.
 
 ---
 
-## Phase 7 — Role lease and fencing
+## Phase 7 — Role lease and conflict handling
 
-- Lease record and epoch rules as in CLAUDE.md.
-- Lease stores: bucket prefix beside the repository (B2 mode), the standby-hosted repo (direct-push mode), and the peer.
-- Checks: at service start, before every app start, before every tunnel start, and every 5 minutes while live.
-- On seeing a higher epoch held by another node: stop the tunnel first, then the apps; set role `demoted`; show a full-screen console notice explaining what happened and offering "Rejoin as standby".
-- If neither lease location is reachable on a paired box: stay down; console offers an admin override that requires typed confirmation and is audited.
-- Agent standby mode is enforced for `standby` and `demoted` roles across reboots and updates.
+Admin-controlled. Nothing running is ever stopped automatically (CLAUDE.md, "Role conflict" and "Accepted risks").
+
+- Append-only lease records and the primary's 15-minute heartbeat, as in CLAUDE.md.
+- Checks at boot and every 5 minutes.
+- **Hold-at-boot:** a box that boots and finds a higher epoch held by its peer sets role `replaced`, starts only its console, and shows "This box was replaced on <date>" with "Rejoin as standby" and "Start anyway" (typed confirmation, audited).
+- **While running:** on seeing a higher epoch held by the peer, show a full-screen warning on the console and send email, daily until resolved. Do not stop anything.
+- If the lease store cannot be reached at boot, start normally and warn.
+- Standby mode is enforced for `standby` and `replaced` across reboots and updates.
 
 **Acceptance (two VMs):**
-- Promote the standby by test hook, power the old primary back on: its apps and tunnel never start, with the peer reachable, and with only the repository reachable.
-- With both lease locations unreachable, the old primary stays down until override.
-- At no moment do two boxes run `cloudflared` with the app tunnel token (invariant 2).
+- Promote the standby, power the old primary back on: only its console starts, in both modes.
+- Promote while the old primary is running and cut off, then reconnect it: it keeps running, both consoles warn, email is sent.
+- "Start anyway" and "Rejoin as standby" both work and are audited.
 
 ---
 
@@ -153,18 +159,17 @@ Guided failover on the standby console. Resumable.
 
 1. **Checks screen:** is the primary reachable (peer channel, each stored address, public URL)? Data age. Last verification result. Versions in step. If the primary answers, block with a clear explanation and point to planned switchover (Phase 9).
 2. **What you will lose:** plain statement of the data age ("work entered after Tuesday 1:30 AM is not on this box").
-3. **Options:** hold job queues for review (QUESTIONS Q2); typed confirmation.
+3. **Confirm:** job queues and sign-in sessions start empty; typed confirmation.
 4. **Run:**
    - write the new lease epoch to every reachable location
    - switch the repository connection to read-write
    - turn off agent standby mode; start Postgres-dependent services, Redis, then apps
    - health-check each app
-   - start `cloudflared` (domain mode), or show this box's address (LAN and Tailscale modes)
+   - unseal the tunnel token and start `cloudflared` (tunnel mode); update public DNS (domain mode without tunnel, manual steps as fallback); or show this box's address (LAN and Tailscale modes)
    - prompt the admin to set up Vibe Backup on this box (QUESTIONS Q22)
    - set role `primary`
 5. **Done screen:** what is live, what was held, what to tell staff, and how to bring the old box back.
 
-- Held queues: a review screen listing queued jobs per app, with release or discard.
 - Promote from a `failed` or `stale` state is allowed with an extra warning; it uses the last verified copy.
 
 **Acceptance (two VMs):**

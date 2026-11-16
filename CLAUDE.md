@@ -1,118 +1,92 @@
 # CLAUDE.md — Vibe Standby
 
-Vibe Standby keeps a second Vibe Appliance (the **standby**) restored nightly from snapshots that Vibe Standby itself takes on the primary, so that disaster recovery is a guided **Promote** that starts the apps and the Cloudflare tunnel on the standby.
+Vibe Standby keeps a second Vibe Appliance (the **standby**) updated nightly from the primary, so that disaster recovery is a guided **Promote** that an admin runs on the standby.
 
-Read this file, then PHASES.md, STATE.md and QUESTIONS.md before doing any work.
-
-## Reconciliation (done 2026-11-16)
-
-The first version of this plan was written without the `Vibe-Backup` and `Vibe-Appliance` source. Both were read on 2026-11-16; the results are in STATE.md and Kurt's answers are in QUESTIONS.md (Q13–Q21). The main change: **Vibe Standby is independent of Vibe Backup.** It captures, ships and restores its own snapshots. Vibe Backup stays the firm's offsite, tamper-proof backup and is not a dependency.
-
-Do not invent an endpoint in another repo and code against it silently. Code against an interface in `src/contracts/`, with a fake, and list the real work needed.
+Read this file, then PHASES.md, STATE.md and QUESTIONS.md before doing any work. This is revision 3 (2026-11-16), written after reading the `Vibe-Backup` and `Vibe-Appliance` source and three rounds of Q&A with Kurt. QUESTIONS.md holds every answer; where an older note disagrees with this file, this file wins.
 
 ## Locked decisions
 
 | Area | Decision |
 | --- | --- |
 | Product | Shipped Vibe Appliance feature, own module and repo (`vibe-standby`), operable by a novice IT person. No extra license. |
-| Topology | One primary, one standby per firm in v1. amd64 only. Same LAN, cross-site, or cloud VPS. |
-| Recovery point | Nightly. Standby is at most about a day behind. |
-| Mechanism | Each night the primary's `vibe-standby` captures a snapshot with restic and the standby restores it. Independent of Vibe Backup. No Postgres streaming. |
-| Snapshot repository | Vibe Standby's own restic repository, separate from Vibe Backup's. (a) Default: hosted on the standby and written by the primary over the peer channel (LAN, Tailscale, or a Cloudflare tunnel hostname). (b) Option: a bucket the firm owns (B2 or any S3-compatible store), read-only for the standby. NAS/SFTP are out of v1. |
-| Replicated set | Captured by `vibe-standby` on the primary: Postgres (all product databases), Redis, all volumes, appliance config, `.env`, secrets, Caddy data, license file, Cloudflare tunnel token. |
-| Standby state | Warm and verified: data restored and checked nightly; apps and tunnel stopped. |
-| Version sync | Every sync mirrors the primary's enabled apps, image digests and appliance config. |
-| Tunnel and license | Same tunnel token and firm key, dormant on the standby until Promote. License moves with the data; no re-activation. |
-| Failover | Manual only. Guided wizard confirms the primary is down and shows data age first. Never automatic. |
-| Split-brain | Role lease with a monotonically increasing epoch, checked at boot, before tunnel start, and periodically. A demoted box refuses to go live. |
-| Failback | Admin chooses: swap roles (repaired box rejoins as standby) or guided failback (planned switchover back to the original box). |
-| Monitoring | Status panel on both consoles, email on failed or stale sync, scheduled test promote in isolation. |
-| LAN / Tailscale modes | Promote wizard shows the standby's address; users switch manually. No name takeover. |
-| Redis | Restored from the nightly snapshot like everything else. Promote offers to hold job queues for review. |
-| Pairing | One-time pairing code generated on the primary console, entered on a freshly installed standby. |
+| Independence | Vibe Standby does not depend on Vibe Backup in any way: no shared bucket, no API calls, no shared state. Vibe Backup remains the firm's offsite, tamper-proof backup. |
+| Topology | One primary, one standby per firm in v1. amd64 only. |
+| Recovery point | Nightly. The standby is at most about a day behind. |
+| Transfer modes | **Direct:** the primary writes to a repository hosted on the standby, over LAN or Tailscale only. **Bucket:** both boxes use a B2 bucket as intermediary and need no network path to each other. No Cloudflare-tunnel transfer path, no NAS/SFTP in v1. |
+| Engine | restic, shipped in and run by `vibe-standby`. One repository per pair, encrypted with a password created at pairing. |
+| Bucket mode | A separate bucket that the admin creates in Backblaze, without Object Lock, with two keys the admin pastes in: read/write for the primary, read-only for the standby. One-way: the standby never writes until Promote. |
+| History | Latest snapshot only (plus the one the standby last verified). Vibe Standby is not a backup; a damaged primary replicates its damage. |
+| Replicated set | All of `/opt/vibe/data` (app data directories, Caddy data and certificates, console database) and `/opt/vibe/env` (`.env` files, secrets, tunnel token), Postgres (every database, roles), `state.json`, and the appliance version. |
+| Not replicated | Redis, the GitHub image token (`/opt/vibe/docker`), Vibe Backup state, Vibe Sentinel, Duplicati, Portainer, Tailscale and host network identity, the local overlay. |
+| Standby state | Warm and verified: data restored and checked nightly; console, Caddy and Postgres run; apps, Redis and tunnel stopped. |
+| Version sync | Every sync mirrors the primary's appliance commit, enabled apps and image digests. The standby never updates on its own. |
+| Failover | Manual only, through the Promote wizard. Nothing switches roles automatically. |
+| Role conflict | Admin-controlled. A running box never stops itself. A box that boots and finds it was replaced starts only its console and waits for an admin ("Rejoin as standby" or "Start anyway"). Both consoles warn loudly and email when two boxes claim primary. |
+| Tunnel | Same tunnel token on both boxes, sealed on the standby until Promote. Promote does not rotate it. |
+| Domain mode without tunnel | Promote repoints public DNS automatically using the firm's saved DNS credential; falls back to showing manual steps if none is saved or the call fails. |
+| LAN / Tailscale modes | Promote shows the standby's address; users switch manually. |
+| Redis | Starts empty on Promote. Staff sign in again; jobs queued on the old primary are lost and the Done screen says so. Nothing is sent twice. |
+| Failback | Admin chooses: swap roles, or guided planned switchover back. |
+| Monitoring | Status panel on both consoles (the primary's shows less in bucket mode), email on failed or stale sync, scheduled test promote in isolation (v1, built last). |
+| Pairing | One-time code, no secrets in it. Direct mode: generated on the primary, entered on the standby. Bucket mode: generated on the standby (it carries the standby's public key), entered on the primary, which then leaves the sealed pairing bundle in the bucket. |
+| Stack | TypeScript on Node 24, Fastify, zod, SQLite. Follow the appliance console's conventions. |
+
+## Accepted risks (Kurt, 2026-11-16)
+
+1. **Two live copies are possible.** If the old primary is running (not booting) when the standby is promoted, for example after an office internet outage, both serve the same public hostname and Cloudflare splits traffic between them until an admin shuts one down. Mitigations: the Promote checks screen, hold-at-boot, loud warnings and email on both boxes. Nothing stops a running box.
+2. **No history.** Corruption or ransomware that reaches the primary before the nightly capture is copied to the standby.
+3. **Bucket mode is one-way.** The primary cannot see whether the standby is healthy; a dead standby is noticed only because its own emails stop.
 
 ## Architecture
 
-One service, `vibe-standby`, runs on **both** boxes. Its behaviour depends on its role.
+One service, `vibe-standby`, runs on both boxes. Roles: `unpaired`, `primary`, `standby`, `replaced` (booted and found a newer lease held by the peer).
 
-- **Roles:** `unpaired`, `primary`, `standby`, `demoted`. Role and pairing state live in the **local overlay** (below), never in the replicated set.
-- **Stack:** TypeScript on Node 24, Fastify, zod config, SQLite state store. Follow the appliance console's conventions (Vibe Backup is Go and is not a model for this repo).
-- **restic:** `vibe-standby` ships and runs its own pinned restic binary behind `src/contracts/repository.ts`. Chosen because it is deduplicated, encrypted, resumable, speaks B2, S3 and `rest:` natively, and is the engine Vibe Backup already trusts. Server side of the standby-hosted repository is restic `rest-server` in append-only mode (confirm in the Q1 spike).
-- **Capture without Docker:** Postgres by `pg_dump` over `vibe_net` (client version must match the server image), Redis by `redis-cli --rdb`, files from a read-only mount of `/opt/vibe` (env, Caddy data, app data directories). Each snapshot carries a manifest with image digests, enabled apps, appliance config and per-database and per-volume verification figures, sealed with a hash list.
-- **Containers, tunnel, images:** only through new token-authenticated console routes and new host-runner actions in Vibe-Appliance (there is no host agent). No Docker socket.
-- **UI:** `vibe-standby` serves its own panel and wizards; the appliance console proxies them, as it does for `vibe-backup`.
+- **Capture (primary, 02:30 local):** `pg_dump -Fc` per database plus `pg_dumpall --globals-only` over `vibe_net`; then the files, from a read-only mount of `/opt/vibe`, excluding `data/postgres`, `data/redis` and the not-replicated list. Databases first, files second, so a file referenced by a row is never missing. A manifest (appliance commit, enabled apps, image digests, per-database table and row counts, per-directory file counts and bytes, extension versions) and a hash-list seal are written last. `restic backup`, then `forget --keep-last 2 --prune`.
+- **Restore (standby):** incremental. `restic restore` into a persistent mirror directory rewrites only changed files; the previous good copy is kept as a hard-link snapshot until the new one verifies, then swapped. Each database is restored into `<db>__incoming`, verified against the manifest, then swapped by rename.
+- **Appliance control:** new token-authenticated console routes and new host-runner actions in Vibe-Appliance. No Docker socket in `vibe-standby`.
+- **UI:** own panel and wizards, proxied by the console at `/admin/apps/vibe-standby/`. Relative URLs only.
 
 ### Local overlay (never overwritten by a restore)
 
-Each box keeps its own identity in `/opt/vibe/standby/local/`:
-
-- node ID, role, lease epoch last seen, peer address and peer public key
-- this box's deployment-mode address (LAN IP, Tailscale identity, hostname)
-- sync history and verification results (SQLite)
-- the standby's own repository credentials (read-only B2 key, or the direct-push repo it hosts)
-
-The restore pipeline must treat this path, and the box's Tailscale and host network identity, as excluded. A restore that changes the standby's role, peer, or address is a bug.
-
-### Nightly sync on the standby
-
-0. On the primary: capture and write the snapshot (default 02:30 local, after Vibe Backup's 01:30 window).
-1. Trigger: "snapshot complete" notice from the primary over the peer channel; fallback poll at 04:00 local.
-2. Read the latest snapshot manifest (read-only repository connection).
-3. Mirror versions: enabled apps, image digests, appliance config. Pull images by digest.
-4. Restore volumes to a staging path, then swap.
-5. Restore Postgres into `<db>__incoming`, verify, then swap by rename. Postgres runs on the standby; app containers do not.
-6. Restore Redis data, config, secrets and license. The tunnel token is restored to a sealed file in the local overlay, never into `shared.env`, until Promote.
-7. Verify (Phase 6), record the result, report to the primary if reachable.
-
-A failed sync must leave the previous good copy intact and promotable.
+`/opt/vibe/standby/local/`: node ID, role, last lease epoch seen, peer addresses and public key, this box's own address, sync history (SQLite), repository credentials, and the sealed tunnel token. Also excluded from every restore: `state.json` keys `config.host_ip`, `config.tailscale*`, and Tailscale host state. After a restore the standby re-renders env files for its own address (the appliance's mode-change re-render).
 
 ### Role lease
 
-- Lease record: `{ epoch, holderNodeId, writtenAt, reason }`. Highest epoch wins.
-- Stored in two places: beside the repository (a `standby-lease/` prefix in the bucket, or on the standby-hosted repo) and on the peer. Records are append-only, one object per epoch (`standby-lease/<epoch>-<nodeId>.json`), never overwritten.
-- A box may start apps and the tunnel only when its own node ID holds the highest epoch it can find.
-- If a paired box can reach neither lease location, it stays down until an admin overrides in the console.
+- Record `{ epoch, holderNodeId, writtenAt, reason }`, append-only, one object per epoch. Highest epoch wins.
+- Stored beside the repository (bucket prefix `lease/`, or the standby-hosted repo) and, in direct mode, on the peer.
+- Checked at boot and every 5 minutes. Its only enforcing effect is **hold-at-boot**; while running it drives warnings and email.
+- The primary also writes a heartbeat object every 15 minutes, which the Promote checks screen reads.
 
 ## Invariants (test every one)
 
-1. On a box in role `standby` or `demoted`, app containers and `cloudflared` are never running, including after reboot, Docker restart, or appliance update. The only exception is the test promote, on an isolated network with no tunnel.
-2. `cloudflared` with the firm's app tunnel token is started only by the lease holder, immediately after a fresh lease check.
-3. The standby connects to the repository read-only until promoted.
-4. No restore touches the local overlay.
+1. On a box in role `standby` or `replaced`, app containers, Redis and `cloudflared` are not running, including after reboot, Docker restart, or appliance update. Exceptions: the isolated test promote, and an admin's explicit "Start anyway".
+2. On a standby, the tunnel token exists only as a sealed file in the local overlay until Promote.
+3. The standby holds no credential that can write to the repository until Promote.
+4. No restore touches the local overlay or the box's network identity.
 5. A failed or partial sync never replaces the last verified copy.
-6. Promote and failback are resumable: every step is idempotent and recorded, so a wizard interrupted by a crash continues where it stopped.
-7. Secrets never appear in logs, API responses, or the pairing code. Redact at the logger.
-8. No data leaves the firm's own infrastructure and its own B2 and Cloudflare accounts. Kisaes holds no firm data or credentials.
+6. Promote and failback are resumable: every step is idempotent and recorded.
+7. Secrets never appear in logs, API responses, or the pairing code.
+8. No data leaves the firm's own boxes and its own B2 and Cloudflare accounts.
+9. `vibe-standby` makes no call to Vibe Backup and reads none of its state.
+10. No role change, tunnel start, or DNS change happens without an admin action in a wizard.
 
 ## Contracts with other repos
 
-Names are provisional until reconciled (see "First task").
+**Vibe-Appliance** (all new work; listed in STATE.md)
+- Standby mode in `state.json`, enforced at boot by a root unit before Docker's restart policy matters, and honoured by bootstrap, `update.sh` and enable-app.
+- Console routes with a service token: stop all apps, start all apps, start and stop `cloudflared`, pull images by digest, list running digests, per-app health, start apps on an isolated network with egress blocked.
+- Host-runner actions: check out a given appliance commit and rebuild the console, re-render env for this host, `bootstrap.sh --standby`.
+- Vendored manifest, overlay and env template for `vibe-standby`.
 
-**vibe-backup**
-- None required. Vibe Standby's capture runs after the backup window and must not hold locks or load that would fail a Vibe Backup run.
-- After Promote, Vibe Backup on the new primary needs its own setup (it is not part of the replicated set today); the Done screen says so.
+**Vibe-Backup:** none.
 
-**vibe-appliance console and host-runner** (no host agent exists)
-- Standby mode flag that blocks app and tunnel autostart at boot.
-- Start and stop all apps; start and stop `cloudflared`; pull images by digest; apply appliance config; report health per app.
-- Start apps on an isolated network with outbound egress blocked (test promote).
-
-**vibe-appliance console and installer**
-- Proxy the standby panel.
-- Installer option "Install as standby", which installs the base stack without first-run setup.
-
-**licensing.kisaes.com**
-- License must not bind to hardware.
-- A dormant standby must not send activation or heartbeat calls.
+**Licensing:** unknown. No licensing client exists in either repo; confirm per app before Phase 8 that a license does not bind to hardware.
 
 ## Working rules
 
 - Follow PHASES.md in order. Update STATE.md at the end of every work session.
-- Blockers go in QUESTIONS.md with a default assumption; keep going on the default.
-- Conventional commits (`feat(lease): …`, `test(promote): …`). One logical change per commit.
-- Tests:
-  - Unit tests use fakes for the repository and appliance-control contracts.
-  - Integration tests use a two-node compose harness (`primary` and `standby` stacks on separate networks) with a selectable repository backend: MinIO (default, S3), a real B2 test bucket (credentials from the environment), or the standby-hosted repo.
-  - End-to-end promote, failback and split-brain tests run on two disposable VMs.
-- Structured JSON logs. Every sync, promote, failback and drill writes an audit record that the console can show and export.
-- Wizard copy is written for a novice: one decision per screen, plain words, no jargon without an explanation.
+- Blockers go in QUESTIONS.md with a default; keep going on the default.
+- Conventional commits. One logical change per commit.
+- Unit tests use fakes for the repository and appliance-control contracts. Integration tests use a two-node compose harness with a selectable repository: standby-hosted, MinIO, or a real B2 test bucket. Promote, failback and role-conflict tests run on two disposable VMs.
+- Structured JSON logs. Every sync, promote, failback and drill writes an audit record the console can show and export.
+- Wizard copy is written for a novice: one decision per screen, plain words.
