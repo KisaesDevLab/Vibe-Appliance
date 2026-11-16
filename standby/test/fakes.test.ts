@@ -6,15 +6,8 @@ import { test } from "node:test";
 import { StandbyModeError } from "../src/contracts/appliance.ts";
 import { FakeAppliance } from "../src/contracts/fakes/fakeAppliance.ts";
 import { FakeRepository, FakeRepositoryBackend } from "../src/contracts/fakes/fakeRepository.ts";
-import { RepositoryReadOnlyError, type SnapshotManifest } from "../src/contracts/repository.ts";
+import { RepositoryReadOnlyError } from "../src/contracts/repository.ts";
 
-function manifest(id: string): SnapshotManifest {
-  return {
-    schemaVersion: 1, snapshotId: id, createdAt: new Date().toISOString(), sourceNodeId: "n1",
-    applianceCommit: "c0ffee0", enabledApps: ["vibe-tb"], imageDigests: {}, postgresImage: "paradedb/paradedb:0.23.2-pg16",
-    databases: [], directories: [],
-  };
-}
 function stage(files: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), "vs-stage-"));
   for (const [rel, body] of Object.entries(files)) {
@@ -23,18 +16,22 @@ function stage(files: Record<string, string>): string {
   }
   return dir;
 }
+const req = (id: string, dir: string, excludes: string[] = []) => ({ snapshotId: id, sourceNodeId: "n1", paths: [dir], excludes });
 
-test("fake repository: backup, list newest first, restore with exclude, prune", async () => {
+test("fake repository: backup with excludes, list newest first, read, restore, prune", async () => {
   const repo = new FakeRepository();
   await repo.init();
-  await repo.backup(stage({ "env/shared.env": "A=1", "data/apps/vibe-tb/uploads/x.pdf": "pdf" }), manifest("s1"));
-  await repo.backup(stage({ "env/shared.env": "A=2" }), manifest("s2"));
+  const d1 = stage({ "env/shared.env": "A=1", "data/apps/vibe-tb/uploads/x.pdf": "pdf", "data/redis/dump.rdb": "r" });
+  const r = await repo.backup(req("s1", d1, [join(d1, "data/redis")]));
+  assert.equal(r.files, 2);
+  await repo.backup(req("s2", stage({ "env/shared.env": "A=2" })));
   assert.deepEqual((await repo.listSnapshots()).map((s) => s.id), ["s2", "s1"]);
+  assert.equal((await repo.readFile("s1", join(d1, "env/shared.env"))).toString(), "A=1");
   const out = mkdtempSync(join(tmpdir(), "vs-out-"));
-  await repo.restore("s1", out, { exclude: ["env"] });
-  assert.equal(readFileSync(join(out, "data/apps/vibe-tb/uploads/x.pdf"), "utf8"), "pdf");
-  assert.ok(!existsSync(join(out, "env/shared.env")));
-  await repo.prune(1);
+  await repo.restore("s1", out, { exclude: [join(d1, "env")] });
+  assert.equal(readFileSync(join(out, d1, "data/apps/vibe-tb/uploads/x.pdf"), "utf8"), "pdf");
+  assert.ok(!existsSync(join(out, d1, "env/shared.env")));
+  await repo.prune(["s2"]);
   assert.deepEqual((await repo.listSnapshots()).map((s) => s.id), ["s2"]);
 });
 
@@ -42,24 +39,24 @@ test("invariant 3 groundwork: a read-only view can read but every write is refus
   const backend = new FakeRepositoryBackend();
   const primary = new FakeRepository("read-write", backend);
   await primary.init();
-  await primary.backup(stage({ "a.txt": "a" }), manifest("s1"));
+  await primary.backup(req("s1", stage({ "a.txt": "a" })));
   const writesBefore = backend.writes;
   const standby = new FakeRepository("read-only", backend);
   assert.equal((await standby.listSnapshots()).length, 1);
-  assert.equal((await standby.readManifest("s1")).snapshotId, "s1");
-  await assert.rejects(standby.backup(stage({ "b.txt": "b" }), manifest("s2")), RepositoryReadOnlyError);
-  await assert.rejects(standby.prune(0), RepositoryReadOnlyError);
+  await assert.rejects(standby.backup(req("s2", stage({ "b.txt": "b" }))), RepositoryReadOnlyError);
+  await assert.rejects(standby.prune([]), RepositoryReadOnlyError);
   assert.equal(backend.writes, writesBefore);
 });
 
 test("fake repository: an injected restore failure leaves a partial target, as a dropped link would", async () => {
   const repo = new FakeRepository();
   await repo.init();
-  await repo.backup(stage({ "a.txt": "a", "b.txt": "b", "c.txt": "c" }), manifest("s1"));
+  const d = stage({ "a.txt": "a", "b.txt": "b", "c.txt": "c" });
+  await repo.backup(req("s1", d));
   repo.backend.failNext.set("restore", new Error("link dropped"));
   const out = mkdtempSync(join(tmpdir(), "vs-out-"));
   await assert.rejects(repo.restore("s1", out), /link dropped/);
-  assert.ok(existsSync(join(out, "a.txt")) && !existsSync(join(out, "c.txt")));
+  assert.ok(existsSync(join(out, d, "a.txt")) && !existsSync(join(out, d, "c.txt")));
 });
 
 test("invariant 1 groundwork: standby mode keeps apps, Redis and tunnel down across a reboot", async () => {
