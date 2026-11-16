@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: npm }
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  manifest:
+    # The vendored manifest must validate against the appliance's own schema.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install --quiet jsonschema
+      - run: curl -fsSL -o schema.json https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/console/manifest.schema.json
+      - run: python3 -c "import json,jsonschema; jsonschema.validate(json.load(open('.appliance/manifest.json')), json.load(open('schema.json')))"
+
+  harness:
+    # Phase 0 acceptance on the two-node harness: build the image, start
+    # both nodes, check role and tools.
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash test/harness/phase0.sh

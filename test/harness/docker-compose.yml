@@ -1,0 +1,72 @@
+# Two-node test harness: a primary stack and a standby stack on separate
+# networks, as two boxes at two sites would be. They can meet only on `link`
+# (stands in for LAN/Tailscale, direct mode) or through MinIO on `internet`
+# (stands in for a B2 bucket, bucket mode). To test against real B2 instead,
+# leave MinIO unused and pass bucket credentials to the test scripts.
+name: vibe-standby-harness
+
+x-standby: &standby
+  build: { context: ../.., target: runtime }
+  environment:
+    VIBE_STANDBY_APPLIANCE_DIR: /host/vibe
+    VIBE_STANDBY_LOCAL_DIR: /opt/vibe/standby/local
+    VIBE_STANDBY_TZ: UTC
+
+x-postgres: &postgres
+  image: paradedb/paradedb:0.23.2-pg16
+  environment: { POSTGRES_USER: postgres, POSTGRES_PASSWORD: harness-only, POSTGRES_DB: postgres }
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U postgres"]
+    interval: 5s
+    retries: 12
+
+services:
+  primary-postgres:
+    <<: *postgres
+    container_name: h-primary-postgres
+    networks: { primary_net: { aliases: [vibe-postgres] } }
+  primary:
+    <<: *standby
+    container_name: h-primary
+    volumes:
+      - ./fixture:/host/vibe:ro
+      - primary_standby:/opt/vibe/standby
+    ports: ["127.0.0.1:14010:4010"]
+    networks: [primary_net, link, internet]
+    depends_on: { primary-postgres: { condition: service_healthy } }
+
+  standby-postgres:
+    <<: *postgres
+    container_name: h-standby-postgres
+    networks: { standby_net: { aliases: [vibe-postgres] } }
+  standby:
+    <<: *standby
+    container_name: h-standby
+    volumes:
+      - standby_tree:/host/vibe
+      - standby_standby:/opt/vibe/standby
+    ports: ["127.0.0.1:24010:4010"]
+    networks: [standby_net, link, internet]
+    depends_on: { standby-postgres: { condition: service_healthy } }
+
+  minio:
+    image: minio/minio:latest
+    container_name: h-minio
+    command: server /data
+    environment: { MINIO_ROOT_USER: harness, MINIO_ROOT_PASSWORD: harness-only-secret }
+    networks: [internet]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      retries: 12
+
+networks:
+  primary_net: {}
+  standby_net: {}
+  link: {}
+  internet: {}
+
+volumes:
+  primary_standby: {}
+  standby_standby: {}
+  standby_tree: {}
