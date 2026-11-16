@@ -1,0 +1,31 @@
+# apps/vibe-standby.yml — Vibe Standby overlay (vendor into Vibe-Appliance).
+#
+# One service, the same on both boxes; its role (unpaired, primary, standby,
+# replaced) lives in the local overlay, not in this file.
+#
+# NO CADDY SURFACE: the UI authenticates nobody. The one way in is the
+# console's authenticated proxy at /admin/apps/vibe-standby/.
+# NO DOCKER SOCKET: containers, tunnel and images are controlled only
+# through console routes and host-runner actions.
+# ROOT, READ-ONLY: capture reads /opt/vibe/env and the Caddy certificate
+# store, which are root-only. The appliance tree is mounted read-only; the
+# only writable host path is /opt/vibe/standby.
+
+name: vibe
+
+services:
+  vibe-standby:
+    image: ghcr.io/kisaesdevlab/vibe-standby:${APP_TAG:-latest}
+    container_name: vibe-standby
+    restart: unless-stopped
+    env_file:
+      - /opt/vibe/env/vibe-standby.env
+    volumes:
+      # A directory mount, never a file mount: state.json is replaced
+      # atomically on every write and a file mount would freeze on the old inode.
+      - /opt/vibe:/host/vibe:ro
+      # Local overlay, restore staging, hosted repository, pre-rejoin archive.
+      - /opt/vibe/standby:/opt/vibe/standby
+    networks:
+      - vibe_net
+    stop_grace_period: 30s

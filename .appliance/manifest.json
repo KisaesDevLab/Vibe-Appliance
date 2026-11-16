@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "slug": "vibe-standby",
+  "displayName": "Vibe Standby",
+  "description": "Keeps a second appliance updated nightly and ready to take over through a guided Promote. Independent of Vibe Backup.",
+
+  "image": {
+    "server": "ghcr.io/kisaesdevlab/vibe-standby",
+    "defaultTag": "latest"
+  },
+
+  "subdomain": "standby",
+  "ports": { "server": 4010 },
+
+  "routing": {
+    "default_upstream": "vibe-standby:4010"
+  },
+
+  "userFacing": false,
+
+  "depends": [],
+
+  "env": {
+    "required": [
+      { "name": "VIBE_STANDBY_APPLIANCE_DIR", "from": "static:/host/vibe", "doc": "Read-only mount of /opt/vibe: the capture source on the primary." },
+      { "name": "VIBE_STANDBY_LOCAL_DIR", "from": "static:/opt/vibe/standby/local", "doc": "This box's own identity, role and history. Never replicated and never overwritten by a restore." }
+    ],
+    "optional": [
+      { "name": "VIBE_STANDBY_TZ", "doc": "Firm timezone for the capture and sync times. Defaults to UTC." },
+      { "name": "VIBE_STANDBY_CAPTURE_AT", "doc": "Nightly capture time on the primary, HH:MM. Default 02:30, after Vibe Backup's 01:30 window." },
+      { "name": "VIBE_STANDBY_SYNC_FALLBACK_AT", "doc": "Time the standby polls for a new snapshot if no notice arrived, HH:MM. Default 04:00." },
+      { "name": "VIBE_STANDBY_STALE_AFTER_HOURS", "doc": "Hours without a verified sync before the standby is marked stale. Default 36." },
+      { "name": "VIBE_STANDBY_DRILL_SCHEDULE", "doc": "first-sunday (default) or off." },
+      { "name": "VIBE_STANDBY_ARCHIVE_DAYS", "doc": "Days the pre-rejoin archive is kept. Default 14." },
+      { "name": "VIBE_STANDBY_ALERT_EMAIL", "doc": "Where sync and role alerts are sent. Empty means console only." }
+    ]
+  },
+
+  "health": "/api/health",
+
+  "_doc": "Source of truth for the vendored copy at Vibe-Appliance console/manifests/vibe-standby.json. Appliance integration also needs apps/vibe-standby.yml and env-templates/per-app/vibe-standby.env.tmpl (both in deploy/ here). userFacing false and no subdomains[] means no Caddy surface: the UI authenticates nobody and is reachable only through the console's authenticated proxy at /admin/apps/vibe-standby/. No database or redis blocks: the service owns neither and must keep running when the apps are stopped."
+}
