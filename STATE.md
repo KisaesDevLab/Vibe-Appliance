@@ -4,9 +4,12 @@ Update this file at the end of every work session.
 
 ## Current status
 
-- **Phase:** 0 — in progress (reconciliation done; scaffold not started)
-- **Last session:** 2026-11-16 — read `Vibe-Backup` @ `cc7c984` and `Vibe-Appliance` @ `cb10091`; filled the contract table below; opened Q13–Q20.
-- **Next action:** run the three Phase 0 spikes (Q38), then scaffold. Design is revision 3 in CLAUDE.md after the deep-review Q&A (Q23–Q36).
+- **Phase:** 0 — scaffold built; acceptance not yet proven
+- **Last session:** 2026-11-16 — reconciliation, three Q&A rounds (plan revision 3), Phase 0 scaffold.
+- **Built and tested here (20 unit tests, typecheck, build, service started by hand):** config schema, redacting logger, local overlay store (node ID, role, sync runs, verification, audit, wizard steps), repository and appliance-control contracts with fakes, health/status API, panel.
+- **Written but NOT run** (no Docker in the build container): `Dockerfile`, `test/harness/` (two nodes + MinIO), `.github/workflows/ci.yml`. Phase 0's first acceptance line ("starts on both harness nodes, reports `unpaired`") is proven only when CI runs `test/harness/phase0.sh`.
+- **Not pushed:** `KisaesDevLab/vibe-standby` does not exist; the session cannot create repositories.
+- **Next action:** create the repo and push; get CI green; run the Phase 0 spikes (Q38); vendor `deploy/` and `.appliance/manifest.json` into Vibe-Appliance; then Phase 1.
 
 ## Headline findings
 
@@ -26,7 +29,7 @@ Vibe Standby is independent of Vibe Backup: it captures on the primary, ships wi
 
 | Phase | Name | Status | Notes |
 | --- | --- | --- | --- |
-| 0 | Reconcile and scaffold | In progress | Reconcile done. Scaffold waits on Q13. |
+| 0 | Reconcile and scaffold | In progress | Reconcile done. Scaffold built and unit-tested. Harness, image and spikes not yet run. |
 | 1 | Pairing and peer channel | Not started | |
 | 2 | Shared repository source (B2) | Not started | Needs vibe-backup replica mode (Q18) |
 | 3 | Direct push source | Not started | Blocked on Q1 spike; restic has `rest-server`, see Q1 note |
