@@ -2171,9 +2171,7 @@ function queueSentinelAction(req, res, action, args) {
 
 // Poll target for the admin UI: where the action is, its result when
 // finished, and the log so far (tailed — install transcripts get long).
-app.get('/api/v1/host-actions/:id', requireAdmin, (req, res) => {
-  const id = req.params.id;
-  if (!HA_ID_RE.test(id)) return res.status(400).json({ error: 'invalid action id' });
+function hostActionStatus(id) {
   let stateName = 'unknown';
   let result = null;
   const doneP = path.join(HOST_ACTIONS_DIR, 'done', `${id}.json`);
@@ -2194,8 +2192,28 @@ app.get('/api/v1/host-actions/:id', requireAdmin, (req, res) => {
   if (stateName === 'queued' || stateName === 'unknown') {
     runner = (((readState().host_services || {})['host-runner']) || {}).status || 'unknown';
   }
-  res.json({ id, state: stateName, result, log: logText, runner });
+  return { id, state: stateName, result, log: logText, runner };
+}
+
+app.get('/api/v1/host-actions/:id', requireAdmin, (req, res) => {
+  const id = req.params.id;
+  if (!HA_ID_RE.test(id)) return res.status(400).json({ error: 'invalid action id' });
+  res.json(hostActionStatus(id));
 });
+
+// ----- Vibe Standby control surface -----------------------------------
+// Service-token routes for the `standby` container (no admin auth: it is
+// not a browser). See console/lib/standby-control.js.
+app.use('/api/v1/standby-control', createStandbyControl({
+  docker,
+  readState,
+  enqueueHostAction,
+  hostActionStatus,
+  applianceDir: APPLIANCE_DIR,
+  token: () => process.env.STANDBY_CONTROL_TOKEN || '',
+  log,
+}));
+
 
 // A sentinel-install transcript contains the installer's ONE-TIME
 // break-glass credential (its unattended mode prints it to the
@@ -2398,6 +2416,15 @@ app.post('/api/v1/sentinel/enroll', requireAdmin, testRateLimit, (req, res) => {
 // budget as the test endpoints, keyed separately by req.path.
 app.post('/api/v1/enable/:slug', requireAdmin, testRateLimit, async (req, res) => {
   const m = MANIFESTS[req.params.slug];
+  // A standby must not run apps: enabling one here would start a second
+  // live copy of the firm's data. Promote is the way to bring apps up.
+  if ((readState().config || {}).standby_mode) {
+    return res.status(409).json({
+      error: 'This box is a standby, so apps cannot be enabled here. ' +
+             'Apps are enabled on the primary and follow at the next sync. ' +
+             'To make this box live, open Standby and choose Promote.',
+    });
+  }
   if (m && appRuntime(m) !== 'appliance') {
     return queueSentinelAction(req, res, 'sentinel-enable', {});
   }

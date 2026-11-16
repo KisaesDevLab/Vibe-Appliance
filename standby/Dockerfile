@@ -8,6 +8,11 @@ FROM golang:1.25-bookworm AS restic
 ARG RESTIC_VERSION=v0.18.1
 RUN CGO_ENABLED=0 go install -trimpath -ldflags="-s -w" \
     github.com/restic/restic/cmd/restic@${RESTIC_VERSION}
+# rest-server: the receiver for direct mode, run on the standby in
+# append-only mode behind the peer channel.
+ARG REST_SERVER_VERSION=v0.14.0
+RUN CGO_ENABLED=0 go install -trimpath -ldflags="-s -w" \
+    github.com/restic/rest-server/cmd/rest-server@${REST_SERVER_VERSION}
 
 # ---- build ------------------------------------------------------------------
 FROM node:24-bookworm-slim AS build
@@ -28,7 +33,7 @@ ARG PG_MAJOR=16
 # pg_dump must match the appliance's Postgres major (paradedb …-pg16). The
 # PGDG repository carries it; Debian bookworm's own client is 15.
 RUN apt-get update -qq \
- && apt-get install -y --no-install-recommends ca-certificates curl gnupg tzdata \
+ && apt-get install -y --no-install-recommends ca-certificates curl gnupg tzdata openssl \
  && install -d /usr/share/postgresql-common/pgdg \
  && curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
       https://www.postgresql.org/media/keys/ACCC4CF8.asc \
@@ -38,7 +43,7 @@ RUN apt-get update -qq \
  && apt-get install -y --no-install-recommends postgresql-client-${PG_MAJOR} \
  && apt-get purge -y gnupg && apt-get autoremove -y \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=restic /go/bin/restic /usr/local/bin/restic
+COPY --from=restic /go/bin/restic /go/bin/rest-server /usr/local/bin/
 WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist

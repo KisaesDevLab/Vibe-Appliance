@@ -10,9 +10,9 @@ name: standby
 on:
   push:
     branches: [main]
-    paths: ['standby/**', '.github/workflows/standby.yml']
+    paths: ['standby/**', 'lib/standby-host.sh', '.github/workflows/standby.yml']
   pull_request:
-    paths: ['standby/**', '.github/workflows/standby.yml']
+    paths: ['standby/**', 'lib/standby-host.sh', '.github/workflows/standby.yml']
   workflow_dispatch:
 
 permissions:
@@ -28,7 +28,19 @@ jobs:
         with: { node-version: 24, cache: npm, cache-dependency-path: standby/package-lock.json }
       - run: npm ci --no-audit --no-fund
       - run: npm run typecheck
+      # The integration tests run real restic, rest-server and Postgres.
+      # REQUIRE_TOOLS makes a missing tool a failure instead of a skip.
+      - name: Install restic and rest-server
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl -fsSL -o restic.bz2 https://github.com/restic/restic/releases/download/v0.18.1/restic_0.18.1_linux_amd64.bz2
+          bunzip2 restic.bz2 && sudo install -m 0755 restic /usr/local/bin/restic
+          curl -fsSL https://github.com/restic/rest-server/releases/download/v0.14.0/rest-server_0.14.0_linux_amd64.tar.gz | tar xz
+          sudo install -m 0755 rest-server_0.14.0_linux_amd64/rest-server /usr/local/bin/rest-server
+          restic version && rest-server --version
       - run: npm test
+        env:
+          VIBE_STANDBY_REQUIRE_TOOLS: "1"
       - run: npm run build
 
   harness:
