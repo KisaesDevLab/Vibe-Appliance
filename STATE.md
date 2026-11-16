@@ -89,6 +89,18 @@ Status is `exists`, `differs` or `missing`.
 4. `bootstrap.sh --standby`.
 5. Vendored manifest, overlay and env template for vibe-standby.
 
+## Spike results (Q38)
+
+Run 2026-11-16 in the build container with restic v0.18.1 and rest-server v0.14.0, about 380 MB of test data.
+
+| Spike | Result | Notes |
+| --- | --- | --- |
+| 3. Direct-mode receiver with the link dropped mid-upload | **Pass (simulated)** | Server killed during a backup and left down for about five minutes. restic kept retrying, resumed when the server returned and saved the snapshot without a rerun. No partial snapshot was ever visible. `check --read-data` clean. Simulated on localhost by killing the server, without auth; not yet repeated over real Tailscale. |
+| Design check: hard-link previous copy | **Pass** | After `cp -al mirror prev`, an incremental `restore --delete` rewrote only the 5 changed entries and skipped 38. Changed files got new inodes, so `prev` kept the old content and the deleted file; unchanged files still share inodes. |
+| Design check: pruning through the append-only receiver | **Fails, as it should** | `forget --prune` from the primary gets 403. Pruning locally on the hosting box works and leaves a clean repository. Plan changed: in direct mode the standby prunes. |
+| 1. restic with a read-only B2 key | **Not run** | Needs a real B2 bucket and a read-only key. |
+| 2. ParadeDB dump and restore time at realistic size | **Not run** | Needs Docker and the ParadeDB image. |
+
 ## Decisions made during the build
 
 - 2026-11-16 — Independent of Vibe Backup (Q14, Q18, Q21). Reason: today's Vibe Backup snapshot lacks most of the replicated set and has no restore-to-staging or read-only mode.
