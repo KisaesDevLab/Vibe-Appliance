@@ -6,7 +6,7 @@ Update this file at the end of every work session.
 
 - **Phase:** 0 — in progress (reconciliation done; scaffold not started)
 - **Last session:** 2026-11-16 — read `Vibe-Backup` @ `cc7c984` and `Vibe-Appliance` @ `cb10091`; filled the contract table below; opened Q13–Q20.
-- **Next action:** Kurt answers Q13 (stack) and Q14 (snapshot coverage). Then scaffold against `src/contracts/` with fakes.
+- **Next action:** scaffold (TypeScript service, contracts and fakes, overlay, config, health, logger, harness). Q13–Q21 answered; Q22 open with defaults.
 
 ## Headline findings
 
@@ -17,6 +17,10 @@ The plan was written without the source. Five assumptions do not hold:
 3. **The snapshot does not contain the replicated set.** Today it holds: Postgres globals, `state.json`, and the databases/secrets/volumes of modules that ship a backup contract. Only `vibe-auth` ships one. Not captured: `/opt/vibe/env` (`.env`, secrets, tunnel token), Caddy data, Redis, any license file, and every other app's database. A standby restored from today's snapshot could not run the firm. → Q14
 4. **There is no host agent API.** The appliance has (a) the console, which holds the Docker socket and exposes admin routes behind HTTP Basic, and (b) `lib/host-runner.sh`, a root file-queue with a fixed allowlist of five Sentinel actions. Neither offers start/stop-all, pull-by-digest, standby mode, or an isolated network. → Q16
 5. **MinIO cannot stand in for B2 as built.** Vibe Backup uses restic's native `b2:` backend and the B2 native API for provisioning; MinIO speaks S3 only. → Q17
+
+## Direction after the 2026-11-16 Q&A
+
+Vibe Standby is independent of Vibe Backup: it captures on the primary, ships with its own restic, and restores on the standby. The vibe-backup rows in the contract table below are kept as a record of what exists; none of them is a dependency any more, and the Vibe-Backup list under "Cross-repo work needed" is no longer required. The Vibe-Appliance list still is.
 
 ## Phase tracker
 
@@ -84,7 +88,9 @@ Status is `exists`, `differs` or `missing`.
 
 ## Decisions made during the build
 
-None yet. Record each with the date and the reason.
+- 2026-11-16 — Independent of Vibe Backup (Q14, Q18, Q21). Reason: today's Vibe Backup snapshot lacks most of the replicated set and has no restore-to-staging or read-only mode.
+- 2026-11-16 — restic as the transfer engine, run by vibe-standby (Q15). Reason: dedup, encryption, resume, native B2/S3/rest backends, already proven in the suite.
+- 2026-11-16 — TypeScript (Q13); console routes plus host-runner for appliance control (Q16); harness on MinIO or B2 (Q17); append-only leases (Q19); tunnel token sealed until promote (Q20).
 
 ## Measurements
 

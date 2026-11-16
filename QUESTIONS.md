@@ -83,52 +83,52 @@ Some apps (Filer, MyBooks storage, Connect vault) write documents straight to B2
 Questions below were opened on 2026-11-16 by the Phase 0 reconciliation against the real `Vibe-Backup` and `Vibe-Appliance` source. Details are in STATE.md.
 
 ## Q13 — Implementation stack
-**Status:** Open — blocks the scaffold
+**Status:** **Answered 2026-11-16** — TypeScript, as locked.
 
 CLAUDE.md locks "TypeScript on Node, Fastify, zod, SQLite" and also says to match vibe-backup exactly. Vibe Backup is Go (stdlib HTTP, `state.json`, scratch image). The console is Node 24 + Express + SQLite.
 
 **Default:** TypeScript as locked, following the console's conventions (Node 24, SQLite) rather than vibe-backup's. Reason to reconsider: Go would let vibe-standby reuse vibe-backup's manifest, pairing-seal and Docker-client packages directly.
 
 ## Q14 — The snapshot does not hold the replicated set
-**Status:** Open — blocks Phase 4 in any real sense
+**Status:** **Answered 2026-11-16** — Capture in vibe-standby. See Q21 for the route.
 
 Today's snapshot has Postgres globals, `state.json`, and `vibe-auth`'s database and secrets. No env files, tunnel token, Caddy data, Redis, or other apps' databases.
 
 **Default:** treat closing this as Vibe-Backup work that must land first (cross-repo items 1 and 8 in STATE.md). vibe-standby builds Phases 0–3 and the Phase 4 orchestrator against fakes meanwhile. It does not grow a second capture path of its own.
 
 ## Q15 — restic, not Kopia
-**Status:** Open (wording only)
+**Status:** **Answered 2026-11-16** — Kurt: use whichever product is most reliable and efficient for data transfers. Chosen: restic, run by vibe-standby itself (deduplicated, encrypted, resumable, native B2/S3/rest backends, already proven in Vibe Backup).
 
 **Default:** replace "Kopia" with "restic" throughout. The rule stands: vibe-standby never runs restic; only vibe-backup does.
 
 ## Q16 — What plays the "host agent"
-**Status:** Open
+**Status:** **Answered 2026-11-16** — Console routes with a service token, plus host-runner actions. No Docker socket.
 
 No agent exists. The console holds the Docker socket; `lib/host-runner.sh` is a root file-queue with a fixed allowlist.
 
 **Default:** vibe-standby gets no Docker socket. New console routes, authenticated by a per-install service token, cover container and tunnel control; anything needing root on the host (boot-time standby enforcement, bootstrap mode) goes through new host-runner actions.
 
 ## Q17 — B2 stand-in for the harness
-**Status:** Open
+**Status:** **Answered 2026-11-16** — Harness backend is selectable: MinIO or real B2.
 
 restic's `b2:` backend and vibe-backup's provisioning use the B2 native API, which MinIO does not speak.
 
 **Default:** harness uses MinIO through restic's `s3:` backend, which needs vibe-backup to accept an S3-style repository URL in replica and test mode. Object Lock and read-only behaviour are then tested on S3 semantics; one manual run against real B2 is recorded per release.
 
 ## Q18 — How the standby reads the repository
-**Status:** Open
+**Status:** **Answered 2026-11-16** — Independent process. vibe-standby does not require Vibe Backup; it reads its own repository with its own restic.
 
 **Default:** the standby runs its own vibe-backup container in a new replica mode (no schedule, read-only key, `--no-lock`), configured by vibe-standby over the internal network after pairing. This replaces "connect read-only with supplied credentials" as a one-off call.
 
 ## Q19 — Lease records in an Object Lock bucket
-**Status:** Open
+**Status:** **Answered 2026-11-16** — Append-only, one object per epoch.
 
 The firm bucket is compliance-locked for 90 days and the appliance key cannot delete. The standby's key is read-only until promote.
 
 **Default:** leases are append-only objects, one per epoch (`standby-lease/<epoch>-<nodeId>.json`), never overwritten; highest epoch wins on list. The standby writes its first lease at promote using the write key received at pairing and held sealed until then.
 
 ## Q20 — Same tunnel token on two boxes
-**Status:** Open (confirms invariant 2)
+**Status:** **Answered 2026-11-16** — Sealed until promote.
 
 Cloudflare treats two connectors with one token as replicas and sends traffic to both. A standby that starts `vibe-cloudflared` early serves stale data to real users. `restart: unless-stopped` makes this the default outcome after a restore plus reboot.
 
@@ -141,3 +141,15 @@ Cloudflare treats two connectors with one token as replicas and sends traffic to
 - **Q7:** vibe-backup's local-repo policy is 14 daily, 8 weekly, 3 monthly, not 7/4/12.
 - **Q9:** Vibe Filer does not exist (removed from vibe-backup 2026-08-30).
 - **Q11:** the backup window is fixed at 01:30 firm-local.
+
+## Q21 — Route for data captured by vibe-standby
+**Status:** **Answered 2026-11-16** — send over the peer channel.
+
+Together with Q14, Q15 and Q18 this makes Vibe Standby independent of Vibe Backup: the primary writes its own restic snapshots to a repository hosted on the standby, over the peer channel. The firm-bucket option (B2 or S3) remains for sites where the peer link cannot carry the nightly snapshot.
+
+## Q22 — Consequences of independence
+**Status:** Open
+
+1. Vibe Backup's own state (Recovery Kit generation, B2 write key) is not replicated. **Default:** after Promote the Done screen tells the admin to set up Vibe Backup on the new primary; no automatic takeover of the backup schedule.
+2. The standby-hosted repository is now the default and is on the same box as the restored copy. **Default:** the panel states it is not a backup, and pairing warns if Vibe Backup is not active on the primary.
+3. Two nightly capture jobs run on the primary. **Default:** Vibe Standby captures at 02:30 local and skips with a warning if a Vibe Backup run is still in progress.

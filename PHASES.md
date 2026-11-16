@@ -6,14 +6,14 @@ Every phase ends with its acceptance criteria passing and STATE.md updated. Do t
 
 ## Phase 0 — Reconcile and scaffold
 
-- Read `vibe-backup` and `vibe-appliance`; complete the "First task" in CLAUDE.md.
-- Repo, TypeScript/Fastify service, Dockerfile, CI, matching `vibe-backup` conventions.
-- `src/contracts/`: typed interfaces plus fakes for the vibe-backup API and the host agent API.
+- Read `vibe-backup` and `vibe-appliance`; reconcile (done 2026-11-16).
+- Repo, TypeScript/Fastify service, Dockerfile (with pinned restic, pg client, redis-cli), CI, following the console's conventions.
+- `src/contracts/`: typed interfaces plus fakes for the repository (restic) and appliance control (console routes, host-runner).
 - Local overlay at `/opt/vibe/standby/local/`: node ID generation, role (`unpaired` on first start), SQLite store (sync runs, verification results, audit records, wizard step state).
 - Config schema (zod): stale threshold, sync fallback time, drill schedule, alert email.
 - Appliance manifest entry and compose service.
 - Health endpoint; logger with secret redaction.
-- Two-node compose test harness with MinIO.
+- Two-node compose test harness; repository backend selectable (MinIO or B2).
 
 **Acceptance:**
 - Service starts in the appliance stack on both harness nodes and reports role `unpaired`.
@@ -39,10 +39,14 @@ Every phase ends with its acceptance criteria passing and STATE.md updated. Do t
 
 ---
 
-## Phase 2 — Shared repository source (B2)
+## Phase 2 — Capture on the primary, and the bucket repository option
+
+- Capture job on the primary: `pg_dump` per database plus globals, Redis RDB, env files, Caddy data, app data directories, license material; manifest with digests and verification figures; hash-list seal written last.
+- restic repository wrapper (init, backup, snapshots, restore, check), secrets redacted.
+- The items below cover the firm-bucket option (B2 or S3-compatible).
 
 - Pairing wizard step on the primary: create or enter a read-only B2 application key for the standby (list and read only).
-- Standby connects to the firm's repository read-only through vibe-backup.
+- Standby connects to the bucket repository read-only with its own restic.
 - List snapshots, read the latest manifest, show "latest snapshot available" in the standby panel.
 - Trigger: primary sends "snapshot complete" over the peer channel after each backup; standby also polls at the fallback time.
 
@@ -52,13 +56,13 @@ Every phase ends with its acceptance criteria passing and STATE.md updated. Do t
 
 ---
 
-## Phase 3 — Direct push source
+## Phase 3 — Standby-hosted repository (default)
 
-For firms with no shared repository. The standby hosts a repository on its own disk; the primary writes to it as an extra Vibe Backup destination.
+The standby hosts the repository on its own disk; the primary's `vibe-standby` writes to it over the peer channel.
 
 - Spike first (QUESTIONS Q1): pick the transport that works unchanged over LAN, Tailscale and a Cloudflare tunnel hostname. Record the result before building.
 - Standby: receiver service with storage under `/var/lib/vibe-standby/repo`, authenticated with credentials issued at pairing, reachable only on the peer path.
-- Primary: register the standby as a vibe-backup destination (new destination type, cross-repo change).
+- Primary: point its restic repository at the standby's receiver.
 - Cloudflare path: a separate, always-on sync hostname on the standby. It is not the app tunnel and exposes only the receiver.
 - Retention on the hosted repo follows the firm's policy; no Object Lock.
 - Disk check at pairing and nightly: hosted repo plus restored data plus staging must fit; warn at 80%.
@@ -156,7 +160,7 @@ Guided failover on the standby console. Resumable.
    - turn off agent standby mode; start Postgres-dependent services, Redis, then apps
    - health-check each app
    - start `cloudflared` (domain mode), or show this box's address (LAN and Tailscale modes)
-   - take over the backup schedule and run a backup immediately
+   - prompt the admin to set up Vibe Backup on this box (QUESTIONS Q22)
    - set role `primary`
 5. **Done screen:** what is live, what was held, what to tell staff, and how to bring the old box back.
 
@@ -166,7 +170,7 @@ Guided failover on the standby console. Resumable.
 **Acceptance (two VMs):**
 - Kill the primary; complete the wizard; apps answer on the same public hostname with the restored data.
 - Crash the standby service mid-run; reopening the wizard resumes at the right step (invariant 6).
-- The first backup after promote succeeds to the same repository.
+- After promote the Done screen shows the Vibe Backup setup step, and a standby snapshot can be taken from the new primary once a standby is paired.
 - With the primary still up, the wizard refuses to proceed.
 
 ---

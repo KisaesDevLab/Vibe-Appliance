@@ -1,16 +1,12 @@
 # CLAUDE.md — Vibe Standby
 
-Vibe Standby keeps a second Vibe Appliance (the **standby**) restored nightly from the primary's Vibe Backup snapshots, so that disaster recovery is a guided **Promote** that starts the apps and the Cloudflare tunnel on the standby.
+Vibe Standby keeps a second Vibe Appliance (the **standby**) restored nightly from snapshots that Vibe Standby itself takes on the primary, so that disaster recovery is a guided **Promote** that starts the apps and the Cloudflare tunnel on the standby.
 
 Read this file, then PHASES.md, STATE.md and QUESTIONS.md before doing any work.
 
-## First task in every new environment
+## Reconciliation (done 2026-11-16)
 
-This plan was written without access to the `vibe-backup` and `vibe-appliance` source. Before Phase 0 code:
-
-1. Read both repos (CLAUDE.md, the agent API, the manifest schema, the vibe-backup HTTP API and snapshot layout).
-2. Reconcile every name in "Contracts with other repos" below against what actually exists.
-3. Record each mismatch in QUESTIONS.md with a default, and each missing capability in STATE.md under "Cross-repo work needed".
+The first version of this plan was written without the `Vibe-Backup` and `Vibe-Appliance` source. Both were read on 2026-11-16; the results are in STATE.md and Kurt's answers are in QUESTIONS.md (Q13–Q21). The main change: **Vibe Standby is independent of Vibe Backup.** It captures, ships and restores its own snapshots. Vibe Backup stays the firm's offsite, tamper-proof backup and is not a dependency.
 
 Do not invent an endpoint in another repo and code against it silently. Code against an interface in `src/contracts/`, with a fake, and list the real work needed.
 
@@ -21,9 +17,9 @@ Do not invent an endpoint in another repo and code against it silently. Code aga
 | Product | Shipped Vibe Appliance feature, own module and repo (`vibe-standby`), operable by a novice IT person. No extra license. |
 | Topology | One primary, one standby per firm in v1. amd64 only. Same LAN, cross-site, or cloud VPS. |
 | Recovery point | Nightly. Standby is at most about a day behind. |
-| Mechanism | Standby restores the latest Vibe Backup (Kopia) snapshot each night. No Postgres streaming, no second replication channel. |
-| Snapshot sources | (a) The firm's B2 repository, connected read-only. (b) Direct push: the primary writes snapshots to a repository hosted on the standby, over LAN, Tailscale, or a Cloudflare tunnel hostname. NAS/SFTP repositories are out of v1. |
-| Replicated set | Everything Vibe Backup captures: Postgres (all product databases), Redis, all volumes, appliance config, `.env`, secrets, Caddy data, license file, Cloudflare tunnel token. |
+| Mechanism | Each night the primary's `vibe-standby` captures a snapshot with restic and the standby restores it. Independent of Vibe Backup. No Postgres streaming. |
+| Snapshot repository | Vibe Standby's own restic repository, separate from Vibe Backup's. (a) Default: hosted on the standby and written by the primary over the peer channel (LAN, Tailscale, or a Cloudflare tunnel hostname). (b) Option: a bucket the firm owns (B2 or any S3-compatible store), read-only for the standby. NAS/SFTP are out of v1. |
+| Replicated set | Captured by `vibe-standby` on the primary: Postgres (all product databases), Redis, all volumes, appliance config, `.env`, secrets, Caddy data, license file, Cloudflare tunnel token. |
 | Standby state | Warm and verified: data restored and checked nightly; apps and tunnel stopped. |
 | Version sync | Every sync mirrors the primary's enabled apps, image digests and appliance config. |
 | Tunnel and license | Same tunnel token and firm key, dormant on the standby until Promote. License moves with the data; no re-activation. |
@@ -40,9 +36,10 @@ Do not invent an endpoint in another repo and code against it silently. Code aga
 One service, `vibe-standby`, runs on **both** boxes. Its behaviour depends on its role.
 
 - **Roles:** `unpaired`, `primary`, `standby`, `demoted`. Role and pairing state live in the **local overlay** (below), never in the replicated set.
-- **Stack:** TypeScript on Node, Fastify, zod config, SQLite state store. Match `vibe-backup`'s versions, lint, logging and UI approach exactly; when in doubt, copy its conventions.
-- **Kopia:** `vibe-standby` never spawns `kopia`. All repository work goes through the `vibe-backup` API. `vibe-backup` stays the only place Kopia is run.
-- **Containers, tunnel, images:** only through the appliance host agent API. No Docker socket.
+- **Stack:** TypeScript on Node 24, Fastify, zod config, SQLite state store. Follow the appliance console's conventions (Vibe Backup is Go and is not a model for this repo).
+- **restic:** `vibe-standby` ships and runs its own pinned restic binary behind `src/contracts/repository.ts`. Chosen because it is deduplicated, encrypted, resumable, speaks B2, S3 and `rest:` natively, and is the engine Vibe Backup already trusts. Server side of the standby-hosted repository is restic `rest-server` in append-only mode (confirm in the Q1 spike).
+- **Capture without Docker:** Postgres by `pg_dump` over `vibe_net` (client version must match the server image), Redis by `redis-cli --rdb`, files from a read-only mount of `/opt/vibe` (env, Caddy data, app data directories). Each snapshot carries a manifest with image digests, enabled apps, appliance config and per-database and per-volume verification figures, sealed with a hash list.
+- **Containers, tunnel, images:** only through new token-authenticated console routes and new host-runner actions in Vibe-Appliance (there is no host agent). No Docker socket.
 - **UI:** `vibe-standby` serves its own panel and wizards; the appliance console proxies them, as it does for `vibe-backup`.
 
 ### Local overlay (never overwritten by a restore)
@@ -58,12 +55,13 @@ The restore pipeline must treat this path, and the box's Tailscale and host netw
 
 ### Nightly sync on the standby
 
+0. On the primary: capture and write the snapshot (default 02:30 local, after Vibe Backup's 01:30 window).
 1. Trigger: "snapshot complete" notice from the primary over the peer channel; fallback poll at 04:00 local.
 2. Read the latest snapshot manifest (read-only repository connection).
 3. Mirror versions: enabled apps, image digests, appliance config. Pull images by digest.
 4. Restore volumes to a staging path, then swap.
 5. Restore Postgres into `<db>__incoming`, verify, then swap by rename. Postgres runs on the standby; app containers do not.
-6. Restore Redis data, config, secrets, license and tunnel token.
+6. Restore Redis data, config, secrets and license. The tunnel token is restored to a sealed file in the local overlay, never into `shared.env`, until Promote.
 7. Verify (Phase 6), record the result, report to the primary if reachable.
 
 A failed sync must leave the previous good copy intact and promotable.
@@ -71,7 +69,7 @@ A failed sync must leave the previous good copy intact and promotable.
 ### Role lease
 
 - Lease record: `{ epoch, holderNodeId, writtenAt, reason }`. Highest epoch wins.
-- Stored in two places: beside the repository (a `standby-lease/` prefix in the B2 bucket, or on the standby's hosted repo in direct-push mode) and on the peer.
+- Stored in two places: beside the repository (a `standby-lease/` prefix in the bucket, or on the standby-hosted repo) and on the peer. Records are append-only, one object per epoch (`standby-lease/<epoch>-<nodeId>.json`), never overwritten.
 - A box may start apps and the tunnel only when its own node ID holds the highest epoch it can find.
 - If a paired box can reach neither lease location, it stays down until an admin overrides in the console.
 
@@ -91,14 +89,10 @@ A failed sync must leave the previous good copy intact and promotable.
 Names are provisional until reconciled (see "First task").
 
 **vibe-backup**
-- List snapshots and read a snapshot manifest (must include image digests, enabled apps, appliance config, per-database and per-volume verification figures).
-- Connect to a repository read-only with supplied credentials.
-- Restore a snapshot's volumes to a caller-supplied staging path; restore a database dump into a caller-named database; restore Redis; restore config and secrets with an exclude list.
-- New destination type for direct push (repository hosted on the standby).
-- Post-backup webhook or event.
-- "Hand over schedule": enable or disable scheduled backups on a box.
+- None required. Vibe Standby's capture runs after the backup window and must not hold locks or load that would fail a Vibe Backup run.
+- After Promote, Vibe Backup on the new primary needs its own setup (it is not part of the replicated set today); the Done screen says so.
 
-**vibe-appliance host agent**
+**vibe-appliance console and host-runner** (no host agent exists)
 - Standby mode flag that blocks app and tunnel autostart at boot.
 - Start and stop all apps; start and stop `cloudflared`; pull images by digest; apply appliance config; report health per app.
 - Start apps on an isolated network with outbound egress blocked (test promote).
@@ -117,8 +111,8 @@ Names are provisional until reconciled (see "First task").
 - Blockers go in QUESTIONS.md with a default assumption; keep going on the default.
 - Conventional commits (`feat(lease): …`, `test(promote): …`). One logical change per commit.
 - Tests:
-  - Unit tests use fakes for the vibe-backup and agent contracts.
-  - Integration tests use a two-node compose harness (`primary` and `standby` stacks on separate networks) with MinIO, Object Lock enabled, standing in for B2.
+  - Unit tests use fakes for the repository and appliance-control contracts.
+  - Integration tests use a two-node compose harness (`primary` and `standby` stacks on separate networks) with a selectable repository backend: MinIO (default, S3), a real B2 test bucket (credentials from the environment), or the standby-hosted repo.
   - End-to-end promote, failback and split-brain tests run on two disposable VMs.
 - Structured JSON logs. Every sync, promote, failback and drill writes an audit record that the console can show and export.
 - Wizard copy is written for a novice: one decision per screen, plain words, no jargon without an explanation.
