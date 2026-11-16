@@ -12,6 +12,16 @@ const schema = z.object({
   localDir: z.string().default("/opt/vibe/standby/local"),
   /** Read-only view of the appliance tree (capture source). */
   applianceDir: z.string().default("/host/vibe"),
+  /** Writable working area: stage, restore mirror, hosted repository, archive. */
+  dataDir: z.string().default("/opt/vibe/standby"),
+  /** The appliance console, for container, tunnel and image control. */
+  consoleUrl: z.string().url().default("http://console:3000"),
+  pgHost: z.string().default("postgres"),
+  pgPort: z.coerce.number().int().default(5432),
+  /** Port of the peer channel (direct mode), published on the host. */
+  peerPort: z.coerce.number().int().default(4480),
+  /** Upload limit for the nightly transfer, KiB/s. 0 = unlimited. */
+  limitUploadKib: z.coerce.number().int().min(0).default(0),
   /** Nightly capture time on the primary, firm-local. After Vibe Backup's 01:30. */
   captureAt: hhmm.default("02:30"),
   /** Standby polls for a new snapshot at this time if no notice arrived. */
@@ -35,6 +45,12 @@ const ENV_NAMES: Record<keyof Config, string> = {
   host: "VIBE_STANDBY_HOST",
   localDir: "VIBE_STANDBY_LOCAL_DIR",
   applianceDir: "VIBE_STANDBY_APPLIANCE_DIR",
+  dataDir: "VIBE_STANDBY_DATA_DIR",
+  consoleUrl: "VIBE_STANDBY_CONSOLE_URL",
+  pgHost: "VIBE_STANDBY_PG_HOST",
+  pgPort: "VIBE_STANDBY_PG_PORT",
+  peerPort: "VIBE_STANDBY_PEER_PORT",
+  limitUploadKib: "VIBE_STANDBY_LIMIT_UPLOAD_KIB",
   captureAt: "VIBE_STANDBY_CAPTURE_AT",
   syncFallbackAt: "VIBE_STANDBY_SYNC_FALLBACK_AT",
   staleAfterHours: "VIBE_STANDBY_STALE_AFTER_HOURS",

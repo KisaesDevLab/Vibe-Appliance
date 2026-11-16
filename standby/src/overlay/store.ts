@@ -98,6 +98,14 @@ export class Store {
     this.db.prepare("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value);
   }
 
+  /** Small JSON values kept in the local overlay (last verified snapshot, pairing, and so on). */
+  get<T>(key: string): T | undefined {
+    const v = this.#meta(`kv:${key}`);
+    return v === undefined ? undefined : (JSON.parse(v) as T);
+  }
+  set(key: string, value: unknown): void { this.#setMeta(`kv:${key}`, JSON.stringify(value)); }
+  unset(key: string): void { this.db.prepare("DELETE FROM meta WHERE key = ?").run(`kv:${key}`); }
+
   /** Stable for the life of the install; generated on first start. */
   get nodeId(): string { return this.#meta("node_id")!; }
 
