@@ -17,12 +17,11 @@ import { Pg } from "../src/pg/pg.ts";
 import { Runtime } from "../src/runtime.ts";
 import { buildServer } from "../src/server.ts";
 import { pgAvailable, startCluster, type Cluster } from "./helpers/pgcluster.ts";
-import { tool } from "./helpers/tools.ts";
+import { freePort, tool } from "./helpers/tools.ts";
 
 const skip = pgAvailable() && tool("restic") && tool("rest-server") ? false : "needs postgres, restic and rest-server";
-interface Box { api: FastifyInstance; rt: Runtime; store: Store; box: FakeAppliance; tree: string; data: string; pg: Pg; cluster: Cluster }
+interface Box { api: FastifyInstance; rt: Runtime; store: Store; box: FakeAppliance; tree: string; data: string; pg: Pg; cluster: Cluster; ports: { receiverPort: number; forwarderPort: number } }
 const boxes: Box[] = [];
-let basePort = 48100 + Math.floor(Math.random() * 300);
 
 async function mkBox(name: string, apps: string[]): Promise<Box> {
   const root = mkdtempSync(join(tmpdir(), `vs-e2e-${name}-`));
@@ -32,7 +31,7 @@ async function mkBox(name: string, apps: string[]): Promise<Box> {
   const cluster = startCluster();
   writeFileSync(join(tree, "env/shared.env"), `POSTGRES_USER=postgres\nPOSTGRES_PASSWORD=${cluster.conn.password}\nSTANDBY_CONTROL_TOKEN=x\n`);
   writeFileSync(join(tree, "state.json"), JSON.stringify({ config: { mode: "lan", host_ip: "127.0.0.1" } }));
-  const peerPort = (basePort += 10);
+  const peerPort = freePort(), receiverPort = freePort(), forwarderPort = freePort();
   const config = loadConfig({
     VIBE_STANDBY_APPLIANCE_DIR: tree, VIBE_STANDBY_DATA_DIR: data, VIBE_STANDBY_LOCAL_DIR: join(data, "local"),
     VIBE_STANDBY_PG_HOST: cluster.conn.host, VIBE_STANDBY_PG_PORT: String(cluster.conn.port), VIBE_STANDBY_PEER_PORT: String(peerPort),
@@ -41,9 +40,10 @@ async function mkBox(name: string, apps: string[]): Promise<Box> {
   const store = new Store(config.localDir);
   const identity = await loadOrCreateIdentity(config.localDir, store.nodeId);
   const box = new FakeAppliance({ apps, running: apps.length > 0, applianceCommit: "abc1234" });
-  const rt = new Runtime({ config, store, identity, appliance: box, peerHost: "127.0.0.1" });
+  const ports = { receiverPort, forwarderPort };
+  const rt = new Runtime({ config, store, identity, appliance: box, peerHost: "127.0.0.1", ...ports });
   await rt.start();
-  const b: Box = { api: buildServer({ config, store, runtime: rt, quiet: true }), rt, store, box, tree, data, pg: new Pg(cluster.conn), cluster };
+  const b: Box = { api: buildServer({ config, store, runtime: rt, quiet: true }), rt, store, box, tree, data, pg: new Pg(cluster.conn), cluster, ports };
   boxes.push(b);
   return b;
 }
@@ -134,7 +134,7 @@ test("e2e direct mode: pair, nightly copy, sync, then promote after the primary 
   // It was down during the promote, so the new lease never reached it. It must
   // still find out — by asking the box that replaced it — and hold.
   assert.equal(P.store.role, "primary", "it still believes it is the primary");
-  const back = new Runtime({ config: P.rt.config, store: P.store, identity: P.rt.identity, appliance: P.box, peerHost: "127.0.0.1" });
+  const back = new Runtime({ config: P.rt.config, store: P.store, identity: P.rt.identity, appliance: P.box, peerHost: "127.0.0.1", ...P.ports });
   boxes.push({ ...P, rt: back });
   await back.start();
   await back.tick(new Date());

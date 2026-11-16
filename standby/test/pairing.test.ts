@@ -14,10 +14,10 @@ import { getPairing, publicPairing } from "../src/pairing/state.ts";
 import { startPeerServer } from "../src/peer/channel.ts";
 import type { Pg } from "../src/pg/pg.ts";
 import { FakeBucket, FakeS3 } from "./helpers/fakeS3.ts";
+import { freePort } from "./helpers/tools.ts";
 
 const servers: Server[] = [];
 after(() => { for (const s of servers) s.close(); });
-let port = 47500 + Math.floor(Math.random() * 400);
 
 interface Box { store: Store; id: Identity; box: FakeAppliance; svc: PairingService; port: number; clock: { t: number }; dbs: string[] }
 async function mkBox(name: string, opts: { apps?: string[]; dbs?: string[]; bucket?: FakeBucket; readOnly?: boolean } = {}): Promise<Box> {
@@ -26,7 +26,7 @@ async function mkBox(name: string, opts: { apps?: string[]; dbs?: string[]; buck
   const box = new FakeAppliance({ apps: opts.apps ?? [], running: (opts.apps ?? []).length > 0 });
   const clock = { t: Date.UTC(2026, 10, 16, 12) };
   const dbs = opts.dbs ?? [];
-  const p = ++port;
+  const p = freePort();
   const svc = new PairingService({
     store, identity: id, appliance: box, pg: { listDatabases: async () => dbs } as unknown as Pg, peerPort: p,
     ownAddresses: async () => ["127.0.0.1"], now: () => new Date(clock.t),

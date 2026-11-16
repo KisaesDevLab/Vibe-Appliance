@@ -10,12 +10,12 @@ import { loadOrCreateIdentity, type Identity } from "../src/crypto/identity.ts";
 import { PeerClient, PeerIdentityError, startPeerServer, startRepoForwarder, type PeerTarget } from "../src/peer/channel.ts";
 import { startReceiver, type Receiver } from "../src/peer/receiver.ts";
 import { ResticRepository } from "../src/repo/restic.ts";
-import { tool } from "./helpers/tools.ts";
+import { freePort, tool } from "./helpers/tools.ts";
 
 const root = mkdtempSync(join(tmpdir(), "vs-peer-"));
 let primary: Identity, standby: Identity, stranger: Identity;
 let server: Server, forwarder: Server, receiver: Receiver | undefined;
-const PEER = 46480 + Math.floor(Math.random() * 500), REST = PEER + 1000, FWD = PEER + 2000;
+const PEER = freePort(), REST = freePort(), FWD = freePort(), FWD2 = freePort();
 const seen: string[] = [];
 const target = (): PeerTarget => ({ addresses: ["127.0.0.1"], port: PEER, fingerprint: standby.fingerprint });
 const haveTools = tool("restic") && tool("rest-server");
@@ -65,9 +65,9 @@ test("peer: addresses are tried in order; a dead first address does not stop the
 });
 
 test("peer: an unpaired client can neither read nor write the repository receiver", { skip: haveTools ? false : "restic/rest-server not installed" }, async () => {
-  const fwdStranger = await startRepoForwarder(FWD + 1, target, stranger);
+  const fwdStranger = await startRepoForwarder(FWD2, target, stranger);
   try {
-    const repo = new ResticRepository({ location: { kind: "rest", url: `http://127.0.0.1:${FWD + 1}/` }, password: "pw-for-stranger", access: "read-write", bin: tool("restic")!, cacheDir: join(root, "cx") });
+    const repo = new ResticRepository({ location: { kind: "rest", url: `http://127.0.0.1:${FWD2}/` }, password: "pw-for-stranger", access: "read-write", bin: tool("restic")!, cacheDir: join(root, "cx") });
     await assert.rejects(repo.init());
     await assert.rejects(repo.listSnapshots());
   } finally { fwdStranger.close(); }

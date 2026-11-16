@@ -4,9 +4,7 @@ import { chmodSync, chownSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import type { PgConnection } from "../../src/pg/pg.ts";
-import { tool } from "./tools.ts";
-
-let nextPort = 54400 + Math.floor(Math.random() * 400);
+import { freePort, tool } from "./tools.ts";
 
 export interface Cluster { conn: PgConnection; stop: () => void }
 
@@ -17,7 +15,7 @@ export function startCluster(): Cluster {
   const binDir = dirname(initdb);
   const root = mkdtempSync(join(tmpdir(), "vs-pg-"));
   const data = join(root, "data");
-  const port = nextPort++;
+  let port = freePort();
   const password = "cluster-test-password";
   const pwFile = join(root, "pw");
   writeFileSync(pwFile, password);
@@ -39,7 +37,16 @@ export function startCluster(): Cluster {
     if (r.status !== 0) throw new Error(`${args[0]} failed: ${r.stderr || r.stdout}`);
   };
   sh([initdb, "-D", data, "-U", "postgres", "--pwfile", pwFile, "--auth", "scram-sha-256", "-E", "UTF8"]);
-  sh([join(binDir, "pg_ctl"), "-D", data, "-w", "-o", `-p ${port} -c listen_addresses=127.0.0.1 -c unix_socket_directories=${root} -c fsync=off`, "-l", join(root, "log"), "start"]);
+  // Another process can still take the port between the probe and the start; try again with a new one.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      sh([join(binDir, "pg_ctl"), "-D", data, "-w", "-o", `-p ${port} -c listen_addresses=127.0.0.1 -c unix_socket_directories=${root} -c fsync=off`, "-l", join(root, "log"), "start"]);
+      break;
+    } catch (err) {
+      if (attempt >= 4) throw err;
+      port = freePort();
+    }
+  }
   return {
     conn: { host: "127.0.0.1", port, user: "postgres", password, binDir },
     stop: () => { try { sh([join(binDir, "pg_ctl"), "-D", data, "-m", "immediate", "stop"]); } catch { /* already down */ } },

@@ -24,3 +24,14 @@ export function tool(name: "restic" | "rest-server" | "initdb"): string | null {
   if (!found && process.env.VIBE_STANDBY_REQUIRE_TOOLS === "1") throw new Error(`${name} is required for this test run but was not found`);
   return found;
 }
+
+/**
+ * A port nobody is using right now, chosen by the OS. Test files run in
+ * parallel, so a guessed number can collide with another file's server.
+ */
+export function freePort(): number {
+  const r = spawnSync(process.execPath, ["-e", "const s=require('net').createServer();s.listen(0,'127.0.0.1',()=>{process.stdout.write(String(s.address().port));s.close()})"], { encoding: "utf8" });
+  const port = Number(r.stdout);
+  if (!Number.isInteger(port) || port <= 0) throw new Error("could not find a free port");
+  return port;
+}
