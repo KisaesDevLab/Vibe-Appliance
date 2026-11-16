@@ -1,0 +1,39 @@
+# .github/workflows/standby.yml — Vibe Standby (standby/) checks.
+#
+#   test     — typecheck, unit tests and build of the TypeScript service.
+#   harness  — builds standby/Dockerfile and starts two nodes (a primary
+#              and a standby stack on separate networks) and checks both
+#              answer /api/health with role "unpaired". `docker build`
+#              exiting 0 is not enough; the container has to start.
+name: standby
+
+on:
+  push:
+    branches: [main]
+    paths: ['standby/**', '.github/workflows/standby.yml']
+  pull_request:
+    paths: ['standby/**', '.github/workflows/standby.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: standby } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: npm, cache-dependency-path: standby/package-lock.json }
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  harness:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash standby/test/harness/phase0.sh

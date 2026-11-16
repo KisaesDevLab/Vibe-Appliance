@@ -231,6 +231,58 @@ services:
       # Linux ≥ 20.10.
       - "host.docker.internal:host-gateway"
 
+  standby:
+    # Vibe Standby (standby/): keeps a second appliance updated nightly
+    # from this one and guides an admin through Promote. The same
+    # service runs on both boxes; its role (unpaired, primary, standby,
+    # replaced) lives in /opt/vibe/standby/local, never in a replicated
+    # file. Independent of Vibe Backup. See standby/CLAUDE.md.
+    #
+    # Built locally like the console, so both boxes run the same code
+    # whenever they are on the same appliance commit.
+    #
+    # NO DOCKER SOCKET. Containers, tunnel and images are controlled
+    # only through the console's /api/v1/standby-control routes and
+    # host-runner actions.
+    #
+    # ROOT, READ-ONLY TREE. Capture reads /opt/vibe/env and the Caddy
+    # certificate store, which are root-only (0600), so this container
+    # runs as root — but the appliance tree is mounted read-only. The
+    # only writable host path is /opt/vibe/standby.
+    build:
+      context: ./standby
+      dockerfile: Dockerfile
+    image: vibe-appliance/standby:latest
+    container_name: vibe-standby
+    restart: unless-stopped
+    init: true
+    environment:
+      VIBE_STANDBY_APPLIANCE_DIR: /host/vibe
+      VIBE_STANDBY_LOCAL_DIR: /opt/vibe/standby/local
+      VIBE_STANDBY_DATA_DIR: /opt/vibe/standby
+      VIBE_STANDBY_CONSOLE_URL: http://console:3000
+    volumes:
+      # Directory mount, never a file mount: state.json is replaced
+      # atomically (new inode) on every write.
+      - /opt/vibe:/host/vibe:ro
+      # Local overlay, restore mirror, hosted repository, archive.
+      - /opt/vibe/standby:/opt/vibe/standby
+    ports:
+      # Peer channel for direct mode (mutual TLS, pinned certificates).
+      # Nothing listens on it until pairing starts. Bucket mode never
+      # uses it. Restrict with STANDBY_PEER_BIND (a LAN or Tailscale
+      # address) to keep it off other interfaces.
+      - "${STANDBY_PEER_BIND:-0.0.0.0}:4480:4480"
+    networks:
+      - vibe_net
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4010/api/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
   duplicati:
     # Self-hosted backup. Per-backup AES-256 encryption is configured
     # in Duplicati's UI when the operator sets up a backup job — the

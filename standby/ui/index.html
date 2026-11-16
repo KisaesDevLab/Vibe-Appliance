@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Standby</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c2330; --muted:#5b6575; --line:#dfe3ea; --accent:#2457c5; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#12161d; --card:#1b212b; --text:#e8ecf2; --muted:#9aa5b5; --line:#2c3543; --accent:#7aa5ff; } }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.5 system-ui, sans-serif; }
+  main { max-width:44rem; margin:0 auto; padding:24px 16px; }
+  h1 { font-size:1.5rem; margin:0 0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:20px; margin-bottom:16px; }
+  .big { font-size:1.25rem; font-weight:600; margin:0 0 4px; }
+  .muted { color:var(--muted); margin:0; }
+  dl { display:grid; grid-template-columns:max-content 1fr; gap:6px 16px; margin:0; }
+  dt { color:var(--muted); } dd { margin:0; overflow-wrap:anywhere; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Standby</h1>
+  <div class="card" id="headline"><p class="big">Loading…</p></div>
+  <div class="card"><dl id="facts"></dl></div>
+</main>
+<script>
+  // Relative URLs only: this page is served behind the console's proxy prefix.
+  const HEADLINES = {
+    unpaired: ["This box is not paired yet", "A standby is a second box kept ready to take over if this one fails. Pairing will be added here."],
+    primary: ["This box is the primary", "It is the live copy of your firm's data."],
+    standby: ["This box is the standby", "It holds a copy of the primary and is not live."],
+    replaced: ["This box was replaced", "The other box was promoted. This one is not live."],
+  };
+  function row(dl, k, v) {
+    const dt = document.createElement("dt"); dt.textContent = k;
+    const dd = document.createElement("dd"); dd.textContent = v;
+    dl.append(dt, dd);
+  }
+  fetch("api/status").then((r) => r.json()).then((s) => {
+    const [title, sub] = HEADLINES[s.role] || [s.role, ""];
+    const h = document.getElementById("headline");
+    h.replaceChildren();
+    const p1 = document.createElement("p"); p1.className = "big"; p1.textContent = title;
+    const p2 = document.createElement("p"); p2.className = "muted"; p2.textContent = sub;
+    h.append(p1, p2);
+    const dl = document.getElementById("facts");
+    row(dl, "Status", s.health);
+    row(dl, "Box ID", s.nodeId);
+    row(dl, "Version", s.version);
+  }).catch(() => {
+    document.querySelector("#headline .big").textContent = "Standby service is not answering";
+  });
+</script>
+</body>
+</html>
