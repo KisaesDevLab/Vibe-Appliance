@@ -37,15 +37,21 @@ export interface ApplianceControl {
   appHealth(): Promise<AppHealth[]>;
 
   stopTunnel(): Promise<void>;
-  /** Refused while standby mode is on. The caller supplies the unsealed token. */
-  startTunnel(token: string): Promise<void>;
+  /** Refused while standby mode is on. Uses the tunnel token in the placed settings. */
+  startTunnel(): Promise<void>;
 
   /** Pull every image by digest. Returns the references that could not be pulled. */
   pullImages(digests: Record<string, string>): Promise<{ failed: string[] }>;
   /** Check out the given appliance commit, rebuild the console, set the enabled apps. */
   mirrorVersion(v: ApplianceVersion): Promise<void>;
-  /** Re-render env files for this host's own address after a restore. */
-  rerenderEnvForThisHost(): Promise<void>;
+  /**
+   * Promote: put the verified mirror into /opt/vibe and bring the box up as
+   * a primary (apps re-enabled, env re-rendered for this host, Redis empty).
+   * `snapshotId` is recorded as the copy being placed.
+   */
+  place(snapshotId: string): Promise<void>;
+  /** Rejoin: set this box's current data aside, read-only, before it is overwritten. */
+  archive(): Promise<void>;
 
   /** Test promote: start apps on a network with no egress and no tunnel. */
   startAppsIsolated(): Promise<void>;

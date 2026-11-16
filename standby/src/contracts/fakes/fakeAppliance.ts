@@ -88,10 +88,10 @@ export class FakeAppliance implements ApplianceControl {
   }
 
   async stopTunnel(): Promise<void> { this.#call("stopTunnel"); this.#set("tunnel", false); }
-  async startTunnel(token: string): Promise<void> {
+  async startTunnel(): Promise<void> {
     this.#call("startTunnel");
     if (this.standbyMode) throw new StandbyModeError("startTunnel");
-    this.tunnelTokenSeen = token;
+    this.tunnelTokenSeen = "placed-token";
     this.#set("tunnel", true);
   }
 
@@ -109,7 +109,19 @@ export class FakeAppliance implements ApplianceControl {
     }
     for (const s of [...this.services.values()]) if (s.kind === "app" && !v.enabledApps.includes(s.name)) this.services.delete(s.name);
   }
-  async rerenderEnvForThisHost(): Promise<void> { this.#call("rerenderEnvForThisHost"); }
+  placed: string | null = null;
+  archived = 0;
+  /** What the real placement does: the primary's apps appear and start, Redis comes up empty. */
+  async place(snapshotId: string): Promise<void> {
+    this.#call("place");
+    if (this.standbyMode) throw new StandbyModeError("place");
+    this.placed = snapshotId;
+    for (const a of this.current.enabledApps) {
+      if (!this.services.has(a)) this.services.set(a, { name: a, kind: "app", running: false, digest: this.current.imageDigests[a] ?? null });
+    }
+    this.#set("redis", true); this.#set("app", true);
+  }
+  async archive(): Promise<void> { this.#call("archive"); this.archived++; }
 
   async startAppsIsolated(): Promise<void> {
     this.#call("startAppsIsolated");

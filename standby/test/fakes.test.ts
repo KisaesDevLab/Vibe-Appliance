@@ -64,7 +64,7 @@ test("invariant 1 groundwork: standby mode keeps apps, Redis and tunnel down acr
   box.simulateReboot();
   assert.deepEqual((await box.listServices()).filter((s) => s.running).map((s) => s.name), ["postgres"]);
   await assert.rejects(box.startApps(), StandbyModeError);
-  await assert.rejects(box.startTunnel("tok"), StandbyModeError);
+  await assert.rejects(box.startTunnel(), StandbyModeError);
   assert.equal(box.everRunning.size, 0);
   assert.equal(box.tunnelTokenSeen, null);
 });
