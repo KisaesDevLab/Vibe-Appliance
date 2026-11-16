@@ -57,6 +57,14 @@ enable_app() {
   local slug="${1:-}"
   [[ -n "$slug" ]] || die "enable_app: slug required"
   [[ -n "${APPLIANCE_DIR:-}" ]] || die "enable_app: APPLIANCE_DIR not set"
+  # A standby must not run apps: enabling one here would start a second
+  # live copy of the firm's data. This is the host-side gate; the console
+  # refuses too, but bootstrap, update.sh and `vibe enable` all land here.
+  if state_standby_mode; then
+    log_error "refusing to enable $slug: this box is a standby" slug="$slug"
+    printf 'ERROR: %s cannot be enabled on a standby.\n  cause: this box is in standby mode (Vibe Standby), so its apps stay stopped.\n  fix: enable the app on the primary; it follows at the next sync.\n  fix: to make this box live, open the console, choose Standby, then Promote.\n' "$slug" >&2
+    return 1
+  fi
   # Private app images: use the stored GitHub token for every pull and
   # `docker run` below, not only the compose ones.
   registry_auth_env

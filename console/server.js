@@ -28,6 +28,7 @@ const Database    = require('better-sqlite3');
 const landingOrderLib = require('./lib/landing-order');
 const landingGate = require('./lib/landing-gate');
 const { validateSettingValue } = require('./lib/settings-validate');
+const { createStandbyControl } = require('./lib/standby-control');
 
 // ----- config -----------------------------------------------------------
 
@@ -1150,19 +1151,17 @@ function consoleProxiedApp(m) {
 }
 const appProxyUrl = (m) => (consoleProxiedApp(m) ? `/admin/apps/${m.slug}/` : null);
 
-app.use('/admin/apps/:slug', requireAdmin, (req, res) => {
-  const m = MANIFESTS[req.params.slug];
-  if (!consoleProxiedApp(m)) {
-    res.status(404).type('text/plain').send('not a console-proxied app\n');
-    return;
-  }
+// Stream one request to an internal upstream ("host:port") on vibe_net.
+// `mount` is the console path the upstream is served under (with its
+// trailing slash); `name` and `container` only shape the error message.
+function proxyToInternal(req, res, { upstream, mount, name, container }) {
   // The mount root must carry a trailing slash or the app's relative
-  // URLs ("api/status") resolve against /admin/apps/ and miss.
+  // URLs ("api/status") resolve against the parent path and miss.
   if (req.url === '/' && !req.originalUrl.split('?')[0].endsWith('/')) {
-    res.redirect(308, `/admin/apps/${m.slug}/`);
+    res.redirect(308, mount);
     return;
   }
-  const [upHost, upPort] = m.routing.default_upstream.split(':');
+  const [upHost, upPort] = upstream.split(':');
   const headers = { ...req.headers };
   // Hop-by-hop headers are ours, not the upstream's; the console's own
   // basic-auth credential does not leak into an app that must never
@@ -1172,27 +1171,57 @@ app.use('/admin/apps/:slug', requireAdmin, (req, res) => {
   delete headers.upgrade;
   delete headers['keep-alive'];
   delete headers['proxy-authorization'];
-  headers.host = m.routing.default_upstream;
-  const upstream = http.request(
+  headers.host = upstream;
+  const up = http.request(
     { host: upHost, port: Number(upPort) || 80, method: req.method, path: req.url, headers },
     (ur) => {
       res.writeHead(ur.statusCode || 502, ur.headers);
       ur.pipe(res);
     },
   );
-  upstream.setTimeout(120000, () => upstream.destroy(new Error('upstream timeout')));
-  upstream.on('error', (err) => {
+  up.setTimeout(120000, () => up.destroy(new Error('upstream timeout')));
+  up.on('error', (err) => {
     if (!res.headersSent) {
       res.status(502).json({
-        error: `${m.displayName} is not answering (${err.code || err.message}). ` +
-               'Is the app enabled and its container running? Diagnose: ' +
-               `sudo docker logs ${m.slug} --tail 50`,
+        error: `${name} is not answering (${err.code || err.message}). ` +
+               'Is its container running? Diagnose: ' +
+               `sudo docker logs ${container} --tail 50`,
       });
     } else {
       res.destroy();
     }
   });
-  req.pipe(upstream);
+  req.pipe(up);
+}
+
+app.use('/admin/apps/:slug', requireAdmin, (req, res) => {
+  const m = MANIFESTS[req.params.slug];
+  if (!consoleProxiedApp(m)) {
+    res.status(404).type('text/plain').send('not a console-proxied app\n');
+    return;
+  }
+  proxyToInternal(req, res, {
+    upstream: m.routing.default_upstream,
+    mount: `/admin/apps/${m.slug}/`,
+    name: m.displayName,
+    container: m.slug,
+  });
+});
+
+// ----- Vibe Standby panel ------------------------------------------------
+// Standby is a CORE service (docker-compose.yml `standby`, source in
+// standby/), not an app: it has no manifest, cannot be disabled, and
+// runs on every box. Its UI authenticates nobody and has no Caddy
+// surface, so — exactly like the console-proxied apps above — the only
+// way in is through this console's admin auth.
+const STANDBY_UPSTREAM = process.env.VIBE_STANDBY_UPSTREAM || 'vibe-standby:4010';
+app.use('/admin/standby', requireAdmin, (req, res) => {
+  proxyToInternal(req, res, {
+    upstream: STANDBY_UPSTREAM,
+    mount: '/admin/standby/',
+    name: 'Vibe Standby',
+    container: 'vibe-standby',
+  });
 });
 
 app.use(express.json({ limit: '64kb' }));
@@ -2143,9 +2172,7 @@ function queueSentinelAction(req, res, action, args) {
 
 // Poll target for the admin UI: where the action is, its result when
 // finished, and the log so far (tailed — install transcripts get long).
-app.get('/api/v1/host-actions/:id', requireAdmin, (req, res) => {
-  const id = req.params.id;
-  if (!HA_ID_RE.test(id)) return res.status(400).json({ error: 'invalid action id' });
+function hostActionStatus(id) {
   let stateName = 'unknown';
   let result = null;
   const doneP = path.join(HOST_ACTIONS_DIR, 'done', `${id}.json`);
@@ -2166,8 +2193,28 @@ app.get('/api/v1/host-actions/:id', requireAdmin, (req, res) => {
   if (stateName === 'queued' || stateName === 'unknown') {
     runner = (((readState().host_services || {})['host-runner']) || {}).status || 'unknown';
   }
-  res.json({ id, state: stateName, result, log: logText, runner });
+  return { id, state: stateName, result, log: logText, runner };
+}
+
+app.get('/api/v1/host-actions/:id', requireAdmin, (req, res) => {
+  const id = req.params.id;
+  if (!HA_ID_RE.test(id)) return res.status(400).json({ error: 'invalid action id' });
+  res.json(hostActionStatus(id));
 });
+
+// ----- Vibe Standby control surface -----------------------------------
+// Service-token routes for the `standby` container (no admin auth: it is
+// not a browser). See console/lib/standby-control.js.
+app.use('/api/v1/standby-control', createStandbyControl({
+  docker,
+  readState,
+  enqueueHostAction,
+  hostActionStatus,
+  applianceDir: APPLIANCE_DIR,
+  token: () => process.env.STANDBY_CONTROL_TOKEN || '',
+  log,
+}));
+
 
 // A sentinel-install transcript contains the installer's ONE-TIME
 // break-glass credential (its unattended mode prints it to the
@@ -2370,6 +2417,15 @@ app.post('/api/v1/sentinel/enroll', requireAdmin, testRateLimit, (req, res) => {
 // budget as the test endpoints, keyed separately by req.path.
 app.post('/api/v1/enable/:slug', requireAdmin, testRateLimit, async (req, res) => {
   const m = MANIFESTS[req.params.slug];
+  // A standby must not run apps: enabling one here would start a second
+  // live copy of the firm's data. Promote is the way to bring apps up.
+  if ((readState().config || {}).standby_mode) {
+    return res.status(409).json({
+      error: 'This box is a standby, so apps cannot be enabled here. ' +
+             'Apps are enabled on the primary and follow at the next sync. ' +
+             'To make this box live, open Standby and choose Promote.',
+    });
+  }
   if (m && appRuntime(m) !== 'appliance') {
     return queueSentinelAction(req, res, 'sentinel-enable', {});
   }

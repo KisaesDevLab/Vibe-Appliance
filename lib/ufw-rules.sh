@@ -33,6 +33,10 @@ VIBE_STATE_FILE="${VIBE_STATE_FILE:-${VIBE_DIR}/state.json}"
 # Port range covering all current and reserved emergency-access ports.
 # See docs/addenda/emergency-access.md §3 for the canonical assignments.
 _EMERGENCY_PORT_RANGE="5171:5198"
+# Vibe Standby's peer channel (direct mode). Direct mode is LAN or
+# Tailscale only by design, so the same source rule as the emergency
+# ports applies: private ranges and the tailnet, never the internet.
+_STANDBY_PEER_PORT="4480"
 
 apply_ufw_rules() {
   if ! command -v ufw >/dev/null 2>&1; then
@@ -153,6 +157,15 @@ except Exception:
   # it in UFW's first-match evaluation order.
   _ufw_deny_silent "$_EMERGENCY_PORT_RANGE" "tcp" "emergency public deny"
 
+  _ufw_drop_deny "$_STANDBY_PEER_PORT" "tcp"
+  _ufw_allow_silent "10.0.0.0/8"     "$_STANDBY_PEER_PORT" "tcp" "standby peer RFC1918"
+  _ufw_allow_silent "172.16.0.0/12"  "$_STANDBY_PEER_PORT" "tcp" "standby peer RFC1918"
+  _ufw_allow_silent "192.168.0.0/16" "$_STANDBY_PEER_PORT" "tcp" "standby peer RFC1918"
+  if [[ "$tailscale_enabled" == "true" ]]; then
+    _ufw_allow_silent "100.64.0.0/10" "$_STANDBY_PEER_PORT" "tcp" "standby peer CGNAT/Tailscale"
+  fi
+  _ufw_deny_silent "$_STANDBY_PEER_PORT" "tcp" "standby peer public deny"
+
   # ---- Workstream A — LAN-mode Cockpit --------------------------------
   if [[ "$mode" == "lan" ]]; then
     _ufw_allow_silent "10.0.0.0/8"     "9090" "tcp" "cockpit RFC1918 (LAN mode)"
@@ -194,9 +207,10 @@ _apply_docker_user_rules() {
     return 0
   fi
 
-  local tailnet_rule=""
+  local tailnet_rule="" standby_tailnet_rule=""
   if [[ "$tailscale_enabled" == "true" ]]; then
     tailnet_rule="-A DOCKER-USER -p tcp -m conntrack --ctorigdstport ${_EMERGENCY_PORT_RANGE} -s 100.64.0.0/10 -j RETURN"
+    standby_tailnet_rule="-A DOCKER-USER -p tcp -m conntrack --ctorigdstport ${_STANDBY_PEER_PORT} -s 100.64.0.0/10 -j RETURN"
   fi
 
   local block
@@ -212,6 +226,12 @@ ${_VIBE_BLOCK_BEGIN}
 -A DOCKER-USER -p tcp -m conntrack --ctorigdstport ${_EMERGENCY_PORT_RANGE} -s 192.168.0.0/16 -j RETURN
 ${tailnet_rule}
 -A DOCKER-USER -p tcp -m conntrack --ctorigdstport ${_EMERGENCY_PORT_RANGE} -j DROP
+-A DOCKER-USER -p tcp -m conntrack --ctorigdstport ${_STANDBY_PEER_PORT} -s 127.0.0.0/8 -j RETURN
+-A DOCKER-USER -p tcp -m conntrack --ctorigdstport ${_STANDBY_PEER_PORT} -s 10.0.0.0/8 -j RETURN
+-A DOCKER-USER -p tcp -m conntrack --ctorigdstport ${_STANDBY_PEER_PORT} -s 172.16.0.0/12 -j RETURN
+-A DOCKER-USER -p tcp -m conntrack --ctorigdstport ${_STANDBY_PEER_PORT} -s 192.168.0.0/16 -j RETURN
+${standby_tailnet_rule}
+-A DOCKER-USER -p tcp -m conntrack --ctorigdstport ${_STANDBY_PEER_PORT} -j DROP
 COMMIT
 ${_VIBE_BLOCK_END}
 EOF

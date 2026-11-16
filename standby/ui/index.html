@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Standby</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c2330; --muted:#5b6575; --line:#dfe3ea; --accent:#2457c5; --accent-text:#fff;
+          --ok:#1d7a45; --warn:#9a6200; --bad:#b3261e; --ok-bg:#e6f4ec; --warn-bg:#fff4dc; --bad-bg:#fdecea; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#12161d; --card:#1b212b; --text:#e8ecf2; --muted:#9aa5b5; --line:#2c3543; --accent:#7aa5ff; --accent-text:#0d1117;
+          --ok:#6fd49a; --warn:#f0c060; --bad:#ff8a80; --ok-bg:#16301f; --warn-bg:#3a2d10; --bad-bg:#3a1614; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.5 system-ui, sans-serif; }
+  main { max-width:46rem; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:1.5rem; margin:0 0 16px; } h2 { font-size:1.15rem; margin:0 0 8px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:20px; margin-bottom:16px; }
+  .big { font-size:1.25rem; font-weight:600; margin:0 0 4px; }
+  p { margin:0 0 12px; } .muted { color:var(--muted); } .small { font-size:.9rem; }
+  dl { display:grid; grid-template-columns:max-content 1fr; gap:6px 16px; margin:0; }
+  dt { color:var(--muted); } dd { margin:0; overflow-wrap:anywhere; }
+  .banner { border-radius:10px; padding:16px 20px; margin-bottom:16px; border:1px solid; }
+  .ok { background:var(--ok-bg); border-color:var(--ok); } .warn { background:var(--warn-bg); border-color:var(--warn); } .bad { background:var(--bad-bg); border-color:var(--bad); }
+  button { font:inherit; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--text); padding:10px 16px; cursor:pointer; min-height:44px; }
+  button.primary { background:var(--accent); color:var(--accent-text); border-color:var(--accent); font-weight:600; }
+  button.danger { border-color:var(--bad); color:var(--bad); }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; margin-top:12px; }
+  label { display:block; margin:10px 0 4px; font-weight:600; }
+  input[type=text], input[type=password], textarea { width:100%; font:inherit; padding:10px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--text); }
+  textarea { min-height:5.5rem; font-family:ui-monospace, monospace; font-size:.9rem; }
+  .code { font-family:ui-monospace, monospace; font-size:.9rem; overflow-wrap:anywhere; background:var(--bg); border:1px dashed var(--line); border-radius:8px; padding:12px; user-select:all; }
+  ol.steps { list-style:none; padding:0; margin:0; } ol.steps li { padding:6px 0; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:12px; }
+  .err { color:var(--bad); margin-top:10px; } ul { margin:0 0 12px; padding-left:1.2rem; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Standby</h1>
+  <div id="app"><div class="card"><p class="big">Loading…</p></div></div>
+</main>
+<script>
+// Relative URLs only: this page is served behind the console's proxy prefix.
+// Every dynamic value is set with textContent; nothing from the server is parsed as HTML.
+const $app = document.getElementById("app");
+let S = null, view = { name: "home" }, timer = null, formErr = "";
+
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") el.className = v; else if (k.startsWith("on")) el.addEventListener(k.slice(2), v); else if (v !== false && v != null) el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) if (k != null && k !== false) el.append(k.nodeType ? k : document.createTextNode(String(k)));
+  return el;
+}
+const P = (...t) => h("p", {}, ...t), M = (...t) => h("p", { class: "muted small" }, ...t);
+const card = (...k) => h("div", { class: "card" }, ...k);
+const btn = (label, fn, cls, disabled) => h("button", { class: cls || "", onclick: fn, disabled: !!disabled }, label);
+const when = (iso) => iso ? new Date(iso).toLocaleString([], { weekday: "long", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "never";
+const age = (hrs) => hrs == null ? "" : hrs < 1 ? "less than an hour old" : hrs < 48 ? `about ${Math.round(hrs)} hours old` : `about ${Math.round(hrs / 24)} days old`;
+
+async function api(method, path, body) {
+  const r = await fetch(path, { method, headers: body ? { "content-type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined });
+  const j = r.status === 204 ? {} : await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(j.error || "Something went wrong. Try again."), { code: j.code });
+  return j;
+}
+async function load() { try { S = await api("GET", "api/status"); render(); } catch { if (!S) $app.replaceChildren(card(h("p", { class: "big" }, "The standby service is not answering"), M("It may still be starting. This page retries by itself."))); } }
+function go(name, extra) { view = { name, ...(extra || {}) }; formErr = ""; render(); }
+async function act(fn) { formErr = ""; try { await fn(); await load(); } catch (e) { formErr = e.message; view.lastCode = e.code; render(); } }
+const errLine = () => formErr ? h("p", { class: "err", role: "alert" }, formErr) : null;
+const field = (id, label, type, hint) => [h("label", { for: id }, label), h("input", { id, type: type || "text", autocomplete: "off", spellcheck: "false" }), hint ? M(hint) : null];
+const val = (id) => (document.getElementById(id) || {}).value || "";
+const bucketForm = (keyLabel, keyHint) => [
+  ...field("endpoint", "Bucket endpoint", "text", "Shown on the bucket's page in Backblaze, for example https://s3.us-west-004.backblazeb2.com"),
+  ...field("bucket", "Bucket name"), ...field("keyId", "Key ID"), ...field("key", keyLabel, "password", keyHint),
+];
+const bucketVals = () => ({ endpoint: val("endpoint"), bucket: val("bucket"), prefix: "standby", keyId: val("keyId"), key: val("key") });
+
+// ---------- screens ----------
+function banner() {
+  const out = [];
+  if (S.conflict) out.push(h("div", { class: "banner bad", role: "alert" }, h("p", { class: "big" }, "Two boxes are acting as the primary"),
+    P("The other box was promoted on ", when(S.conflict.writtenAt), ", and this box is still running. Staff may be entering work on two different copies."),
+    P("Decide which box is the real one. Then shut the other one down, or open its console and choose “Rejoin as standby”.")));
+  if (S.health === "failed" || S.health === "stale") out.push(h("div", { class: "banner bad" }, h("p", { class: "big" }, S.health === "failed" ? "Needs attention" : "Out of date"), P(S.summary),
+    S.lastSync && !S.lastSync.ok ? M("What went wrong: ", S.lastSync.error || "unknown") : null, S.lastCapture && !S.lastCapture.ok ? M("What went wrong: ", S.lastCapture.error || "unknown") : null));
+  else if (S.health === "degraded") out.push(h("div", { class: "banner warn" }, h("p", { class: "big" }, "Working, with a caution"), P(S.summary), h("ul", {}, S.versionIssues.map((v) => h("li", {}, v)))));
+  else if (S.health === "healthy") out.push(h("div", { class: "banner ok" }, h("p", { class: "big" }, "All good"), P(S.summary)));
+  if (S.pairing) out.push(S.alertEmail && view.name !== "home-email"
+    ? h("p", { class: "muted small" }, "Problems on this box are emailed to ", S.alertEmail, ". ", h("a", { href: "#", onclick: (e) => { e.preventDefault(); go("home-email"); } }, "Change"))
+    : h("div", { class: "banner warn" }, P(S.alertEmail ? "Where should this box send an email when something is wrong?" : "No alert email address is set, so problems are shown only on this page."),
+        h("label", { for: "alertEmail" }, "Email address for alerts"), h("input", { id: "alertEmail", type: "text", autocomplete: "email" }), errLine(),
+        h("div", { class: "row" }, btn("Save", () => act(async () => { await api("POST", "api/settings/alert-email", { email: val("alertEmail") }); view = { name: "home" }; }), "primary"))));
+  return out;
+}
+
+function unpaired() {
+  if (view.name === "pick-mode") return card(h("h2", {}, "How will the two boxes reach each other?"),
+    P("Direct: both boxes are on the same office network, or both are on Tailscale. Nothing else is needed."),
+    P("Through a storage bucket: the boxes are in different places and cannot reach each other. You create one Backblaze B2 bucket for this, and two keys."),
+    h("div", { class: "row" }, btn("Direct", () => go(view.as + "-direct", { as: view.as }), "primary"), btn("Through a storage bucket", () => go(view.as + "-bucket", { as: view.as })), btn("Back", () => go("home"))));
+  if (view.name === "primary-direct") return card(h("h2", {}, "Pairing code for the standby"),
+    view.code ? [P("Open the console on the other box, choose Standby, then “This box will be the standby”, and paste this code:"), h("div", { class: "code" }, view.code),
+      M("The code works once and stops working at ", when(view.expiresAt), ". This page updates by itself when the other box has paired.")]
+      : [P("This box stays the live one. The other box will be overwritten with a copy of this one."), h("div", { class: "row" }, btn("Create the code", () => act(async () => { const r = await api("POST", "api/pair/direct/start"); view.code = r.code; view.expiresAt = r.expiresAt; }), "primary"), btn("Back", () => go("home")))], errLine());
+  if (view.name === "standby-direct") return card(h("h2", {}, "Enter the code from the primary"),
+    P("On the primary, open Standby and choose “This box is the primary”. Paste the code it shows here."), h("label", { for: "code" }, "Pairing code"), h("textarea", { id: "code" }),
+    view.lastCode === "has-data" ? h("div", { class: "banner bad" }, P("This box already holds data. Continuing replaces everything on it with the primary's data."), h("label", {}, h("input", { type: "checkbox", id: "ow" }), " I understand. Replace this box's data.")) : null,
+    errLine(), h("div", { class: "row" }, btn("Pair", () => act(() => api("POST", "api/pair/direct/join", { code: val("code"), confirmOverwrite: !!(document.getElementById("ow") || {}).checked })), "primary"), btn("Back", () => go("home"))));
+  if (view.name === "standby-bucket") return card(h("h2", {}, view.code ? "Give this code to the primary" : "This standby's read-only key"),
+    view.code ? [P("On the primary, open Standby, choose “This box is the primary”, then “Through a storage bucket”, and paste this code:"), h("div", { class: "code" }, view.code),
+      M("This page checks the bucket by itself and finishes when the primary has paired."), h("div", { class: "row" }, btn("Check now", () => act(() => api("POST", "api/pair/bucket/complete"))))]
+      : [P("In Backblaze, create a bucket just for Standby (private, no Object Lock). Then create an application key for that bucket with read-only access, and enter it here."),
+        ...bucketForm("Read-only application key", "This box can read the bucket but never write to it."),
+        view.lastCode === "has-data" ? h("div", { class: "banner bad" }, P("This box already holds data. Continuing replaces everything on it with the primary's data."), h("label", {}, h("input", { type: "checkbox", id: "ow" }), " I understand. Replace this box's data.")) : null,
+        h("div", { class: "row" }, btn("Continue", () => act(async () => { const r = await api("POST", "api/pair/bucket/standby", { ...bucketVals(), confirmOverwrite: !!(document.getElementById("ow") || {}).checked }); view.code = r.code; }), "primary"), btn("Back", () => go("home")))], errLine());
+  if (view.name === "primary-bucket") return card(h("h2", {}, "The bucket, and the code from the standby"),
+    P("Use the same bucket you entered on the standby. Create a second application key for it with read and write access, and enter that one here."),
+    ...bucketForm("Read and write application key"), h("label", { for: "code" }, "Code shown on the standby"), h("textarea", { id: "code" }), errLine(),
+    h("div", { class: "row" }, btn("Pair", () => act(() => api("POST", "api/pair/bucket/primary", { ...bucketVals(), code: val("code") })), "primary"), btn("Back", () => go("home"))));
+  const live = S.role === "primary";
+  return [
+    S.rejoining ? h("div", { class: "banner warn" }, h("p", { class: "big" }, "Ready to rejoin as a standby"), P("This box's apps are stopped", S.rejoining.archived ? " and its old data is set aside (see below)." : ".", " Pair it now as the standby of the box that is live.")) : null,
+    card(h("p", { class: "big" }, live ? "This box is live and has no standby" : "This box is not paired yet"),
+      P("A standby is a second box that receives a copy of this firm's data every night. If the main box fails, you can make the standby take over."),
+      M("A standby is not a backup: it keeps only the latest copy. Keep Vibe Backup running as well."),
+      h("div", { class: "row" }, btn("This box is the primary (the live one)", () => go("pick-mode", { as: "primary" }), live ? "primary" : ""),
+        live ? null : btn("This box will be the standby", () => go("pick-mode", { as: "standby" })))),
+  ];
+}
+
+function typed(phrase, label, onGo, cls, extra) {
+  return [h("label", { for: "typed" }, `Type ${phrase} to confirm`), h("input", { id: "typed", type: "text", autocomplete: "off" }), extra || null, errLine(),
+    h("div", { class: "row" }, btn(label, () => onGo(val("typed")), cls || "danger"), btn("Back", () => go("home")))];
+}
+
+function primary() {
+  if (view.name === "switchover") return card(h("h2", {}, "Planned switchover"),
+    P("Use this to move the firm to the standby on purpose, for example before maintenance. Nothing is lost."),
+    h("ul", {}, h("li", {}, "The apps on this box stop. Staff cannot work until the next step is done."), h("li", {}, "This box sends one final copy to the standby."), h("li", {}, "You then open the standby and choose Promote.")),
+    ...typed(S.phrases.switchover, "Stop the apps and send the final copy", (t) => act(() => api("POST", "api/switchover/start", { confirm: t }))));
+  if (view.name === "unpair") return unpairScreen();
+  const r = S.standbyReport, c = S.lastCapture;
+  return [
+    S.switchover ? h("div", { class: "banner warn" }, h("p", { class: "big" }, "Planned switchover in progress"), P("The apps on this box are stopped and the final copy was sent at ", when(S.switchover.at), "."),
+      P("Next: open the console on the standby, choose Standby, wait until it shows it has this copy, then choose Promote."), errLine(), h("div", { class: "row" }, btn("Cancel and bring the apps back here", () => act(() => api("POST", "api/switchover/cancel"))))) : null,
+    card(h("p", { class: "big" }, "This box is the primary"), h("dl", {},
+      h("dt", {}, "Last copy sent"), h("dd", {}, c ? (c.ok ? when(c.at) : "failed at " + when(c.at)) : "not yet"),
+      h("dt", {}, "Copies go"), h("dd", {}, S.pairing.mode === "direct" ? "directly to the standby" : "through the storage bucket"),
+      h("dt", {}, "Standby"), h("dd", {}, S.standbyVisible ? (r ? `${r.health}, as of ${when(r.at)}` : "has not reported yet") : "its status is shown on the standby's own page"),
+      h("dt", {}, "Next copy"), h("dd", {}, `every night at ${S.settings.captureAt}`)),
+      h("div", { class: "row" }, btn(S.busy === "capture" ? "Sending a copy…" : "Send a copy now", () => act(() => api("POST", "api/capture/run")), "", !!S.busy || !!S.switchover),
+        S.switchover ? null : btn("Planned switchover…", () => go("switchover")), btn("Unpair…", () => go("unpair")))),
+  ];
+}
+
+function unpairScreen() {
+  return card(h("h2", {}, "Unpair these boxes"), P("The nightly copy stops. Neither box's data is deleted. You can pair them again later."),
+    ...typed(S.phrases.unpair, "Unpair", (t) => act(async () => { await api("POST", "api/unpair", { confirm: t }); view = { name: "home" }; })));
+}
+
+function standby() {
+  if (view.name === "unpair") return unpairScreen();
+  if (S.promote && (S.promote.inProgress || S.promote.running || (S.promote.result && view.name === "promote-run"))) return promoteRun();
+  if (view.name === "promote-checks") return promoteChecks();
+  if (view.name === "promote-loss") return card(h("h2", {}, "What you will lose"),
+    h("p", { class: "big" }, "Work entered after ", when(view.checks.dataAt), " is not on this box."),
+    view.checks.plannedSwitchover ? P("This is a planned switchover: the primary stopped before sending this copy, so nothing is missing.") : P("Anything staff or clients entered on the old box after that time will not be here. It is still on the old box if that box can be repaired."),
+    P("Everyone will need to sign in again. Jobs that were waiting to run on the old box (queued emails and the like) will not run here; nothing is sent twice."),
+    h("div", { class: "row" }, btn("I understand, continue", () => go("promote-confirm", { checks: view.checks }), "primary"), btn("Back", () => go("home"))));
+  if (view.name === "promote-confirm") return card(h("h2", {}, "Make this box the live one"),
+    P("This box will start the firm's apps using its copy from ", when(view.checks.dataAt), ". This takes several minutes. You can leave this page open; if it is interrupted, come back here and it continues."),
+    ...typed(S.phrases.promote, "Promote this box", (t) => act(async () => { await api("POST", "api/promote/run", { confirm: t }); view = { name: "promote-run" }; })));
+  const run = S.lastSync;
+  return [
+    card(h("p", { class: "big" }, "This box is the standby"),
+      S.dataAt ? P("It holds the primary's data as of ", h("strong", {}, when(S.dataAt)), " (", age(S.dataAgeHours), ").") : P("It has not received a copy yet."),
+      h("dl", {}, h("dt", {}, "Last check"), h("dd", {}, run ? `${run.ok ? "succeeded" : "failed"} ${when(run.at)}` : "not yet"),
+        h("dt", {}, "Copies arrive"), h("dd", {}, S.pairing.mode === "direct" ? "directly from the primary" : "through the storage bucket"),
+        h("dt", {}, "Apps on this box"), h("dd", {}, "stopped, as they should be")),
+      h("div", { class: "row" }, btn(S.busy === "sync" ? "Syncing…" : "Sync now", () => act(() => api("POST", "api/sync/run")), "", !!S.busy), btn("Unpair…", () => go("unpair")))),
+    card(h("h2", {}, "If the primary is down"), P("Promote makes this box the live one, using the copy it holds. Only do this when the primary cannot be used."),
+      h("div", { class: "row" }, btn("Promote…", () => go("promote-checks"), "primary", !S.dataAt))),
+  ];
+}
+
+function promoteChecks() {
+  if (!view.checks) { api("GET", "api/promote/checks").then((c) => { view.checks = c; render(); }, (e) => { formErr = e.message; view.checks = { blocked: true, messages: [] }; render(); }); return card(P("Checking the primary…")); }
+  const c = view.checks;
+  return card(h("h2", {}, "Before you promote"), h("dl", {},
+    h("dt", {}, "Primary"), h("dd", {}, c.primaryAlive ? "still answering" : c.primary ? `last seen ${when(c.primary.at)}` : "no sign of life"),
+    h("dt", {}, "This box's copy"), h("dd", {}, c.dataAt ? `${when(c.dataAt)} (${age(c.dataAgeHours)})` : "none"),
+    h("dt", {}, "Last check of the copy"), h("dd", {}, c.lastSyncFailed ? "the latest sync failed; the earlier verified copy will be used" : "verified")),
+    h("div", { class: "banner " + (c.blocked ? "bad" : "warn"), style: "margin-top:12px" }, c.messages.length ? c.messages.map((m) => P(m)) : P("Nothing stands in the way.")), errLine(),
+    h("div", { class: "row" }, c.blocked ? null : btn("Continue", () => go("promote-loss", { checks: c }), "primary"), btn("Check again", () => go("promote-checks")), btn("Back", () => go("home"))));
+}
+
+const STEP_NAMES = { recover: "Getting the copy ready", lease: "Recording that this box takes over", "leave-standby-mode": "Allowing apps to run here", place: "Putting the data in place and starting the apps", health: "Checking each app", "go-live": "Opening access for staff", finish: "Finishing" };
+function promoteRun() {
+  const pr = S.promote, res = pr.result, order = Object.keys(STEP_NAMES), by = Object.fromEntries(pr.steps.map((s) => [s.step, s]));
+  const list = h("ol", { class: "steps" }, order.map((k) => h("li", {}, h("span", {}, STEP_NAMES[k]), h("span", { class: "muted" }, by[k] ? ({ done: "done", running: "working…", failed: "stopped" }[by[k].status] || "") : ""))));
+  if (res && res.ok) return promoteDone(res);
+  const stuck = !pr.running && pr.inProgress;
+  return card(h("h2", {}, pr.running ? "Promoting this box…" : "Promote was interrupted"), list,
+    stuck ? [h("div", { class: "banner bad", style: "margin-top:12px" }, P("It stopped at “", STEP_NAMES[(res && res.failedStep) || ""] || "a step", "”."), res && res.error ? M(res.error) : null, P("Nothing is lost. Continue picks up at that step.")),
+      errLine(), h("div", { class: "row" }, btn("Continue", () => act(() => api("POST", "api/promote/run", {})), "primary"), btn("Cancel the promote", () => act(() => api("POST", "api/promote/cancel"))))] : M("This takes several minutes. You can leave this page open."));
+}
+function promoteDone(res) {
+  const d = res.deployment || {};
+  return [h("div", { class: "banner ok" }, h("p", { class: "big" }, "This box is now live"), P("It is running the firm's apps with data from ", when(res.dataAt), ".")),
+    card(h("h2", {}, "What to tell staff"),
+      d.tunnel ? P("Nothing changes for them: the usual web address now leads to this box. They need to sign in again.")
+        : d.mode === "domain" ? [P("The firm's web address still points at the old box. Change its DNS record so it points at this box:"), h("div", { class: "code" }, d.address || "this box's public address"), M("Ask whoever manages the firm's domain name if you are not sure how. Until that is done, staff can use this box's address directly.")]
+        : [P("Staff now reach the apps at this box's address:"), h("div", { class: "code" }, d.address || "see Configuration → Network"), M("They need to sign in again.")],
+      res.unhealthyApps.length ? h("div", { class: "banner warn" }, P("These apps did not report healthy yet. Check them on the Apps page:"), h("ul", {}, res.unhealthyApps.map((a) => h("li", {}, `${a.name}: ${a.detail}`)))) : null),
+    card(h("h2", {}, "Two things to do soon"), h("ul", {},
+      h("li", {}, "Set up Vibe Backup on this box. Backups do not carry over from the old box."),
+      h("li", {}, "When the old box is repaired, do not just switch it on and use it. Open its console, choose Standby, then “Rejoin as standby”. Its old data is set aside for ", String(S.settings.archiveDays), " days before being replaced.")),
+      h("div", { class: "row" }, btn("Done", () => { view = { name: "home" }; S.promote.result = null; render(); }, "primary")))];
+}
+
+function replaced() {
+  if (view.name === "rejoin") return card(h("h2", {}, "Rejoin as standby"),
+    P("This box will become the standby of the box that is now live. Its apps stay stopped and its data is then replaced by a copy of the live box."),
+    P("Before that, this box's current data is set aside here, read-only, for ", String(S.settings.archiveDays), " days, so that work entered only on this box can be looked up and typed in again."),
+    ...typed(S.phrases.rejoin, "Set the data aside and rejoin", (t) => act(async () => { await api("POST", "api/rejoin", { confirm: t, skipArchive: val("skip") || undefined }); view = { name: "home" }; }), "danger",
+      [h("label", { for: "skip" }, "Only if there is not enough disk: type ", S.phrases.skipArchive, " to skip setting the data aside"), h("input", { id: "skip", type: "text", autocomplete: "off" })]));
+  if (view.name === "start-anyway") return card(h("h2", {}, "Start anyway"),
+    h("div", { class: "banner bad" }, P("The other box is live. Starting this one too gives you two live copies with different data, and the public web address may reach either of them."), P("Only do this if the other box is being shut down and you have decided this box is the real one.")),
+    ...typed(S.phrases.startAnyway, "Start this box's apps", (t) => act(async () => { await api("POST", "api/start-anyway", { confirm: t }); view = { name: "home" }; })));
+  return h("div", { class: "banner bad", role: "alert" }, h("p", { class: "big" }, "This box was replaced"),
+    P("While this box was off, the other box was promoted", S.replacedBy ? [" on ", when(S.replacedBy.writtenAt)] : "", " and is now the live one. This box has not started its apps."),
+    P("Usually the right choice is to make this box the new standby."), errLine(),
+    h("div", { class: "row" }, btn("Rejoin as standby…", () => go("rejoin"), "primary"), btn("Start anyway…", () => go("start-anyway"), "danger")));
+}
+
+function footer() {
+  const out = [];
+  if (S.archives.length) out.push(card(h("h2", {}, "Data set aside on this box"), M("Read-only copies kept when this box rejoined as a standby. To look something up, ask your IT person to open the folder named below under /opt/vibe/standby/local/archive."),
+    h("ol", { class: "steps" }, S.archives.map((a) => h("li", {}, h("span", {}, a.name, h("span", { class: "muted" }, " · removed ", when(a.expiresAt))), btn("Delete now", () => { if (confirm("Delete this archive now? It cannot be recovered.")) act(() => api("POST", "api/archives/delete", { name: a.name })); }))))));
+  out.push(h("p", { class: "muted small" }, "Box ID ", S.nodeId.slice(0, 8), " · version ", S.version, " · ", h("a", { href: "api/audit.csv" }, "Download the activity record")));
+  return out;
+}
+
+function render() {
+  if (!S) return;
+  const focus = document.activeElement && document.activeElement.id, keep = {};
+  document.querySelectorAll("input, textarea").forEach((i) => { if (i.id) keep[i.id] = i.type === "checkbox" ? i.checked : i.value; });
+  let body;
+  if (S.role === "replaced") body = [replaced()];
+  else if (!S.pairing) body = [unpaired()];
+  else body = [view.name === "home" || view.name === "home-email" ? banner() : null, S.role === "primary" ? primary() : standby()];
+  $app.replaceChildren(...[body, footer()].flat(3).filter(Boolean));
+  for (const [id, v] of Object.entries(keep)) { const el = document.getElementById(id); if (el) { if (el.type === "checkbox") el.checked = v; else el.value = v; } }
+  if (focus && document.getElementById(focus)) document.getElementById(focus).focus();
+}
+
+async function poll() {
+  await load();
+  // Bucket-mode standby: collect the pairing bundle as soon as the primary leaves it.
+  if (S && !S.pairing && view.name === "standby-bucket" && view.code) api("POST", "api/pair/bucket/complete").then(load, () => {});
+  if (S && S.pairing && /-(direct|bucket)$/.test(view.name)) { view = { name: "home" }; render(); }
+}
+poll();
+timer = setInterval(poll, 4000);
+</script>
+</body>
+</html>

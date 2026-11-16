@@ -62,8 +62,8 @@ if ! flock -n 9; then
   exit 0
 fi
 
-# Parse + validate one request file. Prints TAB-separated validated
-# fields (id, action, slug, modules, reason, approver) or exits 1.
+# Parse + validate one request file. Prints the validated fields joined
+# by the ASCII Unit Separator (0x1f) (id, action, slug, modules, reason, approver, ref) or exits 1.
 _ha_parse() { # <file>
   python3 - "$1" <<'PYEOF'
 import json, re, sys
@@ -78,16 +78,28 @@ slug   = str(r.get("slug", ""))
 args   = r.get("args") or {}
 if not re.fullmatch(r"[0-9]{10,16}-[a-f0-9]{8}", rid):
     print("invalid id", file=sys.stderr); sys.exit(1)
-if action not in ("sentinel-enable", "sentinel-disable", "sentinel-health", "sentinel-install", "sentinel-enroll"):
+STANDBY_ACTIONS = ("standby-mode-on", "standby-mode-off", "standby-place", "standby-tunnel-up", "standby-follow-version", "standby-archive")
+if action not in ("sentinel-enable", "sentinel-disable", "sentinel-health", "sentinel-install", "sentinel-enroll") + STANDBY_ACTIONS:
     print(f"unknown action {action!r}", file=sys.stderr); sys.exit(1)
 if not re.fullmatch(r"[a-z][a-z0-9-]+", slug):
     print("invalid slug", file=sys.stderr); sys.exit(1)
 modules = str(args.get("modules", ""))
 if modules and not re.fullmatch(r"[a-z]+(,[a-z]+)*", modules):
     print("invalid modules list", file=sys.stderr); sys.exit(1)
-reason   = str(args.get("reason", ""))[:500].replace("\t", " ").replace("\n", " ")
-approver = str(args.get("approver", ""))[:200].replace("\t", " ").replace("\n", " ")
-print("\t".join([rid, action, slug, modules, reason, approver]))
+# Standby actions take the fixed slug and at most one argument: a git
+# commit for follow-version. Nothing else from the request is used.
+ref = str(args.get("ref", ""))
+if action in STANDBY_ACTIONS and slug != "vibe-standby":
+    print("invalid slug for a standby action", file=sys.stderr); sys.exit(1)
+if ref and not re.fullmatch(r"[0-9a-f]{7,40}", ref):
+    print("invalid ref", file=sys.stderr); sys.exit(1)
+reason   = str(args.get("reason", ""))[:500].replace("\x1f", " ").replace("\t", " ").replace("\n", " ")
+approver = str(args.get("approver", ""))[:200].replace("\x1f", " ").replace("\t", " ").replace("\n", " ")
+# Unit Separator, not TAB: bash treats TAB as IFS *whitespace* and
+# collapses a run of them, so an empty field in the middle shifted every
+# later field left (an empty modules/reason/approver put `ref` into
+# `modules`). A non-whitespace separator keeps empty fields in place.
+print("\x1f".join([rid, action, slug, modules, reason, approver, ref]))
 PYEOF
 }
 
@@ -138,8 +150,8 @@ _ha_run_one() { # <queue-file>
     rm -f "$qfile"
     return 0
   fi
-  local rid action slug modules reason approver
-  IFS=$'\t' read -r rid action slug modules reason approver <<<"$parsed"
+  local rid action slug modules reason approver ref
+  IFS=$'\x1f' read -r rid action slug modules reason approver ref <<<"$parsed"
 
   # The request file name must match its inner id, or a crafted file
   # could overwrite another request's result.
@@ -211,6 +223,15 @@ _ha_run_one() { # <queue-file>
         fi
       fi
       rm -f "$payload"
+      ;;
+    standby-mode-on|standby-mode-off|standby-place|standby-tunnel-up|standby-follow-version|standby-archive)
+      # Vibe Standby's host-side half (lib/standby-host.sh). The action
+      # name maps to a fixed subcommand; the only argument, a validated
+      # commit id, travels as an environment variable. `place` and
+      # `follow-version` re-run bootstrap, so they get a long timeout.
+      timeout 7200 env VIBE_STANDBY_REF="$ref" \
+        /bin/bash "$APPLIANCE_DIR/lib/standby-host.sh" "${action#standby-}" \
+        </dev/null >>"$logf" 2>&1 || rc=$?
       ;;
     sentinel-enroll)
       # Connect THIS box to a firm's Sentinel running elsewhere: NetBird
