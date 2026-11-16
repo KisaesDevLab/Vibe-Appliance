@@ -7,11 +7,11 @@ Each question has a default. Build on the default; do not wait. Mark a question 
 ## Q1 — Direct push transport
 **Status:** Open (needs a spike in Phase 3)
 
-The primary must write a Kopia repository hosted on the standby over LAN, Tailscale, or a Cloudflare tunnel hostname. Candidates: a WebDAV endpoint on the standby, or Kopia's own repository server.
+The primary must write a restic repository hosted on the standby over LAN, Tailscale, or a Cloudflare tunnel hostname. Candidates: restic `rest-server` (append-only), or a WebDAV endpoint on the standby.
 
 Check in the spike: does it pass through a Cloudflare tunnel unchanged; do Cloudflare's request-size limits and terms allow nightly backup traffic on the firm's plan; resume behaviour on a dropped link.
 
-**Default:** WebDAV over HTTPS with credentials issued at pairing. If the Cloudflare path fails the spike, ship direct push for LAN and Tailscale only and report back.
+**Default:** restic `rest-server` in append-only mode over the peer channel, with credentials issued at pairing. If the Cloudflare path fails the spike, ship direct push for LAN and Tailscale only and report back.
 
 ## Q2 — Redis queues after promote
 **Status:** Open
