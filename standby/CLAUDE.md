@@ -23,7 +23,7 @@ Read this file, then PHASES.md, STATE.md and QUESTIONS.md before doing any work.
 | Failover | Manual only, through the Promote wizard. Nothing switches roles automatically. |
 | Role conflict | Admin-controlled. A running box never stops itself. A box that boots and finds it was replaced starts only its console and waits for an admin ("Rejoin as standby" or "Start anyway"). Both consoles warn loudly and email when two boxes claim primary. |
 | Tunnel | Same tunnel token on both boxes, sealed on the standby until Promote. Promote does not rotate it. |
-| Domain mode without tunnel | Promote repoints public DNS automatically using the firm's saved DNS credential; falls back to showing manual steps if none is saved or the call fails. |
+| Domain mode without tunnel | Decision: promote repoints public DNS automatically using the firm's saved DNS credential, with manual steps as the fallback. **Not built yet:** today the Done screen shows the manual steps. |
 | LAN / Tailscale modes | Promote shows the standby's address; users switch manually. |
 | Redis | Starts empty on Promote. Staff sign in again; jobs queued on the old primary are lost and the Done screen says so. Nothing is sent twice. |
 | Failback | Admin chooses: swap roles, or guided planned switchover back. Whole-box replacement, never a merge. Before a box rejoins as standby, its old data is archived locally, read-only, for 14 days so that work entered only on that box can be looked up and re-keyed. |
@@ -61,7 +61,7 @@ One service, `vibe-standby`, runs on both boxes. Roles: `unpaired`, `primary`, `
 
 1. On a box in role `standby` or `replaced`, app containers, Redis and `cloudflared` are not running, including after reboot, Docker restart, or appliance update. Exceptions: the isolated test promote, and an admin's explicit "Start anyway".
 2. On a standby, the tunnel token exists only as a sealed file in the local overlay until Promote.
-3. The standby holds no credential that can write to the repository until Promote.
+3. The standby does not write to the repository until Promote. Direct mode: the repository is on its own disk and it only prunes. Bucket mode: it works with a read-only key; the read/write key received sealed at pairing sits unused in the local overlay until an admin promotes.
 4. No restore touches the local overlay or the box's network identity.
 5. A failed or partial sync never replaces the last verified copy.
 6. Promote and failback are resumable: every step is idempotent and recorded.

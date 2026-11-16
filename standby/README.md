@@ -4,7 +4,7 @@ Part of Vibe-Appliance. This directory is the `standby` core service (`docker-co
 
 Keeps a second Vibe Appliance updated nightly from the primary, so that disaster recovery is a guided **Promote** an admin runs on the standby. Independent of Vibe Backup.
 
-Status: Phase 0 (scaffold). See `STATE.md` for where the build is, `CLAUDE.md` for the design, `PHASES.md` for the plan and `QUESTIONS.md` for decisions.
+Status: built and passing its automated tests; not yet run on a real appliance. `STATE.md` says exactly what is tested, what is not built, and what has never run for real. `CLAUDE.md` holds the design, `PHASES.md` the plan, `QUESTIONS.md` every decision.
 
 ## Develop
 
@@ -34,9 +34,16 @@ bash test/harness/phase0.sh
 
 ## Layout
 
-- `src/config.ts` — settings, all with defaults
-- `src/logger.ts` — JSON logs with secret redaction
-- `src/overlay/` — this box's identity and history (SQLite), never replicated
-- `src/contracts/` — interfaces for the snapshot repository and appliance control, with in-memory fakes
-- `src/server.ts`, `ui/` — API and panel, served behind the console's proxy
-- `test/harness/` — two-node compose harness
+- `src/capture/`, `src/sync/` — nightly copy on the primary, crash-safe restore on the standby
+- `src/repo/`, `src/pg/` — restic and Postgres, driven through their own tools
+- `src/pairing/`, `src/peer/`, `src/link/`, `src/crypto/` — pairing, the pinned mutual-TLS channel, bucket control objects, leases
+- `src/promote/`, `src/role/` — promote, rejoin, planned switchover, hold-at-boot
+- `src/status.ts`, `src/alerts/` — health model and email
+- `src/appliance/` — client for the console's control routes; `src/contracts/` — interfaces and in-memory fakes
+- `src/runtime.ts`, `src/server.ts`, `ui/` — wiring, API and panel
+- `src/overlay/` — this box's own identity and history (SQLite), never replicated
+- `test/` — unit and integration tests; `test/harness/` — two-node compose harness
+
+Appliance-side pieces live outside this directory: `console/lib/standby-control.js`, `lib/standby-host.sh`, and the host-runner actions in `lib/host-runner.sh`.
+
+Integration tests need `restic`, `rest-server` and Postgres server binaries. Without them those tests skip locally; CI sets `VIBE_STANDBY_REQUIRE_TOOLS=1` so a missing tool fails instead.

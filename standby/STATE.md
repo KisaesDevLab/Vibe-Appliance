@@ -4,12 +4,64 @@ Update this file at the end of every work session.
 
 ## Current status
 
-- **Phase:** 0 — scaffold built; acceptance not yet proven
-- **Last session:** 2026-11-16 — reconciliation, three Q&A rounds (plan revision 3), Phase 0 scaffold.
-- **Built and tested here (20 unit tests, typecheck, build, service started by hand):** config schema, redacting logger, local overlay store (node ID, role, sync runs, verification, audit, wizard steps), repository and appliance-control contracts with fakes, health/status API, panel.
-- **Written but NOT run** (no Docker in the build container): `Dockerfile`, `test/harness/` (two nodes + MinIO), `.github/workflows/ci.yml`. Phase 0's first acceptance line ("starts on both harness nodes, reports `unpaired`") is proven only when CI runs `test/harness/phase0.sh`.
-- **Home:** `standby/` in Vibe-Appliance, branch `claude/vibe-standby` (Q40). The earlier parked copy on branch `vibe-standby-build` is superseded.
-- **Next action:** get the `standby` CI workflow green; run the remaining spikes (Q38); continue the build in phase order.
+- **Home:** `standby/` in Vibe-Appliance, branch `claude/vibe-standby`, draft PR #22 (Q40).
+- **Last session:** 2026-11-16 — plan revision 3, then the build described below.
+- **Where it stands:** the standby service and the appliance-side pieces are written and pass their automated tests. **Nothing has yet run on a real appliance.** The next step is Kurt's test on two boxes.
+
+### Built and tested automatically
+
+Standby service (`standby/`, 87 tests; real restic, rest-server, Postgres and TLS where noted):
+
+| Area | What is covered |
+| --- | --- |
+| Repository | restic wrapper: incremental restore that never overwrites in place, read-only mode without a lock, prune. Real restic. |
+| Postgres | Dump with row counts taken in the dump's own snapshot; restore into `__incoming`; verify; swap; recover an interrupted swap. Two real clusters. |
+| Capture and sync | End to end; a crash injected at every step; corrupted restore caught; previous copy kept. Real clusters, real restic. |
+| Peer channel | Mutual TLS with pinned certificates; wrong certificate refused both ways; restic backing up through forwarder → channel → append-only receiver; primary cannot delete. Real TLS, restic, rest-server. |
+| Pairing | Direct and bucket modes; code single use and expiry; redirected code refused; overwrite guard; sealed bundle opens only on the intended box. |
+| Status and alerts | Health states, data age, clock skew, one email per change plus daily reminder. |
+| Role conflict | Running box warns only; booting box holds; unreachable lease store does not hold; Start anyway. |
+| Promote | Checks, block while primary answers, resume after failure at a step without repeating or burning a lease epoch, cancel rules. |
+| Failback | Rejoin with archive and typed phrases; planned switchover start, cancel and failure. |
+| Two boxes, whole flow | `test/e2e.test.ts`: pair → copy → sync → second night → promote refused → primary stops → promote, all through the HTTP API. |
+| Panel | Loaded in Chromium in each role at desktop and phone width: no script errors, no horizontal scroll, buttons work. Not an automated test in the repo. |
+
+Appliance side (431 tests in the appliance suite, 13 new):
+
+| Piece | What is covered |
+| --- | --- |
+| `console/lib/standby-control.js` | Token auth, refusal through the proxy, tunnel stopped before apps, starts refused in standby mode, digest-only pulls, fixed host-action vocabulary. Fake Docker. |
+| `lib/standby-host.sh` | `place` and `mode-on` under real bash with a stub `docker` and stub `bootstrap.sh`: refuses without the verified marker, keeps this box's identity, leaves not-replicated directories alone, restartable. |
+
+CI on the scaffold commit was green, including the Docker image build and the two-node harness (`standby` workflow).
+
+### Not built
+
+| Item | Effect |
+| --- | --- |
+| Test promote / drill (Phase 10) | `startAppsIsolated` throws. No scheduled or on-demand drill. |
+| Automatic DNS update at promote (Q33) | For domain mode without a tunnel the Done screen shows manual DNS steps. |
+| Image pin at promote | Sync pulls the primary's images by digest and tags them, but bootstrap's own pull at promote can fetch a newer `latest`. |
+| Phase 11 | Threat review, novice guide, the printable "If the server is down" sheet, nightly two-VM suite. |
+| Harness beyond Phase 0 | The compose harness only proves both nodes start. The two-box flow is proven in-process, not in containers. |
+
+### Built but never run for real
+
+Treat each of these as untested until it passes on real boxes:
+
+1. **Anything on a real appliance.** Bootstrap generating `STANDBY_CONTROL_TOKEN`, the `standby` container building and starting from `docker-compose.yml`, the console proxy at `/admin/standby/`, console control routes against real Docker, host-runner actions, and above all `place` running the real `bootstrap.sh`.
+2. **Bucket mode against a real bucket.** The S3 signing matches AWS's published test vector and the flows pass against an in-memory bucket, but restic's `s3:` backend with a read-only B2 key (`--no-lock`) has not been run. Spike 1 is still open.
+3. **Email delivery** through Resend, Postmark, EmailIt or SMTP.
+4. **ParadeDB.** Tests use stock Postgres 16. Dump and restore of ParadeDB search indexes, and how long it takes at 50–500 GB, are unmeasured (spike 2).
+5. **Tailscale.** The peer channel is tested on localhost only.
+
+### Known gaps to decide or fix
+
+- Port 4480 is published on all interfaces unless `STANDBY_PEER_BIND` is set. Docker-published ports bypass UFW. It is mutual-TLS only, but on a public VPS it is reachable from the internet.
+- `tests/federation/host-runner.sh` fails in the build container before and after this change (exit 127, a missing tool there), so the new host-runner branch has not been exercised by that script.
+- A promoted box keeps Vibe Backup unconfigured by design (Q22); the Done screen says so.
+
+- **Next action:** Kurt tests on two boxes. Then: spikes 1 and 2, the drill, DNS update, image pin.
 
 ## Headline findings
 
@@ -29,18 +81,18 @@ Vibe Standby is independent of Vibe Backup: it captures on the primary, ships wi
 
 | Phase | Name | Status | Notes |
 | --- | --- | --- | --- |
-| 0 | Reconcile and scaffold | In progress | Reconcile done. Scaffold built and unit-tested. Harness, image and spikes not yet run. |
-| 1 | Pairing and peer channel | Not started | |
-| 2 | Shared repository source (B2) | Not started | Needs vibe-backup replica mode (Q18) |
-| 3 | Direct push source | Not started | Blocked on Q1 spike; restic has `rest-server`, see Q1 note |
-| 4 | Nightly sync pipeline | Not started | Blocked on Q14 for anything beyond vibe-auth |
-| 5 | Version and config mirror | Not started | Manifest has tags, not digests |
-| 6 | Verification, status and alerts | Not started | Manifest has no row/file figures; has per-file sha256 seal |
-| 7 | Role lease and fencing | Not started | |
-| 8 | Promote wizard | Not started | |
-| 9 | Failback | Not started | |
-| 10 | Scheduled test promote | Not started | |
-| 11 | Hardening and docs | Not started | |
+| 0 | Reconcile and scaffold | Done | CI green incl. image and harness. Spikes 1 and 2 open. |
+| 1 | Pairing and peer channel | Built, untested on real boxes | Built, tested in-process. Not on real boxes. |
+| 2 | Shared repository source (B2) | Built, untested on real boxes | Built. Not run against a real bucket. |
+| 3 | Direct push source | Built, untested on real boxes | Built, tested with real restic and rest-server on localhost. |
+| 4 | Nightly sync pipeline | Built, untested on real boxes | Built, tested on real Postgres and restic. |
+| 5 | Version and config mirror | Built, untested on real boxes | Built. Image pin at promote missing. |
+| 6 | Verification, status and alerts | Built, untested on real boxes | Built. Email delivery untested. |
+| 7 | Role lease and fencing | Built, untested on real boxes | Built to the admin-controlled design (hold at boot, warn while running). |
+| 8 | Promote wizard | Built, untested on real boxes | Built. Automatic DNS update missing. |
+| 9 | Failback | Built, untested on real boxes | Built: rejoin with archive, planned switchover. |
+| 10 | Scheduled test promote | Not started | Not built. |
+| 11 | Hardening and docs | Not started | Not started. |
 
 ## Contract reconciliation
 

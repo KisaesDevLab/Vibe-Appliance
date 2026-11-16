@@ -58,7 +58,9 @@ export async function promoteChecks(d: Pick<PromoteDeps, "store" | "link" | "now
   const primary = await d.link.primarySighting();
   const announced = d.store.get<{ snapshotId: string }>("switchoverAnnounced");
   const primaryAlive = !!primary && now.getTime() - Date.parse(primary.at) < PRIMARY_ALIVE_MS;
-  const plannedSwitchover = !!announced && !!copy && announced.snapshotId === copy.snapshotId;
+  // A fresh answer from the primary beats what this box remembered: it may have cancelled.
+  const announcedId = primary ? (primary.switchover ?? null) : (announced?.snapshotId ?? null);
+  const plannedSwitchover = !!announcedId && !!copy && announcedId === copy.snapshotId;
   const messages: string[] = [];
   let blocked = false;
   if (d.store.role !== "standby") { blocked = true; messages.push("Only a standby can be promoted."); }

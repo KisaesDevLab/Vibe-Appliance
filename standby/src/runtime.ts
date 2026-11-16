@@ -326,6 +326,8 @@ export class Runtime {
     const op = activeOperation(this.store);
     const slow = now.getTime() - this.#lastSlow >= FIVE_MIN;
     if (slow) this.#lastSlow = now.getTime();
+    // Idempotent: also retries a receiver or forwarder that failed to start earlier.
+    if (slow) await this.rebuild().catch((e: Error) => this.#log("error", "could not start the direct-mode helper", { error: e.message }));
 
     if (role === "primary" && p) {
       if (slow) {
@@ -369,7 +371,7 @@ export class Runtime {
 
     if (slow) {
       await evaluateAlerts({
-        store: this.store, to: () => this.config.alertEmail, boxName: () => this.store.nodeId.slice(0, 8),
+        store: this.store, to: () => this.store.get<string>("alertEmail") ?? this.config.alertEmail, boxName: () => this.store.nodeId.slice(0, 8),
         mailer: async () => {
           const mirrorTree = join(this.paths.mirror, this.config.applianceDir);
           return loadMailer([this.config.applianceDir, ...(existsSync(mirrorTree) ? [mirrorTree] : [])]);

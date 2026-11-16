@@ -60,7 +60,7 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
     return {
       version: VERSION, ...s,
       busy: runtime?.busy() ?? null,
-      alertEmail: config.alertEmail,
+      alertEmail: store.get<string>("alertEmail") ?? config.alertEmail,
       settings: { captureAt: config.captureAt, syncFallbackAt: config.syncFallbackAt, staleAfterHours: config.staleAfterHours, drillSchedule: config.drillSchedule, archiveDays: config.archiveDays, timezone: config.timezone },
       syncRuns: store.recentSyncRuns(10),
       archives: runtime ? await runtime.archives() : [],
@@ -71,6 +71,15 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
       formerPeer: store.get("formerPeer") ?? null,
       phrases: { promote: CONFIRM_PHRASE, rejoin: REJOIN_PHRASE, skipArchive: SKIP_ARCHIVE_PHRASE, switchover: SWITCHOVER_PHRASE, unpair: UNPAIR_PHRASE, startAnyway: START_ANYWAY_PHRASE },
     };
+  });
+
+  // Where alerts go. Kept in the local overlay, so each box has its own.
+  app.post("/api/settings/alert-email", async (req, reply) => {
+    const email = str(((req.body ?? {}) as Record<string, unknown>).email);
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return reply.code(400).send({ error: "That does not look like an email address.", code: "bad-email" });
+    store.set("alertEmail", email);
+    store.audit("alert-email-set", ACTOR, true, { email });
+    return { email };
   });
 
   app.get("/api/audit", async () => store.auditRecords(500));

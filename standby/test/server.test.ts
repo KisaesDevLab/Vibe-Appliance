@@ -41,3 +41,17 @@ test("the panel is served and uses relative URLs only (console proxy prefix)", a
   assert.match(res.headers["content-type"] as string, /text\/html/);
   assert.doesNotMatch(res.body, /(fetch|href|src)\s*[=(]\s*["']\//);
 });
+
+test("alert email: saved per box, validated, and shown in status", async () => {
+  const { app } = make();
+  assert.equal((await app.inject({ method: "POST", url: "/api/settings/alert-email", payload: { email: "not an email" } })).statusCode, 400);
+  assert.equal((await app.inject({ method: "POST", url: "/api/settings/alert-email", payload: { email: "it@firm.example" } })).statusCode, 200);
+  assert.equal((await app.inject({ method: "GET", url: "/api/status" })).json().alertEmail, "it@firm.example");
+});
+
+test("actions that need the runtime say the service is starting, rather than failing oddly", async () => {
+  const { app } = make();
+  const res = await app.inject({ method: "POST", url: "/api/pair/direct/start" });
+  assert.equal(res.statusCode, 503);
+  assert.match(res.json().error, /still starting/);
+});

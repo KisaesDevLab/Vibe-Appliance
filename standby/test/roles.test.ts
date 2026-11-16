@@ -329,7 +329,7 @@ test("planned switchover: the primary stops, takes a final copy and announces it
   assert.equal(activeOperation(w.ps), "switchover", "the primary's own nightly capture is paused");
 
   // The standby has NOT yet synced the final copy: still blocked.
-  w.ss.set("switchoverAnnounced", { snapshotId: "snap-final" });
+  await w.pLink.heartbeat(P, w.now().toISOString(), "snap-final"); // what the primary's scheduler does every few minutes
   assert.equal((await promoteChecks({ store: w.ss, link: w.sRead, now: w.now })).blocked, true);
   // After syncing exactly that copy, promote is allowed and says nothing will be lost.
   w.ss.set("verifiedCopy", { ...w.copy, snapshotId: "snap-final" });

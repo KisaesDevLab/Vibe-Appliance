@@ -87,7 +87,11 @@ function banner() {
     S.lastSync && !S.lastSync.ok ? M("What went wrong: ", S.lastSync.error || "unknown") : null, S.lastCapture && !S.lastCapture.ok ? M("What went wrong: ", S.lastCapture.error || "unknown") : null));
   else if (S.health === "degraded") out.push(h("div", { class: "banner warn" }, h("p", { class: "big" }, "Working, with a caution"), P(S.summary), h("ul", {}, S.versionIssues.map((v) => h("li", {}, v)))));
   else if (S.health === "healthy") out.push(h("div", { class: "banner ok" }, h("p", { class: "big" }, "All good"), P(S.summary)));
-  if (!S.alertEmail && S.pairing) out.push(h("div", { class: "banner warn" }, P("No alert email address is set, so problems are shown only on this page.")));
+  if (S.pairing) out.push(S.alertEmail && view.name !== "home-email"
+    ? h("p", { class: "muted small" }, "Problems on this box are emailed to ", S.alertEmail, ". ", h("a", { href: "#", onclick: (e) => { e.preventDefault(); go("home-email"); } }, "Change"))
+    : h("div", { class: "banner warn" }, P(S.alertEmail ? "Where should this box send an email when something is wrong?" : "No alert email address is set, so problems are shown only on this page."),
+        h("label", { for: "alertEmail" }, "Email address for alerts"), h("input", { id: "alertEmail", type: "text", autocomplete: "email" }), errLine(),
+        h("div", { class: "row" }, btn("Save", () => act(async () => { await api("POST", "api/settings/alert-email", { email: val("alertEmail") }); view = { name: "home" }; }), "primary"))));
   return out;
 }
 
@@ -246,7 +250,7 @@ function render() {
   let body;
   if (S.role === "replaced") body = [replaced()];
   else if (!S.pairing) body = [unpaired()];
-  else body = [view.name === "home" ? banner() : null, S.role === "primary" ? primary() : standby()];
+  else body = [view.name === "home" || view.name === "home-email" ? banner() : null, S.role === "primary" ? primary() : standby()];
   $app.replaceChildren(...[body, footer()].flat(3).filter(Boolean));
   for (const [id, v] of Object.entries(keep)) { const el = document.getElementById(id); if (el) { if (el.type === "checkbox") el.checked = v; else el.value = v; } }
   if (focus && document.getElementById(focus)) document.getElementById(focus).focus();
