@@ -33,7 +33,7 @@ Every phase ends with its acceptance criteria passing and STATE.md updated. Do t
 - Handshake: mutual key exchange, then an authenticated, encrypted peer channel (mutual TLS with pinned keys). The pairing code itself carries no secrets.
 - Over the channel, the primary sends the standby what it needs to read snapshots: repository location, repository password, and read-only credentials.
 - Roles set: `primary` and `standby`. Agent standby mode is switched on for the standby.
-- Peer address options: LAN address, Tailscale address, or a Cloudflare tunnel hostname. Store more than one and try them in order.
+- Peer address options (direct mode): LAN address or Tailscale address. Store more than one and try them in order. Bucket mode needs no peer address.
 - Unpair flow on both sides.
 - Guard: refuse to pair a box that already holds firm data, unless the admin confirms that it will be overwritten.
 
