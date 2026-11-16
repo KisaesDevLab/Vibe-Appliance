@@ -5,7 +5,9 @@
   "description": "Warm standby and guided failover for the Vibe Appliance.",
   "license": "PolyForm-Internal-Use-1.0.0",
   "type": "module",
-  "engines": { "node": ">=22.18.0" },
+  "engines": {
+    "node": ">=22.18.0"
+  },
   "main": "dist/main.js",
   "scripts": {
     "start": "node dist/main.js",
@@ -17,11 +19,13 @@
   "dependencies": {
     "better-sqlite3": "^11.3.0",
     "fastify": "^5.1.0",
+    "nodemailer": "^6.10.1",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^22.10.0",
+    "@types/nodemailer": "^8.0.2",
     "typescript": "^5.7.2"
   }
 }
