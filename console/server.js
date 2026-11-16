@@ -28,6 +28,7 @@ const Database    = require('better-sqlite3');
 const landingOrderLib = require('./lib/landing-order');
 const landingGate = require('./lib/landing-gate');
 const { validateSettingValue } = require('./lib/settings-validate');
+const { createStandbyControl } = require('./lib/standby-control');
 
 // ----- config -----------------------------------------------------------
 

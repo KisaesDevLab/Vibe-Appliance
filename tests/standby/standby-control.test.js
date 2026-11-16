@@ -139,3 +139,10 @@ test('host actions: fixed vocabulary, fixed slug, a commit id only where one bel
   assert.equal((await h.call('GET', '/host-action/1700000000000-deadbeef')).body.state, 'done');
   h.close();
 });
+
+test('console/server.js imports what it mounts (a missing import crashes the console at start)', () => {
+  const src = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', '..', 'console', 'server.js'), 'utf8');
+  assert.match(src, /const \{ createStandbyControl \} = require\('\.\/lib\/standby-control'\);/);
+  assert.match(src, /app\.use\('\/api\/v1\/standby-control', createStandbyControl\(/);
+  assert.match(src, /app\.use\('\/admin\/standby', requireAdmin,/);
+});
