@@ -191,3 +191,13 @@ Earlier questions now settled by these: Q1 (direct transport is restic `rest-ser
 - **Q42 — Network settings on a standby.** The network-mode switch (mode, domain, main host label), the Cloudflare Tunnel provision and enable routes, and app update and rollback are refused on a box in standby mode. They come from the primary at promote. **Decided: refuse.**
 - **Q43 — Cancelling a planned switchover when the other box cannot be checked.** Refused once the other box holds a newer lease. When the lease cannot be read, the panel offers "I checked: the other box is still the standby" behind a confirmation. **Decided: allow with that confirmation.**
 - **Q44 — A cancelled promote during a planned switchover.** The lease is handed back, but a primary that already took the `replaced` role stays so; the admin chooses Start anyway on it. Automatic un-replacing would be a role change without an admin action (invariant 10). **Decided: leave to the admin.**
+
+## Second round, 2026-11-18 (answered by Kurt)
+
+- **Q45 — Boot-time hold.** Build it: a paired primary keeps its apps and tunnel stopped after a reboot until the role record has been read.
+- **Q46 — Role record unreadable at boot.** Wait up to 2 minutes, then start the apps. Consistent with Q29: a network problem never keeps the firm down.
+- **Q47 — Standby service broken after a reboot.** The host starts the apps and tunnel by itself after 10 minutes and logs why.
+- **Q48 — Database restore warnings.** Keep as built: a caution on the panel and a daily reminder email while it lasts; the sync does not fail.
+- **Q49 — A new standby's own Cloudflare tunnel and DNS records.** Removed at pairing, only when the primary reports a different tunnel, so a rejoining old primary never deletes the firm's tunnel.
+- **Q50 — That cleanup fails.** Pairing completes anyway; the panel lists what could not be removed and the command to retry.
+- **Q51 — Next step after the review.** A two-box test plan for Kurt to run (`docs/STANDBY_TWO_BOX_TEST.md`).
