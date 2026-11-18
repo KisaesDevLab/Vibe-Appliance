@@ -42,8 +42,12 @@ export interface PairingDeps {
   onChange?: () => Promise<void>;
   /** Direct mode, standby: remove the repository this box hosted for an earlier pairing. */
   resetHostedRepo?: () => Promise<void>;
-  /** This box's own Cloudflare tunnel id (recorded, else from its connector token), or null when it has none. */
-  ownTunnelId?: () => Promise<string | null>;
+  /**
+   * This box's own Cloudflare tunnel id (recorded, else from its connector
+   * token); null when its settings were read and hold no tunnel; undefined
+   * when that could not be determined. "Could not tell" is never "none".
+   */
+  ownTunnelId?: () => Promise<string | null | undefined>;
 }
 
 /** What became of a new standby's own Cloudflare tunnel. Shown on the panel. */
@@ -103,7 +107,7 @@ export class PairingService {
   }
 
   /** Primary, called by the peer server when a standby presents a code's token. */
-  async acceptDirect(body: unknown, fingerprint: string, remoteAddress: string): Promise<{ nodeId: string; repoPassword: string; lease: Lease; repoId: string; tunnelId: string | null }> {
+  async acceptDirect(body: unknown, fingerprint: string, remoteAddress: string): Promise<{ nodeId: string; repoPassword: string; lease: Lease; repoId: string; tunnelId?: string | null }> {
     const b = (body ?? {}) as { token?: string; nodeId?: string; addresses?: string[]; port?: number };
     const pending = this.#d.store.get<PendingDirect>("pendingDirect");
     const given = Buffer.from(String(b.token ?? "")), want = Buffer.from(pending?.token ?? "");
@@ -127,7 +131,9 @@ export class PairingService {
     this.#d.store.setRole("primary", "admin", "paired in direct mode");
     await this.#d.onChange?.();
     // The tunnel's id, never its token: the standby compares it with its own.
-    return { nodeId: this.#d.store.nodeId, repoPassword: pending!.repoPassword, lease, repoId, tunnelId: await this.#ownTunnel() };
+    // Omitted when this box cannot tell: the standby then removes nothing.
+    const tunnelId = await this.#ownTunnel();
+    return { nodeId: this.#d.store.nodeId, repoPassword: pending!.repoPassword, lease, repoId, ...(tunnelId !== undefined ? { tunnelId } : {}) };
   }
 
   // ---- direct mode, standby ---------------------------------------------
@@ -173,8 +179,9 @@ export class PairingService {
     await this.#giveUpOwnTunnel(res.tunnelId);
   }
 
-  async #ownTunnel(): Promise<string | null> {
-    return (await this.#d.ownTunnelId?.().catch(() => null)) ?? null;
+  async #ownTunnel(): Promise<string | null | undefined> {
+    if (!this.#d.ownTunnelId) return undefined;
+    return this.#d.ownTunnelId().catch(() => undefined);
   }
 
   /**
@@ -205,7 +212,9 @@ export class PairingService {
   /** Panel: try the removal again. Only on a standby, whose settings are still its own. */
   async retryTunnelCleanup(): Promise<void> {
     const c = this.#d.store.get<TunnelCleanup>("tunnelCleanup");
-    if (!c || c.status === "done" || c.status === "pending") return;
+    // Only a removal that was already justified and then failed. A skipped
+    // one was skipped for lack of proof; trying again would delete on a guess.
+    if (!c || c.status !== "failed") return;
     if (this.#d.store.role !== "standby") throw new PairingError("not-standby", "This box is no longer a standby, so its settings are now the firm's. Delete the old tunnel in the Cloudflare dashboard instead (Zero Trust → Networks → Tunnels).");
     const set = (x: Omit<TunnelCleanup, "at" | "tunnelId">) => this.#d.store.set("tunnelCleanup", { ...x, tunnelId: c.tunnelId, at: this.#now().toISOString() } satisfies TunnelCleanup);
     set({ status: "pending" });
@@ -243,6 +252,7 @@ export class PairingService {
     const at = this.#now().toISOString();
     const repoPassword = randomBytes(32).toString("base64url");
     const repoId = newRepoId();
+    const primaryTunnel = await this.#ownTunnel();
     let lease: Lease;
     try {
       // A bucket used before still holds the leases of that pairing.
@@ -251,7 +261,7 @@ export class PairingService {
         try { const l: unknown = JSON.parse((await s3.get(name)) ?? "null"); if (isLease(l) && l.epoch > above) above = l.epoch; } catch { /* a damaged record outranks nothing */ }
       }
       lease = firstLease(this.#d.store.nodeId, at, above);
-      const bundle = seal(code.sealPublic, JSON.stringify({ primaryNodeId: this.#d.store.nodeId, repoPassword, repoId, tunnelId: await this.#ownTunnel(), writeKey: { keyId: bucket.keyId, key: bucket.key }, lease }));
+      const bundle = seal(code.sealPublic, JSON.stringify({ primaryNodeId: this.#d.store.nodeId, repoPassword, repoId, ...(primaryTunnel !== undefined ? { tunnelId: primaryTunnel } : {}), writeKey: { keyId: bucket.keyId, key: bucket.key }, lease }));
       await s3.put(bundleName(code.nodeId, code.nonce), JSON.stringify(bundle));
       await s3.put(leaseObjectName(lease), JSON.stringify(lease));
     } catch (e) { throw new PairingError("bucket-unwritable", `This box could not write to the bucket: ${(e as Error).message}. Check the endpoint, bucket name and that the key can write.`); }

@@ -77,6 +77,7 @@ export class Runtime {
   /** Operations this process is running right now (as opposed to ones a restart left recorded). */
   #inProcess = new Set<string>();
   #tzCache: { at: number; tz: string } | null = null;
+  #bootHoldBusy = false;
   /** Result of the last promote attempt, for the wizard to show. */
   promoteResult: PromoteResult | null = null;
   promoteRunning = false;
@@ -120,16 +121,22 @@ export class Runtime {
    * inside the connector token. null when it has none. The token itself
    * never leaves this function.
    */
-  async ownTunnelId(): Promise<string | null> {
+  async ownTunnelId(): Promise<string | null | undefined> {
     const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-    const recorded = String(((await this.#stateJson()).config ?? {}).cloudflare_tunnel_id ?? "").toLowerCase();
+    // undefined = could not tell. Only "both files read, no id and no token" is null.
+    let state: { config?: Record<string, unknown> }, shared: Record<string, string>;
+    try {
+      state = JSON.parse(await readFile(join(this.config.applianceDir, "state.json"), "utf8")) as { config?: Record<string, unknown> };
+      shared = await readEnvFile(join(this.config.applianceDir, "env", "shared.env"));
+    } catch { return undefined; }
+    const recorded = String((state.config ?? {}).cloudflare_tunnel_id ?? "").toLowerCase();
     if (uuid.test(recorded)) return recorded;
-    const token = (await readEnvFile(join(this.config.applianceDir, "env", "shared.env")).catch(() => ({} as Record<string, string>))).TUNNEL_TOKEN ?? "";
-    if (!token) return null;
+    const token = shared.TUNNEL_TOKEN ?? "";
+    if (!token) return recorded ? undefined : null;
     try {
       const t = String((JSON.parse(Buffer.from(token, "base64").toString("utf8")) as { t?: unknown }).t ?? "").toLowerCase();
-      return uuid.test(t) ? t : null;
-    } catch { return null; }
+      return uuid.test(t) ? t : undefined;
+    } catch { return undefined; }
   }
   async deployment(): Promise<{ mode: string; tunnel: boolean; address: string }> {
     const c = (await this.#stateJson()).config ?? {};
@@ -264,6 +271,13 @@ export class Runtime {
   }
 
   async #bootHold(now: Date): Promise<void> {
+    // One decision at a time: the release waits on a host action, and the
+    // ticks behind it must not queue another.
+    if (this.#bootHoldBusy) return;
+    this.#bootHoldBusy = true;
+    try { await this.#bootHoldOnce(now); } finally { this.#bootHoldBusy = false; }
+  }
+  async #bootHoldOnce(now: Date): Promise<void> {
     const file = join(this.config.dataDir, "boot-held.json");
     let held: BootHeld;
     try { held = JSON.parse(await readFile(file, "utf8")) as BootHeld; } catch { return; }

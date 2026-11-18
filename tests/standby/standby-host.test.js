@@ -28,10 +28,12 @@ function box() {
   w(path.join(bin, 'docker'), `#!/usr/bin/env bash
 echo "$*" >> "${root}/docker.calls"
 case "$1" in
-  ps) if [[ -f "${root}/stopped" && ! -f "${root}/stop-ignored" ]]; then printf 'postgres vibe-postgres\\n';
+  ps) { cat "${vibe}/standby/boot-held.json" 2>/dev/null || echo none; } >> "${root}/held-at-ps"
+      if [[ -f "${root}/stopped" && ! -f "${root}/stop-ignored" ]]; then printf 'postgres vibe-postgres\\n';
       else printf 'vibe-tb vibe-tb\\ncloudflared vibe-cloudflared\\npostgres vibe-postgres\\nredis vibe-redis\\n'; fi ;;
   stop) touch "${root}/stopped" ;;
   start) if [[ -f "${root}/start-fails" ]]; then exit 1; fi; rm -f "${root}/stopped" ;;
+  container) if [[ "$3" == "vibe-gone" ]]; then exit 1; fi ;;
   exec) if [[ -f "${root}/pgdump-fails" && "$*" == *pg_dump* ]]; then echo "pg_dump: error: connection refused" >&2; exit 1; fi
         if [[ "$*" == *"SELECT datname"* ]]; then echo vibe_tb_db; else cat >/dev/null 2>&1 || true; fi ;;
 esac
@@ -384,10 +386,6 @@ test('boot hold: a clean shutdown records and stops them; only a real shutdown c
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(b.held().containers.sort(), ['vibe-cloudflared', 'vibe-redis', 'vibe-tb']);
   assert.equal(b.held().bootId, null);
-  // The safety net does not act on a record the boot step has not seen yet.
-  const n = b.dockerOps().length;
-  b.run('boot-release-safety');
-  assert.equal(b.dockerOps().length, n);
   // At the next boot nothing is running; the shutdown record is kept and stamped.
   b.run('boot-hold', { VIBE_BOOT_ID: 'boot-B' });
   assert.deepEqual(b.held().containers.sort(), ['vibe-cloudflared', 'vibe-redis', 'vibe-tb']);
@@ -469,4 +467,36 @@ test('tunnel-teardown runs only on a box in standby mode, and is in every allowl
     assert.match(fs.readFileSync(path.join(REPO, f), 'utf8'), /standby-tunnel-teardown/, f);
   }
   assert.equal((fs.readFileSync(path.join(REPO, 'lib/host-runner.sh'), 'utf8').match(/standby-tunnel-teardown/g) || []).length, 2, 'the validator and the dispatcher');
+});
+
+test('boot hold: the record gets its boot ID only after the last pass, so the service cannot release in between', () => {
+  const b = holdBox(true);
+  const r = b.run('boot-hold', { VIBE_BOOT_ID: 'boot-A' });
+  assert.equal(r.status, 0, r.stderr);
+  // What the record looked like each time the script listed the containers.
+  const seen = fs.readFileSync(path.join(b.root, 'held-at-ps'), 'utf8').trim().split('\n');
+  assert.equal(seen.length, 3, 'three passes');
+  for (const s of seen) assert.ok(s === 'none' || JSON.parse(s).bootId === null, 'no boot ID while passes are still running: ' + s);
+  assert.equal(b.held().bootId, 'boot-A', 'stamped at the end');
+});
+
+test('boot hold safety net is fail-open: it starts what a clean shutdown stopped even if the boot step never ran', () => {
+  const b = holdBox(true);
+  b.run('shutdown-hold', { VIBE_ASSUME_SHUTDOWN: '1' });
+  assert.equal(b.held().bootId, null);
+  const n = b.dockerOps().length;
+  const r = b.run('boot-release-safety');
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(b.dockerOps().slice(n), ['start vibe-redis', 'start vibe-tb', 'start vibe-cloudflared']);
+});
+
+test('boot hold: a recorded container that no longer exists is skipped, not a permanent failure', () => {
+  const b = holdBox(true);
+  b.run('boot-hold', { VIBE_BOOT_ID: 'boot-A' });
+  const rec = b.held(); rec.containers.push('vibe-gone');
+  fs.writeFileSync(path.join(b.vibe, 'standby/boot-held.json'), JSON.stringify(rec));
+  const r = b.run('boot-release');
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(b.dockerOps().join(' '), /start vibe-gone/);
+  assert.equal(b.held(), null);
 });

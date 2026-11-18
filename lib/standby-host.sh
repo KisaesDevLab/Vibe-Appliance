@@ -418,7 +418,11 @@ action_archive() {
 # Never starts anything on a box in standby mode or one the service
 # recorded as held (invariant 1).
 # After a power loss the containers do run for the few seconds between
-# Docker starting and boot-hold stopping them; a clean reboot has no gap.
+# Docker starting and boot-hold stopping them. After a clean shutdown they
+# are expected to be down already, which is what `unless-stopped` does
+# with an explicitly stopped container (confirmed across a daemon restart
+# in a test container); whether that also holds through a real systemd
+# shutdown has not been observed yet, and boot-hold covers it if not.
 # Reverse: delete ${SB_DIR}/boot-held.json and start the containers
 # (sudo bash bootstrap.sh does both).
 HOLD_WANTED="${SB_DIR}/boot-hold.json"   # written by the Standby service: {"hold": true} on a paired primary
@@ -515,13 +519,17 @@ action_boot_hold() {
   # power loss it restarts them itself), so look again a few times rather
   # than trusting the first listing.
   local names pass settle="${VIBE_BOOT_HOLD_SETTLE:-10}"
+  # The record carries no boot ID until the last pass is done. The Standby
+  # service acts only on a record that has one, so it cannot start the apps
+  # between two passes and have the next pass stop them again.
   for pass in 1 2 3; do
     names="$(_non_core_running || true)"
     _hold_stop "$names"
     # shellcheck disable=SC2086
-    _held_write "$boot" $names
+    _held_write - $names
     [[ "$pass" == 3 || "$settle" == 0 ]] || sleep "$settle"
   done
+  _held_write "$boot"
   printf '%s\n' "$boot" > "$HOLD_HANDLED"
   log_ok "paired primary: apps, Redis and the tunnel are held until the Standby service has read the role record"
 }
@@ -549,6 +557,12 @@ _release_held() { # <why>
     esac
   done <<<"$names"
   for name in $first $rest $last; do
+    # A container that was removed meanwhile (an app disabled, a re-create)
+    # is nothing to start, and must not make every release fail.
+    if ! docker container inspect "$name" >/dev/null 2>&1; then
+      log_info "held container $name no longer exists; skipping it"
+      continue
+    fi
     docker start "$name" >/dev/null 2>&1 || failed="$failed $name"
   done
   if [[ -n "$failed" ]]; then
@@ -563,7 +577,9 @@ action_boot_release() { _release_held "the role record was checked"; }
 action_boot_release_safety() {
   [[ -f "$HELD" ]] || return 0
   [[ "$(_held_field decision)" == "held" ]] && return 0
-  [[ -n "$(_held_field bootId)" ]] || return 0   # recorded at shutdown, boot-hold has not run: not ours to judge
+  # No check for a boot ID: this runs 10 minutes after boot. If the boot
+  # step itself never completed, the containers a clean shutdown stopped
+  # still have to come back.
   log_warn "the Standby service did not decide within 10 minutes of boot; starting the apps so the firm is not left down" \
     "diagnose:sudo docker logs vibe-standby --tail 50"
   _release_held "safety net: no decision from the Standby service"

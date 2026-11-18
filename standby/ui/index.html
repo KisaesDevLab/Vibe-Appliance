@@ -188,8 +188,10 @@ function standby() {
     tc && (tc.status === "failed" || tc.status === "skipped") ? h("div", { class: "banner warn" }, h("p", { class: "big" }, "This box's old Cloudflare Tunnel is still there"),
       P(tc.status === "failed" ? "It could not be removed from your Cloudflare account. Nothing is wrong with the standby; the unused tunnel and its DNS records are simply left over." : "It was not removed, because " + (tc.detail || "it could not be told apart from the primary's") + "."),
       tc.status === "failed" && tc.detail ? M(tc.detail) : null,
-      M("Tunnel ID ", tc.tunnelId || "unknown", ". You can also delete it by hand in the Cloudflare dashboard: Zero Trust → Networks → Tunnels, and the DNS records that point at it."), errLine(),
-      h("div", { class: "row" }, btn("Try again", () => act(() => api("POST", "api/tunnel-cleanup/retry"))))) : null,
+      tc.status === "failed"
+        ? [M("Tunnel ID ", tc.tunnelId || "unknown", ". You can also delete it by hand in the Cloudflare dashboard: Zero Trust → Networks → Tunnels, and the DNS records that point at it."), errLine(),
+          h("div", { class: "row" }, btn("Try again", () => act(() => api("POST", "api/tunnel-cleanup/retry"))))]
+        : M("Tunnel ID ", tc.tunnelId || "unknown", ". Before deleting anything, check on the live box (Configuration → Network → Cloudflare Tunnel) that it does NOT use this tunnel. If it does, leave it alone: it is the firm's.")) : null,
     card(h("p", { class: "big" }, "This box is the standby"),
       S.dataAt ? P("It holds the primary's data as of ", h("strong", {}, when(S.dataAt)), " (", age(S.dataAgeHours), ").") : P("It has not received a copy yet."),
       h("dl", {}, h("dt", {}, "Last check"), h("dd", {}, run ? `${run.ok ? "succeeded" : "failed"} ${when(run.at)}` : "not yet"),

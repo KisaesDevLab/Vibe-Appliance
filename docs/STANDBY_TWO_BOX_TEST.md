@@ -109,8 +109,15 @@ These are the highest-value things to watch for, because nothing but this checkl
 **Reboot 2, a healthy primary.** B is now the primary and A its standby.
 
 1. Reboot B: `sudo reboot`.
-2. **Expect:** B's apps are back within about two minutes of the box answering, and `/opt/vibe/standby/boot-held.json` no longer exists. Note the time.
-3. `sudo docker logs vibe-standby --tail 20` on B should say the role record was read and the apps were started.
+2. As soon as B answers SSH, before two minutes have passed, record whether the apps were already down:
+
+   ```bash
+   sudo cat /opt/vibe/standby/boot-held.json; sudo docker ps -a --format '{{.Names}}\t{{.Status}}'
+   ```
+
+   Note whether any app shows "Up" from before the hold. This is the one thing about a clean reboot that has not been observed yet.
+3. **Expect:** B's apps are back within about two minutes of the box answering, and `/opt/vibe/standby/boot-held.json` no longer exists. Note the time.
+4. `sudo docker logs vibe-standby --tail 20` on B should say the role record was read and the apps were started.
 
 **Reboot 3, the Standby service is broken.**
 

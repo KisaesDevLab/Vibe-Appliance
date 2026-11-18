@@ -842,7 +842,10 @@ check_standby_boot_hold() {
     _check_warn "the boot-hold units are not enabled — a primary replaced while it was off would start its apps at boot until the Standby service stops them" \
       "Fix: sudo bash /opt/vibe/appliance/infra/standby-boot-hold-install.sh"
   fi
-  if [[ -f "${VIBE_DIR}/standby/boot-held.json" ]]; then
+  if grep -q '"decision": *"held"' "${VIBE_DIR}/standby/boot-held.json" 2>/dev/null; then
+    _check_warn "this box is held: the other box was promoted while this one was off, so its apps stay stopped until an admin decides" \
+      "Open Standby in the console and choose Rejoin as standby, or Start anyway"
+  elif [[ -f "${VIBE_DIR}/standby/boot-held.json" ]]; then
     _check_warn "apps are being held since boot (${VIBE_DIR}/standby/boot-held.json exists). The Standby service releases them after the role check, the host after 10 minutes." \
       "Diagnose: sudo docker logs vibe-standby --tail 50; cat ${VIBE_DIR}/standby/boot-held.json" \
       "Fix (starts everything): sudo bash /opt/vibe/appliance/bootstrap.sh"

@@ -278,6 +278,9 @@ test("a tunnel removal that fails does not undo the pairing; it is shown and can
   const box = new FakeAppliance({ apps: [], running: false });
   const svc = new PairingService({ store, identity: id, appliance: box, pg: { listDatabases: async () => [] } as unknown as Pg, peerPort: freePort(), ownAddresses: async () => ["127.0.0.1"], ownTunnelId: async () => T2 });
   box.failNext.set("removeOwnTunnel", new Error("Cloudflare answered 403"));
+  // The primary reports its own, different tunnel.
+  const real = p.svc.acceptDirect.bind(p.svc);
+  p.svc.acceptDirect = async (...x: Parameters<typeof real>) => ({ ...(await real(...x)), tunnelId: T1 });
   const { code } = await p.svc.startDirect();
   await svc.joinDirect(code, false);
   await new Promise((r) => setTimeout(r, 20));
@@ -287,8 +290,31 @@ test("a tunnel removal that fails does not undo the pairing; it is shown and can
   assert.match(c.detail, /403/);
   await svc.retryTunnelCleanup();
   assert.equal(store.get<{ status: string }>("tunnelCleanup")!.status, "done");
+  // A removal that was skipped for lack of proof is never retried: that would delete on a guess.
+  const n = box.calls.filter((c) => c === "removeOwnTunnel").length;
+  store.set("tunnelCleanup", { status: "skipped", tunnelId: T2, at: new Date().toISOString() });
+  await svc.retryTunnelCleanup();
+  assert.equal(box.calls.filter((c) => c === "removeOwnTunnel").length, n);
+  assert.equal(store.get<{ status: string }>("tunnelCleanup")!.status, "skipped");
   // After a promote this box's settings are the firm's: no retry from here.
   store.set("tunnelCleanup", { status: "failed", tunnelId: T2, at: new Date().toISOString() });
   store.setRole("primary", "t", "promote");
   await assert.rejects(svc.retryTunnelCleanup(), /no longer a standby/);
+});
+
+test("'could not tell' is never sent or taken as 'no tunnel'", async () => {
+  // The primary cannot read its own settings: the field is left out, so the standby removes nothing.
+  const p = await mkBox("p", { apps: ["vibe-tb"] });
+  const store = new Store(":memory:");
+  const id = await loadOrCreateIdentity(mkdtempSync(join(tmpdir(), "vs-pair-u-")), store.nodeId);
+  const box = new FakeAppliance({ apps: [], running: false });
+  const svc = new PairingService({ store, identity: id, appliance: box, pg: { listDatabases: async () => [] } as unknown as Pg, peerPort: freePort(), ownAddresses: async () => ["127.0.0.1"], ownTunnelId: async () => T2 });
+  const { code } = await p.svc.startDirect(); // p's service was built without ownTunnelId: it cannot tell
+  await svc.joinDirect(code, false);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(box.calls.includes("removeOwnTunnel"), false);
+  assert.equal(store.get<{ status: string }>("tunnelCleanup")!.status, "skipped");
+  // The standby cannot tell what its own tunnel is: nothing is removed either.
+  const unknown = await tunnelBoxes(T1, undefined as unknown as null);
+  assert.equal(unknown.box.calls.includes("removeOwnTunnel"), false);
 });

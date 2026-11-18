@@ -2765,5 +2765,5 @@ Append to this list as phases complete. Format:
     units, the "boot hold" section of `lib/standby-host.sh`); a new standby
     removes its own Cloudflare tunnel at pairing when the primary reports a
     different one; `docs/STANDBY_TWO_BOX_TEST.md`. Linux container: appliance
-    suite 467/467, Standby suite 125/125, units pass `systemd-analyze verify`.
+    suite 470/470, Standby suite 126/126, units pass `systemd-analyze verify`.
     Not run under real systemd or against Cloudflare.
