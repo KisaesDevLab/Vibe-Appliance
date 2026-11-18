@@ -2757,6 +2757,6 @@ Append to this list as phases complete. Format:
     `shared.env` into `/opt/vibe/standby/local/control.token`;
     `lib/standby-host.sh` locks `state.json` and verifies its stops.
   - **Verified.** Linux container: appliance suite 459/459, Standby suite
-    118/118 with real restic, rest-server and Postgres, `tsc` clean.
+    119/119 with real restic, rest-server and Postgres, `tsc` clean.
   - **Not verified.** No fresh Ubuntu host, no two-box run, no real B2 or
     Cloudflare. Seven tests fail on Windows only (file modes, hard links).

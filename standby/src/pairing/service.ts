@@ -139,7 +139,9 @@ export class PairingService {
     // Standby mode goes on BEFORE the code is spent. Done the other way
     // round, a host action that failed here left the primary paired with a
     // box that was not a standby and whose apps could still run.
-    const wasRunning = (await this.#d.appliance.listServices().catch(() => [])).some((s) => s.running && s.kind === "app");
+    const before = await this.#d.appliance.listServices().catch(() => []);
+    const wasRunning = before.some((s) => s.running && s.kind === "app");
+    const tunnelWasRunning = before.some((s) => s.running && s.kind === "tunnel");
     await this.#d.appliance.setStandbyMode(true);
     let res: { nodeId: string; repoPassword: string; lease: Lease; repoId?: string };
     try {
@@ -150,6 +152,7 @@ export class PairingService {
       // Not paired after all: put this box back the way it was.
       await this.#d.appliance.setStandbyMode(false).catch(() => {});
       if (wasRunning) await this.#d.appliance.startApps().catch(() => {});
+      if (tunnelWasRunning) await this.#d.appliance.startTunnel().catch(() => {});
       throw err;
     }
     // A repository left from an earlier pairing has another password.

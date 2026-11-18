@@ -3,7 +3,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { redactor } from "../logger.ts";
-import { run } from "../util/run.ts";
+import { run, trackChild } from "../util/run.ts";
 import type { DatabaseFigures } from "../contracts/repository.ts";
 
 export interface PgConnection {
@@ -31,7 +31,7 @@ class PsqlSession {
   #closed = false;
 
   constructor(bin: string, args: string[], env: NodeJS.ProcessEnv) {
-    this.#child = spawn(bin, args, { env });
+    this.#child = trackChild(spawn(bin, args, { env }));
     this.#child.stdout.setEncoding("utf8");
     this.#child.stdout.on("data", (c: string) => { this.#buf += c; this.#wake(); });
     this.#child.stderr.on("data", (c: Buffer) => { this.#err += c.toString("utf8"); });

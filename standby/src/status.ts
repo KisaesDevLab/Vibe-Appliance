@@ -72,7 +72,6 @@ export function computeStatus(store: Store, config: Pick<Config, "staleAfterHour
 
   // primary
   if (lastCapture && !lastCapture.ok) return out("failed", "The last nightly copy could not be taken on this box.");
-  if (lastCapture?.unreadable) return out("degraded", `The last copy was sent, but ${lastCapture.unreadable} file${lastCapture.unreadable === 1 ? "" : "s"} could not be read and ${lastCapture.unreadable === 1 ? "is" : "are"} not in it. The log of the standby service on this box names them.`);
   const since = lastCapture ? Date.parse(lastCapture.at) : Date.parse(pairing.pairedAt);
   if (now.getTime() - since > staleMs) return out("stale", `No nightly copy has been taken in over ${config.staleAfterHours} hours.`);
   if (pairing.mode === "bucket") return out("healthy", "Nightly copies are being sent. In bucket mode the standby's own health is shown only on the standby.");

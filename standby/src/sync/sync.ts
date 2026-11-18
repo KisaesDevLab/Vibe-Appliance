@@ -162,6 +162,7 @@ export async function runSync(d: SyncDeps): Promise<SyncOutcome> {
     let latest: Awaited<ReturnType<Repository["listSnapshots"]>>[number] | undefined;
     try { latest = (await d.repo.listSnapshots())[0]; }
     catch (err) { if (have) throw err; d.store.set("waitingNote", (err as Error).message.split("\n")[0]); }
+    if (!latest && have) throw new Error("the repository no longer holds any copy from the primary, although this box received one before. The previous verified copy is still in place here");
     if (!latest) {
       d.store.finishSyncRun(runId, { ok: true, snapshotId: "" });
       outcome = { status: "skipped", reason: "the primary has not sent a copy yet" };

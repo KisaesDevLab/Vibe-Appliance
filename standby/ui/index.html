@@ -153,7 +153,7 @@ function primary() {
         view.lastCode === "cannot-check" ? btn("I checked: the other box is still the standby. Bring the apps back here", () => { if (confirm("Only continue if the other box's Standby page still says it is the standby. If it was promoted, starting the apps here gives you two live copies.")) act(() => api("POST", "api/switchover/cancel", { force: true })); }, "danger") : null,
         view.lastCode === "promoted" ? btn("Rejoin as standby…", () => go("rejoin"), "primary") : null)) : null,
     card(h("p", { class: "big" }, "This box is the primary"), h("dl", {},
-      h("dt", {}, "Last copy sent"), h("dd", {}, c ? (c.ok ? when(c.at) : "failed at " + when(c.at)) : "not yet"),
+      h("dt", {}, "Last copy sent"), h("dd", {}, c ? (c.ok ? [when(c.at), c.unreadable ? ` (${c.unreadable} file${c.unreadable === 1 ? "" : "s"} changed or vanished while being read and ${c.unreadable === 1 ? "is" : "are"} not in this copy; a few is normal on a box in use)` : ""] : "failed at " + when(c.at)) : "not yet"),
       h("dt", {}, "Copies go"), h("dd", {}, S.pairing.mode === "direct" ? "directly to the standby" : "through the storage bucket"),
       h("dt", {}, "Standby"), h("dd", {}, S.standbyVisible ? (r ? `${r.health}, as of ${when(r.at)}` : "has not reported yet") : "its status is shown on the standby's own page"),
       h("dt", {}, "Next copy"), h("dd", {}, `every night at ${S.settings.captureAt} (${S.settings.timezone === "UTC" ? "UTC, not local time: set the time zone under Configuration" : S.settings.timezone + " time"})`)),
@@ -209,6 +209,9 @@ function promoteRun() {
   const list = h("ol", { class: "steps" }, order.map((k) => h("li", {}, h("span", {}, STEP_NAMES[k]), h("span", { class: "muted" }, by[k] ? ({ done: "done", running: "working…", failed: "stopped" }[by[k].status] || "") : ""))));
   if (res && res.ok) return promoteDone(res);
   const stuck = !pr.running && pr.inProgress;
+  if (!pr.running && !pr.inProgress && res && !res.ok) return card(h("h2", {}, "Promote did not start"),
+    h("div", { class: "banner bad" }, P(res.error || "Something went wrong before the first step."), P("Nothing was changed on this box.")),
+    h("div", { class: "row" }, btn("Back", () => { api("POST", "api/promote/dismiss").catch(() => {}); S.promote.result = null; go("home"); })));
   return card(h("h2", {}, pr.running ? "Promoting this box…" : "Promote was interrupted"), list,
     stuck ? [h("div", { class: "banner bad", style: "margin-top:12px" }, P("It stopped at “", STEP_NAMES[(res && res.failedStep) || ""] || "a step", "”."), res && res.error ? M(res.error) : null, P("Nothing is lost. Continue picks up at that step.")),
       errLine(), h("div", { class: "row" }, btn("Continue", () => act(() => api("POST", "api/promote/run", {})), "primary"), btn("Cancel the promote", () => act(() => api("POST", "api/promote/cancel"))))] : M("This takes several minutes. You can leave this page open."));

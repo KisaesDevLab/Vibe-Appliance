@@ -39,6 +39,14 @@ export class RunError extends Error {
 export const DEFAULT_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
 
 const live = new Set<ReturnType<typeof spawn>>();
+/** Count a child started outside run() (a streaming dump, a long-lived psql session) among those Promote may stop. */
+export function trackChild<T extends ReturnType<typeof spawn>>(child: T): T {
+  live.add(child);
+  child.once("close", () => live.delete(child));
+  child.once("error", () => live.delete(child));
+  return child;
+}
+
 /** Kill every child process started through run(). Used when an admin's Promote must not wait behind a sync. Returns how many. */
 export function killRunning(): number {
   let n = 0;

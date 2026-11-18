@@ -289,3 +289,13 @@ test("capture refuses to send a copy that would be missing a whole part of the b
   await assert.rejects(w.capture(), /cannot see \/opt\/vibe\/env on this box, so the copy would be incomplete/);
   assert.equal(w.primary.store.get<{ ok: boolean }>("lastCapture")?.ok, false);
 });
+
+test("a repository that lost every copy is a failed sync once this box holds one, not a quiet wait", { skip }, async () => {
+  const w = await world();
+  await w.capture();
+  assert.equal((await w.sync()).status, "ok");
+  const out = await w.sync({ repo: { ...w.ro, listSnapshots: async () => [] } as Repository });
+  assert.equal(out.status, "failed");
+  assert.match((out as { error: string }).error, /no longer holds any copy/);
+  assert.ok(w.standby.store.get<VerifiedCopy>("verifiedCopy"), "the verified copy is kept");
+});

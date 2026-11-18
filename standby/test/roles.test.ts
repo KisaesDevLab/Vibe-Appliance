@@ -539,12 +539,12 @@ test("status: a retry in progress does not hide the failure before it (no 'back 
   assert.match(s.lastSync?.error ?? "", /do not match/);
 });
 
-test("status: files the copy could not read are reported on the primary, not silently dropped", () => {
+test("status: files skipped by a live capture are carried in the status for the panel, without raising an alert every night", () => {
   const w = pair();
   w.ps.set("lastCapture", { snapshotId: "s", at: w.now().toISOString(), ok: true, unreadable: 3 });
   const s = computeStatus(w.ps, cfg, w.now());
-  assert.equal(s.health, "degraded");
-  assert.match(s.summary, /3 files could not be read/);
+  assert.equal(s.health, "healthy");
+  assert.equal(s.lastCapture?.unreadable, 3);
 });
 
 // ---- review 2026-11-18: cancel, re-pair, interrupted operations ---------------

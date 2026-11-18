@@ -190,7 +190,7 @@ Run 2026-11-16 in the build container with restic v0.18.1 and rest-server v0.14.
 
 Four independent read-only reviews (data path, control plane, appliance side, hostname naming). Status of each finding is kept here: `fixed <commit>`, or **left** with the risk. Fixes are on branch `fix/standby-review`.
 
-**What was run:** on Linux (node 24, restic 0.18.1, rest-server 0.14.0, Postgres) the Standby suite passes 118 of 118 with `VIBE_STANDBY_REQUIRE_TOOLS=1`, `tsc` is clean, and the appliance suite passes 459 of 459. **What was not:** nothing has run on two real boxes, against a real B2 bucket or Cloudflare, or under a real host runner; the panel was not opened in a browser (its script was only syntax-checked).
+**What was run:** on Linux (node 24, restic 0.18.1, rest-server 0.14.0, Postgres) the Standby suite passes 119 of 119 with `VIBE_STANDBY_REQUIRE_TOOLS=1`, `tsc` is clean, and the appliance suite passes 459 of 459. **What was not:** nothing has run on two real boxes, against a real B2 bucket or Cloudflare, or under a real host runner; the panel was not opened in a browser (its script was only syntax-checked). The gates in `infra/cloudflared-up.sh`, `lib/settings-save.sh` and the console routes are tested by matching the source text, not by running them; the network-mode route's new warnings have no test.
 
 ### Control plane (standby/src)
 
@@ -220,9 +220,9 @@ Four independent read-only reviews (data path, control plane, appliance side, ho
 | D5 | "The primary has not sent a snapshot yet" is recorded as a failed sync: FAILED status and emails until the first copy arrives. | fixed `a6ce9ef`. |
 | D6 | `pg_restore` warnings and `psql` errors while applying globals are discarded; verification does not cover views, functions, triggers, sequences or grants. | partly fixed `a6ce9ef`: the warnings are kept and shown as a caution. **Left:** they do not fail the sync, and verification still does not cover views, functions, triggers, sequences or grants. |
 | D7 | A sync that fails after `swapPending` rolls forward but never runs the mirror-version step for that snapshot. | fixed `a6ce9ef`. |
-| D8 | No child process, database session or network call has a timeout; a hung one blocks every later sync and Promote. | fixed `a6ce9ef`: 7-day backstop on child processes, timeouts on bucket, console and mail calls, and Promote stops a running sync. **Left:** the long-lived `psql` session has no timeout of its own. |
-| D9 | Capture silently drops a missing capture root, and `unreadable` is never surfaced. | fixed `a6ce9ef`. |
-| D10 | File verification compares existence and size only; one promise per file is held for the whole tree. | **left.** Content is trusted to restic's own restore; a wrong byte with the right size would pass. Memory use grows with the file count. |
+| D8 | No child process, database session or network call has a timeout; a hung one blocks every later sync and Promote. | fixed `a6ce9ef`: 7-day backstop on child processes, timeouts on bucket, console and mail calls, and Promote stops a running sync. Promote can stop the long-lived `psql` session and a streaming `restic dump` too. **Left:** those two have no timeout of their own; if one hangs with no promote, the status goes stale after 36 hours and alerts. |
+| D9 | Capture silently drops a missing capture root, and `unreadable` is never surfaced. | fixed `a6ce9ef`: a missing `data`, `env` or `state.json` stops the copy. The count of files skipped while being read is shown on the primary's panel; it raises no alert, because a few are normal on a box in use, and the files are not named anywhere. |
+| D10 | File verification compares existence and size only; one promise per file is held for the whole tree. | **Left.** Content is trusted to restic's own restore; a wrong byte with the right size would pass. Memory use grows with the file count. |
 
 ### Appliance side
 

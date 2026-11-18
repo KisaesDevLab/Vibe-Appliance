@@ -32,6 +32,8 @@ export async function readEnvFile(path: string): Promise<Record<string, string>>
   return out;
 }
 
+const LONG_CALL_MS = 30 * 60 * 1000;
+
 export class ConsoleClient implements ApplianceControl {
   #o: ConsoleClientOptions;
   constructor(o: ConsoleClientOptions) { this.#o = o; }
@@ -90,8 +92,11 @@ export class ConsoleClient implements ApplianceControl {
   async listServices(): Promise<ServiceState[]> { return this.#call("GET", "/services"); }
   async version(): Promise<ApplianceVersion> { return this.#call("GET", "/version"); }
 
-  async stopApps(): Promise<void> { await this.#call("POST", "/apps/stop"); }
-  async startApps(): Promise<void> { await this.#call("POST", "/apps/start"); }
+  // The console stops containers one at a time (30 s grace each) and, on
+  // start, runs each app's jobs to completion first (up to 5 minutes). Giving
+  // up early here would report a failure while the console carries on.
+  async stopApps(): Promise<void> { await this.#call("POST", "/apps/stop", undefined, LONG_CALL_MS); }
+  async startApps(): Promise<void> { await this.#call("POST", "/apps/start", undefined, LONG_CALL_MS); }
   async appHealth(): Promise<AppHealth[]> { return this.#call("GET", "/health"); }
 
   async stopTunnel(): Promise<void> { await this.#call("POST", "/tunnel/stop"); }
