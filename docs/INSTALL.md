@@ -823,6 +823,16 @@ mode**. With **Public domain** selected, change **Main host label** and
 click **Apply changes**. The tunnel is re-provisioned for you when it is
 on. Same outcome.
 
+A label other than `vibe` also renames the admin tools, unless a
+hostname tag is set: `--tunnel-subdomain vibe2` gives
+`vibe2-cockpit.firm.com`, `vibe2-portainer.firm.com` and
+`vibe2-backup.firm.com`. That keeps a second appliance on the same
+domain from sharing those names with the first. App hosts
+(`client.firm.com`, `1040.firm.com`) do not follow the label; for those
+use `--host-tag` or the app's own Subdomain setting. After the change
+re-run `sudo /opt/vibe/appliance/bootstrap.sh` so Cockpit accepts its
+new name.
+
 **How do I add a new app subdomain?**
 In the default layout (single host) you don't: enabling an app from the
 admin **Apps** tab is the whole flow, and it appears at

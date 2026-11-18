@@ -89,6 +89,15 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
   // `tag` is the appliance's hostname tag (HOST_TAG). Two appliances under
   // ONE domain share the domain slug, so the tag is what keeps their
   // tunnel names apart. Matches the fallback in infra/cloudflared-up.sh.
+  //
+  // An appliance with no tag but its own main host label (vibe2) is told
+  // apart by that label instead: see tunnelNameSuffix().
+  function tunnelNameSuffix(hosts) {
+    if (!hosts) return '';
+    if (hosts.tag) return hosts.tag;
+    return (hosts.main && hosts.main.source === 'override') ? (hosts.main.label || '') : '';
+  }
+
   function defaultTunnelName(domain, tag) {
     const slug = (domain || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
     const t = (tag || '').toLowerCase().replace(/[^a-z0-9-]+/g, '').replace(/^-+|-+$/g, '');
@@ -1462,6 +1471,7 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
     const SOURCE = {
       default:  'built-in name',
       tagged:   'built-in name + hostname tag',
+      'main-label': 'main host label + built-in name',
       override: 'set by you',
       applied:  'in use by the app',
     };
@@ -2017,7 +2027,10 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
       grid.appendChild(el('p', { class: 'help', style: 'margin:0;' }, [
         'The <label> in https://<label>.<domain> that fronts the console and every path-routed app. ',
         'Leave it as "vibe" for the default; a Hostname tag (below, under Network settings) is added to the default automatically, ',
-        'so a second appliance on the same domain becomes vibe-<tag>. A label you type here is used exactly as written. ',
+        'so a second appliance on the same domain becomes vibe-<tag>. A label you type here is used exactly as written, ',
+        'and when no Hostname tag is set it also names the admin tools: label "vibe2" gives vibe2-cockpit, vibe2-portainer and vibe2-backup ',
+        '(after applying, run "sudo bash /opt/vibe/appliance/bootstrap.sh" on the host so Cockpit accepts its new name). ',
+        'App hosts such as client.<domain> do not change with this label; use the Hostname tag or the Subdomain setting of that app for those. ',
         'One DNS label: lowercase letters, digits and dashes.',
       ]));
       wrap.appendChild(grid);
@@ -2433,7 +2446,7 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
           if (data.tunnel_name) {
             wiz.tunnelName = data.tunnel_name;
           } else if (wiz.domain) {
-            wiz.tunnelName = defaultTunnelName(wiz.domain, wiz.hosts && wiz.hosts.tag);
+            wiz.tunnelName = defaultTunnelName(wiz.domain, tunnelNameSuffix(wiz.hosts));
           }
 
           // Bootstrap state transitions from default IDLE:

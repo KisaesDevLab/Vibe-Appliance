@@ -157,6 +157,9 @@ FLAGS
                                   is the app slug with the redundant `vibe-`
                                   stripped (e.g. /tb, /mybooks). Mirrors LAN
                                   routing. Must be a single DNS label.
+                                  A label other than vibe also names the
+                                  admin tools when no --host-tag is set:
+                                  SUB-cockpit, SUB-portainer, SUB-backup.
   --email  EMAIL                  ACME contact email for --mode domain.
   --tailscale                     Also install Tailscale (any mode).
   --tailscale-authkey KEY         Pre-shared authkey for unattended Tailscale up.

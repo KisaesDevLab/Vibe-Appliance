@@ -173,6 +173,71 @@ test('the default main label "vibe" takes the tag; an explicit one does not', ()
   assert.equal(run(explicit, 'get', 'main-label').trim(), 'console');
 });
 
+// --- the admin tools follow a chosen main host label -------------------
+// Owner 2026-11-18: a second appliance on one domain (a Vibe Standby box
+// before it is paired) gets its own main host label, and its Cockpit,
+// Portainer and Duplicati must not share names with the first box.
+
+test('a chosen main host label names the admin tools; app hosts keep their names', () => {
+  const fx = mkFixture({ config: { mode: 'domain', domain: 'firm.com', tunnel_subdomain: 'vibe2' } });
+  const d = dump(fx);
+  assert.equal(d.infra.cockpit.label, 'vibe2-cockpit');
+  assert.equal(d.infra.portainer.label, 'vibe2-portainer');
+  assert.equal(d.infra.backup.label, 'vibe2-backup');
+  assert.equal(d.infra.cockpit.source, 'main-label');
+  assert.equal(run(fx, 'get', 'cockpit-host').trim(), 'vibe2-cockpit.firm.com');
+  assert.deepEqual(list(fx, 'caddy'), [
+    'firm.com', 'www.firm.com', 'vibe2.firm.com',
+    'client.firm.com', '1040.firm.com',   // apps are not renamed by the label
+    'vibe2-backup.firm.com', 'vibe2-portainer.firm.com', 'vibe2-cockpit.firm.com',
+  ]);
+  assert.deepEqual(list(fx, 'tunnel'), ['vibe2.firm.com', 'client.firm.com', '1040.firm.com'],
+    'the admin tools still never reach the tunnel');
+  assert.equal(validate(fx).code, 0);
+});
+
+test('the default label, a tag and an explicit admin-tool label each keep the names they had', () => {
+  // "vibe" written out is the default, not a choice.
+  assert.equal(dump(mkFixture()).infra.cockpit.label, 'cockpit');
+  // A tagged appliance keeps <name>-<tag> whatever its main host label is.
+  const tagged = mkFixture({
+    config: { mode: 'domain', domain: 'firm.com', tunnel_subdomain: 'vibe2' },
+    applianceEnv: 'HOST_TAG=east\n',
+  });
+  assert.equal(dump(tagged).infra.cockpit.label, 'cockpit-east');
+  assert.equal(dump(tagged).infra.cockpit.source, 'tagged');
+  // An explicit label is used as written.
+  const own = mkFixture({
+    config: { mode: 'domain', domain: 'firm.com', tunnel_subdomain: 'vibe2' },
+    applianceEnv: 'INFRA_SUBDOMAIN_COCKPIT=host-admin\n',
+  });
+  assert.equal(dump(own).infra.cockpit.label, 'host-admin');
+  assert.equal(dump(own).infra.portainer.label, 'vibe2-portainer');
+});
+
+test('two appliances told apart only by the main host label share no admin-tool name', () => {
+  const a = mkFixture();
+  const b = mkFixture({
+    config: { mode: 'domain', domain: 'firm.com', tunnel_subdomain: 'vibe2' },
+    applianceEnv: 'APEX_DOMAIN_OWNED=false\n',
+    apps: {},
+  });
+  const hostsA = new Set(list(a, 'caddy'));
+  assert.deepEqual(list(b, 'caddy').filter((h) => hostsA.has(h)), []);
+});
+
+test('validate refuses a main host label that makes an admin-tool name too long or taken', () => {
+  const fx = mkFixture();
+  const long = 'a'.repeat(55);   // fine alone; a55-portainer is 65 characters
+  let r = validate(fx, `tunnel_subdomain=${long}`);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /the portainer host: .*longer than 63 characters.*the main host label/);
+  // vibe2-cockpit is now Cockpit's name, so an app surface cannot take it.
+  r = validate(fx, 'tunnel_subdomain=vibe2', 'vibe-connect:VIBE_APP_SUBDOMAIN_CLIENT=vibe2-cockpit');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /'vibe2-cockpit' is claimed by both/);
+});
+
 test('labels applied by enable-app are served as recorded, even after the tag changes', () => {
   // state.apps.<slug>.subdomain / .subdomains hold what the app's env file
   // was rendered for. Until enable-app re-runs for the app, Caddy and the

@@ -23,6 +23,12 @@ Naming model
       infra hosts    INFRA_SUBDOMAIN_<COCKPIT|PORTAINER|BACKUP> (appliance.env)
       app primary    VIBE_APP_SUBDOMAIN            (<slug>.env)
       app extra      VIBE_APP_SUBDOMAIN_<NAME>     (<slug>.env)
+  * A main host label the operator chose (anything but "vibe") also names
+    the built-in infra hosts when no tag is set: main host `vibe2` gives
+    vibe2-cockpit, vibe2-portainer, vibe2-backup. The default label and a
+    tagged appliance keep the names above, and app hosts never take the
+    main label. So a second appliance needs only its main host label
+    changed for its admin tools to stop sharing names with the first.
   * APEX_DOMAIN_OWNED=false (appliance.env) stops this appliance claiming
     <domain> and www.<domain> — only one appliance per domain can.
 
@@ -235,11 +241,21 @@ def main_label(config, tag):
     return raw, "override"
 
 
-def infra_label(key, env, tag):
+def infra_label(key, env, tag, config=None):
+    """(label, source) for a built-in infra host. In order: the operator's
+    own label, verbatim; the built-in name with the tag; the built-in name
+    behind a main host label the operator chose (`vibe2-cockpit`); the
+    built-in name. The tag wins over the main label so an appliance that
+    already has a tag keeps every name it serves."""
     override = _clean(env.get(infra_env_key(key), "")).lower()
     if override:
         return override, "override"
-    return tag_label(key, tag), ("tagged" if tag else "default")
+    if tag:
+        return tag_label(key, tag), "tagged"
+    m_label, m_source = main_label(config or {}, tag)
+    if m_source == "override":
+        return m_label + "-" + key, "main-label"
+    return key, "default"
 
 
 def is_appliance_app(manifest):
@@ -439,7 +455,7 @@ def resolve(state, manifests, env):
                           "tunnel": True, "doctor": True, "ddns": ddns})
 
     for key in INFRA_KEYS:
-        label, source = infra_label(key, env, tag)
+        label, source = infra_label(key, env, tag, config)
         out["infra"][key] = {"label": label, "fqdn": fqdn(label), "source": source}
         if in_domain:
             # Admin tooling: served by Caddy for LAN/Tailscale reach, never
@@ -522,8 +538,13 @@ def validate(state, manifests, env, app_envs):
     claims.append((m_label, "the main host",
                    "the main host label (Configuration → Network, or --tunnel-subdomain)", None))
     for key in INFRA_KEYS:
-        label, _src = infra_label(key, env, tag)
-        claims.append((label, "the %s host" % key, infra_env_key(key), None))
+        label, src = infra_label(key, env, tag, config)
+        setting = infra_env_key(key)
+        if src == "main-label":
+            # The name is built from the main host label, so that is the
+            # other setting that can fix it (too long, or already taken).
+            setting = "the main host label (to something shorter or different) or " + setting
+        claims.append((label, "the %s host" % key, setting, None))
 
     state_apps = (state.get("apps") or {})
     env_for_plan = dict(env)

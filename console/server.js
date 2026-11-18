@@ -4258,6 +4258,11 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, globa
   const prevMode = state.config.mode || null;
   const prevDomain = state.config.domain || '';
   const prevTunnelSub = state.config.tunnel_subdomain || 'vibe';
+  // Cockpit's name before the change. A main host label the operator
+  // chose also names the admin tools (<label>-cockpit), so a new label
+  // can move Cockpit; see the warning below.
+  const cockpitHostOf = (hm) => (((hm || {}).infra || {}).cockpit || {}).fqdn || '';
+  const prevCockpitHost = prevMode === 'domain' ? cockpitHostOf(hostMap()) : '';
   state.config.mode = mode;
   if (mode === 'domain') {
     state.config.domain = domain;
@@ -4500,6 +4505,16 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, globa
           + 'Fix: Configuration → Network → Cloudflare Tunnel → Re-provision, or run: sudo bash /opt/vibe/appliance/infra/cloudflared-up.sh. '
           + 'Detail: ' + trim(r.stderr, 400));
       }
+    }
+
+    // Cockpit's allowed origins live in /etc/cockpit on the HOST, which
+    // the console cannot rewrite (the settings routing-reconcile job says
+    // the same when the tag or Cockpit's own label moves it).
+    const newCockpitHost = mode === 'domain' ? cockpitHostOf(hostMap()) : '';
+    if (prevCockpitHost && newCockpitHost && newCockpitHost !== prevCockpitHost) {
+      warnings.push(`Cockpit, Portainer and Duplicati moved with the main host label: Cockpit is now https://${newCockpitHost} (was ${prevCockpitHost}). `
+        + 'Until its allowed origins are refreshed Cockpit shows a blank page after login at the new name. '
+        + 'Fix: sudo bash /opt/vibe/appliance/bootstrap.sh');
     }
 
     if (mode === 'domain') {
