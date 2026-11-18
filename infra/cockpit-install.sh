@@ -79,7 +79,8 @@ cockpit_install() {
 #
 # Origins list covers the modes Cockpit can be reached through:
 #   - https://<cockpit host> + https://<domain>     (domain mode via Caddy;
-#     the host is cockpit.<domain> unless the operator tagged/renamed it)
+#     the host is cockpit.<domain> unless the operator tagged/renamed it
+#     or chose a main host label, which gives <label>-cockpit)
 #   - https://<host>.<tailnet>.ts.net:9090           (tailscale serve)
 #   - https://localhost / https://127.0.0.1          (loopback / SSH-tunnel)
 #
@@ -201,6 +202,14 @@ try:
 except Exception:
     pass
 " 2>/dev/null || true)"
+fi
+# Cockpit's public hostname, from the one resolver. bootstrap.sh passes
+# it in; a standalone run (the fix doctor.sh and this script's own
+# warning recommend) must ask too, or it would write the built-in
+# cockpit.<domain> into Origins on a box whose Cockpit has another name
+# and bring the blank page after login back.
+if [[ -z "${COCKPIT_HOST:-}" ]]; then
+  COCKPIT_HOST="$(VIBE_DIR="$VIBE_DIR" python3 "$(dirname "${BASH_SOURCE[0]}")/../lib/vibe_hosts.py" get cockpit-host 2>/dev/null || true)"
 fi
 if [[ -z "${COCKPIT_HOST_IP:-}" && -r "${VIBE_DIR}/state.json" ]]; then
   COCKPIT_HOST_IP="$(python3 -c "

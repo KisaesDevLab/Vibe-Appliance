@@ -1040,7 +1040,8 @@ phase_infra() {
   # handshake completes — operator gets a blank page).
   export COCKPIT_HOST_IP="${_host_ip:-}"
   # Cockpit's public hostname — cockpit.<domain> unless the operator set
-  # a HOST_TAG or INFRA_SUBDOMAIN_COCKPIT. Empty outside domain mode.
+  # a HOST_TAG, INFRA_SUBDOMAIN_COCKPIT or a main host label of their own
+  # (<label>-cockpit). Empty outside domain mode.
   COCKPIT_HOST="$(python3 "$APPLIANCE_DIR/lib/vibe_hosts.py" get cockpit-host 2>/dev/null || true)"
   export COCKPIT_HOST
   if ! ( cd "$APPLIANCE_DIR" && /bin/bash infra/cockpit-install.sh ); then
@@ -1459,6 +1460,15 @@ main() {
     _prev="$(state_get_config_kv email)"
     [[ -n "$_prev" ]] && CONFIG_EMAIL="$_prev"
   fi
+  # A main host label that is being chosen or changed now also names the
+  # admin tools (<label>-cockpit ...; lib/vibe_hosts.py). An appliance
+  # that already had this label keeps the names it has, so re-running
+  # bootstrap with the same --tunnel-subdomain renames nothing.
+  local _label_changed="false"
+  if [[ "$CONFIG_TUNNEL_SUBDOMAIN_EXPLICIT" == "true" \
+        && "$(state_get_config_kv tunnel_subdomain)" != "$CONFIG_TUNNEL_SUBDOMAIN" ]]; then
+    _label_changed="true"
+  fi
   if [[ "$CONFIG_TUNNEL_SUBDOMAIN_EXPLICIT" != "true" ]]; then
     _prev="$(state_get_config_kv tunnel_subdomain)"
     [[ -n "$_prev" ]] && CONFIG_TUNNEL_SUBDOMAIN="$_prev"
@@ -1489,7 +1499,7 @@ main() {
   # rejected afterwards, leaving the bad value on disk for the next
   # enable-app or settings save to render from. The candidate values are
   # passed with --set; nothing on disk is touched until this passes.
-  local -a _naming_sets=(--set "tunnel_subdomain=${CONFIG_TUNNEL_SUBDOMAIN}")
+  local -a _naming_sets=(--set "mode=${CONFIG_MODE}" --set "tunnel_subdomain=${CONFIG_TUNNEL_SUBDOMAIN}")
   if [[ "$CONFIG_HOST_TAG_EXPLICIT" == "true" ]]; then
     _naming_sets+=(--set "HOST_TAG=${CONFIG_HOST_TAG}")
   fi
@@ -1518,6 +1528,9 @@ ${_naming_errors}
   state_set_config_kv mode               "$CONFIG_MODE"
   state_set_config_kv domain             "$CONFIG_DOMAIN"
   state_set_config_kv tunnel_subdomain   "$CONFIG_TUNNEL_SUBDOMAIN"
+  if [[ "$_label_changed" == "true" ]]; then
+    state_set_config_kv infra_follow_main_label "true"
+  fi
   state_set_config_kv email              "$CONFIG_EMAIL"
   # Only persist the Tailscale flag when the operator explicitly
   # passed --tailscale or --tailscale-authkey this run. A bare

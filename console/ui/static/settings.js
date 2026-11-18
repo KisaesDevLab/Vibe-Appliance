@@ -88,7 +88,8 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
   //
   // `tag` is the appliance's hostname tag (HOST_TAG). Two appliances under
   // ONE domain share the domain slug, so the tag is what keeps their
-  // tunnel names apart. Matches the fallback in infra/cloudflared-up.sh.
+  // tunnel names apart. (infra/cloudflared-up.sh's own fallback stays the
+  // plain 'vibe-appliance'; this wizard is what writes a unique name.)
   //
   // An appliance with no tag but its own main host label (vibe2) is told
   // apart by that label instead: see tunnelNameSuffix().
@@ -2028,8 +2029,9 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
         'The <label> in https://<label>.<domain> that fronts the console and every path-routed app. ',
         'Leave it as "vibe" for the default; a Hostname tag (below, under Network settings) is added to the default automatically, ',
         'so a second appliance on the same domain becomes vibe-<tag>. A label you type here is used exactly as written, ',
-        'and when no Hostname tag is set it also names the admin tools: label "vibe2" gives vibe2-cockpit, vibe2-portainer and vibe2-backup ',
-        '(after applying, run "sudo bash /opt/vibe/appliance/bootstrap.sh" on the host so Cockpit accepts its new name). ',
+        'and when you change it and no Hostname tag is set it also names the admin tools: label "vibe2" gives vibe2-cockpit, vibe2-portainer and vibe2-backup. ',
+        'Those three are never published through the Cloudflare Tunnel, so create a DNS record for each new name, ',
+        'and run "sudo bash /opt/vibe/appliance/bootstrap.sh" on the host so Cockpit accepts its new name. ',
         'App hosts such as client.<domain> do not change with this label; use the Hostname tag or the Subdomain setting of that app for those. ',
         'One DNS label: lowercase letters, digits and dashes.',
       ]));

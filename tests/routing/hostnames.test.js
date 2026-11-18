@@ -179,7 +179,7 @@ test('the default main label "vibe" takes the tag; an explicit one does not', ()
 // Portainer and Duplicati must not share names with the first box.
 
 test('a chosen main host label names the admin tools; app hosts keep their names', () => {
-  const fx = mkFixture({ config: { mode: 'domain', domain: 'firm.com', tunnel_subdomain: 'vibe2' } });
+  const fx = mkFixture({ config: { mode: 'domain', domain: 'firm.com', tunnel_subdomain: 'vibe2', infra_follow_main_label: true } });
   const d = dump(fx);
   assert.equal(d.infra.cockpit.label, 'vibe2-cockpit');
   assert.equal(d.infra.portainer.label, 'vibe2-portainer');
@@ -196,19 +196,60 @@ test('a chosen main host label names the admin tools; app hosts keep their names
   assert.equal(validate(fx).code, 0);
 });
 
+test('an appliance that had its own label before the rule keeps its admin-tool names', () => {
+  // No infra_follow_main_label in state: an update must not rename hosts.
+  const fx = mkFixture({ config: { mode: 'domain', domain: 'firm.com', tunnel_subdomain: 'apps' } });
+  const d = dump(fx);
+  assert.equal(d.main.label, 'apps');
+  assert.equal(d.infra.cockpit.label, 'cockpit');
+  assert.equal(d.infra.cockpit.source, 'default');
+  assert.deepEqual(list(fx, 'ddns'), ['@', 'www', 'apps', 'backup', 'portainer', 'cockpit']);
+  assert.equal(validate(fx).code, 0);
+  // Changing the label is what turns the rule on: validate checks the
+  // names that save would produce.
+  const r = validate(fx, 'tunnel_subdomain=' + 'a'.repeat(55));
+  assert.equal(r.code, 1);
+  assert.match(r.err, /the portainer host: /);
+  // The same label again is not a change.
+  assert.equal(validate(fx, 'tunnel_subdomain=apps').code, 0);
+});
+
+test('DNS publishes the admin tools under their new names', () => {
+  const fx = mkFixture({ config: { mode: 'domain', domain: 'firm.com', tunnel_subdomain: 'vibe2', infra_follow_main_label: true } });
+  assert.deepEqual(list(fx, 'ddns'), ['@', 'www', 'vibe2', 'vibe2-backup', 'vibe2-portainer', 'vibe2-cockpit']);
+});
+
+test('a main host label may not be the built-in name of an admin tool', () => {
+  const fx = mkFixture();
+  for (const name of ['cockpit', 'portainer', 'backup']) {
+    const r = validate(fx, `tunnel_subdomain=${name}`);
+    assert.equal(r.code, 1, name);
+    assert.match(r.err, new RegExp(`'${name}' is the built-in name of the ${name} host`));
+  }
+});
+
+test('outside domain mode a long main host label is not refused for names nobody serves', () => {
+  const long = 'a'.repeat(60);
+  const fx = mkFixture({ config: { mode: 'lan', host_ip: '10.0.0.9', tunnel_subdomain: long, infra_follow_main_label: true } });
+  assert.equal(validate(fx).code, 0);
+  assert.equal(run(fx, 'get', 'cockpit-host').trim(), '');
+  // The switch to domain mode is where it is checked.
+  assert.equal(validate(fx, 'mode=domain').code, 1);
+});
+
 test('the default label, a tag and an explicit admin-tool label each keep the names they had', () => {
   // "vibe" written out is the default, not a choice.
   assert.equal(dump(mkFixture()).infra.cockpit.label, 'cockpit');
   // A tagged appliance keeps <name>-<tag> whatever its main host label is.
   const tagged = mkFixture({
-    config: { mode: 'domain', domain: 'firm.com', tunnel_subdomain: 'vibe2' },
+    config: { mode: 'domain', domain: 'firm.com', tunnel_subdomain: 'vibe2', infra_follow_main_label: true },
     applianceEnv: 'HOST_TAG=east\n',
   });
   assert.equal(dump(tagged).infra.cockpit.label, 'cockpit-east');
   assert.equal(dump(tagged).infra.cockpit.source, 'tagged');
   // An explicit label is used as written.
   const own = mkFixture({
-    config: { mode: 'domain', domain: 'firm.com', tunnel_subdomain: 'vibe2' },
+    config: { mode: 'domain', domain: 'firm.com', tunnel_subdomain: 'vibe2', infra_follow_main_label: true },
     applianceEnv: 'INFRA_SUBDOMAIN_COCKPIT=host-admin\n',
   });
   assert.equal(dump(own).infra.cockpit.label, 'host-admin');
@@ -218,7 +259,7 @@ test('the default label, a tag and an explicit admin-tool label each keep the na
 test('two appliances told apart only by the main host label share no admin-tool name', () => {
   const a = mkFixture();
   const b = mkFixture({
-    config: { mode: 'domain', domain: 'firm.com', tunnel_subdomain: 'vibe2' },
+    config: { mode: 'domain', domain: 'firm.com', tunnel_subdomain: 'vibe2', infra_follow_main_label: true },
     applianceEnv: 'APEX_DOMAIN_OWNED=false\n',
     apps: {},
   });
