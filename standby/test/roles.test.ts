@@ -546,3 +546,30 @@ test("status: files the copy could not read are reported on the primary, not sil
   assert.equal(s.health, "degraded");
   assert.match(s.summary, /3 files could not be read/);
 });
+
+// ---- review 2026-11-18: cancel, re-pair, interrupted operations ---------------
+
+test("promote: a cancel after the lease moved gives the lease back, so the primary is not left reading as replaced", async () => {
+  const w = pair();
+  w.clock.t += 20 * 60 * 1000;
+  w.sBox.failNext.set("setStandbyMode:false", new Error("host runner is not answering"));
+  const r = await runPromote(w.promoteDeps(), { confirm: "PROMOTE", actor: "admin" });
+  assert.equal(r.failedStep, "leave-standby-mode");
+  assert.equal(highest((await w.pLink.readLeases()).leases)!.holderNodeId, S, "the lease had moved");
+  let returned = 0;
+  await cancelPromote({ store: w.ss, appliance: w.sBox, returnLease: async () => {
+    returned++;
+    const top = highest((await w.sWrite.readLeases()).leases)!;
+    await w.sWrite.writeLease({ epoch: top.epoch + 1, holderNodeId: P, writtenAt: w.now().toISOString(), reason: "promote cancelled on the standby" });
+  } }, "admin");
+  assert.equal(returned, 1);
+  assert.equal(highest((await w.pLink.readLeases()).leases)!.holderNodeId, P);
+  assert.equal(await checkRole({ store: w.ps, link: w.pLink, appliance: w.pBox, bootId: "boot-next", now: w.now }), "ok", "the primary boots normally");
+  // A cancel whose hand-back cannot be recorded does not count, and can be repeated.
+  const w2 = pair();
+  w2.clock.t += 20 * 60 * 1000;
+  w2.sBox.failNext.set("setStandbyMode:false", new Error("x"));
+  await runPromote(w2.promoteDeps(), { confirm: "PROMOTE", actor: "admin" });
+  await assert.rejects(cancelPromote({ store: w2.ss, appliance: w2.sBox, returnLease: async () => { throw new Error("bucket unreachable"); } }, "admin"), /bucket unreachable/);
+  assert.ok(activePromote(w2.ss), "still in progress");
+});

@@ -19,10 +19,19 @@ function fakeDocker(containers) {
     })),
     getContainer: (id) => ({
       stop: async () => { calls.push('stop:' + id); containers.find((c) => c.name === id).running = false; },
-      start: async () => { calls.push('start:' + id); containers.find((c) => c.name === id).running = true; },
+      start: async () => {
+        calls.push('start:' + id);
+        const c = containers.find((x) => x.name === id);
+        // A job runs and exits; a service stays up.
+        c.running = !c.job;
+      },
+      inspect: async () => {
+        const c = containers.find((x) => x.name === id);
+        return { HostConfig: { RestartPolicy: { Name: c.job ? 'no' : 'unless-stopped' } }, State: { ExitCode: c.exitCode || 0 } };
+      },
     }),
     getImage: (id) => ({ inspect: async () => ({ RepoDigests: ['ghcr.io/x/' + id.replace('img-', '') + '@sha256:' + '1'.repeat(64)] }), tag: async () => {} }),
-    pull: async (ref) => { calls.push('pull:' + ref); if (ref.includes('broken')) throw new Error('manifest unknown'); return {}; },
+    pull: async (ref, opts) => { calls.push('pull:' + ref + ((opts || {}).authconfig ? ' as ' + opts.authconfig.username : '')); if (ref.includes('broken')) throw new Error('manifest unknown'); return {}; },
     modem: { followProgress: (_s, cb) => cb(null) },
   };
 }
@@ -33,7 +42,8 @@ async function harness(state, containers) {
   const app = express();
   app.use(express.json());
   app.use('/api/v1/standby-control', createStandbyControl({
-    docker, readState: () => state, applianceDir: '/nonexistent', token: () => TOKEN,
+    docker, readState: () => state, applianceDir: '/nonexistent', token: () => TOKEN, pollMs: 1,
+    pullAuth: (ref) => (ref.startsWith('ghcr.io/private/') ? { username: 'firm-bot', password: 'secret', serveraddress: 'ghcr.io' } : null),
     enqueueHostAction: (action, slug, args) => { queued.push({ action, slug, args }); return '1700000000000-deadbeef'; },
     hostActionStatus: (id) => ({ id, state: 'done', result: { exit_code: 0 }, log: '' }),
   }));
@@ -145,4 +155,42 @@ test('console/server.js imports what it mounts (a missing import crashes the con
   assert.match(src, /const \{ createStandbyControl \} = require\('\.\/lib\/standby-control'\);/);
   assert.match(src, /app\.use\('\/api\/v1\/standby-control', createStandbyControl\(/);
   assert.match(src, /app\.use\('\/admin\/standby', requireAdmin,/);
+});
+
+// ---- review 2026-11-18 ------------------------------------------------------
+
+test('health: a job that ran and finished is not an unhealthy app; one that failed is reported', async () => {
+  const containers = [...BOX(),
+    { name: 'vibe-1040-migrate', service: 'vibe-1040-migrate', running: false, job: true },
+    { name: 'vibe-recap-seed', service: 'vibe-recap-seed', running: false, job: true, exitCode: 2 }];
+  const h = await harness({ config: {} }, containers);
+  const r = await h.call('GET', '/health');
+  assert.deepEqual(r.body, [
+    { name: 'vibe-tb', healthy: true, detail: 'ok' },
+    { name: 'vibe-recap-seed', healthy: false, detail: 'finished with an error (exit 2)' },
+  ]);
+  h.close();
+});
+
+test('apps/start runs jobs to completion before the apps that depend on them', async () => {
+  const containers = [
+    { name: 'vibe-postgres', service: 'postgres', running: true },
+    { name: 'vibe-redis', service: 'redis', running: false },
+    { name: 'vibe-1040', service: 'vibe-1040', running: false },
+    { name: 'vibe-1040-migrate', service: 'vibe-1040-migrate', running: false, job: true },
+  ];
+  const h = await harness({ config: {} }, containers);
+  const r = await h.call('POST', '/apps/start');
+  assert.equal(r.status, 200);
+  assert.deepEqual(h.docker.calls, ['start:vibe-redis', 'start:vibe-1040-migrate', 'start:vibe-1040']);
+  h.close();
+});
+
+test('pull: private images are pulled with the stored registry login; public ones anonymously', async () => {
+  const h = await harness({ config: {} }, BOX());
+  const d = '@sha256:' + '2'.repeat(64);
+  const r = await h.call('POST', '/pull', { images: { a: 'ghcr.io/private/app' + d, b: 'ghcr.io/public/app' + d } });
+  assert.deepEqual(r.body, { failed: [] });
+  assert.deepEqual(h.docker.calls, ['pull:ghcr.io/private/app' + d + ' as firm-bot', 'pull:ghcr.io/public/app' + d]);
+  h.close();
 });

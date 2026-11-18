@@ -11,8 +11,8 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { ApplianceControl } from "../contracts/appliance.ts";
 import { open, seal, type Identity, type Sealed } from "../crypto/identity.ts";
-import { rememberLease } from "../link/link.ts";
-import { leaseObjectName, type Lease } from "../link/lease.ts";
+import { knownLease, rememberLease } from "../link/link.ts";
+import { isLease, leaseObjectName, type Lease } from "../link/lease.ts";
 import { S3Client, type S3Target } from "../link/s3.ts";
 import type { Store } from "../overlay/store.ts";
 import type { Pg } from "../pg/pg.ts";
@@ -40,12 +40,22 @@ export interface PairingDeps {
   now?: () => Date;
   /** Called after a role change so the runtime can rebuild repositories and links. */
   onChange?: () => Promise<void>;
+  /** Direct mode, standby: remove the repository this box hosted for an earlier pairing. */
+  resetHostedRepo?: () => Promise<void>;
 }
 
 interface PendingDirect { token: string; expiresAt: number; repoPassword: string }
-interface PendingBucket { bucket: S3Target }
+interface PendingBucket { bucket: S3Target; nonce?: string }
 
-const firstLease = (holder: string, at: string): Lease => ({ epoch: 1, holderNodeId: holder, writtenAt: at, reason: "pairing" });
+/**
+ * The lease a new pairing starts with. Its epoch is above every lease this
+ * box already knows (and, in bucket mode, every lease left in the bucket by
+ * an earlier pairing): otherwise an old record held by another box would
+ * outrank it, and the new primary would read as replaced.
+ */
+const firstLease = (holder: string, at: string, above = 0): Lease => ({ epoch: above + 1, holderNodeId: holder, writtenAt: at, reason: "pairing" });
+const bundleName = (nodeId: string, nonce?: string): string => `control/pairing/${nodeId}${nonce ? `-${nonce}` : ""}.json`;
+const newRepoId = (): string => randomBytes(6).toString("hex");
 
 export class PairingService {
   #d: PairingDeps;
@@ -88,7 +98,7 @@ export class PairingService {
   }
 
   /** Primary, called by the peer server when a standby presents a code's token. */
-  async acceptDirect(body: unknown, fingerprint: string, remoteAddress: string): Promise<{ nodeId: string; repoPassword: string; lease: Lease }> {
+  async acceptDirect(body: unknown, fingerprint: string, remoteAddress: string): Promise<{ nodeId: string; repoPassword: string; lease: Lease; repoId: string }> {
     const b = (body ?? {}) as { token?: string; nodeId?: string; addresses?: string[]; port?: number };
     const pending = this.#d.store.get<PendingDirect>("pendingDirect");
     const given = Buffer.from(String(b.token ?? "")), want = Buffer.from(pending?.token ?? "");
@@ -103,14 +113,15 @@ export class PairingService {
     this.#d.store.unset("pendingDirect");
     const at = this.#now().toISOString();
     const addresses = [...new Set([remoteAddress, ...(b.addresses ?? [])].filter((a) => /^[A-Za-z0-9.:-]{1,253}$/.test(a)))];
-    setPairing(this.#d.store, { mode: "direct", peerNodeId: b.nodeId, repoPassword: pending!.repoPassword, pairedAt: at, peerFingerprint: fingerprint, peerAddresses: addresses,
+    const repoId = newRepoId();
+    setPairing(this.#d.store, { mode: "direct", peerNodeId: b.nodeId, repoPassword: pending!.repoPassword, repoId, pairedAt: at, peerFingerprint: fingerprint, peerAddresses: addresses,
       // The standby's own peer port, as it told us; normally the same as ours.
       peerPort: Number.isInteger(b.port) && b.port! > 0 && b.port! < 65536 ? b.port! : this.#d.peerPort });
-    const lease = firstLease(this.#d.store.nodeId, at);
+    const lease = firstLease(this.#d.store.nodeId, at, knownLease(this.#d.store)?.epoch ?? 0);
     rememberLease(this.#d.store, lease);
     this.#d.store.setRole("primary", "admin", "paired in direct mode");
     await this.#d.onChange?.();
-    return { nodeId: this.#d.store.nodeId, repoPassword: pending!.repoPassword, lease };
+    return { nodeId: this.#d.store.nodeId, repoPassword: pending!.repoPassword, lease, repoId };
   }
 
   // ---- direct mode, standby ---------------------------------------------
@@ -125,21 +136,35 @@ export class PairingService {
     }
     const target = { addresses: code.addresses, port: code.port, fingerprint: code.fingerprint };
     const client = new PeerClient(() => target, this.#d.identity);
-    const res = await client.request<{ nodeId: string; repoPassword: string; lease: Lease }>("POST", "/peer/pair", {
-      token: code.token, nodeId: this.#d.store.nodeId, addresses: await this.#d.ownAddresses(), port: this.#d.peerPort,
-    });
+    // Standby mode goes on BEFORE the code is spent. Done the other way
+    // round, a host action that failed here left the primary paired with a
+    // box that was not a standby and whose apps could still run.
+    const wasRunning = (await this.#d.appliance.listServices().catch(() => [])).some((s) => s.running && s.kind === "app");
+    await this.#d.appliance.setStandbyMode(true);
+    let res: { nodeId: string; repoPassword: string; lease: Lease; repoId?: string };
+    try {
+      res = await client.request("POST", "/peer/pair", {
+        token: code.token, nodeId: this.#d.store.nodeId, addresses: await this.#d.ownAddresses(), port: this.#d.peerPort,
+      });
+    } catch (err) {
+      // Not paired after all: put this box back the way it was.
+      await this.#d.appliance.setStandbyMode(false).catch(() => {});
+      if (wasRunning) await this.#d.appliance.startApps().catch(() => {});
+      throw err;
+    }
+    // A repository left from an earlier pairing has another password.
+    await this.#d.resetHostedRepo?.();
     // Find which address actually answered, so it is tried first from now on.
     const working: string[] = [];
     for (const a of code.addresses) { try { (await connectPinned(a, code.port, code.fingerprint, this.#d.identity, 3000)).destroy(); working.push(a); } catch { /* keep for later */ } }
     const addresses = [...working, ...code.addresses.filter((a) => !working.includes(a))];
-    setPairing(this.#d.store, { mode: "direct", peerNodeId: res.nodeId, repoPassword: res.repoPassword, pairedAt: this.#now().toISOString(), peerFingerprint: code.fingerprint, peerAddresses: addresses, peerPort: code.port });
+    setPairing(this.#d.store, { mode: "direct", peerNodeId: res.nodeId, repoPassword: res.repoPassword, ...(res.repoId ? { repoId: res.repoId } : {}), pairedAt: this.#now().toISOString(), peerFingerprint: code.fingerprint, peerAddresses: addresses, peerPort: code.port });
     rememberLease(this.#d.store, res.lease);
     await this.#becomeStandby("paired in direct mode");
   }
 
+  /** The caller has already turned standby mode on; the pairing and the role are recorded together. */
   async #becomeStandby(reason: string): Promise<void> {
-    // Standby mode first: from this moment the box must not run apps or the tunnel.
-    await this.#d.appliance.setStandbyMode(true);
     this.#d.store.setRole("standby", "admin", reason);
     await this.#d.onChange?.();
   }
@@ -154,8 +179,9 @@ export class PairingService {
     }
     try { await this.#s3(bucket).list("control"); }
     catch (e) { throw new PairingError("bucket-unreachable", `This box could not read the bucket: ${(e as Error).message}. Check the endpoint, bucket name and the read-only key.`); }
-    this.#d.store.set("pendingBucket", { bucket } satisfies PendingBucket);
-    return { code: encodeCode({ kind: "bucket", nodeId: this.#d.store.nodeId, sealPublic: this.#d.identity.sealPublic }) };
+    const nonce = randomBytes(9).toString("base64url");
+    this.#d.store.set("pendingBucket", { bucket, nonce } satisfies PendingBucket);
+    return { code: encodeCode({ kind: "bucket", nodeId: this.#d.store.nodeId, sealPublic: this.#d.identity.sealPublic, nonce }) };
   }
 
   /** Primary: bucket details, its read/write key, and the standby's code. */
@@ -166,13 +192,20 @@ export class PairingService {
     const s3 = this.#s3(bucket);
     const at = this.#now().toISOString();
     const repoPassword = randomBytes(32).toString("base64url");
-    const lease = firstLease(this.#d.store.nodeId, at);
-    const bundle = seal(code.sealPublic, JSON.stringify({ primaryNodeId: this.#d.store.nodeId, repoPassword, writeKey: { keyId: bucket.keyId, key: bucket.key }, lease }));
+    const repoId = newRepoId();
+    let lease: Lease;
     try {
-      await s3.put(`control/pairing/${code.nodeId}.json`, JSON.stringify(bundle));
+      // A bucket used before still holds the leases of that pairing.
+      let above = knownLease(this.#d.store)?.epoch ?? 0;
+      for (const name of await s3.list("control/lease")) {
+        try { const l: unknown = JSON.parse((await s3.get(name)) ?? "null"); if (isLease(l) && l.epoch > above) above = l.epoch; } catch { /* a damaged record outranks nothing */ }
+      }
+      lease = firstLease(this.#d.store.nodeId, at, above);
+      const bundle = seal(code.sealPublic, JSON.stringify({ primaryNodeId: this.#d.store.nodeId, repoPassword, repoId, writeKey: { keyId: bucket.keyId, key: bucket.key }, lease }));
+      await s3.put(bundleName(code.nodeId, code.nonce), JSON.stringify(bundle));
       await s3.put(leaseObjectName(lease), JSON.stringify(lease));
     } catch (e) { throw new PairingError("bucket-unwritable", `This box could not write to the bucket: ${(e as Error).message}. Check the endpoint, bucket name and that the key can write.`); }
-    setPairing(this.#d.store, { mode: "bucket", peerNodeId: code.nodeId, repoPassword, pairedAt: at, bucket });
+    setPairing(this.#d.store, { mode: "bucket", peerNodeId: code.nodeId, repoPassword, repoId, pairedAt: at, bucket });
     rememberLease(this.#d.store, lease);
     this.#d.store.setRole("primary", "admin", "paired in bucket mode");
     await this.#d.onChange?.();
@@ -183,10 +216,13 @@ export class PairingService {
     this.#requireUnpaired();
     const pending = this.#d.store.get<PendingBucket>("pendingBucket");
     if (!pending) throw new PairingError("not-started", "Start pairing on this box first to get its code.");
-    const raw = await this.#s3(pending.bucket).get(`control/pairing/${this.#d.store.nodeId}.json`);
+    const raw = await this.#s3(pending.bucket).get(bundleName(this.#d.store.nodeId, pending.nonce));
     if (!raw) return false;
-    const b = JSON.parse(open(this.#d.identity, JSON.parse(raw) as Sealed)) as { primaryNodeId: string; repoPassword: string; writeKey: { keyId: string; key: string }; lease: Lease };
-    setPairing(this.#d.store, { mode: "bucket", peerNodeId: b.primaryNodeId, repoPassword: b.repoPassword, pairedAt: this.#now().toISOString(), bucket: pending.bucket, heldWriteKey: b.writeKey });
+    const b = JSON.parse(open(this.#d.identity, JSON.parse(raw) as Sealed)) as { primaryNodeId: string; repoPassword: string; repoId?: string; writeKey: { keyId: string; key: string }; lease: Lease };
+    // Standby mode first; the pairing is saved only once that has happened.
+    // If it fails nothing is recorded, and the panel's next check tries again.
+    await this.#d.appliance.setStandbyMode(true);
+    setPairing(this.#d.store, { mode: "bucket", peerNodeId: b.primaryNodeId, repoPassword: b.repoPassword, ...(b.repoId ? { repoId: b.repoId } : {}), pairedAt: this.#now().toISOString(), bucket: pending.bucket, heldWriteKey: b.writeKey });
     rememberLease(this.#d.store, b.lease);
     this.#d.store.unset("pendingBucket");
     await this.#becomeStandby("paired in bucket mode");

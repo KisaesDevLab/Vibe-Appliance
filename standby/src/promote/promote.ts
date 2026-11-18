@@ -216,7 +216,7 @@ export async function runPromote(d: PromoteDeps, opts: { confirm?: string; actor
 }
 
 /** Abandon a promote. Only possible before the restored data has been placed. */
-export async function cancelPromote(d: Pick<PromoteDeps, "store" | "appliance">, actor: string): Promise<void> {
+export async function cancelPromote(d: Pick<PromoteDeps, "store" | "appliance"> & { /** Give the role lease back to the primary (and, bucket mode, go back to the read-only key). */ returnLease?: () => Promise<void> }, actor: string): Promise<void> {
   const runId = activePromote(d.store);
   if (!runId) return;
   const steps = d.store.wizardSteps(WIZARD, runId);
@@ -224,7 +224,12 @@ export async function cancelPromote(d: Pick<PromoteDeps, "store" | "appliance">,
     throw new Error("The restored data is already being put in place, so this promote can only be continued, not cancelled.");
   }
   await d.appliance.setStandbyMode(true);
+  // If the lease already moved here, the primary would read as replaced
+  // although no box went live. It is handed back before the cancel counts;
+  // if that cannot be recorded the cancel fails and can be repeated.
+  const leaseMoved = steps.some((s) => s.step === "lease" && s.status !== "pending");
+  if (leaseMoved) await d.returnLease?.();
   d.store.unset("operation");
   d.store.unset("promoteRunId");
-  d.store.audit("promote-cancel", actor, true, { leaseAlreadyMoved: steps.some((s) => s.step === "lease" && s.status === "done") });
+  d.store.audit("promote-cancel", actor, true, { leaseAlreadyMoved: leaseMoved, leaseReturned: leaseMoved && !!d.returnLease });
 }

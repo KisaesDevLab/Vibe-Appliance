@@ -61,7 +61,7 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
       version: VERSION, ...s,
       busy: runtime?.busy() ?? null,
       alertEmail: store.get<string>("alertEmail") ?? config.alertEmail,
-      settings: { captureAt: config.captureAt, syncFallbackAt: config.syncFallbackAt, staleAfterHours: config.staleAfterHours, drillSchedule: config.drillSchedule, archiveDays: config.archiveDays, timezone: config.timezone },
+      settings: { captureAt: config.captureAt, syncFallbackAt: config.syncFallbackAt, staleAfterHours: config.staleAfterHours, drillSchedule: config.drillSchedule, archiveDays: config.archiveDays, timezone: runtime ? await runtime.timezone() : config.timezone },
       syncRuns: store.recentSyncRuns(10),
       archives: runtime ? await runtime.archives() : [],
       promote: runtime ? runtime.promoteState() : null,
@@ -69,6 +69,7 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
       replacedBy: store.get("replacedBy") ?? null,
       rejoining: store.get("rejoining") ?? null,
       formerPeer: store.get("formerPeer") ?? null,
+      formerLive: store.get("formerLive") ?? null,
       phrases: { promote: CONFIRM_PHRASE, rejoin: REJOIN_PHRASE, skipArchive: SKIP_ARCHIVE_PHRASE, switchover: SWITCHOVER_PHRASE, unpair: UNPAIR_PHRASE, startAnyway: START_ANYWAY_PHRASE },
     };
   });
@@ -151,6 +152,7 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
       return reply.code(202).send({ started: true });
     } catch (e) { return fail(reply, e); }
   });
+  app.post("/api/promote/dismiss", async (_req, reply) => { const r = rt(reply); if (!r) return; r.promoteDismiss(); return { ok: true }; });
   app.post("/api/promote/cancel", async (_req, reply) => { const r = rt(reply); if (!r) return; try { await r.promoteCancel(ACTOR); return { ok: true }; } catch (e) { return fail(reply, e); } });
 
   // ---- bringing a box back, and moving on purpose -------------------------------

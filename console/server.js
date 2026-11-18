@@ -2222,6 +2222,19 @@ app.use('/api/v1/standby-control', createStandbyControl({
   enqueueHostAction,
   hostActionStatus,
   applianceDir: APPLIANCE_DIR,
+  // Registry login for image pulls by digest: the same file every compose
+  // call uses through DOCKER_CONFIG (lib/registry-auth.sh). Read per
+  // pull; never logged.
+  pullAuth: (ref) => {
+    try {
+      const host = String(ref).split('/')[0];
+      const cfg = JSON.parse(fs.readFileSync(path.join(VIBE_DIR, 'docker', 'config.json'), 'utf8'));
+      const entry = (cfg.auths || {})[host];
+      if (!entry || !entry.auth) return null;
+      const [username, ...rest] = Buffer.from(entry.auth, 'base64').toString('utf8').split(':');
+      return { username, password: rest.join(':'), serveraddress: host };
+    } catch (_e) { return null; }
+  },
   // The token is in a root-only file that only this container and the
   // standby service read (lib/secrets.sh secrets_standby_token_ensure),
   // re-read on every request so a new token needs no restart. The

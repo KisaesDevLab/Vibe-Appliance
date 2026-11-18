@@ -148,12 +148,42 @@ function createStandbyControl(deps) {
     res.json({ stopped: [...tunnel, ...rest] });
   }));
 
+  // A run-to-completion container (a migrate or seed job: restart policy
+  // "no") is not an app that stays up. Returns its last exit code, or null
+  // for an ordinary service or when Docker cannot say.
+  async function jobExit(c) {
+    try {
+      const info = await deps.docker.getContainer(c.id).inspect();
+      const policy = ((info.HostConfig || {}).RestartPolicy || {}).Name || 'no';
+      if (policy !== 'no') return null;
+      return { exitCode: Number((info.State || {}).ExitCode || 0) };
+    } catch { return null; }
+  }
+
   router.post('/apps/start', guard(async (_req, res) => {
     if (standbyMode()) return refuseInStandbyMode(res, 'starting apps');
     const redis = await startKinds(['redis']);
-    const apps = await startKinds(['app']);
-    log('info', 'standby-control: apps started', { count: redis.length + apps.length });
-    res.json({ started: [...redis, ...apps] });
+    // Jobs first, and to completion: an app's migrate job must finish
+    // before the app itself starts, the order `compose up` gives them.
+    const stopped = (await projectContainers()).filter((c) => c.kind === 'app' && !c.running);
+    const jobs = [];
+    for (const c of stopped) { if (await jobExit(c)) jobs.push(c); }
+    for (const c of jobs) await deps.docker.getContainer(c.id).start().catch((e) => { if (e.statusCode !== 304) throw e; });
+    const deadline = Date.now() + (deps.jobWaitMs || 5 * 60 * 1000);
+    while (jobs.length && Date.now() < deadline) {
+      const names = new Set(jobs.map((c) => c.name));
+      if (!(await projectContainers()).some((c) => names.has(c.name) && c.running)) break;
+      await new Promise((r) => setTimeout(r, deps.pollMs || 2000));
+    }
+    const jobNames = new Set(jobs.map((c) => c.name));
+    const apps = [];
+    for (const c of stopped) {
+      if (jobNames.has(c.name)) continue;
+      await deps.docker.getContainer(c.id).start().catch((e) => { if (e.statusCode !== 304) throw e; });
+      apps.push(c.name);
+    }
+    log('info', 'standby-control: apps started', { count: redis.length + apps.length, jobs: jobs.length });
+    res.json({ started: [...redis, ...jobs.map((c) => c.name), ...apps] });
   }));
 
   router.post('/tunnel/stop', guard(async (_req, res) => res.json({ stopped: await stopKinds(['tunnel'], 5) })));
@@ -167,6 +197,13 @@ function createStandbyControl(deps) {
     const out = [];
     for (const c of await projectContainers()) {
       if (c.kind !== 'app') continue;
+      // A job that ran and finished is done, not down: counting it as an
+      // unhealthy app made every promote wait out its whole health check.
+      if (!c.running) {
+        const job = await jobExit(c);
+        if (job && job.exitCode === 0) continue;
+        if (job) { out.push({ name: c.service || c.name, healthy: false, detail: `finished with an error (exit ${job.exitCode})` }); continue; }
+      }
       // Docker's own health status when the image declares one; else "running".
       const unhealthy = /\(unhealthy\)|\(health: starting\)/.test(c.status);
       const healthy = c.running && !unhealthy;
@@ -183,7 +220,10 @@ function createStandbyControl(deps) {
     for (const [service, ref] of Object.entries(images)) {
       if (typeof ref !== 'string' || !IMAGE_RE.test(ref)) { failed.push(service); continue; }
       try {
-        const stream = await deps.docker.pull(ref, deps.pullAuth ? { authconfig: deps.pullAuth(ref) } : {});
+        // Private app images need the appliance's stored registry login;
+        // the Docker Engine API does not read DOCKER_CONFIG by itself.
+        const auth = deps.pullAuth ? deps.pullAuth(ref) : null;
+        const stream = await deps.docker.pull(ref, auth ? { authconfig: auth } : {});
         await new Promise((resolve, reject) => deps.docker.modem.followProgress(stream, (e) => (e ? reject(e) : resolve())));
         const repo = ref.split('@')[0];
         await deps.docker.getImage(ref).tag({ repo, tag: 'latest' }).catch(() => {});
