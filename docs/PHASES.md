@@ -2742,3 +2742,21 @@ Append to this list as phases complete. Format:
     vibe-auth 1.0.21. Peer session tested registration, sign-in, logout and
     break-glass against the real Vibe Auth stack. **Not verified** on an
     appliance.
+- 2026-11-18: Admin tools follow a chosen main host label, and a review of Vibe Standby.
+  - **Hostnames** (branch `feat/infra-hosts-follow-main-label`). With no hostname
+    tag, a main host label chosen or changed from now on also names Cockpit,
+    Portainer and Duplicati (`vibe2-cockpit`, ...). `state.config.infra_follow_main_label`
+    records it, so an appliance that already had its own label is not renamed
+    by an update. A main label of `cockpit`, `portainer` or `backup` is refused.
+    PLAN.md and INSTALL.md updated.
+  - **Standby review** (branch `fix/standby-review`, on top). 34 findings from
+    four read-only reviews; status of each in `standby/STATE.md`, decisions
+    in `standby/QUESTIONS.md` (Q41-Q44). Appliance-side changes: standby
+    gates in `update.sh`, `infra/cloudflared-up.sh`, `lib/settings-save.sh`
+    and the console routes; the Standby control token moved out of
+    `shared.env` into `/opt/vibe/standby/local/control.token`;
+    `lib/standby-host.sh` locks `state.json` and verifies its stops.
+  - **Verified.** Linux container: appliance suite 459/459, Standby suite
+    118/118 with real restic, rest-server and Postgres, `tsc` clean.
+  - **Not verified.** No fresh Ubuntu host, no two-box run, no real B2 or
+    Cloudflare. Seven tests fail on Windows only (file modes, hard links).
