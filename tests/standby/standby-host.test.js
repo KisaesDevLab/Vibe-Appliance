@@ -28,8 +28,11 @@ function box() {
   w(path.join(bin, 'docker'), `#!/usr/bin/env bash
 echo "$*" >> "${root}/docker.calls"
 case "$1" in
-  ps) printf 'vibe-tb vibe-tb\\ncloudflared vibe-cloudflared\\npostgres vibe-postgres\\nredis vibe-redis\\n' ;;
-  exec) cat >/dev/null 2>&1 || true ;;
+  ps) if [[ -f "${root}/stopped" && ! -f "${root}/stop-ignored" ]]; then printf 'postgres vibe-postgres\\n';
+      else printf 'vibe-tb vibe-tb\\ncloudflared vibe-cloudflared\\npostgres vibe-postgres\\nredis vibe-redis\\n'; fi ;;
+  stop) touch "${root}/stopped" ;;
+  exec) if [[ -f "${root}/pgdump-fails" && "$*" == *pg_dump* ]]; then echo "pg_dump: error: connection refused" >&2; exit 1; fi
+        if [[ "$*" == *"SELECT datname"* ]]; then echo vibe_tb_db; else cat >/dev/null 2>&1 || true; fi ;;
 esac
 exit 0
 `, 0o755);
@@ -223,6 +226,8 @@ test('standby mode is enforced on the host: state helper, bootstrap, enable-app'
   const apps = bootstrap.slice(bootstrap.indexOf('phase_apps() {'), bootstrap.indexOf('phase_apps() {') + 900);
   assert.match(apps, /if state_standby_mode; then[\s\S]*return 0/, 'bootstrap skips app re-enable on a standby');
   assert.match(bootstrap, /if state_standby_mode; then\s+docker stop -t 10 vibe-redis/, 'bootstrap stops Redis again on a standby');
+  // ...and does so before the console health wait, so a slow console does not leave Redis running.
+  assert.ok(bootstrap.indexOf('docker stop -t 10 vibe-redis') < bootstrap.indexOf('waiting for console healthcheck'));
   const enable = fs.readFileSync(path.join(REPO, 'lib/enable-app.sh'), 'utf8');
   const fn = enable.slice(enable.indexOf('enable_app() {'), enable.indexOf('enable_app() {') + 2000);
   assert.match(fn, /if state_standby_mode; then[\s\S]*return 1/, 'enable-app refuses on a standby before doing anything');
@@ -238,4 +243,62 @@ test('the peer port is preflighted and firewalled to private networks and the ta
   assert.match(ufw, /_ufw_deny_silent "\$_STANDBY_PEER_PORT" "tcp"/);
   const compose = fs.readFileSync(path.join(REPO, 'docker-compose.yml'), 'utf8');
   assert.match(compose, /\$\{STANDBY_PEER_BIND:-0\.0\.0\.0\}:4480:4480/);
+});
+
+// ---- review 2026-11-18 ------------------------------------------------------
+
+test('mode-on fails, with a fix, when the containers did not actually stop', () => {
+  const b = box();
+  fs.writeFileSync(path.join(b.root, 'stop-ignored'), '');
+  const r = b.run('mode-on');
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /still running after being asked to stop/);
+  assert.match(r.stderr, /fix: sudo docker stop/);
+});
+
+test('archive: a failed database dump reports a fix and leaves no partial archive behind', () => {
+  const b = box();
+  fs.writeFileSync(path.join(b.root, 'pgdump-fails'), '');
+  const r = b.run('archive');
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /could not archive the database 'vibe_tb_db'/);
+  assert.match(r.stderr, /fix: /);
+  const dir = path.join(b.vibe, 'standby/local/archive');
+  assert.deepEqual(fs.existsSync(dir) ? fs.readdirSync(dir) : [], [], 'the partial archive was removed');
+});
+
+test('state.json is written under the shared state lock', () => {
+  const src = fs.readFileSync(path.join(REPO, 'lib/standby-host.sh'), 'utf8');
+  assert.equal((src.match(/fcntl\.flock\(_lk\.fileno\(\), fcntl\.LOCK_EX\)/g) || []).length, 2, 'mode flag and the promote merge both lock');
+  assert.doesNotMatch(src, /tmp = (local_)?path \+ "\.tmp"/, 'no shared temp name with other writers');
+});
+
+test('a standby refuses app updates and rollbacks, with the way forward', () => {
+  const b = box();
+  for (const args of [['vibe-tb'], ['vibe-tb', '--rollback']]) {
+    const r = spawnSync('bash', [path.join(REPO, 'update.sh'), ...args], {
+      encoding: 'utf8', env: { ...process.env, VIBE_DIR: b.vibe, VIBE_LOG_DIR: path.join(b.root, 'logs') },
+    });
+    assert.notEqual(r.status, 0, args.join(' '));
+    assert.match(r.stderr + r.stdout, /this box is a standby/);
+    assert.match(r.stderr + r.stdout, /Update the app on the primary/);
+  }
+  assert.deepEqual(b.calls('docker.calls'), [], 'nothing was started or pulled');
+});
+
+test('the tunnel, settings restarts and the console routes all refuse on a standby', () => {
+  const cf = fs.readFileSync(path.join(REPO, 'infra/cloudflared-up.sh'), 'utf8');
+  assert.ok(cf.indexOf('this box is a standby (Vibe Standby), so the Cloudflare Tunnel is not started') > 0);
+  assert.ok(cf.indexOf('this box is a standby (Vibe Standby)') < cf.indexOf('cfd_tunnel'), 'refused before anything is created at Cloudflare');
+  const ss = fs.readFileSync(path.join(REPO, 'lib/settings-save.sh'), 'utf8');
+  const restart = ss.slice(ss.indexOf('_settings_restart_app() {'), ss.indexOf('_settings_restart_app() {') + 700);
+  assert.match(restart, /state_standby_mode \); then[\s\S]*return 0/);
+  assert.match(ss, /tunnel_enabled" == "true" && "\$_rr_standby" != "yes"/);
+  const server = fs.readFileSync(path.join(REPO, 'console/server.js'), 'utf8');
+  for (const route of ["'/api/v1/update/:slug'", "'/api/v1/update/:slug/rollback'", "'/api/v1/admin/cloudflare/enable'",
+    "'/api/v1/admin/cloudflare/provision'", "'/api/v1/admin/network-mode/switch'", "'/api/v1/enable/:slug'"]) {
+    const at = server.indexOf(`app.post(${route}`);
+    assert.ok(at > 0, route);
+    assert.match(server.slice(at, at + 900), /standby_mode\) \{\s+return res\.status\(409\)/, `${route} refuses on a standby`);
+  }
 });

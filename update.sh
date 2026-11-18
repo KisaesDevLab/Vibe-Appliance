@@ -53,6 +53,30 @@ log_init
 
 # ---- helpers -----------------------------------------------------------
 
+# A box in standby mode (Vibe Standby) holds a copy of the firm's data and
+# must not run apps or Redis. Updating or rolling back an app here would
+# run its migrations against that copy and start it (and Redis, through
+# depends_on). The primary is updated; the standby follows at its next
+# sync. An unreadable state file reads as "not a standby", so a damaged
+# file never blocks updates on a live box.
+_standby_mode() {
+  python3 - "$VIBE_STATE_FILE" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        sys.exit(0 if json.load(f).get("config", {}).get("standby_mode") is True else 1)
+except Exception:
+    sys.exit(1)
+PYEOF
+}
+
+_refuse_on_standby() { # <what>
+  if _standby_mode; then
+    die "refusing to $1: this box is a standby (Vibe Standby), so its apps stay stopped." \
+      "Update the app on the primary; this box follows at its next sync. To make this box live instead, open Standby in the console and choose Promote."
+  fi
+}
+
 _manifest_path() {
   printf '%s' "${APPLIANCE_DIR}/console/manifests/${1}.json"
 }
@@ -421,6 +445,7 @@ for slug, e in (s.get('apps',{}) or {}).items():
 cmd_update() {
   local slug="$1"
   local manifest="$(_manifest_path "$slug")"
+  _refuse_on_standby "update $slug"
 
   [[ -f "$manifest" ]] || die "manifest not found: $manifest"
   # Units another orchestrator installs are not ours to update. A Sentinel
@@ -700,6 +725,7 @@ cmd_rollback() {
   esac
   local manifest="$(_manifest_path "$slug")"
   [[ -f "$manifest" ]] || die "manifest not found: $manifest"
+  _refuse_on_standby "roll back $slug"
   # Units another orchestrator installs are not ours to update. A Sentinel
   # module's images live in versions/manifest.json on that side, and five
   # families are gated on a detection-harness run with deliberately no

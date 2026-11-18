@@ -85,15 +85,28 @@ _stop_non_core() {
   docker stop -t 5 vibe-cloudflared >/dev/null 2>&1 || true
   # shellcheck disable=SC2086
   docker stop -t 30 $names >/dev/null 2>&1 || true
+  # Believe the result, not the command: everything after this (standby
+  # mode, placing data under the app directories) assumes nothing is
+  # running. A Docker that hung or refused must stop the action here.
+  local left
+  left="$(_non_core_running || true)"
+  if [[ -n "$left" ]]; then
+    die "these containers are still running after being asked to stop: $(printf '%s' "$left" | tr '\n' ' ')" \
+      "sudo docker stop $(printf '%s' "$left" | tr '\n' ' ') — if that hangs: sudo systemctl restart docker — then repeat the step in the Standby panel"
+  fi
 }
 
 _set_mode() { # true|false
   python3 - "$VIBE_STATE_FILE" "$1" <<'PYEOF'
-import json, os, sys
+import fcntl, json, os, sys
 path, on = sys.argv[1], sys.argv[2] == "true"
+# The same lock every other writer of state.json takes (lib/state.sh): a
+# concurrent `update.sh --check` must not overwrite the flag just set.
+_lk = open(path + ".lock", "w")
+fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
 with open(path) as f: s = json.load(f)
 s.setdefault("config", {})["standby_mode"] = on
-tmp = path + ".tmp"
+tmp = "%s.standby.%d.tmp" % (path, os.getpid())
 with open(tmp, "w") as f: json.dump(s, f, indent=2); f.write("\n")
 os.chmod(tmp, 0o644); os.replace(tmp, path)
 PYEOF
@@ -227,8 +240,10 @@ rc=\$?; rm -f $pwfile; exit \$rc" || die "could not set the database password" \
 
   # state.json: the primary's apps and settings, this box's own identity.
   python3 - "$VIBE_STATE_FILE" "$SRC/state.json" <<'PYEOF'
-import json, os, sys
+import fcntl, json, os, sys
 local_path, new_path = sys.argv[1], sys.argv[2]
+_lk = open(local_path + ".lock", "w")
+fcntl.flock(_lk.fileno(), fcntl.LOCK_EX)
 with open(local_path) as f: local = json.load(f)
 with open(new_path) as f: new = json.load(f)
 cfg, lcfg = new.setdefault("config", {}), local.get("config", {})
@@ -242,7 +257,7 @@ cfg["standby_mode"] = False
 new["phases"] = local.get("phases", {})
 if "host_services" in local: new["host_services"] = local["host_services"]
 else: new.pop("host_services", None)
-tmp = local_path + ".tmp"
+tmp = "%s.standby.%d.tmp" % (local_path, os.getpid())
 with open(tmp, "w") as f: json.dump(new, f, indent=2); f.write("\n")
 os.chmod(tmp, 0o644); os.replace(tmp, local_path)
 PYEOF
@@ -308,20 +323,36 @@ action_archive() {
   stamp="$(date -u +%Y%m%d-%H%M%S)"
   dest="${SB_DIR}/local/archive/${stamp}"
   local need have
-  need="$(du -sk "${VIBE_DIR}/data/postgres" 2>/dev/null | cut -f1)"; need="${need:-0}"
-  have="$(df -Pk "$SB_DIR" | awk 'NR==2 {print $4}')"
+  # `du` exits non-zero when a file vanishes while it walks, which a live
+  # Postgres directory does all the time; under `set -e` that would end
+  # the script here with no message. The figure is an estimate either way.
+  need="$( (du -sk "${VIBE_DIR}/data/postgres" 2>/dev/null || true) | cut -f1)"; need="${need:-0}"
+  [[ "$need" =~ ^[0-9]+$ ]] || need=0
+  have="$(df -Pk "$SB_DIR" | awk 'NR==2 {print $4}')" || have=0
+  [[ "$have" =~ ^[0-9]+$ ]] || die "could not read the free disk space under $SB_DIR" "df -h $SB_DIR"
   (( have > need + 1048576 )) || die "not enough free disk to archive this box's databases (need about $((need/1024)) MB plus 1 GB)" \
     "free some disk, or choose 'skip the archive' in the Rejoin wizard"
+  # An attempt that fails part-way must not leave gigabytes of dumps
+  # behind for the next attempt to trip over: the archive either
+  # completes or is removed. (Nothing in it is hard-linked yet.)
+  _archive_failed() { # <what failed> <fix>
+    rm -rf "$dest" 2>/dev/null || true
+    die "$1" "$2"
+  }
   install -d -m 700 "$dest/db"
   log_step "archiving this box's current data before it is overwritten" dest="$dest"
-  local pg_user db
+  local pg_user db dbs
   pg_user="$(_env_get "${VIBE_DIR}/env/shared.env" POSTGRES_USER)"; pg_user="${pg_user:-postgres}"
-  docker exec "$PG_CONTAINER" psql -U "$pg_user" -At -d postgres \
-    -c "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres'" \
-  | while read -r db; do
-      [[ -n "$db" ]] || continue
-      docker exec "$PG_CONTAINER" pg_dump -U "$pg_user" -Fc "$db" > "$dest/db/${db}.dump"
-    done
+  dbs="$(docker exec "$PG_CONTAINER" psql -U "$pg_user" -At -d postgres \
+    -c "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres'" 2>>"$VIBE_LOG_FILE")" \
+    || _archive_failed "could not list this box's databases (is $PG_CONTAINER running?)" \
+         "sudo docker ps --filter name=$PG_CONTAINER; sudo docker logs $PG_CONTAINER --tail 50 — then choose Rejoin again"
+  while read -r db; do
+    [[ -n "$db" ]] || continue
+    docker exec "$PG_CONTAINER" pg_dump -U "$pg_user" -Fc "$db" > "$dest/db/${db}.dump" 2>>"$VIBE_LOG_FILE" \
+      || _archive_failed "could not archive the database '$db'" \
+           "sudo tail -30 $VIBE_LOG_FILE; df -h $SB_DIR — fix the cause and choose Rejoin again, or skip the archive in the Rejoin wizard if this data is not needed"
+  done <<<"$dbs"
   # App files are archived as HARD LINKS: no copy, no extra disk. A hard
   # link is the same file under a second name, which has two consequences
   # this script must respect:

@@ -571,6 +571,15 @@ PYEOF
 )"
 
   local rc=0 slug _rr_manifest _rr_rt
+  # A standby runs no apps and no tunnel (Vibe Standby): enable-app would
+  # refuse each one and cloudflared-up refuses too. Only Caddy is
+  # re-rendered below; the rest happens when this box is promoted.
+  local _rr_standby="no"
+  if ( . "${APPLIANCE_DIR}/lib/state.sh" >/dev/null 2>&1; state_standby_mode ); then
+    _rr_standby="yes"
+    slugs=""
+    log_info "routing-reconcile: standby mode — apps and the tunnel are left stopped; they take the new names when this box is promoted"
+  fi
   while IFS= read -r slug; do
     [[ -z "$slug" ]] && continue
     # Units another orchestrator installs share state.apps but have no
@@ -634,7 +643,7 @@ PYEOF
   # anyway, but skipping the spawn keeps the log clean.
   local tunnel_enabled
   tunnel_enabled="$(secrets_get_appliance CLOUDFLARE_TUNNEL_ENABLED 2>/dev/null || true)"
-  if [[ "$tunnel_enabled" == "true" ]]; then
+  if [[ "$tunnel_enabled" == "true" && "$_rr_standby" != "yes" ]]; then
     log_step "routing-reconcile: re-provisioning Cloudflare Tunnel ingress + CNAMEs"
     if ! bash "${APPLIANCE_DIR}/infra/cloudflared-up.sh" >>"$VIBE_LOG_FILE" 2>&1; then
       log_warn "routing-reconcile: cloudflared-up failed; tunnel ingress/CNAMEs may be stale until re-run" \
@@ -927,6 +936,12 @@ _settings_app_services() {
 # would be silently recreated on :latest.
 _settings_restart_app() {
   local slug="$1"
+  # A standby's apps stay stopped (Vibe Standby). The setting is saved;
+  # the app picks it up when this box is promoted.
+  if ( . "${APPLIANCE_DIR}/lib/state.sh" >/dev/null 2>&1; state_standby_mode ); then
+    log_info "standby mode: $slug is not restarted; the saved setting applies when this box is promoted" slug="$slug"
+    return 0
+  fi
   local overlay="${APPLIANCE_DIR}/apps/${slug}.yml"
   [[ -f "$overlay" ]] || { log_warn "no overlay for $slug; skipping restart"; return 0; }
 

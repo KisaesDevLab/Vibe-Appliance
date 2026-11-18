@@ -905,6 +905,17 @@ phase_core_up() {
     die "Failed to bring up core stack. Inspect logs above and re-run."
   fi
 
+  # `compose up` starts every core service, Redis included. A standby
+  # must not run Redis (queued jobs would run against copied data) or the
+  # tunnel. Stopped here, before the health wait, so that a console that
+  # is slow to come up does not leave them running; `unless-stopped`
+  # then keeps them down.
+  if state_standby_mode; then
+    docker stop -t 10 vibe-redis >>"$VIBE_LOG_FILE" 2>&1 || true
+    docker stop -t 5 vibe-cloudflared >>"$VIBE_LOG_FILE" 2>&1 || true
+    log_info "standby mode: Redis and the tunnel are kept stopped"
+  fi
+
   log_step "waiting for console healthcheck (timeout 90s)"
   local deadline=$(( $(date +%s) + 90 ))
   while (( $(date +%s) < deadline )); do
@@ -913,14 +924,6 @@ phase_core_up() {
       vibe-console 2>/dev/null || true)"
     if [[ "$health" == "healthy" ]]; then
       log_ok "console healthy"
-      # `compose up` starts every core service, Redis included. A standby
-      # must not run Redis (queued jobs would run against copied data),
-      # so stop it again here; `unless-stopped` then keeps it down.
-      if state_standby_mode; then
-        docker stop -t 10 vibe-redis >>"$VIBE_LOG_FILE" 2>&1 || true
-        docker stop -t 5 vibe-cloudflared >>"$VIBE_LOG_FILE" 2>&1 || true
-        log_info "standby mode: Redis and the tunnel are kept stopped"
-      fi
       _check_core_image_drift
       state_set_phase core ok
       return 0

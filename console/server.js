@@ -2986,6 +2986,14 @@ app.post('/api/v1/admin/cloudflare/discover', requireAdmin, testRateLimit, async
 // validates that each slug names a real, ENABLED app — invalid slugs
 // surface as warnings in stdout/stderr and are skipped.
 app.post('/api/v1/admin/cloudflare/provision', requireAdmin, testRateLimit, globalOp('Cloudflare tunnel provision'), async (req, res) => {
+  // A standby must not run apps or the tunnel (Vibe Standby): provisioning starts the connector.
+  if ((readState().config || {}).standby_mode) {
+    return res.status(409).json({
+      ok: false,
+      error: 'This box is a standby, so the Cloudflare Tunnel is not provisioned or started here. ' +
+             'The tunnel runs on the live box. To make this box live, open Standby and choose Promote.',
+    });
+  }
   // Tunnel ingress forwards to https://caddy:443 with noTLSVerify.
   // In LAN/Tailscale modes Caddy has no :443 listener at all — every
   // tunnel request would 502 silently. Hard-fail at the API layer
@@ -3416,6 +3424,14 @@ app.post('/api/v1/admin/cloudflare/disable', requireAdmin, testRateLimit, async 
 });
 
 app.post('/api/v1/admin/cloudflare/enable', requireAdmin, testRateLimit, async (_req, res) => {
+  // A standby must not run apps or the tunnel (Vibe Standby): a second connector on the firm's tunnel would take part of the public traffic.
+  if ((readState().config || {}).standby_mode) {
+    return res.status(409).json({
+      ok: false,
+      error: 'This box is a standby, so the Cloudflare Tunnel is not started here. ' +
+             'The tunnel runs on the live box. To make this box live, open Standby and choose Promote.',
+    });
+  }
   const found = await _inspectCloudflared();
   if (found.error) {
     if (found.error.daemonDown) {
@@ -4191,6 +4207,14 @@ const EMAIL_RE  = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, globalOp('network mode switch'), async (req, res) => {
+  // A standby must not run apps or the tunnel (Vibe Standby): this route re-enables every app and re-provisions the tunnel.
+  if ((readState().config || {}).standby_mode) {
+    return res.status(409).json({
+      ok: false,
+      error: 'This box is a standby, so its network mode, domain and main host label are not changed here. ' +
+             'They come from the primary at promote; change them on the primary. To make this box live, open Standby and choose Promote.',
+    });
+  }
   const body  = req.body || {};
   const mode  = typeof body.mode === 'string' ? body.mode : '';
   const domain = typeof body.domain === 'string' ? body.domain.trim().toLowerCase() : '';
@@ -4717,6 +4741,14 @@ app.post('/api/v1/update/:slug', requireAdmin, testRateLimit, async (req, res) =
   const slug = req.params.slug;
   if (!SLUG_RE.test(slug)) return res.status(400).json({ error: 'invalid slug' });
   if (!MANIFESTS[slug])    return res.status(404).json({ error: 'unknown app' });
+  // A standby must not run apps or the tunnel (Vibe Standby): an update would run migrations against the copied data and start the app.
+  if ((readState().config || {}).standby_mode) {
+    return res.status(409).json({
+      ok: false,
+      error: 'This box is a standby, so apps are not updated here. ' +
+             'Update the app on the primary; this box follows at its next sync. To make this box live, open Standby and choose Promote.',
+    });
+  }
   if (appRuntime(MANIFESTS[slug]) !== 'appliance') {
     return res.status(409).json({
       error: 'not updatable here',
@@ -4732,6 +4764,14 @@ app.post('/api/v1/update/:slug/rollback', requireAdmin, testRateLimit, async (re
   const slug = req.params.slug;
   if (!SLUG_RE.test(slug)) return res.status(400).json({ error: 'invalid slug' });
   if (!MANIFESTS[slug])    return res.status(404).json({ error: 'unknown app' });
+  // A standby must not run apps or the tunnel (Vibe Standby): a rollback would start the app against the copied data.
+  if ((readState().config || {}).standby_mode) {
+    return res.status(409).json({
+      ok: false,
+      error: 'This box is a standby, so apps are not rolled back here. ' +
+             'Roll the app back on the primary; this box follows at its next sync. To make this box live, open Standby and choose Promote.',
+    });
+  }
   if (appRuntime(MANIFESTS[slug]) !== 'appliance') {
     return res.status(409).json({
       error: 'not updatable here',
