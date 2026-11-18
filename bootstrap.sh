@@ -1036,6 +1036,15 @@ phase_infra() {
       "fix:sudo bash /opt/vibe/appliance/infra/host-runner-install.sh"
   fi
 
+  # Vibe Standby boot hold: keeps a paired primary's apps stopped across
+  # a reboot until the role record has been read. Does nothing on a box
+  # that is not a paired primary.
+  log_step "installing the Vibe Standby boot-hold units"
+  if ! ( cd "$APPLIANCE_DIR" && /bin/bash infra/standby-boot-hold-install.sh ); then
+    log_warn "Vibe Standby boot-hold install failed; a replaced primary would start its apps at boot until the Standby service stops them" \
+      "fix:sudo bash /opt/vibe/appliance/infra/standby-boot-hold-install.sh"
+  fi
+
   if [[ "$CONFIG_COCKPIT" != "true" ]]; then
     log_info "skipping cockpit install (--no-cockpit)"
     return 0

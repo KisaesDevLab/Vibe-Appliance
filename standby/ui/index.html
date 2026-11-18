@@ -106,13 +106,16 @@ function unpaired() {
       M("The code works once and stops working at ", when(view.expiresAt), ". This page updates by itself when the other box has paired.")]
       : [P("This box stays the live one. The other box will be overwritten with a copy of this one."), h("div", { class: "row" }, btn("Create the code", () => act(async () => { const r = await api("POST", "api/pair/direct/start"); view.code = r.code; view.expiresAt = r.expiresAt; }), "primary"), btn("Back", () => go("home")))], errLine());
   if (view.name === "standby-direct") return card(h("h2", {}, "Enter the code from the primary"),
-    P("On the primary, open Standby and choose “This box is the primary”. Paste the code it shows here."), h("label", { for: "code" }, "Pairing code"), h("textarea", { id: "code" }),
+    P("On the primary, open Standby and choose “This box is the primary”. Paste the code it shows here."),
+    M("If this box has a Cloudflare Tunnel of its own, that tunnel and its DNS records are removed when it becomes the standby: after a promote it uses the primary's. A tunnel it shares with the primary is left alone."),
+    h("label", { for: "code" }, "Pairing code"), h("textarea", { id: "code" }),
     view.lastCode === "has-data" ? h("div", { class: "banner bad" }, P("This box already holds data. Continuing replaces everything on it with the primary's data."), h("label", {}, h("input", { type: "checkbox", id: "ow" }), " I understand. Replace this box's data.")) : null,
     errLine(), h("div", { class: "row" }, btn("Pair", () => act(() => api("POST", "api/pair/direct/join", { code: val("code"), confirmOverwrite: !!(document.getElementById("ow") || {}).checked })), "primary"), btn("Back", () => go("home"))));
   if (view.name === "standby-bucket") return card(h("h2", {}, view.code ? "Give this code to the primary" : "This standby's read-only key"),
     view.code ? [P("On the primary, open Standby, choose “This box is the primary”, then “Through a storage bucket”, and paste this code:"), h("div", { class: "code" }, view.code),
       M("This page checks the bucket by itself and finishes when the primary has paired."), h("div", { class: "row" }, btn("Check now", () => act(() => api("POST", "api/pair/bucket/complete"))))]
       : [P("In Backblaze, create a bucket just for Standby (private, no Object Lock). Then create an application key for that bucket with read-only access, and enter it here."),
+        M("If this box has a Cloudflare Tunnel of its own, that tunnel and its DNS records are removed when it becomes the standby: after a promote it uses the primary's. A tunnel it shares with the primary is left alone."),
         ...bucketForm("Read-only application key", "This box can read the bucket but never write to it."),
         view.lastCode === "has-data" ? h("div", { class: "banner bad" }, P("This box already holds data. Continuing replaces everything on it with the primary's data."), h("label", {}, h("input", { type: "checkbox", id: "ow" }), " I understand. Replace this box's data.")) : null,
         h("div", { class: "row" }, btn("Continue", () => act(async () => { const r = await api("POST", "api/pair/bucket/standby", { ...bucketVals(), confirmOverwrite: !!(document.getElementById("ow") || {}).checked }); view.code = r.code; }), "primary"), btn("Back", () => go("home")))], errLine());
@@ -179,8 +182,14 @@ function standby() {
   if (view.name === "promote-confirm") return card(h("h2", {}, "Make this box the live one"),
     P("This box will start the firm's apps using its copy from ", when(view.checks.dataAt), ". This takes several minutes. You can leave this page open; if it is interrupted, come back here and it continues."),
     ...typed(S.phrases.promote, "Promote this box", (t) => act(async () => { await api("POST", "api/promote/run", { confirm: t }); view = { name: "promote-run" }; })));
-  const run = S.lastSync;
+  const run = S.lastSync, tc = S.tunnelCleanup;
   return [
+    tc && tc.status === "pending" ? h("p", { class: "muted small" }, "Removing this box's own Cloudflare Tunnel and its DNS records…") : null,
+    tc && (tc.status === "failed" || tc.status === "skipped") ? h("div", { class: "banner warn" }, h("p", { class: "big" }, "This box's old Cloudflare Tunnel is still there"),
+      P(tc.status === "failed" ? "It could not be removed from your Cloudflare account. Nothing is wrong with the standby; the unused tunnel and its DNS records are simply left over." : "It was not removed, because " + (tc.detail || "it could not be told apart from the primary's") + "."),
+      tc.status === "failed" && tc.detail ? M(tc.detail) : null,
+      M("Tunnel ID ", tc.tunnelId || "unknown", ". You can also delete it by hand in the Cloudflare dashboard: Zero Trust → Networks → Tunnels, and the DNS records that point at it."), errLine(),
+      h("div", { class: "row" }, btn("Try again", () => act(() => api("POST", "api/tunnel-cleanup/retry"))))) : null,
     card(h("p", { class: "big" }, "This box is the standby"),
       S.dataAt ? P("It holds the primary's data as of ", h("strong", {}, when(S.dataAt)), " (", age(S.dataAgeHours), ").") : P("It has not received a copy yet."),
       h("dl", {}, h("dt", {}, "Last check"), h("dd", {}, run ? `${run.ok ? "succeeded" : "failed"} ${when(run.at)}` : "not yet"),

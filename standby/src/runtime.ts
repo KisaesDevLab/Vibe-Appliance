@@ -1,7 +1,7 @@
 // Wires everything together for one box: which repository and link to use
 // for the current role and mode, the peer channel, and the periodic work.
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import type { Server as HttpServer } from "node:http";
 import type { Server as HttpsServer } from "node:https";
 import { join } from "node:path";
@@ -45,6 +45,11 @@ export interface RuntimeOptions {
 }
 
 const FIVE_MIN = 5 * 60 * 1000;
+/** How long a rebooted primary waits for a role record it cannot read before starting its apps (Q46). */
+export const BOOT_HOLD_WAIT_MS = 2 * 60 * 1000;
+
+/** Written by the host at boot (lib/standby-host.sh boot-hold): what it stopped, and what was decided. */
+interface BootHeld { bootId: string | null; at: string | null; containers: string[]; decision: string | null }
 
 /** The box this one replaced at a promote (direct mode), kept until it has learned of the new lease. */
 interface FormerPeer { nodeId: string | null; mode: string | null; promotedAt: string; fingerprint: string | null; addresses: string[]; port: number | null; leaseDelivered: boolean }
@@ -88,6 +93,7 @@ export class Runtime {
       onChange: () => this.rebuild(),
       // The receiver is not running while this box is unpaired, so nothing holds the directory.
       resetHostedRepo: () => rm(this.paths.hostedRepo, { recursive: true, force: true }),
+      ownTunnelId: () => this.ownTunnelId(),
     });
   }
 
@@ -107,6 +113,23 @@ export class Runtime {
   async boxName(): Promise<string> {
     const c = (await this.#stateJson()).config ?? {};
     return String(c.domain || c.tailscale_hostname || c.host_ip || this.store.nodeId.slice(0, 8));
+  }
+  /**
+   * This box's own Cloudflare tunnel, identified the way the appliance does
+   * (infra/cloudflared-down.sh): the id recorded in state.json, else the id
+   * inside the connector token. null when it has none. The token itself
+   * never leaves this function.
+   */
+  async ownTunnelId(): Promise<string | null> {
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+    const recorded = String(((await this.#stateJson()).config ?? {}).cloudflare_tunnel_id ?? "").toLowerCase();
+    if (uuid.test(recorded)) return recorded;
+    const token = (await readEnvFile(join(this.config.applianceDir, "env", "shared.env")).catch(() => ({} as Record<string, string>))).TUNNEL_TOKEN ?? "";
+    if (!token) return null;
+    try {
+      const t = String((JSON.parse(Buffer.from(token, "base64").toString("utf8")) as { t?: unknown }).t ?? "").toLowerCase();
+      return uuid.test(t) ? t : null;
+    } catch { return null; }
   }
   async deployment(): Promise<{ mode: string; tunnel: boolean; address: string }> {
     const c = (await this.#stateJson()).config ?? {};
@@ -221,6 +244,67 @@ export class Runtime {
     if (!wantReceiver && this.#receiver) { await this.#receiver.stop(); this.#receiver = undefined; }
     if (wantForwarder && !this.#forwarder) this.#forwarder = await startRepoForwarder(this.#forwarderPort, this.#peerTarget, this.identity);
     if (!wantForwarder && this.#forwarder) { this.#forwarder.close(); this.#forwarder = undefined; }
+    await this.#writeBootHoldMarker().catch((e: Error) => this.#log("warn", "could not record whether this box should be held at boot", { error: e.message }));
+  }
+
+  // ---- boot hold ----------------------------------------------------------------
+  // The host keeps a paired primary's apps, Redis and tunnel stopped across a
+  // reboot (lib/standby-host.sh, "boot hold"). This side tells the host
+  // whether this box is one to hold, and after a reboot decides: start them
+  // again, or keep the box held because the other one was promoted.
+
+  /** Tell the host whether to hold this box's apps at the next boot: only a paired primary. */
+  async #writeBootHoldMarker(): Promise<void> {
+    const hold = this.store.role === "primary" && !!getPairing(this.store);
+    const file = join(this.config.dataDir, "boot-hold.json");
+    const want = JSON.stringify({ hold });
+    if (await readFile(file, "utf8").then((s) => s.trim() === want, () => false)) return;
+    await writeFile(`${file}.tmp`, `${want}\n`, { mode: 0o644 });
+    await rename(`${file}.tmp`, file);
+  }
+
+  async #bootHold(now: Date): Promise<void> {
+    const file = join(this.config.dataDir, "boot-held.json");
+    let held: BootHeld;
+    try { held = JSON.parse(await readFile(file, "utf8")) as BootHeld; } catch { return; }
+    // No boot ID: recorded at shutdown, and the host's boot step has not run yet.
+    if (!held.bootId || !held.at || held.decision === "held") return;
+    const decide = async (decision: string): Promise<void> => {
+      await writeFile(`${file}.tmp`, `${JSON.stringify({ ...held, decision, decidedAt: now.toISOString() })}\n`, { mode: 0o644 });
+      await rename(`${file}.tmp`, file);
+      this.store.audit("boot-hold", "boot-check", true, { decision, containers: held.containers.length });
+    };
+    const role = this.store.role;
+    let decision = "release";
+    if (role === "standby" || role === "replaced") { await decide("held"); return; }
+    const p = getPairing(this.store);
+    if (role === "primary" && p) {
+      const { leases, unreachable } = await this.link(p).readLeases();
+      const top = highest(leases);
+      if (top && top.holderNodeId !== this.store.nodeId) {
+        // The other box was promoted while this one was off. This IS the
+        // boot check, whatever an earlier check this boot concluded.
+        this.store.unset("lastBootId");
+        const g = await checkRole(this.#guardDeps());
+        if (g === "held-at-boot" || this.store.role === "replaced") {
+          await decide("held");
+          this.#log("warn", "this box was replaced while it was off; its apps stay stopped until an admin decides");
+          await this.rebuild();
+        }
+        return; // not held yet (the console is still starting): try again at the next tick
+      }
+      if (unreachable.length) {
+        if (now.getTime() - Date.parse(held.at) < BOOT_HOLD_WAIT_MS) return;
+        // Cannot tell, and a network problem must not keep the firm down
+        // (Q46). The lease check stays open, so a newer lease that becomes
+        // readable in the next minutes still holds this box.
+        decision = "release-unverified";
+      }
+    }
+    // Recorded before anything starts.
+    await decide(decision);
+    await this.appliance.releaseBootHold();
+    this.#log(decision === "release" ? "info" : "warn", decision === "release" ? "role record read after boot; this box's apps were started" : "the role record could not be read within 2 minutes of boot; this box's apps were started anyway");
   }
 
   startScheduler(everyMs = 30_000): void {
@@ -414,6 +498,9 @@ export class Runtime {
     if (slow) this.#lastSlow = now.getTime();
     // Idempotent: also retries a receiver or forwarder that failed to start earlier.
     if (slow) await this.rebuild().catch((e: Error) => this.#log("error", "could not start the direct-mode helper", { error: e.message }));
+
+    // After a reboot the host holds a paired primary's apps until this has read the role record.
+    await this.#bootHold(now).catch((e: Error) => this.#log("warn", "the boot hold could not be decided yet; it is retried", { error: e.message }));
 
     // A restart can leave an operation recorded that nothing is running any more.
     if (slow) await this.#resumeInterrupted().catch((e: Error) => this.#log("warn", "an interrupted operation could not be cleared yet; it is retried", { error: e.message }));

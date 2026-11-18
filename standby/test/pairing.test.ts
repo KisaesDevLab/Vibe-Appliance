@@ -227,3 +227,68 @@ test("direct pairing again: the standby clears the repository of the earlier pai
   assert.equal(knownLease(store)!.epoch, 5);
   assert.equal(getPairing(store)!.repoId, getPairing(p.store)!.repoId);
 });
+
+// ---- a new standby gives up its own Cloudflare tunnel (Q49, Q50) -----------------
+
+const T1 = "11111111-1111-4111-8111-111111111111", T2 = "22222222-2222-4222-8222-222222222222";
+async function tunnelBoxes(primaryTunnel: string | null | undefined, standbyTunnel: string | null) {
+  const p = await mkBox("p", { apps: ["vibe-tb"] });
+  const store = new Store(":memory:");
+  const id = await loadOrCreateIdentity(mkdtempSync(join(tmpdir(), "vs-pair-t-")), store.nodeId);
+  const box = new FakeAppliance({ apps: [], running: false });
+  const svc = new PairingService({ store, identity: id, appliance: box, pg: { listDatabases: async () => [] } as unknown as Pg, peerPort: freePort(), ownAddresses: async () => ["127.0.0.1"], ownTunnelId: async () => standbyTunnel });
+  // The primary's answer is what its own service returns; `undefined` stands for an older primary.
+  const real = p.svc.acceptDirect.bind(p.svc);
+  p.svc.acceptDirect = async (...a: Parameters<typeof real>) => {
+    const r = await real(...a);
+    if (primaryTunnel === undefined) { const { tunnelId: _drop, ...rest } = r; return rest as typeof r; }
+    return { ...r, tunnelId: primaryTunnel };
+  };
+  const { code } = await p.svc.startDirect();
+  await svc.joinDirect(code, false);
+  await new Promise((r) => setTimeout(r, 20)); // the removal runs in the background
+  return { store, box, svc };
+}
+
+test("a new standby removes its own tunnel only when the primary reports a different one", async () => {
+  const diff = await tunnelBoxes(T1, T2);
+  assert.equal(diff.box.calls.includes("removeOwnTunnel"), true);
+  assert.equal(diff.store.get<{ status: string; tunnelId: string }>("tunnelCleanup")!.status, "done");
+  assert.equal(diff.store.get<{ tunnelId: string }>("tunnelCleanup")!.tunnelId, T2);
+  // The primary has no tunnel at all (LAN): the standby's own one is still not the firm's.
+  const lan = await tunnelBoxes(null, T2);
+  assert.equal(lan.box.calls.includes("removeOwnTunnel"), true);
+});
+
+test("a rejoining old primary never deletes the firm's tunnel; an older primary that does not say leaves it alone too", async () => {
+  const same = await tunnelBoxes(T1, T1);
+  assert.equal(same.box.calls.includes("removeOwnTunnel"), false, "same tunnel as the primary: the firm's own");
+  assert.equal(same.store.get("tunnelCleanup"), undefined);
+  const old = await tunnelBoxes(undefined, T2);
+  assert.equal(old.box.calls.includes("removeOwnTunnel"), false, "no positive proof, no deletion");
+  assert.equal(old.store.get<{ status: string }>("tunnelCleanup")!.status, "skipped");
+  const none = await tunnelBoxes(T1, null);
+  assert.equal(none.box.calls.includes("removeOwnTunnel"), false, "this box has no tunnel");
+});
+
+test("a tunnel removal that fails does not undo the pairing; it is shown and can be retried while the box is a standby", async () => {
+  const p = await mkBox("p", { apps: ["vibe-tb"] });
+  const store = new Store(":memory:");
+  const id = await loadOrCreateIdentity(mkdtempSync(join(tmpdir(), "vs-pair-tf-")), store.nodeId);
+  const box = new FakeAppliance({ apps: [], running: false });
+  const svc = new PairingService({ store, identity: id, appliance: box, pg: { listDatabases: async () => [] } as unknown as Pg, peerPort: freePort(), ownAddresses: async () => ["127.0.0.1"], ownTunnelId: async () => T2 });
+  box.failNext.set("removeOwnTunnel", new Error("Cloudflare answered 403"));
+  const { code } = await p.svc.startDirect();
+  await svc.joinDirect(code, false);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(store.role, "standby", "paired all the same");
+  const c = store.get<{ status: string; detail: string }>("tunnelCleanup")!;
+  assert.equal(c.status, "failed");
+  assert.match(c.detail, /403/);
+  await svc.retryTunnelCleanup();
+  assert.equal(store.get<{ status: string }>("tunnelCleanup")!.status, "done");
+  // After a promote this box's settings are the firm's: no retry from here.
+  store.set("tunnelCleanup", { status: "failed", tunnelId: T2, at: new Date().toISOString() });
+  store.setRole("primary", "t", "promote");
+  await assert.rejects(svc.retryTunnelCleanup(), /no longer a standby/);
+});

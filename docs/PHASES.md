@@ -2760,3 +2760,10 @@ Append to this list as phases complete. Format:
     119/119 with real restic, rest-server and Postgres, `tsc` clean.
   - **Not verified.** No fresh Ubuntu host, no two-box run, no real B2 or
     Cloudflare. Seven tests fail on Windows only (file modes, hard links).
+  - **Added after the owner's second round of answers (Q45-Q51).** A boot
+    hold for paired primaries (`infra/standby-boot-hold-install.sh`, systemd
+    units, the "boot hold" section of `lib/standby-host.sh`); a new standby
+    removes its own Cloudflare tunnel at pairing when the primary reports a
+    different one; `docs/STANDBY_TWO_BOX_TEST.md`. Linux container: appliance
+    suite 467/467, Standby suite 125/125, units pass `systemd-analyze verify`.
+    Not run under real systemd or against Cloudflare.

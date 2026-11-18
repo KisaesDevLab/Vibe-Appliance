@@ -13,6 +13,12 @@
 #                    re-run bootstrap (the standby follows the primary)
 #   archive          REJOIN: set this box's current data aside, read-only
 #   tunnel-up        start cloudflared with the token already in shared.env
+#   tunnel-teardown  a new standby removes its OWN tunnel and DNS records
+#   boot-hold, shutdown-hold, boot-release, boot-release-safety
+#                    keep a paired primary's apps stopped across a reboot
+#                    until the role record has been read (see "boot hold"
+#                    below); the first, second and fourth are run by systemd
+#                    units (infra/standby-boot-hold-install.sh), not the runner
 #
 # Idempotency: every action converges when re-run from any partial state.
 #   `place` links files from the mirror (same filesystem, no copy), so an
@@ -297,6 +303,22 @@ action_tunnel_up() {
   log_ok "tunnel started"
 }
 
+# A box that becomes a standby gives up its OWN Cloudflare tunnel and the
+# DNS records pointing at it: from now on it uses the primary's, placed at
+# promote. The Standby service asks for this only after comparing tunnel
+# ids with the primary (a rejoining old primary shares the firm's tunnel
+# and must never delete it), and only a box in standby mode may do it.
+# Idempotent: infra/cloudflared-down.sh is. Reverse: provision a tunnel
+# again from Configuration → Network after unpairing.
+action_tunnel_teardown() {
+  state_standby_mode || die "this box is not in standby mode; its Cloudflare Tunnel is not removed" \
+    "to remove a tunnel on a live box use Configuration → Network → Cloudflare Tunnel → Tear down"
+  log_step "removing this box's own Cloudflare Tunnel and its DNS records (it will use the primary's after a promote)"
+  bash "${APPLIANCE_DIR}/infra/cloudflared-down.sh" || die "this box's own Cloudflare Tunnel could not be removed completely" \
+    "sudo tail -40 ${VIBE_DIR}/logs/cloudflared.log — then choose Try again on the Standby panel, or delete the tunnel in the Cloudflare dashboard (Zero Trust → Networks → Tunnels)"
+  log_ok "this box's own tunnel and DNS records were removed"
+}
+
 action_follow_version() {
   local ref="${VIBE_STANDBY_REF:-}"
   [[ "$ref" =~ ^[0-9a-f]{7,40}$ ]] || die "no valid appliance version was given" "this action is requested by the Standby service; re-run a sync"
@@ -373,12 +395,191 @@ action_archive() {
   log_ok "archive written" dest="$dest"
 }
 
+# ---- boot hold ---------------------------------------------------------------
+# A paired primary that was replaced while it was off must not serve the
+# firm's old data when it comes back. Docker restarts its app, Redis and
+# tunnel containers by itself, before anything has read the role record.
+# So on a paired primary:
+#   shutdown-hold   (at system shutdown) stops those containers explicitly
+#                   and records their names. A container that was stopped
+#                   explicitly is NOT restarted by `unless-stopped`, so
+#                   after a clean reboot they are simply down.
+#   boot-hold       (at boot, after Docker) stops any that came up anyway
+#                   — a power loss skips shutdown-hold — and records them.
+#   boot-release    starts exactly the recorded containers again. Requested
+#                   by the Standby service once it has read the role record
+#                   (or after 2 minutes if it cannot be read).
+#   boot-release-safety  the same, run by a timer 10 minutes after boot if
+#                   the Standby service never decided, so a fault in Standby
+#                   cannot keep a firm's apps down.
+#
+# Fail open: without the service's marker (an unpaired box, or an install
+# that has no Standby pairing) every one of these does nothing.
+# Never starts anything on a box in standby mode or one the service
+# recorded as held (invariant 1).
+# After a power loss the containers do run for the few seconds between
+# Docker starting and boot-hold stopping them; a clean reboot has no gap.
+# Reverse: delete ${SB_DIR}/boot-held.json and start the containers
+# (sudo bash bootstrap.sh does both).
+HOLD_WANTED="${SB_DIR}/boot-hold.json"   # written by the Standby service: {"hold": true} on a paired primary
+HELD="${SB_DIR}/boot-held.json"          # written here: {"bootId","at","containers":[...],"decision":...}
+HOLD_HANDLED="${SB_DIR}/boot-hold.handled"
+
+_boot_id() { printf '%s' "${VIBE_BOOT_ID:-$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)}"; }
+
+_hold_wanted() {
+  python3 - "$HOLD_WANTED" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        sys.exit(0 if json.load(f).get("hold") is True else 1)
+except Exception:
+    sys.exit(1)
+PYEOF
+}
+
+# _held_write <bootId|-> <names...>   merge names into the held record
+_held_write() {
+  python3 - "$HELD" "$@" <<'PYEOF'
+import json, os, sys, datetime
+path, boot, names = sys.argv[1], sys.argv[2], sys.argv[3:]
+try:
+    with open(path) as f: cur = json.load(f)
+except Exception:
+    cur = {}
+have = [n for n in (cur.get("containers") or []) if isinstance(n, str)]
+for n in names:
+    if n and n not in have: have.append(n)
+out = {"containers": have, "decision": None,
+       "bootId": None if boot == "-" else boot,
+       "at": None if boot == "-" else datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+tmp = "%s.%d.tmp" % (path, os.getpid())
+with open(tmp, "w") as f: json.dump(out, f); f.write("\n")
+os.chmod(tmp, 0o644); os.replace(tmp, path)
+PYEOF
+}
+
+_held_field() { # <field>  -> value ("" if absent); containers one per line
+  python3 - "$HELD" "$1" <<'PYEOF' 2>/dev/null || true
+import json, sys
+try:
+    with open(sys.argv[1]) as f: d = json.load(f)
+except Exception:
+    sys.exit(0)
+v = d.get(sys.argv[2])
+if isinstance(v, list): print("\n".join(x for x in v if isinstance(x, str)))
+elif v is not None: print(v)
+PYEOF
+}
+
+_hold_stop() { # stop what is running, tunnel first; never fails the caller
+  local names="$1"
+  docker stop -t 5 vibe-cloudflared >/dev/null 2>&1 || true
+  # shellcheck disable=SC2086
+  [[ -z "$names" ]] || docker stop -t 30 $names >/dev/null 2>&1 || true
+}
+
+action_shutdown_hold() {
+  # `systemctl restart` of the unit also runs this; only a real shutdown counts.
+  if [[ "${VIBE_ASSUME_SHUTDOWN:-}" != "1" && "$(systemctl is-system-running 2>/dev/null || true)" != "stopping" ]]; then
+    log_info "not a system shutdown; nothing to do"
+    return 0
+  fi
+  if ! _hold_wanted || state_standby_mode; then return 0; fi
+  local names
+  names="$(_non_core_running || true)"
+  [[ -n "$names" ]] || return 0
+  # shellcheck disable=SC2086
+  _held_write - $names
+  _hold_stop "$names"
+  log_ok "paired primary: apps, Redis and the tunnel were stopped for shutdown and will be started again after the role check at boot"
+}
+
+action_boot_hold() {
+  local boot
+  boot="$(_boot_id)"
+  # Once per boot: enabling or restarting the unit on a running box must
+  # not stop a live firm's apps.
+  if [[ -f "$HOLD_HANDLED" && "$(cat "$HOLD_HANDLED" 2>/dev/null)" == "$boot" ]]; then
+    log_info "boot hold already handled for this boot"
+    return 0
+  fi
+  mkdir -p "$SB_DIR"
+  if ! _hold_wanted || state_standby_mode; then
+    # Not a paired primary: nothing to hold, and nothing left over to release.
+    rm -f "$HELD"
+    printf '%s\n' "$boot" > "$HOLD_HANDLED"
+    return 0
+  fi
+  # Docker may still be bringing containers back when this runs (after a
+  # power loss it restarts them itself), so look again a few times rather
+  # than trusting the first listing.
+  local names pass settle="${VIBE_BOOT_HOLD_SETTLE:-10}"
+  for pass in 1 2 3; do
+    names="$(_non_core_running || true)"
+    _hold_stop "$names"
+    # shellcheck disable=SC2086
+    _held_write "$boot" $names
+    [[ "$pass" == 3 || "$settle" == 0 ]] || sleep "$settle"
+  done
+  printf '%s\n' "$boot" > "$HOLD_HANDLED"
+  log_ok "paired primary: apps, Redis and the tunnel are held until the Standby service has read the role record"
+}
+
+# Start exactly what was recorded, Redis first and the tunnel last.
+_release_held() { # <why>
+  [[ -f "$HELD" ]] || { log_info "nothing is held"; return 0; }
+  if state_standby_mode; then
+    log_info "standby mode is on: the held containers stay stopped"
+    rm -f "$HELD"
+    return 0
+  fi
+  if [[ "$(_held_field decision)" == "held" ]]; then
+    log_info "the Standby service recorded this box as replaced: the held containers stay stopped"
+    return 0
+  fi
+  local names name failed="" first="" last="" rest=""
+  names="$(_held_field containers)"
+  while read -r name; do
+    [[ -n "$name" ]] || continue
+    case "$name" in
+      vibe-redis)       first="$name" ;;
+      vibe-cloudflared) last="$name" ;;
+      *)                rest="$rest $name" ;;
+    esac
+  done <<<"$names"
+  for name in $first $rest $last; do
+    docker start "$name" >/dev/null 2>&1 || failed="$failed $name"
+  done
+  if [[ -n "$failed" ]]; then
+    die "could not start:$failed ($1)" "sudo docker start$failed — or bring everything up again: sudo bash ${APPLIANCE_DIR}/bootstrap.sh"
+  fi
+  rm -f "$HELD"
+  log_ok "held containers started ($1)"
+}
+
+action_boot_release() { _release_held "the role record was checked"; }
+
+action_boot_release_safety() {
+  [[ -f "$HELD" ]] || return 0
+  [[ "$(_held_field decision)" == "held" ]] && return 0
+  [[ -n "$(_held_field bootId)" ]] || return 0   # recorded at shutdown, boot-hold has not run: not ours to judge
+  log_warn "the Standby service did not decide within 10 minutes of boot; starting the apps so the firm is not left down" \
+    "diagnose:sudo docker logs vibe-standby --tail 50"
+  _release_held "safety net: no decision from the Standby service"
+}
+
 case "${1:-}" in
   mode-on)        action_mode_on ;;
+  boot-hold)      action_boot_hold ;;
+  shutdown-hold)  action_shutdown_hold ;;
+  boot-release)   action_boot_release ;;
+  boot-release-safety) action_boot_release_safety ;;
   mode-off)       action_mode_off ;;
   place)          action_place ;;
   tunnel-up)      action_tunnel_up ;;
+  tunnel-teardown) action_tunnel_teardown ;;
   follow-version) action_follow_version ;;
   archive)        action_archive ;;
-  *) die "unknown standby action '${1:-}'" "valid: mode-on mode-off place tunnel-up follow-version archive" ;;
+  *) die "unknown standby action '${1:-}'" "valid: mode-on mode-off place tunnel-up tunnel-teardown follow-version archive boot-hold shutdown-hold boot-release boot-release-safety" ;;
 esac

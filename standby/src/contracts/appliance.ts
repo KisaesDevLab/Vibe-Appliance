@@ -52,6 +52,10 @@ export interface ApplianceControl {
   place(snapshotId: string): Promise<void>;
   /** Rejoin: set this box's current data aside, read-only, before it is overwritten. */
   archive(): Promise<void>;
+  /** A new standby: remove this box's OWN Cloudflare tunnel and its DNS records. Refused unless the box is in standby mode. */
+  removeOwnTunnel(): Promise<void>;
+  /** After a reboot: start the app, Redis and tunnel containers the host held back until the role record was read. */
+  releaseBootHold(): Promise<void>;
 
   /** Test promote: start apps on a network with no egress and no tunnel. */
   startAppsIsolated(): Promise<void>;

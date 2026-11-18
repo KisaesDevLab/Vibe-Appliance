@@ -99,6 +99,15 @@ export class FakeAppliance implements ApplianceControl {
     this.#call("pullImages");
     return { failed: Object.keys(digests).filter((ref) => this.unpullable.has(ref)) };
   }
+  async removeOwnTunnel(): Promise<void> {
+    this.#call("removeOwnTunnel");
+    if (!this.standbyMode) throw new Error("this box is not in standby mode; its Cloudflare Tunnel is not removed");
+  }
+  async releaseBootHold(): Promise<void> {
+    this.#call("releaseBootHold");
+    if (this.standbyMode) return; // the host never starts anything in standby mode
+    this.#set("redis", true); this.#set("app", true);
+  }
   async mirrorVersion(v: ApplianceVersion): Promise<void> {
     this.#call("mirrorVersion");
     this.current = structuredClone(v);

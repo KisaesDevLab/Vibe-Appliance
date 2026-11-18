@@ -241,3 +241,53 @@ test("nightly times follow the appliance's own time zone setting", { skip }, asy
   writeFileSync(join(d.tree, "env/appliance.env"), "TZ=Not/AZone\n");
   assert.equal(await d.rt.timezone(), "UTC", "an unknown zone falls back rather than breaking the schedule");
 });
+
+// ---- boot hold (Q45-Q47) ------------------------------------------------------
+
+const heldFile = (b: Box) => join(b.data, "boot-held.json");
+const writeHeld = (b: Box, at: Date) => writeFileSync(heldFile(b), JSON.stringify({ bootId: "boot-X", at: at.toISOString(), containers: ["vibe-redis", "vibe-tb"], decision: null }));
+const bucketPair = async (b: Box) => {
+  const { setPairing } = await import("../src/pairing/state.ts");
+  b.store.setRole("primary", "t", "t");
+  // An endpoint nothing listens on: the role record cannot be read.
+  setPairing(b.store, { mode: "bucket", peerNodeId: "c".repeat(32), repoPassword: "pw-pw-pw-pw", pairedAt: new Date().toISOString(), bucket: { endpoint: "http://127.0.0.1:1", bucket: "b", prefix: "", keyId: "k", key: "kkkkkkkk" } });
+  // No nightly copy during these tests: the bucket is unreachable on purpose.
+  b.store.set("operation", "drill");
+  await b.rt.rebuild();
+};
+
+test("boot hold: the service tells the host to hold only a paired primary", { skip }, async () => {
+  const b = await mkBox("hold-marker", ["vibe-tb"]);
+  assert.deepEqual(JSON.parse(readFileSync(join(b.data, "boot-hold.json"), "utf8")), { hold: false });
+  await bucketPair(b);
+  assert.deepEqual(JSON.parse(readFileSync(join(b.data, "boot-hold.json"), "utf8")), { hold: true });
+});
+
+test("boot hold: an unreadable role record releases after 2 minutes, not before, and the decision is recorded first", { skip }, async () => {
+  const b = await mkBox("hold-wait", ["vibe-tb"]);
+  await bucketPair(b);
+  await b.box.stopApps();
+  const boot = new Date();
+  writeHeld(b, boot);
+  await b.rt.tick(new Date(boot.getTime() + 30_000));
+  assert.equal(b.box.calls.includes("releaseBootHold"), false, "still waiting for the record");
+  assert.equal(JSON.parse(readFileSync(heldFile(b), "utf8")).decision, null);
+  await b.rt.tick(new Date(boot.getTime() + 150_000));
+  assert.equal(b.box.calls.includes("releaseBootHold"), true);
+  assert.equal(JSON.parse(readFileSync(heldFile(b), "utf8")).decision, "release-unverified");
+  assert.equal((await b.box.listServices()).find((x) => x.name === "vibe-tb")!.running, true);
+});
+
+test("boot hold: an unpaired box is released at once; a standby or replaced box is recorded as held and nothing starts", { skip }, async () => {
+  const u = await mkBox("hold-unpaired", ["vibe-tb"]);
+  writeHeld(u, new Date());
+  await u.rt.tick(new Date());
+  assert.equal(u.box.calls.includes("releaseBootHold"), true);
+  assert.equal(JSON.parse(readFileSync(heldFile(u), "utf8")).decision, "release");
+  const r = await mkBox("hold-replaced", []);
+  r.store.setRole("replaced", "t", "t");
+  writeHeld(r, new Date());
+  await r.rt.tick(new Date());
+  assert.equal(r.box.calls.includes("releaseBootHold"), false);
+  assert.equal(JSON.parse(readFileSync(heldFile(r), "utf8")).decision, "held");
+});

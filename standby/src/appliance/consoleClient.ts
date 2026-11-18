@@ -125,6 +125,8 @@ export class ConsoleClient implements ApplianceControl {
   }
 
   async archive(): Promise<void> { await this.#hostAction("standby-archive"); }
+  async removeOwnTunnel(): Promise<void> { await this.#hostAction("standby-tunnel-teardown"); }
+  async releaseBootHold(): Promise<void> { await this.#hostAction("standby-boot-release"); }
 
   async startAppsIsolated(): Promise<void> { throw new Error("The test promote (drill) is not available in this version."); }
   async stopAppsIsolated(): Promise<void> { /* nothing was started */ }

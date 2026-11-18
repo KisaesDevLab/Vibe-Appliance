@@ -70,6 +70,7 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
       rejoining: store.get("rejoining") ?? null,
       formerPeer: store.get("formerPeer") ?? null,
       formerLive: store.get("formerLive") ?? null,
+      tunnelCleanup: store.get("tunnelCleanup") ?? null,
       phrases: { promote: CONFIRM_PHRASE, rejoin: REJOIN_PHRASE, skipArchive: SKIP_ARCHIVE_PHRASE, switchover: SWITCHOVER_PHRASE, unpair: UNPAIR_PHRASE, startAnyway: START_ANYWAY_PHRASE },
     };
   });
@@ -112,6 +113,7 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
     try { await r.pairing.pairBucketPrimary(t, str(b.code)); return { ok: true }; } catch (e) { return fail(reply, e); }
   });
   app.post("/api/pair/bucket/complete", async (_req, reply) => { const r = rt(reply); if (!r) return; try { return { paired: await r.pairing.completeBucketStandby() }; } catch (e) { return fail(reply, e); } });
+  app.post("/api/tunnel-cleanup/retry", async (_req, reply) => { const r = rt(reply); if (!r) return; try { await r.pairing.retryTunnelCleanup(); return { ok: true }; } catch (e) { return fail(reply, e); } });
   app.post("/api/unpair", async (req, reply) => {
     const r = rt(reply); if (!r) return;
     if (str(((req.body ?? {}) as Record<string, unknown>).confirm) !== UNPAIR_PHRASE) return reply.code(400).send({ error: `Type ${UNPAIR_PHRASE} to confirm.`, code: "confirm" });
