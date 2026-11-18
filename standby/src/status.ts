@@ -37,7 +37,10 @@ export function computeStatus(store: Store, config: Pick<Config, "staleAfterHour
   const role = store.role;
   const pairing = getPairing(store);
   const copy = store.get<VerifiedCopy>("verifiedCopy") ?? null;
-  const run = store.recentSyncRuns(1)[0];
+  // A retry in progress does not erase the failure before it: the state is
+  // that of the last run that finished.
+  const runs = store.recentSyncRuns(5);
+  const run = runs.find((r) => r.status !== "running") ?? runs[0];
   const lastCapture = store.get<LastCapture>("lastCapture") ?? null;
   const versionIssues = store.get<string[]>("versionIssues") ?? [];
   const report = store.get<StatusReport>("peerReport") ?? null;
@@ -57,14 +60,19 @@ export function computeStatus(store: Store, config: Pick<Config, "staleAfterHour
 
   if (role === "standby") {
     if (run?.status === "failed") return out("failed", `The last sync failed${copy ? "; the previous verified copy is still in place" : ""}.`);
-    if (!copy) return out(now.getTime() - Date.parse(pairing.pairedAt) > staleMs ? "stale" : "healthy", "Waiting for the first copy from the primary.");
+    if (!copy) {
+      const late = now.getTime() - Date.parse(pairing.pairedAt) > staleMs;
+      const note = store.get<string>("waitingNote");
+      return out(late ? "stale" : "healthy", `Waiting for the first copy from the primary.${late && note ? ` The repository could not be read: ${note}` : ""}`);
+    }
     if (now.getTime() - Date.parse(copy.verifiedAt) > staleMs) return out("stale", `No verified sync in over ${config.staleAfterHours} hours.`);
-    if (versionIssues.length) return out("degraded", "Data is up to date, but this box could not match the primary's app versions.");
+    if (versionIssues.length) return out("degraded", "Data is up to date, with a caution. See the list below.");
     return out("healthy", "This box holds a verified copy of the primary.");
   }
 
   // primary
   if (lastCapture && !lastCapture.ok) return out("failed", "The last nightly copy could not be taken on this box.");
+  if (lastCapture?.unreadable) return out("degraded", `The last copy was sent, but ${lastCapture.unreadable} file${lastCapture.unreadable === 1 ? "" : "s"} could not be read and ${lastCapture.unreadable === 1 ? "is" : "are"} not in it. The log of the standby service on this box names them.`);
   const since = lastCapture ? Date.parse(lastCapture.at) : Date.parse(pairing.pairedAt);
   if (now.getTime() - since > staleMs) return out("stale", `No nightly copy has been taken in over ${config.staleAfterHours} hours.`);
   if (pairing.mode === "bucket") return out("healthy", "Nightly copies are being sent. In bucket mode the standby's own health is shown only on the standby.");

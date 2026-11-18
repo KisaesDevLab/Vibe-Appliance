@@ -39,7 +39,10 @@ async function main(): Promise<void> {
   // channel and the first role check follow; a problem there is logged and
   // retried by the scheduler rather than keeping the panel down.
   await runtime.start().catch((e: Error) => app.log.error({ err: e.message }, "runtime start failed; will keep serving the panel"));
-  await runtime.tick(new Date()).catch((e: Error) => app.log.warn({ err: e.message }, "first check failed; the scheduler retries"));
+  // Not awaited: the first tick can run a whole catch-up copy or sync, which
+  // takes hours. The scheduler must be ticking meanwhile, or a primary stops
+  // writing its heartbeat and the standby's promote checks stop blocking.
+  void runtime.tick(new Date()).catch((e: Error) => app.log.warn({ err: e.message }, "first check failed; the scheduler retries"));
   runtime.startScheduler();
 }
 

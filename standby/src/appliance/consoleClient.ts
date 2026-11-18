@@ -44,10 +44,10 @@ export class ConsoleClient implements ApplianceControl {
     return t;
   }
 
-  async #call<T>(method: string, path: string, body?: unknown): Promise<T> {
+  async #call<T>(method: string, path: string, body?: unknown, timeoutMs = 5 * 60 * 1000): Promise<T> {
     const f = this.#o.fetchImpl ?? fetch;
     const res = await f(`${this.#o.consoleUrl}/api/v1/standby-control${path}`, {
-      method,
+      method, signal: AbortSignal.timeout(timeoutMs),
       headers: { "x-standby-token": await this.#token(), ...(body ? { "content-type": "application/json" } : {}) },
       body: body ? JSON.stringify(body) : undefined,
     });
@@ -103,7 +103,8 @@ export class ConsoleClient implements ApplianceControl {
   async pullImages(digests: Record<string, string>): Promise<{ failed: string[] }> {
     const images = Object.fromEntries(Object.entries(digests).filter(([, ref]) => ref.includes("@sha256:")));
     if (Object.keys(images).length === 0) return { failed: [] };
-    return this.#call("POST", "/pull", { images });
+    // Pulling every app image can take a long time on a slow line.
+    return this.#call("POST", "/pull", { images }, 2 * 60 * 60 * 1000);
   }
 
   /** Fire and return: following the primary's version rebuilds and restarts this very service. */

@@ -527,3 +527,22 @@ test("planned switchover: with the standby unreachable and not promoted, the ove
   assert.equal((await w.pBox.listServices()).find((s) => s.name === "vibe-tb")!.running, true);
   assert.equal(activeOperation(w.ps), undefined);
 });
+
+test("status: a retry in progress does not hide the failure before it (no 'back to normal' email mid-retry)", () => {
+  const w = pair();
+  const failed = w.ss.startSyncRun();
+  w.ss.finishSyncRun(failed, { ok: false, error: "restored files do not match the snapshot" });
+  w.ss.startSyncRun(); // the next attempt, still running
+  const s = computeStatus(w.ss, cfg, w.now());
+  assert.equal(s.health, "failed");
+  assert.equal(s.lastSync?.ok, false);
+  assert.match(s.lastSync?.error ?? "", /do not match/);
+});
+
+test("status: files the copy could not read are reported on the primary, not silently dropped", () => {
+  const w = pair();
+  w.ps.set("lastCapture", { snapshotId: "s", at: w.now().toISOString(), ok: true, unreadable: 3 });
+  const s = computeStatus(w.ps, cfg, w.now());
+  assert.equal(s.health, "degraded");
+  assert.match(s.summary, /3 files could not be read/);
+});

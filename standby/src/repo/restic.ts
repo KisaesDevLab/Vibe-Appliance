@@ -172,6 +172,10 @@ export class ResticRepository implements Repository {
     this.#requireWrite("prune");
     const drop = (await this.#snapshots()).filter((s) => !keepIds.includes(s.vsId)).map((s) => s.id);
     if (drop.length === 0) return;
+    // A backup that was killed (reboot, container restart) can leave its
+    // lock behind, and forget --prune needs the repository to itself.
+    // `unlock` removes only locks restic itself considers stale.
+    await this.#restic(["unlock"]).catch(() => { /* prune reports the real problem */ });
     await this.#restic(["forget", "--prune", ...drop]);
   }
 

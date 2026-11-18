@@ -32,12 +32,28 @@ export class RunError extends Error {
   }
 }
 
+/**
+ * Backstop for a child that hangs. Generous on purpose: a first upload of
+ * hundreds of gigabytes over a slow link legitimately runs for days.
+ */
+export const DEFAULT_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
+
+const live = new Set<ReturnType<typeof spawn>>();
+/** Kill every child process started through run(). Used when an admin's Promote must not wait behind a sync. Returns how many. */
+export function killRunning(): number {
+  let n = 0;
+  for (const c of live) { if (c.kill("SIGKILL")) n++; }
+  return n;
+}
+
 export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise<RunResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, {
       env: { ...process.env, ...opts.env } as NodeJS.ProcessEnv,
       stdio: ["pipe", "pipe", "pipe"], cwd: opts.cwd, uid: opts.uid, gid: opts.gid,
     });
+    live.add(child);
+    const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const out: Buffer[] = [];
     const err: Buffer[] = [];
     let errBytes = 0;
@@ -57,15 +73,17 @@ export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise
     } else child.stdout.on("data", (c: Buffer) => out.push(c));
     child.stderr.on("data", (c: Buffer) => { if (errBytes < 1_000_000) { err.push(c); errBytes += c.length; } });
 
-    if (opts.timeoutMs) timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, opts.timeoutMs);
-    child.on("error", (e) => { if (timer) clearTimeout(timer); reject(new Error(`could not start ${cmd}: ${e.message}`)); });
+    timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeoutMs);
+    timer.unref();
+    child.on("error", (e) => { live.delete(child); if (timer) clearTimeout(timer); reject(new Error(`could not start ${cmd}: ${e.message}`)); });
     child.on("close", (code) => {
+      live.delete(child);
       if (timer) clearTimeout(timer);
       if (opts.onLine && pending) opts.onLine(pending);
       const finish = () => {
         const stderr = Buffer.concat(err).toString("utf8");
         const c = timedOut ? 124 : (code ?? 1);
-        if (!(opts.okCodes ?? [0]).includes(c)) reject(new RunError(cmd, c, timedOut ? `timed out after ${opts.timeoutMs} ms\n${stderr}` : stderr));
+        if (!(opts.okCodes ?? [0]).includes(c)) reject(new RunError(cmd, c, timedOut ? `timed out after ${timeoutMs} ms\n${stderr}` : stderr));
         else resolve({ code: c, stdout: Buffer.concat(out).toString("utf8"), stderr });
       };
       if (file) file.end(finish); else finish();

@@ -30,6 +30,7 @@ import { checkRole, readBootId, startAnyway, type GuardDeps } from "./role/guard
 import { dueDaily } from "./schedule.ts";
 import { computeStatus, type LastCapture, type Status } from "./status.ts";
 import { activeOperation, recover, runSync, type SyncDeps, type SyncOutcome, type VerifiedCopy } from "./sync/sync.ts";
+import { killRunning } from "./util/run.ts";
 
 export interface RuntimeOptions {
   config: Config;
@@ -66,6 +67,8 @@ export class Runtime {
   #lastArchiveSweep = 0;
   #timer?: NodeJS.Timeout;
   #syncRequested = false;
+  /** A promote is stopping the running sync: nothing new may start meanwhile. */
+  #interrupting = false;
   /** Result of the last promote attempt, for the wizard to show. */
   promoteResult: PromoteResult | null = null;
   promoteRunning = false;
@@ -256,6 +259,7 @@ export class Runtime {
   busy(): string | null { return this.#busy; }
   async #exclusive<T>(what: string, fn: () => Promise<T>): Promise<T> {
     if (this.#busy) throw new Error(`A ${this.#busy} is already running on this box.`);
+    if (this.#interrupting || activePromote(this.store)) throw new Error("A promote is in progress on this box.");
     this.#busy = what;
     try { return await fn(); } finally { this.#busy = null; }
   }
@@ -316,11 +320,23 @@ export class Runtime {
   /** Start or resume a promote in the background; the wizard polls `promoteState()`. */
   promoteStart(confirm: string | undefined, actor: string): void {
     if (this.promoteRunning) return;
-    if (!activePromote(this.store) && this.#busy) throw new Error(`A ${this.#busy} is running. Wait for it to finish, then promote.`);
     const deps = this.#promoteDeps();
     this.promoteRunning = true;
     this.promoteResult = null;
-    void runPromote(deps, { confirm, actor }).then(
+    // A sync that is running (or hung) must not keep the firm down: it is
+    // stopped, its own failure handling rolls the copy back to the last
+    // verified one, and the promote's first step checks that again.
+    const clear = async (): Promise<void> => {
+      if (!this.#busy) return;
+      const what = this.#busy;
+      this.#interrupting = true;
+      try {
+        for (let i = 0; this.#busy && i < 600; i++) { killRunning(); await new Promise((r) => setTimeout(r, 200)); }
+      } finally { this.#interrupting = false; }
+      if (this.#busy) throw new Error(`The ${what} that was running on this box could not be stopped. Restart the standby service (sudo docker restart vibe-standby), then choose Promote again.`);
+      this.store.audit("sync-interrupted", actor, true, { for: "promote", what });
+    };
+    void clear().then(() => runPromote(deps, { confirm, actor })).then(
       (r) => { this.promoteResult = r; },
       (e: Error) => { this.promoteResult = { ok: false, error: e.message, unhealthyApps: [], leaseWrittenTo: [], dataAt: null }; },
     ).finally(() => { this.promoteRunning = false; });
