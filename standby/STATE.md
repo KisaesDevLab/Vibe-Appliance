@@ -185,3 +185,59 @@ Run 2026-11-16 in the build container with restic v0.18.1 and rest-server v0.14.
 - Nightly sync time: —
 - Promote time, confirmation to apps healthy: —
 - Planned switchover downtime: —
+
+## Review 2026-11-18: findings
+
+Four independent read-only reviews (data path, control plane, appliance side, hostname naming). Status of each finding is kept here: `open`, `fixed <commit>`, or `left` with the risk. Nothing here has run on two real boxes.
+
+### Control plane (standby/src)
+
+| # | Finding | Status |
+| --- | --- | --- |
+| C1 | Bucket mode: a lease write that fails is recorded as done (`link.ts` writeLease, `promote.ts` lease step), and an unreadable bucket reads as "primary down" in the promote checks. Old primary never learns it was replaced: two live copies. | open |
+| C2 | Direct mode: pairing a replacement standby unsets `formerPeer` (`runtime.ts` rebuild), so a down old primary can no longer ask who holds the role and starts live. `#tellFormerPeer` also stops once paired. | open |
+| C3 | "Cancel and bring the apps back here" (`failback.ts` cancelSwitchover) does no lease check; works after the standby was promoted. | open |
+| C4 | `guard.ts`: a lease store unreachable on the first check after boot uses up the hold-at-boot for that boot. | open |
+| C5 | A service restart during planned switchover (final capture) or rejoin leaves `operation` set for good: apps stopped, no button to recover, nightly capture skipped. | open |
+| C6 | Promote cannot resume after a crash between `clearPairing` and clearing `operation`; Start anyway sets the role before `startApps`, so a failed start cannot be retried. | open |
+| C7 | Cancelling a promote after the lease step leaves the lease with the standby (and, bucket mode, the read/write key in use). | open |
+| C8 | Pairing the same two boxes again: new repository password against the old repository (every capture fails); bucket mode also collects the old pairing bundle; old `control/lease` objects outrank the new epoch-1 lease. | open |
+| C9 | Standby: the pairing is saved before standby mode and role are set; a failed host action leaves "paired, role unpaired" with the panel saying apps are stopped. | open |
+| C10 | The promote Done screen can never be shown (role and pairing change before the result exists). | open |
+| C11 | Conflict banner names a button that is not there on a running old primary; the promoted box never checks for a conflict. | open |
+| C12 | Nightly times are UTC in the shipped compose while the panel says "every night at 02:30". | open |
+
+### Data path (standby/src)
+
+| # | Finding | Status |
+| --- | --- | --- |
+| D1 | `sync.ts`: an interrupted `cp -al` leaves a partial `mirror.prev`; recovery then deletes the verified mirror and renames the partial tree into place (invariant 5). | open |
+| D2 | `status.ts` looks only at the newest run: a retry in progress hides the previous failure, and a "back to normal" email goes out. | open |
+| D3 | No `restic unlock`: a stale lock from a killed backup makes every prune fail. Reported as plausible; to be reproduced. | open |
+| D4 | `main.ts` awaits the first tick, which can run a whole capture; bucket heartbeats stop and the standby's promote checks stop blocking. | open |
+| D5 | "The primary has not sent a snapshot yet" is recorded as a failed sync: FAILED status and emails until the first copy arrives. | open |
+| D6 | `pg_restore` warnings and `psql` errors while applying globals are discarded; verification does not cover views, functions, triggers, sequences or grants. | open |
+| D7 | A sync that fails after `swapPending` rolls forward but never runs the mirror-version step for that snapshot. | open |
+| D8 | No child process, database session or network call has a timeout; a hung one blocks every later sync and Promote. | open |
+| D9 | Capture silently drops a missing capture root, and `unreadable` is never surfaced. | open |
+| D10 | File verification compares existence and size only; one promise per file is held for the whole tree. | open |
+
+### Appliance side
+
+| # | Finding | Status |
+| --- | --- | --- |
+| A1 | Apps and Redis start on a standby through `update.sh` (and rollback), the console update routes, and settings save restarts. | open |
+| A2 | `vibe-cloudflared` can start on a standby: `infra/cloudflared-up.sh` (console Provision, settings routing-reconcile, network-mode switch) and `/api/v1/admin/cloudflare/enable`. | open |
+| A3 | `STANDBY_CONTROL_TOKEN` is in `shared.env`, which every container loads. | open |
+| A4 | A place that fails after the env copy leaves the console holding the old token: the wizard polls 401 for two hours and shows the wrong error. | open |
+| A5 | Run-to-completion containers (vibe-1040-migrate, vibe-recap, vibe-auth jobs) count as unhealthy apps: every promote waits the full 10 minutes; `/apps/start` re-runs them. | open |
+| A6 | `standby-host.sh archive`: `du` failure exits silently under `set -e`; dump failures have no recovery hint; partial archives are left behind. | open |
+| A7 | No boot-time unit exists; hold-at-boot swallows failures of all three stop calls and still records the box as held, without standby mode. | open |
+| A8 | `standby-host.sh` writes `state.json` without the state lock. | open |
+| A9 | Image pulls by digest are anonymous (no registry auth passed). | open |
+| A10 | Bootstrap leaves Redis running on a standby when it fails after `compose up`. | open |
+| A11 | `mode-on` and `place` report success when `docker stop` failed. | open |
+
+### Hostname naming (branch feat/infra-hosts-follow-main-label)
+
+Fixed in `bd8fa88`: no rename on update (state flag), reserved infra names as main label, standalone Cockpit script, mode-route warnings and DDNS, resolver-down fallback, docs. Left: after a promote the standby's own pre-pairing DNS records and Cloudflare tunnel object stay behind (N10).
