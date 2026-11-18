@@ -2222,7 +2222,18 @@ app.use('/api/v1/standby-control', createStandbyControl({
   enqueueHostAction,
   hostActionStatus,
   applianceDir: APPLIANCE_DIR,
-  token: () => process.env.STANDBY_CONTROL_TOKEN || '',
+  // The token is in a root-only file that only this container and the
+  // standby service read (lib/secrets.sh secrets_standby_token_ensure),
+  // re-read on every request so a new token needs no restart. The
+  // environment is the fallback for a box whose bootstrap has not yet
+  // run on this version.
+  token: () => {
+    try {
+      const t = fs.readFileSync(path.join(VIBE_DIR, 'standby', 'local', 'control.token'), 'utf8').trim();
+      if (t) return t;
+    } catch (_e) { /* not created yet */ }
+    return process.env.STANDBY_CONTROL_TOKEN || '';
+  },
   log,
 }));
 

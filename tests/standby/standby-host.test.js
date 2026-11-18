@@ -302,3 +302,31 @@ test('the tunnel, settings restarts and the console routes all refuse on a stand
     assert.match(server.slice(at, at + 900), /standby_mode\) \{\s+return res\.status\(409\)/, `${route} refuses on a standby`);
   }
 });
+
+test('the control token lives in its own root-only file, and is moved out of an older shared.env', () => {
+  const b = box();
+  const shared = path.join(b.vibe, 'env/shared.env');
+  fs.writeFileSync(shared, 'POSTGRES_PASSWORD=pw\nSTANDBY_CONTROL_TOKEN=' + 'ab12'.repeat(16) + '\nREDIS_PASSWORD=r\n', { mode: 0o600 });
+  const ensure = () => spawnSync('bash', ['-c', `set -euo pipefail; . "${REPO}/lib/log.sh"; . "${REPO}/lib/state.sh"; . "${REPO}/lib/secrets.sh"; secrets_standby_token_ensure`],
+    { encoding: 'utf8', env: { ...process.env, VIBE_DIR: b.vibe, APPLIANCE_DIR: REPO } });
+  let r = ensure();
+  assert.equal(r.status, 0, r.stderr);
+  const file = path.join(b.vibe, 'standby/local/control.token');
+  assert.equal(fs.readFileSync(file, 'utf8').trim(), 'ab12'.repeat(16), 'the existing token is kept, so both services still agree');
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  assert.equal(fs.readFileSync(shared, 'utf8'), 'POSTGRES_PASSWORD=pw\nREDIS_PASSWORD=r\n', 'only that line was removed');
+  assert.equal(fs.statSync(shared).mode & 0o777, 0o600);
+  // Idempotent, and a primary's shared.env placed by a promote does not replace this box's token.
+  fs.writeFileSync(shared, 'POSTGRES_PASSWORD=pw\nSTANDBY_CONTROL_TOKEN=' + 'cd34'.repeat(16) + '\n', { mode: 0o600 });
+  r = ensure();
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fs.readFileSync(file, 'utf8').trim(), 'ab12'.repeat(16));
+  assert.doesNotMatch(fs.readFileSync(shared, 'utf8'), /STANDBY_CONTROL_TOKEN/);
+  // A fresh box gets a generated one.
+  fs.rmSync(file);
+  r = ensure();
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(fs.readFileSync(file, 'utf8').trim(), /^[0-9a-f]{64}$/);
+  const tmpl = fs.readFileSync(path.join(REPO, 'env-templates/shared.env.tmpl'), 'utf8');
+  assert.doesNotMatch(tmpl, /^STANDBY_CONTROL_TOKEN=/m, 'every container loads shared.env');
+});

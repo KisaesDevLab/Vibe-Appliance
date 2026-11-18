@@ -73,3 +73,15 @@ test("console client: only digest-pinned images are sent to pull; follow-version
   await s.client.mirrorVersion({ applianceCommit: "abc1234", enabledApps: [], imageDigests: {} });
   assert.deepEqual(s.calls.slice(-1), ["POST /host-action"]);
 });
+
+test("console client: this box's own token file wins over shared.env, which a promote replaces with the primary's", async () => {
+  const tokens: string[] = [];
+  const s = setup((_m, _p, _b, h) => { tokens.push(h["x-standby-token"]!); return { body: { standbyMode: false } }; });
+  mkdirSync(join(s.root, "data/local"), { recursive: true });
+  writeFileSync(join(s.root, "data/local/control.token"), "tok-own-0123456789\n");
+  await s.client.getStandbyMode();
+  // A promote copies the primary's shared.env over this box's.
+  writeFileSync(join(s.root, "tree/env/shared.env"), "STANDBY_CONTROL_TOKEN=tok-primary-0123456789\n");
+  await s.client.getStandbyMode();
+  assert.deepEqual(tokens, ["tok-own-0123456789", "tok-own-0123456789"]);
+});

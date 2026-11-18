@@ -621,6 +621,12 @@ HELP
     die "Could not render shared.env. See $VIBE_LOG_FILE."
   fi
 
+  # Vibe Standby's control token lives in its own root-only file, not in
+  # shared.env (every container loads that). Also moves it out of the
+  # shared.env of an older install, or of a primary's copy just placed
+  # here by a promote.
+  secrets_standby_token_ensure
+
   # Put the preserved secrets back — secrets_render archived the old file
   # and regenerated every placeholder, these included. Values travel via
   # the environment (never argv, so nothing lands in `ps`), and the write

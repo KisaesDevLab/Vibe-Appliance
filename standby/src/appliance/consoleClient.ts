@@ -1,6 +1,8 @@
 // ApplianceControl against the console's /api/v1/standby-control routes and
-// the host-action queue. The service token is read from shared.env on every
-// call, because a promote replaces that file.
+// the host-action queue. The service token is read on every call from this
+// box's own root-only file (<dataDir>/local/control.token), which a promote
+// never replaces. shared.env is the fallback for a box whose bootstrap has
+// not yet moved the token out of it.
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { redactor } from "../logger.ts";
@@ -35,9 +37,9 @@ export class ConsoleClient implements ApplianceControl {
   constructor(o: ConsoleClientOptions) { this.#o = o; }
 
   async #token(): Promise<string> {
-    const env = await readEnvFile(join(this.#o.applianceDir, "env", "shared.env"));
-    const t = env.STANDBY_CONTROL_TOKEN;
-    if (!t) throw new Error("STANDBY_CONTROL_TOKEN is missing from shared.env. Re-run bootstrap on this box: sudo bash /opt/vibe/appliance/bootstrap.sh");
+    let t = await readFile(join(this.#o.dataDir, "local", "control.token"), "utf8").then((s) => s.trim(), () => "");
+    if (!t) t = (await readEnvFile(join(this.#o.applianceDir, "env", "shared.env")).catch(() => ({} as Record<string, string>))).STANDBY_CONTROL_TOKEN ?? "";
+    if (!t) throw new Error("This box has no Standby control token yet. Re-run bootstrap on this box: sudo bash /opt/vibe/appliance/bootstrap.sh");
     redactor.register(t);
     return t;
   }

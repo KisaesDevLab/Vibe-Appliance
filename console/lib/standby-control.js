@@ -6,7 +6,8 @@
 // vocabulary is fixed: nothing here runs a command or path taken from
 // the request.
 //
-// Auth: a service token (STANDBY_CONTROL_TOKEN in shared.env) in the
+// Auth: a service token (/opt/vibe/standby/local/control.token, root only;
+// never in shared.env, which every container loads) in the
 // X-Standby-Token header, compared in constant time. Requests that came
 // through Caddy (they carry X-Forwarded-For) are refused outright: this
 // surface is for vibe_net only, whatever the token.

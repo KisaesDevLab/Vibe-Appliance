@@ -780,3 +780,46 @@ EOF
 
   log_info "credentials file written" path="$VIBE_CREDS_FILE"
 }
+
+# secrets_standby_token_ensure
+#   Vibe Standby's control token: what the `standby` container presents to
+#   the console's /api/v1/standby-control routes. Whoever holds it can stop
+#   every app, start the tunnel and queue root host actions, so it must
+#   not sit in shared.env, which every container loads as its environment.
+#   It is kept in ${VIBE_DIR}/standby/local/control.token (0600, root):
+#   the console and the standby service run as root and read the file; no
+#   app container mounts that directory. `local/` is never captured or
+#   restored, so each box keeps its own token through a promote.
+#
+#   Idempotent. An install made before this moved carries the token in
+#   shared.env: that value is moved into the file (so the running pair of
+#   services keeps agreeing) and the line is removed.
+#   Reverse: delete the file; the next bootstrap generates a new one.
+secrets_standby_token_ensure() {
+  local dir="${VIBE_DIR}/standby/local" file old=""
+  file="${dir}/control.token"
+  mkdir -p "${VIBE_DIR}/standby"
+  install -d -m 700 "$dir"
+  if [[ -f "$VIBE_ENV_SHARED" ]]; then
+    old="$(grep -m1 '^STANDBY_CONTROL_TOKEN=' "$VIBE_ENV_SHARED" 2>/dev/null | cut -d= -f2- || true)"
+    old="${old#\"}"; old="${old%\"}"; old="${old#\'}"; old="${old%\'}"
+  fi
+  if [[ ! -s "$file" ]]; then
+    local value="$old"
+    if [[ ! "$value" =~ ^[A-Za-z0-9]{32,}$ ]]; then
+      value="$(openssl rand -hex 32)" || die "could not generate the Vibe Standby control token (openssl failed)." \
+        "Check openssl is installed: openssl version — then re-run: sudo bash ${APPLIANCE_DIR}/bootstrap.sh"
+    fi
+    ( umask 077; printf '%s\n' "$value" > "${file}.tmp" ) && mv -f "${file}.tmp" "$file" \
+      || die "could not write $file." "Check free disk and permissions: df -h ${VIBE_DIR}; ls -ld $dir — then re-run bootstrap."
+  fi
+  chmod 600 "$file"
+  if [[ -n "$old" || "$(grep -c '^STANDBY_CONTROL_TOKEN=' "$VIBE_ENV_SHARED" 2>/dev/null || true)" != "0" ]] && [[ -f "$VIBE_ENV_SHARED" ]]; then
+    # Temp file + rename: this file holds every core secret.
+    local tmp="${VIBE_ENV_SHARED}.standby-token.$$"
+    ( umask 077; grep -v '^STANDBY_CONTROL_TOKEN=' "$VIBE_ENV_SHARED" > "$tmp" || true ) \
+      && chmod --reference="$VIBE_ENV_SHARED" "$tmp" 2>/dev/null; mv -f "$tmp" "$VIBE_ENV_SHARED" \
+      || log_warn "could not remove STANDBY_CONTROL_TOKEN from shared.env; it is no longer used, but every container can still read it" \
+           "fix:sudo sed -i '/^STANDBY_CONTROL_TOKEN=/d' $VIBE_ENV_SHARED && sudo bash ${APPLIANCE_DIR}/bootstrap.sh"
+  fi
+}
