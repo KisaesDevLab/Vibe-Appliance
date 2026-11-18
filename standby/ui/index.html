@@ -144,7 +144,9 @@ function primary() {
   const r = S.standbyReport, c = S.lastCapture;
   return [
     S.switchover ? h("div", { class: "banner warn" }, h("p", { class: "big" }, "Planned switchover in progress"), P("The apps on this box are stopped and the final copy was sent at ", when(S.switchover.at), "."),
-      P("Next: open the console on the standby, choose Standby, wait until it shows it has this copy, then choose Promote."), errLine(), h("div", { class: "row" }, btn("Cancel and bring the apps back here", () => act(() => api("POST", "api/switchover/cancel"))))) : null,
+      P("Next: open the console on the standby, choose Standby, wait until it shows it has this copy, then choose Promote."), errLine(), h("div", { class: "row" }, btn("Cancel and bring the apps back here", () => act(() => api("POST", "api/switchover/cancel"))),
+        view.lastCode === "cannot-check" ? btn("I checked: the other box is still the standby. Bring the apps back here", () => { if (confirm("Only continue if the other box's Standby page still says it is the standby. If it was promoted, starting the apps here gives you two live copies.")) act(() => api("POST", "api/switchover/cancel", { force: true })); }, "danger") : null,
+        view.lastCode === "promoted" ? btn("Rejoin as standby…", () => go("rejoin"), "primary") : null)) : null,
     card(h("p", { class: "big" }, "This box is the primary"), h("dl", {},
       h("dt", {}, "Last copy sent"), h("dd", {}, c ? (c.ok ? when(c.at) : "failed at " + when(c.at)) : "not yet"),
       h("dt", {}, "Copies go"), h("dd", {}, S.pairing.mode === "direct" ? "directly to the standby" : "through the storage bucket"),

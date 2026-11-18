@@ -344,10 +344,11 @@ export class Runtime {
       store: this.store, appliance: this.appliance,
       capture: async () => (await this.captureNow()).snapshotId,
       announce: async (id: string | null) => { await this.link().heartbeat(this.store.nodeId, new Date().toISOString(), id); },
+      link: getPairing(this.store) ? this.link() : undefined,
     };
   }
   async switchoverStart(confirm: string, actor: string) { return startSwitchover(this.#switchoverDeps(), { confirm, actor }); }
-  async switchoverCancel(actor: string) { return cancelSwitchover(this.#switchoverDeps(), actor); }
+  async switchoverCancel(actor: string, force = false) { return cancelSwitchover(this.#switchoverDeps(), actor, { force }); }
 
   /** Unpair this box and, in direct mode, tell the other one if it can be reached. */
   async unpair(): Promise<void> {
