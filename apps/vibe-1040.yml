@@ -138,6 +138,14 @@ services:
       # uploaded bundle would sit in the queue forever.
       vibe-1040-worker:
         condition: service_started
+      # Same trick for the draft-return engine: nothing in manifest routing
+      # names it, so this edge is what brings it up. `service_started`,
+      # not `service_healthy`, on purpose — the api degrades and reports
+      # the engine unreachable rather than failing (its /health never
+      # waits on the engine, since the 2026-09-27 incident), so a slow or
+      # broken engine must not hold the api's own readiness gate.
+      vibe-1040-opentax:
+        condition: service_started
     healthcheck:
       # Liveness on the api's own port. The appliance's readiness gate is
       # manifest.health = /health, probed through Caddy; this just needs
@@ -149,3 +157,39 @@ services:
       timeout: 5s
       retries: 12
       start_period: 45s
+
+  # The draft-return engine (OpenTax), added 2026-09-28 — Vibe-1040
+  # QUESTIONS.md Q27. Mirrors the `opentax` service in the upstream repo's
+  # docker-compose.yml minus its build block and compose profile: the
+  # image is built and published by the upstream release workflow with the
+  # engine version pinned and its SHA-256 verified at build time, and the
+  # published image is checked to report that same version before it is
+  # tagged. No volumes, no env file: the engine holds no credentials,
+  # makes no network call, and computes each return in a temp directory
+  # that is deleted with the response — `read_only` plus a tmpfs /tmp is
+  # what makes "nothing holding taxpayer amounts persists" true rather
+  # than assumed. The api reaches it as OPENTAX_URL (env template).
+  #
+  # Pinned to 10001:10001 like the others, although it shares no blob
+  # store: the manifest validator requires every service of a dataOwner
+  # app to pin the same user, and the image tolerates it — the wrapper
+  # and the engine binary are root-owned and world-executable, the only
+  # writable path it needs is the tmpfs /tmp, and the wrapper points each
+  # engine child's HOME at its own temp directory.
+  vibe-1040-opentax:
+    image: ghcr.io/kisaesdevlab/vibe-1040-opentax:${APP_TAG:-latest}
+    container_name: vibe-1040-opentax
+    user: "10001:10001"
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    networks:
+      - vibe_net
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8230/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

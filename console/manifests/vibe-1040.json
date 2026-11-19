@@ -4,7 +4,7 @@
   "displayName": "Vibe 1040",
   "description": "Reads a client's 1040 source documents and emits a worksheet of totals keyed to Form 1040 and schedule line numbers.",
   "logo": "vibe-1040.svg",
-  "_doc": "In-tree manifest for KisaesDevLab/Vibe-1040 (github.com/KisaesDevLab/Vibe-1040), current release v0.0.1. THREE containers plus a migration one-shot, from two GHCR images: `vibe-1040` runs the Fastify api (8240, and the React review UI it serves at its own root), the BullMQ worker, and the migration one-shot; `vibe-1040-sidecar` is the Python PyMuPDF rasterization worker, which talks to nothing over HTTP - it takes work off the shared Redis and shares the encrypted blob store on disk. THE ROUTER IS A HARD DEPENDENCY: the app's env schema requires a non-empty VIBE_AI_TOKEN, so with vibe-ai-router down even the migration step throws at config-parse time. That is what requiredApps encodes. See also the ROUTER_REQUIRE_US_REGION note in env-templates/per-app/vibe-1040.env.tmpl - the appliance ships it OFF because the router has no region concept yet, and the app fails closed when it is on. MIGRATIONS: This app has no MIGRATIONS_AUTO knob and its server never migrates on boot, so the appliance owns migrations outright - update.sh runs this command with its pre-update dump and health-check rollback behind it. Enable-time migration comes from the overlay's vibe-1040-migrate one-shot instead, which every other service in the set waits on via service_completed_successfully. FIRST LOGIN: Verified against src/db/seed.ts in the upstream repo: it reads SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD from the environment, is a no-op when the user already exists, and deliberately does NOT pre-enrol MFA. SSO: mirrors Vibe-1040/.appliance/manifest.json (requires identity, sso block, ALLOWED_ORIGIN). 1040 is one service, so /auth/* needs no routing matcher — sso.internalUrl names the same container the default upstream does.",
+  "_doc": "In-tree manifest for KisaesDevLab/Vibe-1040 (github.com/KisaesDevLab/Vibe-1040), current release v0.12.1. FOUR containers plus a migration one-shot, from three GHCR images: `vibe-1040` runs the Fastify api (8240, and the React review UI it serves at its own root), the BullMQ worker, and the migration one-shot; `vibe-1040-sidecar` is the Python PyMuPDF rasterization worker, which talks to nothing over HTTP - it takes work off the shared Redis and shares the encrypted blob store on disk; `vibe-1040-opentax` (added 2026-09-28, upstream QUESTIONS.md Q27) is the pinned OpenTax draft-return engine behind a dependency-free HTTP wrapper on 8230, reached only by the api at OPENTAX_URL, read-only root with a tmpfs /tmp, no volumes, no env file - whether the draft return is ON is an audited setting inside the app, not anything here. It is a health_extra target so an enable waits for it; the api itself degrades and reports the engine unreachable rather than failing when it is down. THE ROUTER IS A HARD DEPENDENCY: the app's env schema requires a non-empty VIBE_AI_TOKEN, so with vibe-ai-router down even the migration step throws at config-parse time. That is what requiredApps encodes. See also the ROUTER_REQUIRE_US_REGION note in env-templates/per-app/vibe-1040.env.tmpl - the appliance ships it OFF because the router has no region concept yet, and the app fails closed when it is on. MIGRATIONS: This app has no MIGRATIONS_AUTO knob and its server never migrates on boot, so the appliance owns migrations outright - update.sh runs this command with its pre-update dump and health-check rollback behind it. Enable-time migration comes from the overlay's vibe-1040-migrate one-shot instead, which every other service in the set waits on via service_completed_successfully. FIRST LOGIN: Verified against src/db/seed.ts in the upstream repo: it reads SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD from the environment, is a no-op when the user already exists, and deliberately does NOT pre-enrol MFA. SSO: mirrors Vibe-1040/.appliance/manifest.json (requires identity, sso block, ALLOWED_ORIGIN). 1040 is one service, so /auth/* needs no routing matcher — sso.internalUrl names the same container the default upstream does.",
   "image": {
     "server": "ghcr.io/kisaesdevlab/vibe-1040",
     "defaultTag": "latest",
@@ -12,9 +12,20 @@
       {
         "name": "sidecar",
         "image": "ghcr.io/kisaesdevlab/vibe-1040-sidecar"
+      },
+      {
+        "name": "opentax",
+        "image": "ghcr.io/kisaesdevlab/vibe-1040-opentax"
       }
     ]
   },
+  "health_extra": [
+    {
+      "name": "opentax",
+      "upstream": "vibe-1040-opentax:8230",
+      "path": "/health"
+    }
+  ],
   "subdomain": "1040",
   "emergencyPort": 5177,
   "ports": {
