@@ -312,6 +312,17 @@ remove_cli_symlink() {
   ok "CLI shim removed"
 }
 
+remove_standby_boot_hold() {
+  step "removing the Vibe Standby boot-hold units"
+  systemctl disable --now vibe-standby-boot-release.timer 2>/dev/null || true
+  systemctl disable vibe-standby-boot-hold.service 2>/dev/null || true
+  rm -f /etc/systemd/system/vibe-standby-boot-hold.service \
+        /etc/systemd/system/vibe-standby-boot-release.service \
+        /etc/systemd/system/vibe-standby-boot-release.timer
+  systemctl daemon-reload 2>/dev/null || true
+  ok "boot-hold units removed"
+}
+
 remove_cockpit() {
   step "removing cockpit"
   if dpkg -s cockpit >/dev/null 2>&1; then
@@ -435,6 +446,7 @@ case "$LEVEL" in
     export_foreign_runtimes
     remove_data
     remove_cli_symlink
+    remove_standby_boot_hold
     remove_cockpit
     remove_avahi
     remove_claude_code

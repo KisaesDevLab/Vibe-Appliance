@@ -157,3 +157,164 @@ test("unpair: both roles return to unpaired and the standby leaves standby mode"
   assert.equal(getPairing(s.store), undefined);
   assert.equal(knownLease(s.store), undefined);
 });
+
+// ---- review 2026-11-18 ------------------------------------------------------
+
+test("bucket code: carries a one-time name for the bundle, and older codes without one still decode", () => {
+  const k = Buffer.alloc(32, 7).toString("base64url");
+  const withNonce = decodeCode(encodeCode({ kind: "bucket", nodeId: "c".repeat(32), sealPublic: k, nonce: "abcDEF123_-x" }));
+  assert.deepEqual(withNonce, { kind: "bucket", nodeId: "c".repeat(32), sealPublic: k, nonce: "abcDEF123_-x" });
+  assert.deepEqual(decodeCode(encodeCode({ kind: "bucket", nodeId: "c".repeat(32), sealPublic: k })), { kind: "bucket", nodeId: "c".repeat(32), sealPublic: k });
+});
+
+test("bucket pairing again in the same bucket: the old bundle is not collected, a fresh repository is named, and the new lease outranks the old ones", async () => {
+  const bucket = new FakeBucket();
+  const p = await mkBox("p", { apps: ["vibe-tb"], bucket }), s = await mkBox("s", { bucket, readOnly: true });
+  const target = { endpoint: "https://s3.example", bucket: "b", prefix: "standby", keyId: "k", key: "secret-key-000000" };
+  const first = await s.svc.startBucketStandby(target, false);
+  await p.svc.pairBucketPrimary(target, first.code);
+  assert.equal(await s.svc.completeBucketStandby(), true);
+  const repo1 = getPairing(p.store)!.repoId, pw1 = getPairing(p.store)!.repoPassword;
+  assert.ok(repo1);
+  assert.equal(getPairing(s.store)!.repoId, repo1);
+  // A promote on the standby would have left a higher lease behind in the bucket.
+  bucket.objects.set("control/lease/00000005-" + s.store.nodeId + ".json", JSON.stringify({ epoch: 5, holderNodeId: s.store.nodeId, writtenAt: new Date().toISOString(), reason: "promote" }));
+
+  await p.svc.unpair(); await s.svc.unpair();
+  const second = await s.svc.startBucketStandby(target, false);
+  assert.notEqual(second.code, first.code, "each code names its own bundle");
+  assert.equal(await s.svc.completeBucketStandby(), false, "the bundle from the earlier pairing is not picked up");
+  assert.equal(s.store.role, "unpaired");
+  await p.svc.pairBucketPrimary(target, second.code);
+  assert.equal(await s.svc.completeBucketStandby(), true);
+  const pp = getPairing(p.store)!;
+  assert.notEqual(pp.repoId, repo1, "a new repository, because the password is new");
+  assert.notEqual(pp.repoPassword, pw1);
+  assert.equal(getPairing(s.store)!.repoPassword, pp.repoPassword);
+  assert.equal(knownLease(p.store)!.epoch, 6, "above every lease the bucket already held");
+  assert.equal(knownLease(p.store)!.holderNodeId, p.store.nodeId);
+  assert.equal(knownLease(s.store)!.epoch, 6);
+});
+
+test("direct pairing: standby mode goes on before the code is spent; a refused code puts the box back as it was", async () => {
+  const p = await mkBox("p", { apps: ["vibe-tb"] }), s = await mkBox("s", { apps: ["vibe-old"] });
+  const { code } = await p.svc.startDirect();
+  // The host action fails: the primary must not end up paired with a box that is not a standby.
+  s.box.failNext.set("setStandbyMode:true", new Error("host runner is not answering"));
+  await assert.rejects(s.svc.joinDirect(code, true), /host runner/);
+  assert.equal(p.store.role, "unpaired", "the code was not spent");
+  assert.equal(getPairing(s.store), undefined);
+  // A code that no longer works: standby mode is taken off again and the apps that were running are restarted.
+  p.clock.t += 16 * 60 * 1000;
+  await assert.rejects(s.svc.joinDirect(code, true));
+  assert.equal(s.box.standbyMode, false);
+  assert.equal((await s.box.listServices()).find((x) => x.name === "vibe-old")!.running, true);
+  assert.equal(s.store.role, "unpaired");
+});
+
+test("direct pairing again: the standby clears the repository of the earlier pairing, and the new lease outranks what the primary knew", async () => {
+  const p = await mkBox("p", { apps: ["vibe-tb"] });
+  const store = new Store(":memory:");
+  const id = await loadOrCreateIdentity(mkdtempSync(join(tmpdir(), "vs-pair-s2-")), store.nodeId);
+  const box = new FakeAppliance({ apps: [], running: false });
+  let cleared = 0;
+  const svc = new PairingService({ store, identity: id, appliance: box, pg: { listDatabases: async () => [] } as unknown as Pg, peerPort: freePort(), ownAddresses: async () => ["127.0.0.1"], resetHostedRepo: async () => { cleared++; } });
+  // The primary was itself promoted earlier and holds epoch 4.
+  p.store.set("leases", [{ epoch: 4, holderNodeId: p.store.nodeId, writtenAt: new Date().toISOString(), reason: "promote" }]);
+  const { code } = await p.svc.startDirect();
+  await svc.joinDirect(code, false);
+  assert.equal(cleared, 1);
+  assert.equal(knownLease(store)!.epoch, 5);
+  assert.equal(getPairing(store)!.repoId, getPairing(p.store)!.repoId);
+});
+
+// ---- a new standby gives up its own Cloudflare tunnel (Q49, Q50) -----------------
+
+const T1 = "11111111-1111-4111-8111-111111111111", T2 = "22222222-2222-4222-8222-222222222222";
+async function tunnelBoxes(primaryTunnel: string | null | undefined, standbyTunnel: string | null) {
+  const p = await mkBox("p", { apps: ["vibe-tb"] });
+  const store = new Store(":memory:");
+  const id = await loadOrCreateIdentity(mkdtempSync(join(tmpdir(), "vs-pair-t-")), store.nodeId);
+  const box = new FakeAppliance({ apps: [], running: false });
+  const svc = new PairingService({ store, identity: id, appliance: box, pg: { listDatabases: async () => [] } as unknown as Pg, peerPort: freePort(), ownAddresses: async () => ["127.0.0.1"], ownTunnelId: async () => standbyTunnel });
+  // The primary's answer is what its own service returns; `undefined` stands for an older primary.
+  const real = p.svc.acceptDirect.bind(p.svc);
+  p.svc.acceptDirect = async (...a: Parameters<typeof real>) => {
+    const r = await real(...a);
+    if (primaryTunnel === undefined) { const { tunnelId: _drop, ...rest } = r; return rest as typeof r; }
+    return { ...r, tunnelId: primaryTunnel };
+  };
+  const { code } = await p.svc.startDirect();
+  await svc.joinDirect(code, false);
+  await new Promise((r) => setTimeout(r, 20)); // the removal runs in the background
+  return { store, box, svc };
+}
+
+test("a new standby removes its own tunnel only when the primary reports a different one", async () => {
+  const diff = await tunnelBoxes(T1, T2);
+  assert.equal(diff.box.calls.includes("removeOwnTunnel"), true);
+  assert.equal(diff.store.get<{ status: string; tunnelId: string }>("tunnelCleanup")!.status, "done");
+  assert.equal(diff.store.get<{ tunnelId: string }>("tunnelCleanup")!.tunnelId, T2);
+  // The primary has no tunnel at all (LAN): the standby's own one is still not the firm's.
+  const lan = await tunnelBoxes(null, T2);
+  assert.equal(lan.box.calls.includes("removeOwnTunnel"), true);
+});
+
+test("a rejoining old primary never deletes the firm's tunnel; an older primary that does not say leaves it alone too", async () => {
+  const same = await tunnelBoxes(T1, T1);
+  assert.equal(same.box.calls.includes("removeOwnTunnel"), false, "same tunnel as the primary: the firm's own");
+  assert.equal(same.store.get("tunnelCleanup"), undefined);
+  const old = await tunnelBoxes(undefined, T2);
+  assert.equal(old.box.calls.includes("removeOwnTunnel"), false, "no positive proof, no deletion");
+  assert.equal(old.store.get<{ status: string }>("tunnelCleanup")!.status, "skipped");
+  const none = await tunnelBoxes(T1, null);
+  assert.equal(none.box.calls.includes("removeOwnTunnel"), false, "this box has no tunnel");
+});
+
+test("a tunnel removal that fails does not undo the pairing; it is shown and can be retried while the box is a standby", async () => {
+  const p = await mkBox("p", { apps: ["vibe-tb"] });
+  const store = new Store(":memory:");
+  const id = await loadOrCreateIdentity(mkdtempSync(join(tmpdir(), "vs-pair-tf-")), store.nodeId);
+  const box = new FakeAppliance({ apps: [], running: false });
+  const svc = new PairingService({ store, identity: id, appliance: box, pg: { listDatabases: async () => [] } as unknown as Pg, peerPort: freePort(), ownAddresses: async () => ["127.0.0.1"], ownTunnelId: async () => T2 });
+  box.failNext.set("removeOwnTunnel", new Error("Cloudflare answered 403"));
+  // The primary reports its own, different tunnel.
+  const real = p.svc.acceptDirect.bind(p.svc);
+  p.svc.acceptDirect = async (...x: Parameters<typeof real>) => ({ ...(await real(...x)), tunnelId: T1 });
+  const { code } = await p.svc.startDirect();
+  await svc.joinDirect(code, false);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(store.role, "standby", "paired all the same");
+  const c = store.get<{ status: string; detail: string }>("tunnelCleanup")!;
+  assert.equal(c.status, "failed");
+  assert.match(c.detail, /403/);
+  await svc.retryTunnelCleanup();
+  assert.equal(store.get<{ status: string }>("tunnelCleanup")!.status, "done");
+  // A removal that was skipped for lack of proof is never retried: that would delete on a guess.
+  const n = box.calls.filter((c) => c === "removeOwnTunnel").length;
+  store.set("tunnelCleanup", { status: "skipped", tunnelId: T2, at: new Date().toISOString() });
+  await svc.retryTunnelCleanup();
+  assert.equal(box.calls.filter((c) => c === "removeOwnTunnel").length, n);
+  assert.equal(store.get<{ status: string }>("tunnelCleanup")!.status, "skipped");
+  // After a promote this box's settings are the firm's: no retry from here.
+  store.set("tunnelCleanup", { status: "failed", tunnelId: T2, at: new Date().toISOString() });
+  store.setRole("primary", "t", "promote");
+  await assert.rejects(svc.retryTunnelCleanup(), /no longer a standby/);
+});
+
+test("'could not tell' is never sent or taken as 'no tunnel'", async () => {
+  // The primary cannot read its own settings: the field is left out, so the standby removes nothing.
+  const p = await mkBox("p", { apps: ["vibe-tb"] });
+  const store = new Store(":memory:");
+  const id = await loadOrCreateIdentity(mkdtempSync(join(tmpdir(), "vs-pair-u-")), store.nodeId);
+  const box = new FakeAppliance({ apps: [], running: false });
+  const svc = new PairingService({ store, identity: id, appliance: box, pg: { listDatabases: async () => [] } as unknown as Pg, peerPort: freePort(), ownAddresses: async () => ["127.0.0.1"], ownTunnelId: async () => T2 });
+  const { code } = await p.svc.startDirect(); // p's service was built without ownTunnelId: it cannot tell
+  await svc.joinDirect(code, false);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(box.calls.includes("removeOwnTunnel"), false);
+  assert.equal(store.get<{ status: string }>("tunnelCleanup")!.status, "skipped");
+  // The standby cannot tell what its own tunnel is: nothing is removed either.
+  const unknown = await tunnelBoxes(T1, undefined as unknown as null);
+  assert.equal(unknown.box.calls.includes("removeOwnTunnel"), false);
+});

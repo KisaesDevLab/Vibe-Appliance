@@ -492,7 +492,11 @@ Setup:
    `https://api.ipify.org` — paste that as a placeholder.
 
    If you chose a different `--tunnel-subdomain` (e.g. `apps`), replace
-   the `vibe` row's Host value with that label. Apps don't get
+   the `vibe` row's Host value with that label, and (unless you also
+   set a hostname tag) the three admin rows with `apps-cockpit`,
+   `apps-portainer` and `apps-backup`. The **Hostnames this appliance
+   serves** list under **Configuration → Network** shows the exact
+   names. Apps don't get
    per-subdomain records anymore — they all live under
    `vibe.firm.com/<app>/` (e.g. `/tb/`, `/mybooks/`).
 
@@ -822,6 +826,24 @@ Or do it through the admin UI: **Configuration → Network → Network
 mode**. With **Public domain** selected, change **Main host label** and
 click **Apply changes**. The tunnel is re-provisioned for you when it is
 on. Same outcome.
+
+Choosing or changing the label also renames the admin tools, unless a
+hostname tag is set: `--tunnel-subdomain vibe2` gives
+`vibe2-cockpit.firm.com`, `vibe2-portainer.firm.com` and
+`vibe2-backup.firm.com`. That keeps a second appliance on the same
+domain (for example a Vibe Standby box before it is paired) from
+sharing those names with the first.
+
+- An appliance that already had a label of its own before this rule
+  keeps `cockpit`, `portainer` and `backup` until its label is changed.
+- App hosts (`client.firm.com`, `1040.firm.com`) do not follow the
+  label. For those use `--host-tag` or the app's own Subdomain setting;
+  a hostname tag is still the way to rename every host at once.
+- The admin tools are never published through the Cloudflare Tunnel.
+  Create a DNS record for each new name (the DNS table above lists
+  `cockpit`, `portainer` and `backup`; use the new names instead).
+- After the change re-run `sudo /opt/vibe/appliance/bootstrap.sh` so
+  Cockpit accepts its new name.
 
 **How do I add a new app subdomain?**
 In the default layout (single host) you don't: enabling an app from the

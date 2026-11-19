@@ -23,6 +23,17 @@ Naming model
       infra hosts    INFRA_SUBDOMAIN_<COCKPIT|PORTAINER|BACKUP> (appliance.env)
       app primary    VIBE_APP_SUBDOMAIN            (<slug>.env)
       app extra      VIBE_APP_SUBDOMAIN_<NAME>     (<slug>.env)
+  * A main host label the operator chose (anything but "vibe") also names
+    the built-in infra hosts when no tag is set: main host `vibe2` gives
+    vibe2-cockpit, vibe2-portainer, vibe2-backup. The default label and a
+    tagged appliance keep the names above, and app hosts never take the
+    main label. So a second appliance needs only its main host label
+    changed for its admin tools to stop sharing names with the first.
+    This applies only where state.config.infra_follow_main_label is true.
+    bootstrap.sh and the console's network-mode route set it when the
+    label is chosen or changed; an appliance that already had a label of
+    its own before this rule existed has no flag and keeps cockpit,
+    portainer and backup, so an update never renames its hosts.
   * APEX_DOMAIN_OWNED=false (appliance.env) stops this appliance claiming
     <domain> and www.<domain> — only one appliance per domain can.
 
@@ -67,6 +78,9 @@ TAG_PATTERN = r"^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$"
 TAG_RE = re.compile(TAG_PATTERN)
 
 DEFAULT_MAIN_LABEL = "vibe"
+
+# state.config key: the infra hosts follow a chosen main host label.
+INFRA_FOLLOW_KEY = "infra_follow_main_label"
 
 # Built-in infra hosts (Duplicati, Portainer, Cockpit). `key` is the
 # default label and the INFRA_SERVICES slug in lib/render-caddyfile.sh.
@@ -229,17 +243,36 @@ def apex_owned(env):
 def main_label(config, tag):
     """(label, source). `vibe` — what bootstrap persists by default — and
     an empty value both count as "not chosen" and take the tag."""
-    raw = (config.get("tunnel_subdomain") or "").strip().lower()
+    raw = _label_clean(config.get("tunnel_subdomain") or "")
     if not raw or raw == DEFAULT_MAIN_LABEL:
         return tag_label(DEFAULT_MAIN_LABEL, tag), ("tagged" if tag else "default")
     return raw, "override"
 
 
-def infra_label(key, env, tag):
+def infra_label(key, env, tag, config=None):
+    """(label, source) for a built-in infra host. In order: the operator's
+    own label, verbatim; the built-in name with the tag; the built-in name
+    behind a main host label the operator chose (`vibe2-cockpit`), where
+    state.config says the infra hosts follow it; the built-in name. The
+    tag wins over the main label so an appliance that already has a tag
+    keeps every name it serves."""
     override = _clean(env.get(infra_env_key(key), "")).lower()
     if override:
         return override, "override"
-    return tag_label(key, tag), ("tagged" if tag else "default")
+    if tag:
+        return tag_label(key, tag), "tagged"
+    config = config or {}
+    m_label, m_source = main_label(config, tag)
+    if m_source == "override" and infra_follows_main(config):
+        return m_label + "-" + key, "main-label"
+    return key, "default"
+
+
+def infra_follows_main(config):
+    """True where the infra hosts take a chosen main host label. The
+    state writer stores booleans; a hand edit may leave a string."""
+    v = (config or {}).get(INFRA_FOLLOW_KEY)
+    return v is True or str(v).strip().lower() in ("true", "1", "yes", "on")
 
 
 def is_appliance_app(manifest):
@@ -439,7 +472,7 @@ def resolve(state, manifests, env):
                           "tunnel": True, "doctor": True, "ddns": ddns})
 
     for key in INFRA_KEYS:
-        label, source = infra_label(key, env, tag)
+        label, source = infra_label(key, env, tag, config)
         out["infra"][key] = {"label": label, "fqdn": fqdn(label), "source": source}
         if in_domain:
             # Admin tooling: served by Caddy for LAN/Tailscale reach, never
@@ -521,9 +554,28 @@ def validate(state, manifests, env, app_envs):
     m_label, _src = main_label(config, tag)
     claims.append((m_label, "the main host",
                    "the main host label (Configuration → Network, or --tunnel-subdomain)", None))
+    in_domain = config.get("mode", "lan") == "domain"
     for key in INFRA_KEYS:
-        label, _src = infra_label(key, env, tag)
-        claims.append((label, "the %s host" % key, infra_env_key(key), None))
+        label, src = infra_label(key, env, tag, config)
+        setting = infra_env_key(key)
+        if src == "main-label":
+            # LAN and Tailscale serve no infra hostname, so a long label
+            # there is not a problem yet; it is checked again on the
+            # switch to domain mode, which validates with mode=domain.
+            if not in_domain:
+                continue
+            # The name is built from the main host label, so that is the
+            # other setting that can fix it (too long, or already taken).
+            setting = "the main host label (to something shorter or different) or " + setting
+            # `cockpit` as a main label would make this box's console
+            # answer at cockpit.<domain>: the name another appliance on
+            # the domain serves Cockpit at, which is the clash the
+            # prefix exists to end.
+            if m_label == key:
+                errors.append("the main host: '%s' is the built-in name of the %s host, which another "
+                              "appliance on this domain may be serving. Change the main host label "
+                              "(Configuration → Network, or --tunnel-subdomain)." % (m_label, key))
+        claims.append((label, "the %s host" % key, setting, None))
 
     state_apps = (state.get("apps") or {})
     env_for_plan = dict(env)
@@ -665,7 +717,15 @@ def _main(argv):
                 s, key = key.split(":", 1)
                 app_envs.setdefault(s, {})[key] = value
             elif key == "tunnel_subdomain":
-                state.setdefault("config", {})["tunnel_subdomain"] = value
+                cfg = state.setdefault("config", {})
+                # A label that is being chosen or changed is saved with
+                # the follow flag (bootstrap.sh, the network-mode route),
+                # so check the names that save would produce.
+                if _label_clean(value) != _label_clean(cfg.get("tunnel_subdomain") or ""):
+                    cfg[INFRA_FOLLOW_KEY] = True
+                cfg["tunnel_subdomain"] = value
+            elif key == "mode":
+                state.setdefault("config", {})["mode"] = value
             else:
                 env[key] = value
         errors = validate(state, manifests, env, app_envs)

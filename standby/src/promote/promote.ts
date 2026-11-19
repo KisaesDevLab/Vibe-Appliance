@@ -9,6 +9,7 @@ import { highest, type Lease } from "../link/lease.ts";
 import { knownLease, type Link, type PrimarySighting } from "../link/link.ts";
 import type { Store } from "../overlay/store.ts";
 import { clearPairing, getPairing } from "../pairing/state.ts";
+import { requireRecorded } from "../role/guard.ts";
 import type { VerifiedCopy } from "../sync/sync.ts";
 
 export const PROMOTE_STEPS = ["recover", "lease", "leave-standby-mode", "place", "health", "go-live", "finish"] as const;
@@ -29,6 +30,8 @@ export interface PromoteChecks {
   primaryAlive: boolean;
   /** The primary announced a planned switchover and this box already holds that exact snapshot. */
   plannedSwitchover: boolean;
+  /** Bucket mode: the bucket could not be read, so nothing is known about the primary. */
+  bucketUnreachable: boolean;
   blocked: boolean;
   /** Plain-language reason shown on the checks screen when blocked, or warnings when not. */
   messages: string[];
@@ -56,6 +59,9 @@ export async function promoteChecks(d: Pick<PromoteDeps, "store" | "link" | "now
   const copy = d.store.get<VerifiedCopy>("verifiedCopy");
   const run = d.store.recentSyncRuns(1)[0];
   const primary = await d.link.primarySighting();
+  // Bucket mode: "no heartbeat found" and "could not look" must not read the
+  // same. The lease listing says which it is.
+  const bucketUnreachable = d.link.mode === "bucket" && (await d.link.readLeases()).unreachable.includes("bucket");
   const announced = d.store.get<{ snapshotId: string }>("switchoverAnnounced");
   const primaryAlive = !!primary && now.getTime() - Date.parse(primary.at) < PRIMARY_ALIVE_MS;
   // A fresh answer from the primary beats what this box remembered: it may have cancelled.
@@ -65,6 +71,10 @@ export async function promoteChecks(d: Pick<PromoteDeps, "store" | "link" | "now
   let blocked = false;
   if (d.store.role !== "standby") { blocked = true; messages.push("Only a standby can be promoted."); }
   if (!copy) { blocked = true; messages.push("This box has no verified copy of the primary yet. Wait for the first sync to finish."); }
+  if (bucketUnreachable) {
+    blocked = true;
+    messages.push("This box cannot reach the storage bucket. It cannot tell whether the primary is still running, and it could not record that it is taking over, so the old box would never find out. Check this box's internet connection, then check again.");
+  }
   if (primaryAlive && !plannedSwitchover) {
     blocked = true;
     messages.push("The primary is still answering. Promoting now would leave two live copies of your data. If you want to move to this box on purpose, start a planned switchover from the primary instead.");
@@ -79,7 +89,7 @@ export async function promoteChecks(d: Pick<PromoteDeps, "store" | "link" | "now
     hasVerifiedCopy: !!copy, dataAt: copy?.createdAt ?? null, verifiedAt: copy?.verifiedAt ?? null,
     dataAgeHours: copy ? Math.round(((now.getTime() - Date.parse(copy.createdAt)) / 3_600_000) * 10) / 10 : null,
     lastSyncFailed: run?.status === "failed", versionIssues: d.store.get<string[]>("versionIssues") ?? [],
-    primary, primaryAlive, plannedSwitchover, blocked, messages,
+    primary, primaryAlive, plannedSwitchover, bucketUnreachable, blocked, messages,
   };
 }
 
@@ -141,7 +151,9 @@ export async function runPromote(d: PromoteDeps, opts: { confirm?: string; actor
       // Repeating this step must not burn another epoch.
       const lease: Lease = prior?.holderNodeId === d.store.nodeId ? prior
         : { epoch: (prior?.epoch ?? 0) + 1, holderNodeId: d.store.nodeId, writtenAt: now().toISOString(), reason: "promote" };
-      return { epoch: lease.epoch, writtenTo: await link.writeLease(lease) };
+      const writtenTo = await link.writeLease(lease);
+      requireRecorded(link, writtenTo);
+      return { epoch: lease.epoch, writtenTo };
     })).writtenTo;
 
     await step("leave-standby-mode", async () => { await d.appliance.setStandbyMode(false); return {}; });
@@ -204,7 +216,7 @@ export async function runPromote(d: PromoteDeps, opts: { confirm?: string; actor
 }
 
 /** Abandon a promote. Only possible before the restored data has been placed. */
-export async function cancelPromote(d: Pick<PromoteDeps, "store" | "appliance">, actor: string): Promise<void> {
+export async function cancelPromote(d: Pick<PromoteDeps, "store" | "appliance"> & { /** Give the role lease back to the primary (and, bucket mode, go back to the read-only key). */ returnLease?: () => Promise<void> }, actor: string): Promise<void> {
   const runId = activePromote(d.store);
   if (!runId) return;
   const steps = d.store.wizardSteps(WIZARD, runId);
@@ -212,7 +224,12 @@ export async function cancelPromote(d: Pick<PromoteDeps, "store" | "appliance">,
     throw new Error("The restored data is already being put in place, so this promote can only be continued, not cancelled.");
   }
   await d.appliance.setStandbyMode(true);
+  // If the lease already moved here, the primary would read as replaced
+  // although no box went live. It is handed back before the cancel counts;
+  // if that cannot be recorded the cancel fails and can be repeated.
+  const leaseMoved = steps.some((s) => s.step === "lease" && s.status !== "pending");
+  if (leaseMoved) await d.returnLease?.();
   d.store.unset("operation");
   d.store.unset("promoteRunId");
-  d.store.audit("promote-cancel", actor, true, { leaseAlreadyMoved: steps.some((s) => s.step === "lease" && s.status === "done") });
+  d.store.audit("promote-cancel", actor, true, { leaseAlreadyMoved: leaseMoved, leaseReturned: leaseMoved && !!d.returnLease });
 }

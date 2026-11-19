@@ -3,7 +3,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { redactor } from "../logger.ts";
-import { run } from "../util/run.ts";
+import { run, trackChild } from "../util/run.ts";
 import type { DatabaseFigures } from "../contracts/repository.ts";
 
 export interface PgConnection {
@@ -31,7 +31,7 @@ class PsqlSession {
   #closed = false;
 
   constructor(bin: string, args: string[], env: NodeJS.ProcessEnv) {
-    this.#child = spawn(bin, args, { env });
+    this.#child = trackChild(spawn(bin, args, { env }));
     this.#child.stdout.setEncoding("utf8");
     this.#child.stdout.on("data", (c: string) => { this.#buf += c; this.#wake(); });
     this.#child.stderr.on("data", (c: Buffer) => { this.#err += c.toString("utf8"); });
@@ -159,13 +159,18 @@ export class Pg {
    * database. "Role already exists" is expected and harmless; the ALTER ROLE
    * that follows still brings attributes and password into line.
    */
-  async applyGlobals(file: string): Promise<void> {
+  async applyGlobals(file: string): Promise<string> {
     const su = this.#c.user.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const own = new RegExp(`^(CREATE|ALTER|DROP|COMMENT ON) ROLE "?${su}"?[ ;]`);
     const filtered = (await readFile(file, "utf8")).split("\n").filter((l) => !own.test(l)).join("\n");
     const tmp = `${file}.filtered`;
     await writeFile(tmp, filtered, { mode: 0o600 });
-    await run(this.#bin("psql"), ["-X", "-q", "-d", "postgres", "-f", tmp], { env: this.#env() });
+    const r = await run(this.#bin("psql"), ["-X", "-q", "-d", "postgres", "-f", tmp], { env: this.#env() });
+    // psql carries on past an error here on purpose (see above). What is
+    // left after the expected "already exists" is returned for the caller
+    // to show: a role or grant that did not apply only bites after Promote.
+    const errors = r.stderr.split("\n").filter((l) => /ERROR:/.test(l) && !/already exists/.test(l));
+    return errors.length ? redactor.text(`${errors[0]!.replace(/^.*ERROR:\s*/, "")}${errors.length > 1 ? ` (and ${errors.length - 1} more)` : ""}`) : "";
   }
 
   async #drop(db: string): Promise<void> {

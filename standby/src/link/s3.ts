@@ -69,6 +69,9 @@ export class S3Client {
     const qs = Object.keys(query).sort().map((k) => `${uriEncode(k, false)}=${uriEncode(query[k]!, false)}`).join("&");
     return this.#fetch(`${url.origin}${uriEncode(path, true)}${qs ? `?${qs}` : ""}`, {
       method, body: body as unknown as BodyInit | undefined, headers: { ...headers, "x-amz-date": amzDate, authorization },
+      // Small control objects only (leases, heartbeat, pairing bundle): a
+      // bucket that does not answer in a minute is unreachable.
+      signal: AbortSignal.timeout(60_000),
     });
   }
 

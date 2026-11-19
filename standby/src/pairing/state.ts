@@ -21,6 +21,18 @@ export interface Pairing {
    * pairing. It is not used for anything until an admin runs Promote.
    */
   heldWriteKey?: { keyId: string; key: string };
+  /**
+   * Standby, bucket mode, during a promote: the read-only key that was in
+   * use before the read/write key was taken, so a cancelled promote can go
+   * back to it (invariant 3).
+   */
+  heldReadKey?: { keyId: string; key: string };
+  /**
+   * Names this pairing's repository. A new pairing has a new repository
+   * password, so it must not land on the repository of an earlier pairing
+   * of the same boxes or the same bucket.
+   */
+  repoId?: string;
 }
 
 export function getPairing(store: Store): Pairing | undefined {
@@ -29,6 +41,7 @@ export function getPairing(store: Store): Pairing | undefined {
     redactor.register(p.repoPassword);
     redactor.register(p.bucket?.key);
     redactor.register(p.heldWriteKey?.key);
+    redactor.register(p.heldReadKey?.key);
   }
   return p;
 }

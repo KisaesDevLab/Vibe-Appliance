@@ -11,6 +11,8 @@
 import { readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { ApplianceControl } from "../contracts/appliance.ts";
+import { highest } from "../link/lease.ts";
+import type { Link } from "../link/link.ts";
 import type { Store } from "../overlay/store.ts";
 import { clearPairing } from "../pairing/state.ts";
 
@@ -111,7 +113,14 @@ export interface SwitchoverDeps {
   capture: () => Promise<string>;
   /** Tell the standby which snapshot is the final one (peer notice or heartbeat object). */
   announce: (snapshotId: string | null) => Promise<void>;
+  /** Where the role lease is read, to see whether the other box was promoted meanwhile. */
+  link?: Link;
   now?: () => Date;
+}
+
+export class SwitchoverCancelError extends Error {
+  code: string;
+  constructor(code: string, message: string) { super(message); this.code = code; }
 }
 
 /** Primary: stop taking writes, take the final copy, announce it. The admin then promotes the standby. */
@@ -139,12 +148,26 @@ export async function startSwitchover(d: SwitchoverDeps, opts: { confirm: string
 }
 
 /** Primary: call the switchover off and bring the apps back here. Only before the standby is promoted. */
-export async function cancelSwitchover(d: SwitchoverDeps, actor: string): Promise<void> {
+export async function cancelSwitchover(d: SwitchoverDeps, actor: string, opts: { force?: boolean } = {}): Promise<void> {
   if (d.store.get<string>("operation") !== "switchover") throw new Error("No planned switchover is in progress.");
-  await d.announce(null);
+  // Has the other box been promoted since? Then this box is no longer the
+  // live one, and starting its apps would make two live copies.
+  if (d.link) {
+    const { leases, unreachable } = await d.link.readLeases();
+    const top = highest(leases);
+    if (top && top.holderNodeId !== d.store.nodeId) {
+      throw new SwitchoverCancelError("promoted", "The other box has already been promoted and is the live one now. The apps cannot be brought back here. Choose “Rejoin as standby” on this box instead.");
+    }
+    if (unreachable.length && !opts.force) {
+      throw new SwitchoverCancelError("cannot-check", `This box could not check whether the other box has been promoted (${unreachable.join(", ")} did not answer). Look at the other box's Standby page first. If it still says it is the standby, you can bring the apps back here.`);
+    }
+  }
+  // Withdrawing the announcement is best effort when forced: the standby
+  // may be the thing that is down.
+  if (opts.force) await d.announce(null).catch(() => {}); else await d.announce(null);
   await d.appliance.startApps();
   await d.appliance.startTunnel().catch(() => {});
   d.store.unset("switchover");
   d.store.unset("operation");
-  d.store.audit("switchover-cancel", actor, true, {});
+  d.store.audit("switchover-cancel", actor, true, { forced: !!opts.force });
 }

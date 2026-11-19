@@ -809,7 +809,8 @@ def render_extra_subdomain_vhosts(enabled, hosts, tls_internal=False):
 def render_infra_vhost(svc, host, tls_internal=False):
     """Render a domain-mode site block for an infra service. `host` is
     its resolved hostname (INFRA_SUBDOMAIN_<SLUG> override, else the slug
-    with the HOST_TAG); empty outside domain mode."""
+    with the HOST_TAG, else behind a chosen main host label); empty
+    outside domain mode."""
     if not host:
         return ""
     upstream = svc["upstream"]

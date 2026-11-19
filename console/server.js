@@ -910,8 +910,19 @@ async function ddnsUpdateCycle(force = false) {
     // Resolver unavailable (python3 or the script missing): the built-in
     // set, so DDNS keeps the address current for the hosts every
     // untagged appliance has.
+    // Only for an appliance with built-in names. One with a hostname tag
+    // or a main host label of its own shares its domain with another
+    // appliance, and publishing the built-in set from here would point
+    // that appliance's records at this one.
+    const tagged = (parseEnvFile(path.join(ENV_DIR, 'appliance.env')).HOST_TAG || '').trim() !== '';
+    const ownLabel = ((state.config && state.config.tunnel_subdomain) || 'vibe') !== 'vibe';
+    if (tagged || ownLabel) {
+      ddnsState.last_error = 'the hostname resolver (lib/vibe_hosts.py) did not run, so the DNS names of this appliance are not known; nothing was updated. Fix: sudo bash /opt/vibe/appliance/doctor.sh';
+      log('warn', 'ddns: resolver unavailable on an appliance with its own names; not publishing the built-in set');
+      return;
+    }
     for (const h of ['@', 'www', 'cockpit', 'portainer', 'backup']) hosts.add(h);
-    hosts.add((state.config && state.config.tunnel_subdomain) || 'vibe');
+    hosts.add('vibe');
   }
   if (!hosts.size) {
     // LAN / Tailscale: nothing to publish. Record the IP so the
@@ -2211,7 +2222,31 @@ app.use('/api/v1/standby-control', createStandbyControl({
   enqueueHostAction,
   hostActionStatus,
   applianceDir: APPLIANCE_DIR,
-  token: () => process.env.STANDBY_CONTROL_TOKEN || '',
+  // Registry login for image pulls by digest: the same file every compose
+  // call uses through DOCKER_CONFIG (lib/registry-auth.sh). Read per
+  // pull; never logged.
+  pullAuth: (ref) => {
+    try {
+      const host = String(ref).split('/')[0];
+      const cfg = JSON.parse(fs.readFileSync(path.join(VIBE_DIR, 'docker', 'config.json'), 'utf8'));
+      const entry = (cfg.auths || {})[host];
+      if (!entry || !entry.auth) return null;
+      const [username, ...rest] = Buffer.from(entry.auth, 'base64').toString('utf8').split(':');
+      return { username, password: rest.join(':'), serveraddress: host };
+    } catch (_e) { return null; }
+  },
+  // The token is in a root-only file that only this container and the
+  // standby service read (lib/secrets.sh secrets_standby_token_ensure),
+  // re-read on every request so a new token needs no restart. The
+  // environment is the fallback for a box whose bootstrap has not yet
+  // run on this version.
+  token: () => {
+    try {
+      const t = fs.readFileSync(path.join(VIBE_DIR, 'standby', 'local', 'control.token'), 'utf8').trim();
+      if (t) return t;
+    } catch (_e) { /* not created yet */ }
+    return process.env.STANDBY_CONTROL_TOKEN || '';
+  },
   log,
 }));
 
@@ -2975,6 +3010,14 @@ app.post('/api/v1/admin/cloudflare/discover', requireAdmin, testRateLimit, async
 // validates that each slug names a real, ENABLED app — invalid slugs
 // surface as warnings in stdout/stderr and are skipped.
 app.post('/api/v1/admin/cloudflare/provision', requireAdmin, testRateLimit, globalOp('Cloudflare tunnel provision'), async (req, res) => {
+  // A standby must not run apps or the tunnel (Vibe Standby): provisioning starts the connector.
+  if ((readState().config || {}).standby_mode) {
+    return res.status(409).json({
+      ok: false,
+      error: 'This box is a standby, so the Cloudflare Tunnel is not provisioned or started here. ' +
+             'The tunnel runs on the live box. To make this box live, open Standby and choose Promote.',
+    });
+  }
   // Tunnel ingress forwards to https://caddy:443 with noTLSVerify.
   // In LAN/Tailscale modes Caddy has no :443 listener at all — every
   // tunnel request would 502 silently. Hard-fail at the API layer
@@ -3405,6 +3448,14 @@ app.post('/api/v1/admin/cloudflare/disable', requireAdmin, testRateLimit, async 
 });
 
 app.post('/api/v1/admin/cloudflare/enable', requireAdmin, testRateLimit, async (_req, res) => {
+  // A standby must not run apps or the tunnel (Vibe Standby): a second connector on the firm's tunnel would take part of the public traffic.
+  if ((readState().config || {}).standby_mode) {
+    return res.status(409).json({
+      ok: false,
+      error: 'This box is a standby, so the Cloudflare Tunnel is not started here. ' +
+             'The tunnel runs on the live box. To make this box live, open Standby and choose Promote.',
+    });
+  }
   const found = await _inspectCloudflared();
   if (found.error) {
     if (found.error.daemonDown) {
@@ -4180,6 +4231,14 @@ const EMAIL_RE  = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, globalOp('network mode switch'), async (req, res) => {
+  // A standby must not run apps or the tunnel (Vibe Standby): this route re-enables every app and re-provisions the tunnel.
+  if ((readState().config || {}).standby_mode) {
+    return res.status(409).json({
+      ok: false,
+      error: 'This box is a standby, so its network mode, domain and main host label are not changed here. ' +
+             'They come from the primary at promote; change them on the primary. To make this box live, open Standby and choose Promote.',
+    });
+  }
   const body  = req.body || {};
   const mode  = typeof body.mode === 'string' ? body.mode : '';
   const domain = typeof body.domain === 'string' ? body.domain.trim().toLowerCase() : '';
@@ -4209,7 +4268,7 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, globa
     // an infra host, the reserved www). Same pre-flight the settings
     // save runs; a resolver that cannot run does not block the switch.
     if (tunnelSub) {
-      const check = validateHostnames([`tunnel_subdomain=${tunnelSub}`]);
+      const check = validateHostnames(['mode=domain', `tunnel_subdomain=${tunnelSub}`]);
       if (!check.ok) {
         return res.status(400).json({
           ok: false,
@@ -4258,6 +4317,21 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, globa
   const prevMode = state.config.mode || null;
   const prevDomain = state.config.domain || '';
   const prevTunnelSub = state.config.tunnel_subdomain || 'vibe';
+  // The admin tools' names before the change. A main host label the
+  // operator chooses also names them (<label>-cockpit), and a new domain
+  // moves them too; see the warnings below.
+  const infraHostsOf = (hm) => {
+    const out = {};
+    for (const [key, h] of Object.entries((hm || {}).infra || {})) out[key] = (h && h.fqdn) || '';
+    return out;
+  };
+  const prevHostMap = hostMap();
+  const prevInfraHosts = prevMode === 'domain' ? infraHostsOf(prevHostMap) : {};
+  // Chosen or changed here: from now on the admin tools follow the label
+  // (lib/vibe_hosts.py). Never cleared by this route, so an appliance
+  // that already had a label of its own keeps cockpit/portainer/backup
+  // until its label is actually changed.
+  const labelChosen = mode === 'domain' && !!tunnelSub && tunnelSub !== prevTunnelSub;
   state.config.mode = mode;
   if (mode === 'domain') {
     state.config.domain = domain;
@@ -4279,6 +4353,7 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, globa
         domain:           state.config.domain,
         email:            state.config.email,
         tunnel_subdomain: state.config.tunnel_subdomain,
+        ...(labelChosen ? { infra_follow_main_label: true } : {}),
       },
     });
   } catch (err) {
@@ -4502,6 +4577,40 @@ app.post('/api/v1/admin/network-mode/switch', requireAdmin, testRateLimit, globa
       }
     }
 
+    // Cockpit's allowed origins live in /etc/cockpit on the HOST, which
+    // the console cannot rewrite (the settings routing-reconcile job says
+    // the same when the tag or Cockpit's own label moves it).
+    if (mode === 'domain' && prevMode === 'domain' && configChanged) {
+      const newHostMap = hostMap();
+      // hostMap() serves its last good answer when the resolver fails,
+      // which here would be the map from BEFORE the change and would
+      // read as "nothing moved".
+      const stale = !newHostMap || newHostMap === prevHostMap
+        || ((newHostMap.main || {}).fqdn || '') !== `${newTunnelSub}.${domain}`.toLowerCase()
+           && ((newHostMap.main || {}).source === 'override');
+      if (stale) {
+        warnings.push('Could not confirm the new addresses of Cockpit, Portainer and Duplicati (the hostname resolver did not answer). '
+          + 'Check Configuration → Network → Hostnames, and run: sudo bash /opt/vibe/appliance/bootstrap.sh so Cockpit accepts its address.');
+      } else {
+        const newInfraHosts = infraHostsOf(newHostMap);
+        const moved = Object.keys(newInfraHosts)
+          .filter((k) => prevInfraHosts[k] && newInfraHosts[k] && newInfraHosts[k] !== prevInfraHosts[k]);
+        if (moved.length) {
+          warnings.push('Admin tool addresses changed: '
+            + moved.map((k) => `https://${newInfraHosts[k]} (was ${prevInfraHosts[k]})`).join(', ') + '. '
+            + 'They are reached over the LAN or Tailscale and are never published through the Cloudflare Tunnel, so each new name needs its own DNS record pointing at this appliance '
+            + '(with Namecheap dynamic DNS: create the A record once; the appliance then keeps it current). The old records are not removed for you.');
+          // The next DDNS cycle must publish the new names even though
+          // the public IP did not change.
+          ddnsState.last_ip = null;
+        }
+        if (moved.includes('cockpit')) {
+          warnings.push(`Cockpit shows a blank page after login at https://${newInfraHosts.cockpit} until its allowed origins are refreshed on the host. `
+            + 'Fix: sudo bash /opt/vibe/appliance/bootstrap.sh');
+        }
+      }
+    }
+
     if (mode === 'domain') {
       warnings.push(`Apps live at https://${mainHostLabel(state.config)}.${domain}/<app>/ (e.g. /tb, /mybooks). The bare apex (https://${domain}) redirects to that host.`);
       warnings.push('On the first request Caddy will spend 10–30s issuing a Let\'s Encrypt cert. Subsequent requests are instant.');
@@ -4656,6 +4765,14 @@ app.post('/api/v1/update/:slug', requireAdmin, testRateLimit, async (req, res) =
   const slug = req.params.slug;
   if (!SLUG_RE.test(slug)) return res.status(400).json({ error: 'invalid slug' });
   if (!MANIFESTS[slug])    return res.status(404).json({ error: 'unknown app' });
+  // A standby must not run apps or the tunnel (Vibe Standby): an update would run migrations against the copied data and start the app.
+  if ((readState().config || {}).standby_mode) {
+    return res.status(409).json({
+      ok: false,
+      error: 'This box is a standby, so apps are not updated here. ' +
+             'Update the app on the primary; this box follows at its next sync. To make this box live, open Standby and choose Promote.',
+    });
+  }
   if (appRuntime(MANIFESTS[slug]) !== 'appliance') {
     return res.status(409).json({
       error: 'not updatable here',
@@ -4671,6 +4788,14 @@ app.post('/api/v1/update/:slug/rollback', requireAdmin, testRateLimit, async (re
   const slug = req.params.slug;
   if (!SLUG_RE.test(slug)) return res.status(400).json({ error: 'invalid slug' });
   if (!MANIFESTS[slug])    return res.status(404).json({ error: 'unknown app' });
+  // A standby must not run apps or the tunnel (Vibe Standby): a rollback would start the app against the copied data.
+  if ((readState().config || {}).standby_mode) {
+    return res.status(409).json({
+      ok: false,
+      error: 'This box is a standby, so apps are not rolled back here. ' +
+             'Roll the app back on the primary; this box follows at its next sync. To make this box live, open Standby and choose Promote.',
+    });
+  }
   if (appRuntime(MANIFESTS[slug]) !== 'appliance') {
     return res.status(409).json({
       error: 'not updatable here',

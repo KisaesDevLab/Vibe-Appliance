@@ -22,7 +22,7 @@ async function emailEnv(trees: string[]): Promise<Record<string, string> | null>
 }
 
 async function post(url: string, headers: Record<string, string>, body: unknown, f: typeof fetch): Promise<void> {
-  const r = await f(url, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+  const r = await f(url, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body), signal: AbortSignal.timeout(30_000) });
   if (!r.ok) throw new Error(`the email provider answered ${r.status}: ${redactor.text((await r.text()).slice(0, 200))}`);
 }
 

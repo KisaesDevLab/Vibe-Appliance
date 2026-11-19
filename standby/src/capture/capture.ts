@@ -101,6 +101,11 @@ export async function runCapture(d: CaptureDeps): Promise<CaptureResult> {
     await sealStage(d.paths.stage);
 
     await d.repo.init();
+    // A capture root that is missing must stop the copy: the standby restores
+    // with --delete, so a snapshot without `data` or `env` would remove them
+    // from its verified mirror. Only the credentials note is optional.
+    const missing = CAPTURED.filter((p) => p !== "CREDENTIALS.txt" && !existsSync(join(d.paths.appliance, p)));
+    if (missing.length) throw new Error(`cannot see ${missing.map((p) => join("/opt/vibe", p)).join(" and ")} on this box, so the copy would be incomplete. Check that /opt/vibe is intact, then re-run bootstrap: sudo bash /opt/vibe/appliance/bootstrap.sh`);
     const paths = [d.paths.stage, ...CAPTURED.map((p) => join(d.paths.appliance, p)).filter((p) => existsSync(p))];
     const excludes = NOT_REPLICATED.map((p) => join(d.paths.appliance, p));
     const saved: BackupResult = await d.repo.backup({ snapshotId, sourceNodeId: d.store.nodeId, stagePath: d.paths.stage, paths, excludes });

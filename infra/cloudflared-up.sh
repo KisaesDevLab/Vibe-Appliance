@@ -277,6 +277,26 @@ if (( ${#_missing[@]} > 0 )); then
   die "fill the missing field(s) and re-run."
 fi
 
+# --- Standby mode -----------------------------------------------------
+# A box in standby mode (Vibe Standby) must not run the tunnel: its apps
+# are stopped, and a second connector on the firm's tunnel makes
+# Cloudflare send part of the public traffic to a box that answers 502.
+# Promote starts the tunnel (lib/standby-host.sh tunnel-up) once this box
+# is the live one. Checked before anything is created at Cloudflare.
+if python3 - "${VIBE_STATE_FILE:-${VIBE_DIR:-/opt/vibe}/state.json}" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        sys.exit(0 if json.load(f).get("config", {}).get("standby_mode") is True else 1)
+except Exception:
+    sys.exit(1)
+PYEOF
+then
+  die "this box is a standby (Vibe Standby), so the Cloudflare Tunnel is not started or changed here.
+  The tunnel belongs to the live box. It starts on this one when an admin promotes it.
+  Fix: make the change on the primary; or, to make this box live, open Standby in the console and choose Promote."
+fi
+
 # --- Publish list (which apps go public) ------------------------------
 # Empty publish list = abort. No "default to all enabled" fallback —
 # that's how landing/admin/infra surfaces leaked publicly before.

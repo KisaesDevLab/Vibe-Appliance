@@ -37,7 +37,7 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
   const fail = (reply: FastifyReply, err: unknown) => {
     const e = err as Error & { code?: string };
     const status = e instanceof PairingError || e instanceof BadCodeError ? 400 : 409;
-    return reply.code(status).send({ error: e.message, code: e instanceof PairingError ? e.code : e instanceof BadCodeError ? "bad-code" : "refused" });
+    return reply.code(status).send({ error: e.message, code: e instanceof PairingError ? e.code : e instanceof BadCodeError ? "bad-code" : typeof e.code === "string" ? e.code : "refused" });
   };
   const rt = (reply: FastifyReply): Runtime | undefined => {
     if (!runtime) { void reply.code(503).send({ error: "The standby service is still starting." }); return undefined; }
@@ -61,7 +61,7 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
       version: VERSION, ...s,
       busy: runtime?.busy() ?? null,
       alertEmail: store.get<string>("alertEmail") ?? config.alertEmail,
-      settings: { captureAt: config.captureAt, syncFallbackAt: config.syncFallbackAt, staleAfterHours: config.staleAfterHours, drillSchedule: config.drillSchedule, archiveDays: config.archiveDays, timezone: config.timezone },
+      settings: { captureAt: config.captureAt, syncFallbackAt: config.syncFallbackAt, staleAfterHours: config.staleAfterHours, drillSchedule: config.drillSchedule, archiveDays: config.archiveDays, timezone: runtime ? await runtime.timezone() : config.timezone },
       syncRuns: store.recentSyncRuns(10),
       archives: runtime ? await runtime.archives() : [],
       promote: runtime ? runtime.promoteState() : null,
@@ -69,6 +69,8 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
       replacedBy: store.get("replacedBy") ?? null,
       rejoining: store.get("rejoining") ?? null,
       formerPeer: store.get("formerPeer") ?? null,
+      formerLive: store.get("formerLive") ?? null,
+      tunnelCleanup: store.get("tunnelCleanup") ?? null,
       phrases: { promote: CONFIRM_PHRASE, rejoin: REJOIN_PHRASE, skipArchive: SKIP_ARCHIVE_PHRASE, switchover: SWITCHOVER_PHRASE, unpair: UNPAIR_PHRASE, startAnyway: START_ANYWAY_PHRASE },
     };
   });
@@ -111,6 +113,7 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
     try { await r.pairing.pairBucketPrimary(t, str(b.code)); return { ok: true }; } catch (e) { return fail(reply, e); }
   });
   app.post("/api/pair/bucket/complete", async (_req, reply) => { const r = rt(reply); if (!r) return; try { return { paired: await r.pairing.completeBucketStandby() }; } catch (e) { return fail(reply, e); } });
+  app.post("/api/tunnel-cleanup/retry", async (_req, reply) => { const r = rt(reply); if (!r) return; try { await r.pairing.retryTunnelCleanup(); return { ok: true }; } catch (e) { return fail(reply, e); } });
   app.post("/api/unpair", async (req, reply) => {
     const r = rt(reply); if (!r) return;
     if (str(((req.body ?? {}) as Record<string, unknown>).confirm) !== UNPAIR_PHRASE) return reply.code(400).send({ error: `Type ${UNPAIR_PHRASE} to confirm.`, code: "confirm" });
@@ -151,6 +154,7 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
       return reply.code(202).send({ started: true });
     } catch (e) { return fail(reply, e); }
   });
+  app.post("/api/promote/dismiss", async (_req, reply) => { const r = rt(reply); if (!r) return; r.promoteDismiss(); return { ok: true }; });
   app.post("/api/promote/cancel", async (_req, reply) => { const r = rt(reply); if (!r) return; try { await r.promoteCancel(ACTOR); return { ok: true }; } catch (e) { return fail(reply, e); } });
 
   // ---- bringing a box back, and moving on purpose -------------------------------
@@ -168,7 +172,12 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
     const r = rt(reply); if (!r) return;
     try { return await r.switchoverStart(str(((req.body ?? {}) as Record<string, unknown>).confirm), ACTOR); } catch (e) { return fail(reply, e); }
   });
-  app.post("/api/switchover/cancel", async (_req, reply) => { const r = rt(reply); if (!r) return; try { await r.switchoverCancel(ACTOR); return { ok: true }; } catch (e) { return fail(reply, e); } });
+  app.post("/api/switchover/cancel", async (req, reply) => {
+    const r = rt(reply); if (!r) return;
+    // `force` is offered by the panel only after this box said it could not
+    // check the other one, and the admin confirmed having looked.
+    try { await r.switchoverCancel(ACTOR, ((req.body ?? {}) as Record<string, unknown>).force === true); return { ok: true }; } catch (e) { return fail(reply, e); }
+  });
 
   app.post("/api/archives/delete", async (req, reply) => {
     const r = rt(reply); if (!r) return;

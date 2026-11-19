@@ -82,7 +82,8 @@ function banner() {
   const out = [];
   if (S.conflict) out.push(h("div", { class: "banner bad", role: "alert" }, h("p", { class: "big" }, "Two boxes are acting as the primary"),
     P("The other box was promoted on ", when(S.conflict.writtenAt), ", and this box is still running. Staff may be entering work on two different copies."),
-    P("Decide which box is the real one. Then shut the other one down, or open its console and choose “Rejoin as standby”.")));
+    P("Decide which box is the real one, then stop the other. If the other box is the real one, make this box its standby with the button below. If this box is the real one, open the other box's Standby page and choose “Rejoin as standby” there, or shut it down."),
+    h("div", { class: "row" }, btn("Make this box the standby instead…", () => go("rejoin"), "danger"))));
   if (S.health === "failed" || S.health === "stale") out.push(h("div", { class: "banner bad" }, h("p", { class: "big" }, S.health === "failed" ? "Needs attention" : "Out of date"), P(S.summary),
     S.lastSync && !S.lastSync.ok ? M("What went wrong: ", S.lastSync.error || "unknown") : null, S.lastCapture && !S.lastCapture.ok ? M("What went wrong: ", S.lastCapture.error || "unknown") : null));
   else if (S.health === "degraded") out.push(h("div", { class: "banner warn" }, h("p", { class: "big" }, "Working, with a caution"), P(S.summary), h("ul", {}, S.versionIssues.map((v) => h("li", {}, v)))));
@@ -105,13 +106,16 @@ function unpaired() {
       M("The code works once and stops working at ", when(view.expiresAt), ". This page updates by itself when the other box has paired.")]
       : [P("This box stays the live one. The other box will be overwritten with a copy of this one."), h("div", { class: "row" }, btn("Create the code", () => act(async () => { const r = await api("POST", "api/pair/direct/start"); view.code = r.code; view.expiresAt = r.expiresAt; }), "primary"), btn("Back", () => go("home")))], errLine());
   if (view.name === "standby-direct") return card(h("h2", {}, "Enter the code from the primary"),
-    P("On the primary, open Standby and choose “This box is the primary”. Paste the code it shows here."), h("label", { for: "code" }, "Pairing code"), h("textarea", { id: "code" }),
+    P("On the primary, open Standby and choose “This box is the primary”. Paste the code it shows here."),
+    M("If this box has a Cloudflare Tunnel of its own, that tunnel and its DNS records are removed when it becomes the standby: after a promote it uses the primary's. A tunnel it shares with the primary is left alone."),
+    h("label", { for: "code" }, "Pairing code"), h("textarea", { id: "code" }),
     view.lastCode === "has-data" ? h("div", { class: "banner bad" }, P("This box already holds data. Continuing replaces everything on it with the primary's data."), h("label", {}, h("input", { type: "checkbox", id: "ow" }), " I understand. Replace this box's data.")) : null,
     errLine(), h("div", { class: "row" }, btn("Pair", () => act(() => api("POST", "api/pair/direct/join", { code: val("code"), confirmOverwrite: !!(document.getElementById("ow") || {}).checked })), "primary"), btn("Back", () => go("home"))));
   if (view.name === "standby-bucket") return card(h("h2", {}, view.code ? "Give this code to the primary" : "This standby's read-only key"),
     view.code ? [P("On the primary, open Standby, choose “This box is the primary”, then “Through a storage bucket”, and paste this code:"), h("div", { class: "code" }, view.code),
       M("This page checks the bucket by itself and finishes when the primary has paired."), h("div", { class: "row" }, btn("Check now", () => act(() => api("POST", "api/pair/bucket/complete"))))]
       : [P("In Backblaze, create a bucket just for Standby (private, no Object Lock). Then create an application key for that bucket with read-only access, and enter it here."),
+        M("If this box has a Cloudflare Tunnel of its own, that tunnel and its DNS records are removed when it becomes the standby: after a promote it uses the primary's. A tunnel it shares with the primary is left alone."),
         ...bucketForm("Read-only application key", "This box can read the bucket but never write to it."),
         view.lastCode === "has-data" ? h("div", { class: "banner bad" }, P("This box already holds data. Continuing replaces everything on it with the primary's data."), h("label", {}, h("input", { type: "checkbox", id: "ow" }), " I understand. Replace this box's data.")) : null,
         h("div", { class: "row" }, btn("Continue", () => act(async () => { const r = await api("POST", "api/pair/bucket/standby", { ...bucketVals(), confirmOverwrite: !!(document.getElementById("ow") || {}).checked }); view.code = r.code; }), "primary"), btn("Back", () => go("home")))], errLine());
@@ -121,6 +125,9 @@ function unpaired() {
     h("div", { class: "row" }, btn("Pair", () => act(() => api("POST", "api/pair/bucket/primary", { ...bucketVals(), code: val("code") })), "primary"), btn("Back", () => go("home"))));
   const live = S.role === "primary";
   return [
+    S.formerLive ? h("div", { class: "banner bad", role: "alert" }, h("p", { class: "big" }, "The box this one replaced is running again"),
+      P("This box was promoted and is the live one, but the old box is answering as a primary too. Staff may be entering work on two different copies."),
+      P("Open the old box's Standby page and choose “Rejoin as standby”, or shut it down.")) : null,
     S.rejoining ? h("div", { class: "banner warn" }, h("p", { class: "big" }, "Ready to rejoin as a standby"), P("This box's apps are stopped", S.rejoining.archived ? " and its old data is set aside (see below)." : ".", " Pair it now as the standby of the box that is live.")) : null,
     card(h("p", { class: "big" }, live ? "This box is live and has no standby" : "This box is not paired yet"),
       P("A standby is a second box that receives a copy of this firm's data every night. If the main box fails, you can make the standby take over."),
@@ -141,15 +148,18 @@ function primary() {
     h("ul", {}, h("li", {}, "The apps on this box stop. Staff cannot work until the next step is done."), h("li", {}, "This box sends one final copy to the standby."), h("li", {}, "You then open the standby and choose Promote.")),
     ...typed(S.phrases.switchover, "Stop the apps and send the final copy", (t) => act(() => api("POST", "api/switchover/start", { confirm: t }))));
   if (view.name === "unpair") return unpairScreen();
+  if (view.name === "rejoin") return rejoinScreen();
   const r = S.standbyReport, c = S.lastCapture;
   return [
     S.switchover ? h("div", { class: "banner warn" }, h("p", { class: "big" }, "Planned switchover in progress"), P("The apps on this box are stopped and the final copy was sent at ", when(S.switchover.at), "."),
-      P("Next: open the console on the standby, choose Standby, wait until it shows it has this copy, then choose Promote."), errLine(), h("div", { class: "row" }, btn("Cancel and bring the apps back here", () => act(() => api("POST", "api/switchover/cancel"))))) : null,
+      P("Next: open the console on the standby, choose Standby, wait until it shows it has this copy, then choose Promote."), errLine(), h("div", { class: "row" }, btn("Cancel and bring the apps back here", () => act(() => api("POST", "api/switchover/cancel"))),
+        view.lastCode === "cannot-check" ? btn("I checked: the other box is still the standby. Bring the apps back here", () => { if (confirm("Only continue if the other box's Standby page still says it is the standby. If it was promoted, starting the apps here gives you two live copies.")) act(() => api("POST", "api/switchover/cancel", { force: true })); }, "danger") : null,
+        view.lastCode === "promoted" ? btn("Rejoin as standby…", () => go("rejoin"), "primary") : null)) : null,
     card(h("p", { class: "big" }, "This box is the primary"), h("dl", {},
-      h("dt", {}, "Last copy sent"), h("dd", {}, c ? (c.ok ? when(c.at) : "failed at " + when(c.at)) : "not yet"),
+      h("dt", {}, "Last copy sent"), h("dd", {}, c ? (c.ok ? [when(c.at), c.unreadable ? ` (${c.unreadable} file${c.unreadable === 1 ? "" : "s"} changed or vanished while being read and ${c.unreadable === 1 ? "is" : "are"} not in this copy; a few is normal on a box in use)` : ""] : "failed at " + when(c.at)) : "not yet"),
       h("dt", {}, "Copies go"), h("dd", {}, S.pairing.mode === "direct" ? "directly to the standby" : "through the storage bucket"),
       h("dt", {}, "Standby"), h("dd", {}, S.standbyVisible ? (r ? `${r.health}, as of ${when(r.at)}` : "has not reported yet") : "its status is shown on the standby's own page"),
-      h("dt", {}, "Next copy"), h("dd", {}, `every night at ${S.settings.captureAt}`)),
+      h("dt", {}, "Next copy"), h("dd", {}, `every night at ${S.settings.captureAt} (${S.settings.timezone === "UTC" ? "UTC, not local time: set the time zone under Configuration" : S.settings.timezone + " time"})`)),
       h("div", { class: "row" }, btn(S.busy === "capture" ? "Sending a copy…" : "Send a copy now", () => act(() => api("POST", "api/capture/run")), "", !!S.busy || !!S.switchover),
         S.switchover ? null : btn("Planned switchover…", () => go("switchover")), btn("Unpair…", () => go("unpair")))),
   ];
@@ -172,8 +182,16 @@ function standby() {
   if (view.name === "promote-confirm") return card(h("h2", {}, "Make this box the live one"),
     P("This box will start the firm's apps using its copy from ", when(view.checks.dataAt), ". This takes several minutes. You can leave this page open; if it is interrupted, come back here and it continues."),
     ...typed(S.phrases.promote, "Promote this box", (t) => act(async () => { await api("POST", "api/promote/run", { confirm: t }); view = { name: "promote-run" }; })));
-  const run = S.lastSync;
+  const run = S.lastSync, tc = S.tunnelCleanup;
   return [
+    tc && tc.status === "pending" ? h("p", { class: "muted small" }, "Removing this box's own Cloudflare Tunnel and its DNS records…") : null,
+    tc && (tc.status === "failed" || tc.status === "skipped") ? h("div", { class: "banner warn" }, h("p", { class: "big" }, "This box's old Cloudflare Tunnel is still there"),
+      P(tc.status === "failed" ? "It could not be removed from your Cloudflare account. Nothing is wrong with the standby; the unused tunnel and its DNS records are simply left over." : "It was not removed, because " + (tc.detail || "it could not be told apart from the primary's") + "."),
+      tc.status === "failed" && tc.detail ? M(tc.detail) : null,
+      tc.status === "failed"
+        ? [M("Tunnel ID ", tc.tunnelId || "unknown", ". You can also delete it by hand in the Cloudflare dashboard: Zero Trust → Networks → Tunnels, and the DNS records that point at it."), errLine(),
+          h("div", { class: "row" }, btn("Try again", () => act(() => api("POST", "api/tunnel-cleanup/retry"))))]
+        : M("Tunnel ID ", tc.tunnelId || "unknown", ". Before deleting anything, check on the live box (Configuration → Network → Cloudflare Tunnel) that it does NOT use this tunnel. If it does, leave it alone: it is the firm's.")) : null,
     card(h("p", { class: "big" }, "This box is the standby"),
       S.dataAt ? P("It holds the primary's data as of ", h("strong", {}, when(S.dataAt)), " (", age(S.dataAgeHours), ").") : P("It has not received a copy yet."),
       h("dl", {}, h("dt", {}, "Last check"), h("dd", {}, run ? `${run.ok ? "succeeded" : "failed"} ${when(run.at)}` : "not yet"),
@@ -202,13 +220,16 @@ function promoteRun() {
   const list = h("ol", { class: "steps" }, order.map((k) => h("li", {}, h("span", {}, STEP_NAMES[k]), h("span", { class: "muted" }, by[k] ? ({ done: "done", running: "working…", failed: "stopped" }[by[k].status] || "") : ""))));
   if (res && res.ok) return promoteDone(res);
   const stuck = !pr.running && pr.inProgress;
+  if (!pr.running && !pr.inProgress && res && !res.ok) return card(h("h2", {}, "Promote did not start"),
+    h("div", { class: "banner bad" }, P(res.error || "Something went wrong before the first step."), P("Nothing was changed on this box.")),
+    h("div", { class: "row" }, btn("Back", () => { api("POST", "api/promote/dismiss").catch(() => {}); S.promote.result = null; go("home"); })));
   return card(h("h2", {}, pr.running ? "Promoting this box…" : "Promote was interrupted"), list,
     stuck ? [h("div", { class: "banner bad", style: "margin-top:12px" }, P("It stopped at “", STEP_NAMES[(res && res.failedStep) || ""] || "a step", "”."), res && res.error ? M(res.error) : null, P("Nothing is lost. Continue picks up at that step.")),
       errLine(), h("div", { class: "row" }, btn("Continue", () => act(() => api("POST", "api/promote/run", {})), "primary"), btn("Cancel the promote", () => act(() => api("POST", "api/promote/cancel"))))] : M("This takes several minutes. You can leave this page open."));
 }
 function promoteDone(res) {
   const d = res.deployment || {};
-  return [h("div", { class: "banner ok" }, h("p", { class: "big" }, "This box is now live"), P("It is running the firm's apps with data from ", when(res.dataAt), ".")),
+  return [h("div", { class: "banner ok" }, h("p", { class: "big" }, "This box is now live"), res.dataAt ? P("It is running the firm's apps with data from ", when(res.dataAt), ".") : P("It is running the firm's apps.")),
     card(h("h2", {}, "What to tell staff"),
       d.tunnel ? P("Nothing changes for them: the usual web address now leads to this box. They need to sign in again.")
         : d.mode === "domain" ? [P("The firm's web address still points at the old box. Change its DNS record so it points at this box:"), h("div", { class: "code" }, d.address || "this box's public address"), M("Ask whoever manages the firm's domain name if you are not sure how. Until that is done, staff can use this box's address directly.")]
@@ -217,15 +238,19 @@ function promoteDone(res) {
     card(h("h2", {}, "Two things to do soon"), h("ul", {},
       h("li", {}, "Set up Vibe Backup on this box. Backups do not carry over from the old box."),
       h("li", {}, "When the old box is repaired, do not just switch it on and use it. Open its console, choose Standby, then “Rejoin as standby”. Its old data is set aside for ", String(S.settings.archiveDays), " days before being replaced.")),
-      h("div", { class: "row" }, btn("Done", () => { view = { name: "home" }; S.promote.result = null; render(); }, "primary")))];
+      h("div", { class: "row" }, btn("Done", () => { view = { name: "home" }; S.promote.result = null; render(); api("POST", "api/promote/dismiss").catch(() => {}); }, "primary")))];
 }
 
-function replaced() {
-  if (view.name === "rejoin") return card(h("h2", {}, "Rejoin as standby"),
-    P("This box will become the standby of the box that is now live. Its apps stay stopped and its data is then replaced by a copy of the live box."),
+function rejoinScreen() {
+  return card(h("h2", {}, "Rejoin as standby"),
+    P("This box will become the standby of the box that is now live. Its apps are stopped and its data is then replaced by a copy of the live box."),
     P("Before that, this box's current data is set aside here, read-only, for ", String(S.settings.archiveDays), " days, so that work entered only on this box can be looked up and typed in again."),
     ...typed(S.phrases.rejoin, "Set the data aside and rejoin", (t) => act(async () => { await api("POST", "api/rejoin", { confirm: t, skipArchive: val("skip") || undefined }); view = { name: "home" }; }), "danger",
       [h("label", { for: "skip" }, "Only if there is not enough disk: type ", S.phrases.skipArchive, " to skip setting the data aside"), h("input", { id: "skip", type: "text", autocomplete: "off" })]));
+}
+
+function replaced() {
+  if (view.name === "rejoin") return rejoinScreen();
   if (view.name === "start-anyway") return card(h("h2", {}, "Start anyway"),
     h("div", { class: "banner bad" }, P("The other box is live. Starting this one too gives you two live copies with different data, and the public web address may reach either of them."), P("Only do this if the other box is being shut down and you have decided this box is the real one.")),
     ...typed(S.phrases.startAnyway, "Start this box's apps", (t) => act(async () => { await api("POST", "api/start-anyway", { confirm: t }); view = { name: "home" }; })));
@@ -248,7 +273,10 @@ function render() {
   const focus = document.activeElement && document.activeElement.id, keep = {};
   document.querySelectorAll("input, textarea").forEach((i) => { if (i.id) keep[i.id] = i.type === "checkbox" ? i.checked : i.value; });
   let body;
-  if (S.role === "replaced") body = [replaced()];
+  // A finished promote changes this box's role and ends its pairing, so its
+  // closing screen is shown first, whatever the role is by now.
+  if (S.promote && S.promote.result && S.promote.result.ok) body = [promoteDone(S.promote.result)];
+  else if (S.role === "replaced") body = [replaced()];
   else if (!S.pairing) body = [unpaired()];
   else body = [view.name === "home" || view.name === "home-email" ? banner() : null, S.role === "primary" ? primary() : standby()];
   $app.replaceChildren(...[body, footer()].flat(3).filter(Boolean));

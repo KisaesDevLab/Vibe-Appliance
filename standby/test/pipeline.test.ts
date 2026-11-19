@@ -10,6 +10,8 @@ import { FakeAppliance } from "../src/contracts/fakes/fakeAppliance.ts";
 import { FakeRepository, FakeRepositoryBackend } from "../src/contracts/fakes/fakeRepository.ts";
 import type { Repository } from "../src/contracts/repository.ts";
 import { Store } from "../src/overlay/store.ts";
+import { setPairing } from "../src/pairing/state.ts";
+import { computeStatus } from "../src/status.ts";
 import type { Paths } from "../src/paths.ts";
 import { Pg } from "../src/pg/pg.ts";
 import { ResticRepository } from "../src/repo/restic.ts";
@@ -229,4 +231,71 @@ test("the same pipeline works on real restic, with the standby reading without a
   assert.equal(readFileSync(w.live("data/apps/vibe-tb/uploads/doc2.pdf"), "utf8"), "document two");
   assert.ok(!existsSync(w.live("data/redis/dump.rdb")));
   assert.deepEqual(readdirSync(join(w.standby.paths.mirror, w.primary.tree, "data")).sort(), ["apps"]);
+});
+
+// ---- review 2026-11-18 ------------------------------------------------------
+
+test("invariant 5: an interrupted hard-link copy is never put in place of the verified mirror", { skip }, async () => {
+  const w = await world();
+  await w.capture();
+  assert.equal((await w.sync()).status, "ok");
+  const doc = w.live("data/apps/vibe-tb/uploads/doc1.pdf");
+  assert.equal(readFileSync(doc, "utf8"), "document one");
+  // What a container restart or a full disk leaves half-way through `cp -al`.
+  const partial = `${w.standby.paths.mirrorPrev}.partial`;
+  mkdirSync(partial, { recursive: true });
+  writeFileSync(join(partial, "half-a-tree"), "x");
+  await recover({ store: w.standby.store, repo: w.ro, pg: w.standby.pg, appliance: w.standby.box, paths: w.standby.paths });
+  assert.equal(existsSync(partial), false, "the partial copy is removed");
+  assert.equal(readFileSync(doc, "utf8"), "document one", "the verified mirror is untouched");
+  // The copy is made under the partial name: a crash while it is being made leaves no `mirror.prev`.
+  writeFileSync(join(w.primary.tree, "data/apps/vibe-tb/uploads/doc2.pdf"), "document two");
+  await w.capture();
+  let seenPrevAtRestore = false;
+  await w.sync({ onStep: (s) => { if (s === "verify-files") seenPrevAtRestore = existsSync(w.standby.paths.mirrorPrev) && !existsSync(partial); } });
+  assert.equal(seenPrevAtRestore, true, "by the time files are restored the previous copy is complete and named");
+});
+
+test("a newly paired standby waits for the first copy; that is not a failed sync", { skip }, async () => {
+  const w = await world();
+  setPairing(w.standby.store, { mode: "bucket", peerNodeId: "a".repeat(32), repoPassword: "pw-0123456789", pairedAt: new Date().toISOString(), bucket: { endpoint: "http://fake", bucket: "b", prefix: "", keyId: "ro", key: "ro-key-12345" } });
+  assert.deepEqual(await w.sync(), { status: "skipped", reason: "the primary has not sent a copy yet" });
+  const s = computeStatus(w.standby.store, { staleAfterHours: 36 });
+  assert.equal(s.health, "healthy");
+  assert.match(s.summary, /Waiting for the first copy/);
+  // A repository that cannot even be listed yet (direct mode before the first upload) reads the same.
+  const out = await w.sync({ repo: { ...w.ro, listSnapshots: async () => { throw new Error("repository does not exist"); } } as Repository });
+  assert.equal(out.status, "skipped");
+  assert.equal(computeStatus(w.standby.store, { staleAfterHours: 36 }).health, "healthy");
+});
+
+test("a sync cut short after the swap still follows the primary's version on the next run", { skip }, async () => {
+  const w = await world();
+  w.primary.box.current.applianceCommit = "bbb2222";
+  await w.capture();
+  const out = await w.sync({ onStep: (s) => { if (s === "mirror-version") throw new Error("service stopped"); } });
+  assert.equal(out.status, "failed");
+  assert.equal(w.standby.store.get<VerifiedCopy>("verifiedCopy")?.applianceCommit, "bbb2222", "the data was already swapped in");
+  assert.equal((await w.standby.box.version()).applianceCommit, "aaa1111");
+  const next = await w.sync();
+  assert.deepEqual(next, { status: "ok", snapshotId: (next as { snapshotId: string }).snapshotId, changed: false, versionIssues: [] });
+  assert.equal((await w.standby.box.version()).applianceCommit, "bbb2222", "the version step ran for the snapshot that owed it");
+  assert.equal(w.standby.store.get("versionPending"), undefined);
+});
+
+test("capture refuses to send a copy that would be missing a whole part of the box", { skip }, async () => {
+  const w = await world();
+  rmSync(join(w.primary.tree, "env"), { recursive: true });
+  await assert.rejects(w.capture(), /cannot see \/opt\/vibe\/env on this box, so the copy would be incomplete/);
+  assert.equal(w.primary.store.get<{ ok: boolean }>("lastCapture")?.ok, false);
+});
+
+test("a repository that lost every copy is a failed sync once this box holds one, not a quiet wait", { skip }, async () => {
+  const w = await world();
+  await w.capture();
+  assert.equal((await w.sync()).status, "ok");
+  const out = await w.sync({ repo: { ...w.ro, listSnapshots: async () => [] } as Repository });
+  assert.equal(out.status, "failed");
+  assert.match((out as { error: string }).error, /no longer holds any copy/);
+  assert.ok(w.standby.store.get<VerifiedCopy>("verifiedCopy"), "the verified copy is kept");
 });

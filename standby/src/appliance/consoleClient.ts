@@ -1,6 +1,8 @@
 // ApplianceControl against the console's /api/v1/standby-control routes and
-// the host-action queue. The service token is read from shared.env on every
-// call, because a promote replaces that file.
+// the host-action queue. The service token is read on every call from this
+// box's own root-only file (<dataDir>/local/control.token), which a promote
+// never replaces. shared.env is the fallback for a box whose bootstrap has
+// not yet moved the token out of it.
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { redactor } from "../logger.ts";
@@ -30,22 +32,24 @@ export async function readEnvFile(path: string): Promise<Record<string, string>>
   return out;
 }
 
+const LONG_CALL_MS = 30 * 60 * 1000;
+
 export class ConsoleClient implements ApplianceControl {
   #o: ConsoleClientOptions;
   constructor(o: ConsoleClientOptions) { this.#o = o; }
 
   async #token(): Promise<string> {
-    const env = await readEnvFile(join(this.#o.applianceDir, "env", "shared.env"));
-    const t = env.STANDBY_CONTROL_TOKEN;
-    if (!t) throw new Error("STANDBY_CONTROL_TOKEN is missing from shared.env. Re-run bootstrap on this box: sudo bash /opt/vibe/appliance/bootstrap.sh");
+    let t = await readFile(join(this.#o.dataDir, "local", "control.token"), "utf8").then((s) => s.trim(), () => "");
+    if (!t) t = (await readEnvFile(join(this.#o.applianceDir, "env", "shared.env")).catch(() => ({} as Record<string, string>))).STANDBY_CONTROL_TOKEN ?? "";
+    if (!t) throw new Error("This box has no Standby control token yet. Re-run bootstrap on this box: sudo bash /opt/vibe/appliance/bootstrap.sh");
     redactor.register(t);
     return t;
   }
 
-  async #call<T>(method: string, path: string, body?: unknown): Promise<T> {
+  async #call<T>(method: string, path: string, body?: unknown, timeoutMs = 5 * 60 * 1000): Promise<T> {
     const f = this.#o.fetchImpl ?? fetch;
     const res = await f(`${this.#o.consoleUrl}/api/v1/standby-control${path}`, {
-      method,
+      method, signal: AbortSignal.timeout(timeoutMs),
       headers: { "x-standby-token": await this.#token(), ...(body ? { "content-type": "application/json" } : {}) },
       body: body ? JSON.stringify(body) : undefined,
     });
@@ -88,8 +92,11 @@ export class ConsoleClient implements ApplianceControl {
   async listServices(): Promise<ServiceState[]> { return this.#call("GET", "/services"); }
   async version(): Promise<ApplianceVersion> { return this.#call("GET", "/version"); }
 
-  async stopApps(): Promise<void> { await this.#call("POST", "/apps/stop"); }
-  async startApps(): Promise<void> { await this.#call("POST", "/apps/start"); }
+  // The console stops containers one at a time (30 s grace each) and, on
+  // start, runs each app's jobs to completion first (up to 5 minutes). Giving
+  // up early here would report a failure while the console carries on.
+  async stopApps(): Promise<void> { await this.#call("POST", "/apps/stop", undefined, LONG_CALL_MS); }
+  async startApps(): Promise<void> { await this.#call("POST", "/apps/start", undefined, LONG_CALL_MS); }
   async appHealth(): Promise<AppHealth[]> { return this.#call("GET", "/health"); }
 
   async stopTunnel(): Promise<void> { await this.#call("POST", "/tunnel/stop"); }
@@ -101,7 +108,8 @@ export class ConsoleClient implements ApplianceControl {
   async pullImages(digests: Record<string, string>): Promise<{ failed: string[] }> {
     const images = Object.fromEntries(Object.entries(digests).filter(([, ref]) => ref.includes("@sha256:")));
     if (Object.keys(images).length === 0) return { failed: [] };
-    return this.#call("POST", "/pull", { images });
+    // Pulling every app image can take a long time on a slow line.
+    return this.#call("POST", "/pull", { images }, 2 * 60 * 60 * 1000);
   }
 
   /** Fire and return: following the primary's version rebuilds and restarts this very service. */
@@ -117,6 +125,8 @@ export class ConsoleClient implements ApplianceControl {
   }
 
   async archive(): Promise<void> { await this.#hostAction("standby-archive"); }
+  async removeOwnTunnel(): Promise<void> { await this.#hostAction("standby-tunnel-teardown"); }
+  async releaseBootHold(): Promise<void> { await this.#hostAction("standby-boot-release"); }
 
   async startAppsIsolated(): Promise<void> { throw new Error("The test promote (drill) is not available in this version."); }
   async stopAppsIsolated(): Promise<void> { /* nothing was started */ }

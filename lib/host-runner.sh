@@ -78,7 +78,7 @@ slug   = str(r.get("slug", ""))
 args   = r.get("args") or {}
 if not re.fullmatch(r"[0-9]{10,16}-[a-f0-9]{8}", rid):
     print("invalid id", file=sys.stderr); sys.exit(1)
-STANDBY_ACTIONS = ("standby-mode-on", "standby-mode-off", "standby-place", "standby-tunnel-up", "standby-follow-version", "standby-archive")
+STANDBY_ACTIONS = ("standby-mode-on", "standby-mode-off", "standby-place", "standby-tunnel-up", "standby-follow-version", "standby-archive", "standby-boot-release", "standby-tunnel-teardown")
 if action not in ("sentinel-enable", "sentinel-disable", "sentinel-health", "sentinel-install", "sentinel-enroll") + STANDBY_ACTIONS:
     print(f"unknown action {action!r}", file=sys.stderr); sys.exit(1)
 if not re.fullmatch(r"[a-z][a-z0-9-]+", slug):
@@ -224,7 +224,7 @@ _ha_run_one() { # <queue-file>
       fi
       rm -f "$payload"
       ;;
-    standby-mode-on|standby-mode-off|standby-place|standby-tunnel-up|standby-follow-version|standby-archive)
+    standby-mode-on|standby-mode-off|standby-place|standby-tunnel-up|standby-follow-version|standby-archive|standby-boot-release|standby-tunnel-teardown)
       # Vibe Standby's host-side half (lib/standby-host.sh). The action
       # name maps to a fixed subcommand; the only argument, a validated
       # commit id, travels as an environment variable. `place` and

@@ -28,8 +28,14 @@ function box() {
   w(path.join(bin, 'docker'), `#!/usr/bin/env bash
 echo "$*" >> "${root}/docker.calls"
 case "$1" in
-  ps) printf 'vibe-tb vibe-tb\\ncloudflared vibe-cloudflared\\npostgres vibe-postgres\\nredis vibe-redis\\n' ;;
-  exec) cat >/dev/null 2>&1 || true ;;
+  ps) { cat "${vibe}/standby/boot-held.json" 2>/dev/null || echo none; } >> "${root}/held-at-ps"
+      if [[ -f "${root}/stopped" && ! -f "${root}/stop-ignored" ]]; then printf 'postgres vibe-postgres\\n';
+      else printf 'vibe-tb vibe-tb\\ncloudflared vibe-cloudflared\\npostgres vibe-postgres\\nredis vibe-redis\\n'; fi ;;
+  stop) touch "${root}/stopped" ;;
+  start) if [[ -f "${root}/start-fails" ]]; then exit 1; fi; rm -f "${root}/stopped" ;;
+  container) if [[ "$3" == "vibe-gone" ]]; then exit 1; fi ;;
+  exec) if [[ -f "${root}/pgdump-fails" && "$*" == *pg_dump* ]]; then echo "pg_dump: error: connection refused" >&2; exit 1; fi
+        if [[ "$*" == *"SELECT datname"* ]]; then echo vibe_tb_db; else cat >/dev/null 2>&1 || true; fi ;;
 esac
 exit 0
 `, 0o755);
@@ -57,7 +63,7 @@ exit 0
   w(path.join(src, 'data/console/console.sqlite'), 'console db');
   const run = (action, extraEnv = {}) => spawnSync('bash', [path.join(appl, 'lib/standby-host.sh'), action], {
     encoding: 'utf8',
-    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, VIBE_DIR: vibe, APPLIANCE_DIR: appl, ...extraEnv },
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, VIBE_DIR: vibe, APPLIANCE_DIR: appl, VIBE_BOOT_HOLD_SETTLE: '0', ...extraEnv },
   });
   const read = (p) => fs.readFileSync(path.join(vibe, p), 'utf8');
   const calls = (f) => (fs.existsSync(path.join(root, f)) ? fs.readFileSync(path.join(root, f), 'utf8').trim().split('\n') : []);
@@ -223,6 +229,8 @@ test('standby mode is enforced on the host: state helper, bootstrap, enable-app'
   const apps = bootstrap.slice(bootstrap.indexOf('phase_apps() {'), bootstrap.indexOf('phase_apps() {') + 900);
   assert.match(apps, /if state_standby_mode; then[\s\S]*return 0/, 'bootstrap skips app re-enable on a standby');
   assert.match(bootstrap, /if state_standby_mode; then\s+docker stop -t 10 vibe-redis/, 'bootstrap stops Redis again on a standby');
+  // ...and does so before the console health wait, so a slow console does not leave Redis running.
+  assert.ok(bootstrap.indexOf('docker stop -t 10 vibe-redis') < bootstrap.indexOf('waiting for console healthcheck'));
   const enable = fs.readFileSync(path.join(REPO, 'lib/enable-app.sh'), 'utf8');
   const fn = enable.slice(enable.indexOf('enable_app() {'), enable.indexOf('enable_app() {') + 2000);
   assert.match(fn, /if state_standby_mode; then[\s\S]*return 1/, 'enable-app refuses on a standby before doing anything');
@@ -238,4 +246,257 @@ test('the peer port is preflighted and firewalled to private networks and the ta
   assert.match(ufw, /_ufw_deny_silent "\$_STANDBY_PEER_PORT" "tcp"/);
   const compose = fs.readFileSync(path.join(REPO, 'docker-compose.yml'), 'utf8');
   assert.match(compose, /\$\{STANDBY_PEER_BIND:-0\.0\.0\.0\}:4480:4480/);
+});
+
+// ---- review 2026-11-18 ------------------------------------------------------
+
+test('mode-on fails, with a fix, when the containers did not actually stop', () => {
+  const b = box();
+  fs.writeFileSync(path.join(b.root, 'stop-ignored'), '');
+  const r = b.run('mode-on');
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /still running after being asked to stop/);
+  assert.match(r.stderr, /fix: sudo docker stop/);
+});
+
+test('archive: a failed database dump reports a fix and leaves no partial archive behind', () => {
+  const b = box();
+  fs.writeFileSync(path.join(b.root, 'pgdump-fails'), '');
+  const r = b.run('archive');
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /could not archive the database 'vibe_tb_db'/);
+  assert.match(r.stderr, /fix: /);
+  const dir = path.join(b.vibe, 'standby/local/archive');
+  assert.deepEqual(fs.existsSync(dir) ? fs.readdirSync(dir) : [], [], 'the partial archive was removed');
+});
+
+test('state.json is written under the shared state lock', () => {
+  const src = fs.readFileSync(path.join(REPO, 'lib/standby-host.sh'), 'utf8');
+  assert.equal((src.match(/fcntl\.flock\(_lk\.fileno\(\), fcntl\.LOCK_EX\)/g) || []).length, 2, 'mode flag and the promote merge both lock');
+  assert.doesNotMatch(src, /tmp = (local_)?path \+ "\.tmp"/, 'no shared temp name with other writers');
+});
+
+test('a standby refuses app updates and rollbacks, with the way forward', () => {
+  const b = box();
+  for (const args of [['vibe-tb'], ['vibe-tb', '--rollback']]) {
+    const r = spawnSync('bash', [path.join(REPO, 'update.sh'), ...args], {
+      encoding: 'utf8', env: { ...process.env, VIBE_DIR: b.vibe, VIBE_LOG_DIR: path.join(b.root, 'logs') },
+    });
+    assert.notEqual(r.status, 0, args.join(' '));
+    assert.match(r.stderr + r.stdout, /this box is a standby/);
+    assert.match(r.stderr + r.stdout, /Update the app on the primary/);
+  }
+  assert.deepEqual(b.calls('docker.calls'), [], 'nothing was started or pulled');
+});
+
+test('the tunnel, settings restarts and the console routes all refuse on a standby', () => {
+  const cf = fs.readFileSync(path.join(REPO, 'infra/cloudflared-up.sh'), 'utf8');
+  assert.ok(cf.indexOf('this box is a standby (Vibe Standby), so the Cloudflare Tunnel is not started') > 0);
+  assert.ok(cf.indexOf('this box is a standby (Vibe Standby)') < cf.indexOf('cfd_tunnel'), 'refused before anything is created at Cloudflare');
+  const ss = fs.readFileSync(path.join(REPO, 'lib/settings-save.sh'), 'utf8');
+  const restart = ss.slice(ss.indexOf('_settings_restart_app() {'), ss.indexOf('_settings_restart_app() {') + 700);
+  assert.match(restart, /state_standby_mode \); then[\s\S]*return 0/);
+  assert.match(ss, /tunnel_enabled" == "true" && "\$_rr_standby" != "yes"/);
+  const server = fs.readFileSync(path.join(REPO, 'console/server.js'), 'utf8');
+  for (const route of ["'/api/v1/update/:slug'", "'/api/v1/update/:slug/rollback'", "'/api/v1/admin/cloudflare/enable'",
+    "'/api/v1/admin/cloudflare/provision'", "'/api/v1/admin/network-mode/switch'", "'/api/v1/enable/:slug'"]) {
+    const at = server.indexOf(`app.post(${route}`);
+    assert.ok(at > 0, route);
+    assert.match(server.slice(at, at + 900), /standby_mode\) \{\s+return res\.status\(409\)/, `${route} refuses on a standby`);
+  }
+});
+
+test('the control token lives in its own root-only file, and is moved out of an older shared.env', () => {
+  const b = box();
+  const shared = path.join(b.vibe, 'env/shared.env');
+  fs.writeFileSync(shared, 'POSTGRES_PASSWORD=pw\nSTANDBY_CONTROL_TOKEN=' + 'ab12'.repeat(16) + '\nREDIS_PASSWORD=r\n', { mode: 0o600 });
+  const ensure = () => spawnSync('bash', ['-c', `set -euo pipefail; . "${REPO}/lib/log.sh"; . "${REPO}/lib/state.sh"; . "${REPO}/lib/secrets.sh"; secrets_standby_token_ensure`],
+    { encoding: 'utf8', env: { ...process.env, VIBE_DIR: b.vibe, APPLIANCE_DIR: REPO } });
+  let r = ensure();
+  assert.equal(r.status, 0, r.stderr);
+  const file = path.join(b.vibe, 'standby/local/control.token');
+  assert.equal(fs.readFileSync(file, 'utf8').trim(), 'ab12'.repeat(16), 'the existing token is kept, so both services still agree');
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  assert.equal(fs.readFileSync(shared, 'utf8'), 'POSTGRES_PASSWORD=pw\nREDIS_PASSWORD=r\n', 'only that line was removed');
+  assert.equal(fs.statSync(shared).mode & 0o777, 0o600);
+  // Idempotent, and a primary's shared.env placed by a promote does not replace this box's token.
+  fs.writeFileSync(shared, 'POSTGRES_PASSWORD=pw\nSTANDBY_CONTROL_TOKEN=' + 'cd34'.repeat(16) + '\n', { mode: 0o600 });
+  r = ensure();
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fs.readFileSync(file, 'utf8').trim(), 'ab12'.repeat(16));
+  assert.doesNotMatch(fs.readFileSync(shared, 'utf8'), /STANDBY_CONTROL_TOKEN/);
+  // A fresh box gets a generated one.
+  fs.rmSync(file);
+  r = ensure();
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(fs.readFileSync(file, 'utf8').trim(), /^[0-9a-f]{64}$/);
+  const tmpl = fs.readFileSync(path.join(REPO, 'env-templates/shared.env.tmpl'), 'utf8');
+  assert.doesNotMatch(tmpl, /^STANDBY_CONTROL_TOKEN=/m, 'every container loads shared.env');
+});
+
+// ---- boot hold (Q45-Q47) ------------------------------------------------------
+
+const holdBox = (paired) => {
+  const b = box();
+  const st = JSON.parse(b.read('state.json')); st.config.standby_mode = false;
+  fs.writeFileSync(path.join(b.vibe, 'state.json'), JSON.stringify(st));
+  fs.mkdirSync(path.join(b.vibe, 'standby'), { recursive: true });
+  if (paired) fs.writeFileSync(path.join(b.vibe, 'standby/boot-hold.json'), '{"hold":true}\n');
+  const held = () => { try { return JSON.parse(b.read('standby/boot-held.json')); } catch { return null; } };
+  const dockerOps = () => b.calls('docker.calls').filter((c) => /^(stop|start)/.test(c));
+  return { ...b, held, dockerOps };
+};
+
+test('boot hold fails open: a box that is not a paired primary is never touched', () => {
+  const b = holdBox(false);
+  for (const action of ['boot-hold', 'boot-release', 'boot-release-safety']) {
+    const r = b.run(action, { VIBE_BOOT_ID: 'boot-A' });
+    assert.equal(r.status, 0, r.stderr);
+  }
+  assert.equal(b.run('shutdown-hold', { VIBE_ASSUME_SHUTDOWN: '1' }).status, 0);
+  assert.deepEqual(b.dockerOps(), [], 'nothing was stopped or started');
+  assert.equal(b.held(), null);
+});
+
+test('boot hold: a paired primary is held at boot, once per boot, and released with exactly what was stopped', () => {
+  const b = holdBox(true);
+  let r = b.run('boot-hold', { VIBE_BOOT_ID: 'boot-A' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(b.held().containers.sort(), ['vibe-cloudflared', 'vibe-redis', 'vibe-tb']);
+  assert.equal(b.held().bootId, 'boot-A');
+  assert.equal(b.held().decision, null);
+  assert.doesNotMatch(b.dockerOps().join(' '), /vibe-postgres/, 'core services are never held');
+  // Enabling or restarting the unit later in the same boot does nothing.
+  fs.rmSync(path.join(b.root, 'stopped'));
+  const before = b.dockerOps().length;
+  b.run('boot-hold', { VIBE_BOOT_ID: 'boot-A' });
+  assert.equal(b.dockerOps().length, before, 'a second run in the same boot stops nothing');
+  // Release: Redis first, the tunnel last, nothing else.
+  r = b.run('boot-release');
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(b.dockerOps().slice(before), ['start vibe-redis', 'start vibe-tb', 'start vibe-cloudflared']);
+  assert.equal(b.held(), null, 'the record is gone, so nothing is started twice');
+});
+
+test('boot hold: a clean shutdown records and stops them; only a real shutdown counts', () => {
+  const b = holdBox(true);
+  b.run('shutdown-hold');
+  assert.deepEqual(b.dockerOps(), [], 'a unit restart is not a shutdown');
+  const r = b.run('shutdown-hold', { VIBE_ASSUME_SHUTDOWN: '1' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(b.held().containers.sort(), ['vibe-cloudflared', 'vibe-redis', 'vibe-tb']);
+  assert.equal(b.held().bootId, null);
+  // At the next boot nothing is running; the shutdown record is kept and stamped.
+  b.run('boot-hold', { VIBE_BOOT_ID: 'boot-B' });
+  assert.deepEqual(b.held().containers.sort(), ['vibe-cloudflared', 'vibe-redis', 'vibe-tb']);
+  assert.equal(b.held().bootId, 'boot-B');
+});
+
+test('boot hold: nothing is ever started on a box in standby mode or one recorded as replaced (invariant 1)', () => {
+  const b = holdBox(true);
+  b.run('boot-hold', { VIBE_BOOT_ID: 'boot-A' });
+  const n = b.dockerOps().length;
+  // The Standby service decided: this box was replaced.
+  fs.writeFileSync(path.join(b.vibe, 'standby/boot-held.json'), JSON.stringify({ ...b.held(), decision: 'held' }));
+  assert.equal(b.run('boot-release').status, 0);
+  assert.equal(b.run('boot-release-safety').status, 0);
+  assert.equal(b.dockerOps().length, n, 'held means held, for the service and for the safety net');
+  // Standby mode on: same.
+  fs.writeFileSync(path.join(b.vibe, 'standby/boot-held.json'), JSON.stringify({ ...b.held(), decision: null }));
+  const st = JSON.parse(b.read('state.json')); st.config.standby_mode = true;
+  fs.writeFileSync(path.join(b.vibe, 'state.json'), JSON.stringify(st));
+  assert.equal(b.run('boot-release-safety').status, 0);
+  assert.equal(b.dockerOps().length, n);
+});
+
+test('boot hold safety net: with no decision from the Standby service the host starts the apps itself and says why', () => {
+  const b = holdBox(true);
+  b.run('boot-hold', { VIBE_BOOT_ID: 'boot-A' });
+  const n = b.dockerOps().length;
+  const r = b.run('boot-release-safety');
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(b.dockerOps().slice(n), ['start vibe-redis', 'start vibe-tb', 'start vibe-cloudflared']);
+  assert.match(r.stderr + r.stdout, /did not decide within 10 minutes/);
+  // A start that fails is reported with a fix and keeps the record for a retry.
+  const c = holdBox(true);
+  c.run('boot-hold', { VIBE_BOOT_ID: 'boot-A' });
+  fs.writeFileSync(path.join(c.root, 'start-fails'), '');
+  const f = c.run('boot-release');
+  assert.notEqual(f.status, 0);
+  assert.match(f.stderr, /could not start: vibe-redis vibe-tb vibe-cloudflared/);
+  assert.match(f.stderr, /fix: sudo docker start/);
+  assert.ok(c.held(), 'kept for the retry');
+});
+
+test('boot hold units: the hold runs after Docker and stops before it; the safety net is a 10-minute timer', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vs-units-'));
+  const r = spawnSync('bash', [path.join(REPO, 'infra/standby-boot-hold-install.sh')], {
+    encoding: 'utf8', env: { ...process.env, VIBE_BOOT_HOLD_UNITS_ONLY: '1', VIBE_SYSTEMD_DIR: dir, VIBE_DIR: path.join(dir, 'vibe'), VIBE_LOG_DIR: path.join(dir, 'logs') },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const hold = fs.readFileSync(path.join(dir, 'vibe-standby-boot-hold.service'), 'utf8');
+  assert.match(hold, /^After=docker\.service$/m);
+  assert.match(hold, /^Type=oneshot$/m);
+  assert.match(hold, /^RemainAfterExit=yes$/m, 'so that ExecStop runs at shutdown');
+  assert.match(hold, /^ExecStart=\/bin\/bash .*standby-host\.sh boot-hold$/m);
+  assert.match(hold, /^ExecStop=\/bin\/bash .*standby-host\.sh shutdown-hold$/m);
+  const timer = fs.readFileSync(path.join(dir, 'vibe-standby-boot-release.timer'), 'utf8');
+  assert.match(timer, /^OnBootSec=10min$/m);
+  assert.match(fs.readFileSync(path.join(dir, 'vibe-standby-boot-release.service'), 'utf8'), /standby-host\.sh boot-release-safety$/m);
+  // The install marks the current boot handled before starting the unit.
+  const src = fs.readFileSync(path.join(REPO, 'infra/standby-boot-hold-install.sh'), 'utf8');
+  assert.ok(src.indexOf('boot-hold.handled') < src.indexOf('systemctl start  vibe-standby-boot-hold.service'));
+});
+
+test('the host action that releases the boot hold is in every allowlist', () => {
+  for (const f of ['lib/host-runner.sh', 'console/lib/standby-control.js', 'standby/src/appliance/consoleClient.ts']) {
+    assert.match(fs.readFileSync(path.join(REPO, f), 'utf8'), /standby-boot-release/, f);
+  }
+  assert.equal((fs.readFileSync(path.join(REPO, 'lib/host-runner.sh'), 'utf8').match(/standby-boot-release/g) || []).length, 2, 'the validator and the dispatcher');
+});
+
+test('tunnel-teardown runs only on a box in standby mode, and is in every allowlist', () => {
+  const b = box();
+  const st = JSON.parse(b.read('state.json')); st.config.standby_mode = false;
+  fs.writeFileSync(path.join(b.vibe, 'state.json'), JSON.stringify(st));
+  const r = b.run('tunnel-teardown');
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /not in standby mode/);
+  assert.match(r.stderr, /fix: /);
+  for (const f of ['lib/host-runner.sh', 'console/lib/standby-control.js', 'standby/src/appliance/consoleClient.ts']) {
+    assert.match(fs.readFileSync(path.join(REPO, f), 'utf8'), /standby-tunnel-teardown/, f);
+  }
+  assert.equal((fs.readFileSync(path.join(REPO, 'lib/host-runner.sh'), 'utf8').match(/standby-tunnel-teardown/g) || []).length, 2, 'the validator and the dispatcher');
+});
+
+test('boot hold: the record gets its boot ID only after the last pass, so the service cannot release in between', () => {
+  const b = holdBox(true);
+  const r = b.run('boot-hold', { VIBE_BOOT_ID: 'boot-A' });
+  assert.equal(r.status, 0, r.stderr);
+  // What the record looked like each time the script listed the containers.
+  const seen = fs.readFileSync(path.join(b.root, 'held-at-ps'), 'utf8').trim().split('\n');
+  assert.equal(seen.length, 3, 'three passes');
+  for (const s of seen) assert.ok(s === 'none' || JSON.parse(s).bootId === null, 'no boot ID while passes are still running: ' + s);
+  assert.equal(b.held().bootId, 'boot-A', 'stamped at the end');
+});
+
+test('boot hold safety net is fail-open: it starts what a clean shutdown stopped even if the boot step never ran', () => {
+  const b = holdBox(true);
+  b.run('shutdown-hold', { VIBE_ASSUME_SHUTDOWN: '1' });
+  assert.equal(b.held().bootId, null);
+  const n = b.dockerOps().length;
+  const r = b.run('boot-release-safety');
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(b.dockerOps().slice(n), ['start vibe-redis', 'start vibe-tb', 'start vibe-cloudflared']);
+});
+
+test('boot hold: a recorded container that no longer exists is skipped, not a permanent failure', () => {
+  const b = holdBox(true);
+  b.run('boot-hold', { VIBE_BOOT_ID: 'boot-A' });
+  const rec = b.held(); rec.containers.push('vibe-gone');
+  fs.writeFileSync(path.join(b.vibe, 'standby/boot-held.json'), JSON.stringify(rec));
+  const r = b.run('boot-release');
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(b.dockerOps().join(' '), /start vibe-gone/);
+  assert.equal(b.held(), null);
 });

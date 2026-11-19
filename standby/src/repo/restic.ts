@@ -3,7 +3,7 @@
 // read-only bucket key cannot write the lock file.
 import { mkdir } from "node:fs/promises";
 import { redactor } from "../logger.ts";
-import { run, RunError } from "../util/run.ts";
+import { run, RunError, trackChild } from "../util/run.ts";
 import {
   RepositoryReadOnlyError,
   type BackupRequest, type BackupResult, type Repository, type RepositoryAccess,
@@ -139,7 +139,7 @@ export class ResticRepository implements Repository {
     // `run` buffers stdout as a string; dump may be binary, so stream to memory here.
     const { spawn } = await import("node:child_process");
     return new Promise((resolve, reject) => {
-      const child = spawn(this.#bin(), ["dump", ...this.#readFlags(), id, path], { env: { ...process.env, ...this.#env() } });
+      const child = trackChild(spawn(this.#bin(), ["dump", ...this.#readFlags(), id, path], { env: { ...process.env, ...this.#env() } }));
       let stderr = "";
       child.stdout.on("data", (c: Buffer) => chunks.push(c));
       child.stderr.on("data", (c: Buffer) => { stderr += c.toString("utf8"); });
@@ -172,6 +172,10 @@ export class ResticRepository implements Repository {
     this.#requireWrite("prune");
     const drop = (await this.#snapshots()).filter((s) => !keepIds.includes(s.vsId)).map((s) => s.id);
     if (drop.length === 0) return;
+    // A backup that was killed (reboot, container restart) can leave its
+    // lock behind, and forget --prune needs the repository to itself.
+    // `unlock` removes only locks restic itself considers stale.
+    await this.#restic(["unlock"]).catch(() => { /* prune reports the real problem */ });
     await this.#restic(["forget", "--prune", ...drop]);
   }
 

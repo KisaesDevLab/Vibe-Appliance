@@ -157,6 +157,9 @@ FLAGS
                                   is the app slug with the redundant `vibe-`
                                   stripped (e.g. /tb, /mybooks). Mirrors LAN
                                   routing. Must be a single DNS label.
+                                  A label other than vibe also names the
+                                  admin tools when no --host-tag is set:
+                                  SUB-cockpit, SUB-portainer, SUB-backup.
   --email  EMAIL                  ACME contact email for --mode domain.
   --tailscale                     Also install Tailscale (any mode).
   --tailscale-authkey KEY         Pre-shared authkey for unattended Tailscale up.
@@ -618,6 +621,12 @@ HELP
     die "Could not render shared.env. See $VIBE_LOG_FILE."
   fi
 
+  # Vibe Standby's control token lives in its own root-only file, not in
+  # shared.env (every container loads that). Also moves it out of the
+  # shared.env of an older install, or of a primary's copy just placed
+  # here by a promote.
+  secrets_standby_token_ensure
+
   # Put the preserved secrets back — secrets_render archived the old file
   # and regenerated every placeholder, these included. Values travel via
   # the environment (never argv, so nothing lands in `ps`), and the write
@@ -902,6 +911,17 @@ phase_core_up() {
     die "Failed to bring up core stack. Inspect logs above and re-run."
   fi
 
+  # `compose up` starts every core service, Redis included. A standby
+  # must not run Redis (queued jobs would run against copied data) or the
+  # tunnel. Stopped here, before the health wait, so that a console that
+  # is slow to come up does not leave them running; `unless-stopped`
+  # then keeps them down.
+  if state_standby_mode; then
+    docker stop -t 10 vibe-redis >>"$VIBE_LOG_FILE" 2>&1 || true
+    docker stop -t 5 vibe-cloudflared >>"$VIBE_LOG_FILE" 2>&1 || true
+    log_info "standby mode: Redis and the tunnel are kept stopped"
+  fi
+
   log_step "waiting for console healthcheck (timeout 90s)"
   local deadline=$(( $(date +%s) + 90 ))
   while (( $(date +%s) < deadline )); do
@@ -910,14 +930,6 @@ phase_core_up() {
       vibe-console 2>/dev/null || true)"
     if [[ "$health" == "healthy" ]]; then
       log_ok "console healthy"
-      # `compose up` starts every core service, Redis included. A standby
-      # must not run Redis (queued jobs would run against copied data),
-      # so stop it again here; `unless-stopped` then keeps it down.
-      if state_standby_mode; then
-        docker stop -t 10 vibe-redis >>"$VIBE_LOG_FILE" 2>&1 || true
-        docker stop -t 5 vibe-cloudflared >>"$VIBE_LOG_FILE" 2>&1 || true
-        log_info "standby mode: Redis and the tunnel are kept stopped"
-      fi
       _check_core_image_drift
       state_set_phase core ok
       return 0
@@ -1024,6 +1036,15 @@ phase_infra() {
       "fix:sudo bash /opt/vibe/appliance/infra/host-runner-install.sh"
   fi
 
+  # Vibe Standby boot hold: keeps a paired primary's apps stopped across
+  # a reboot until the role record has been read. Does nothing on a box
+  # that is not a paired primary.
+  log_step "installing the Vibe Standby boot-hold units"
+  if ! ( cd "$APPLIANCE_DIR" && /bin/bash infra/standby-boot-hold-install.sh ); then
+    log_warn "Vibe Standby boot-hold install failed; a replaced primary would start its apps at boot until the Standby service stops them" \
+      "fix:sudo bash /opt/vibe/appliance/infra/standby-boot-hold-install.sh"
+  fi
+
   if [[ "$CONFIG_COCKPIT" != "true" ]]; then
     log_info "skipping cockpit install (--no-cockpit)"
     return 0
@@ -1037,7 +1058,8 @@ phase_infra() {
   # handshake completes — operator gets a blank page).
   export COCKPIT_HOST_IP="${_host_ip:-}"
   # Cockpit's public hostname — cockpit.<domain> unless the operator set
-  # a HOST_TAG or INFRA_SUBDOMAIN_COCKPIT. Empty outside domain mode.
+  # a HOST_TAG, INFRA_SUBDOMAIN_COCKPIT or a main host label of their own
+  # (<label>-cockpit). Empty outside domain mode.
   COCKPIT_HOST="$(python3 "$APPLIANCE_DIR/lib/vibe_hosts.py" get cockpit-host 2>/dev/null || true)"
   export COCKPIT_HOST
   if ! ( cd "$APPLIANCE_DIR" && /bin/bash infra/cockpit-install.sh ); then
@@ -1456,6 +1478,15 @@ main() {
     _prev="$(state_get_config_kv email)"
     [[ -n "$_prev" ]] && CONFIG_EMAIL="$_prev"
   fi
+  # A main host label that is being chosen or changed now also names the
+  # admin tools (<label>-cockpit ...; lib/vibe_hosts.py). An appliance
+  # that already had this label keeps the names it has, so re-running
+  # bootstrap with the same --tunnel-subdomain renames nothing.
+  local _label_changed="false"
+  if [[ "$CONFIG_TUNNEL_SUBDOMAIN_EXPLICIT" == "true" \
+        && "$(state_get_config_kv tunnel_subdomain)" != "$CONFIG_TUNNEL_SUBDOMAIN" ]]; then
+    _label_changed="true"
+  fi
   if [[ "$CONFIG_TUNNEL_SUBDOMAIN_EXPLICIT" != "true" ]]; then
     _prev="$(state_get_config_kv tunnel_subdomain)"
     [[ -n "$_prev" ]] && CONFIG_TUNNEL_SUBDOMAIN="$_prev"
@@ -1486,7 +1517,7 @@ main() {
   # rejected afterwards, leaving the bad value on disk for the next
   # enable-app or settings save to render from. The candidate values are
   # passed with --set; nothing on disk is touched until this passes.
-  local -a _naming_sets=(--set "tunnel_subdomain=${CONFIG_TUNNEL_SUBDOMAIN}")
+  local -a _naming_sets=(--set "mode=${CONFIG_MODE}" --set "tunnel_subdomain=${CONFIG_TUNNEL_SUBDOMAIN}")
   if [[ "$CONFIG_HOST_TAG_EXPLICIT" == "true" ]]; then
     _naming_sets+=(--set "HOST_TAG=${CONFIG_HOST_TAG}")
   fi
@@ -1515,6 +1546,9 @@ ${_naming_errors}
   state_set_config_kv mode               "$CONFIG_MODE"
   state_set_config_kv domain             "$CONFIG_DOMAIN"
   state_set_config_kv tunnel_subdomain   "$CONFIG_TUNNEL_SUBDOMAIN"
+  if [[ "$_label_changed" == "true" ]]; then
+    state_set_config_kv infra_follow_main_label "true"
+  fi
   state_set_config_kv email              "$CONFIG_EMAIL"
   # Only persist the Tailscale flag when the operator explicitly
   # passed --tailscale or --tailscale-authkey this run. A bare

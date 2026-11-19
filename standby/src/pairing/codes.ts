@@ -3,7 +3,7 @@
 // in minutes and is useless after one pairing. Bucket codes carry only the
 // standby's public key.
 export interface DirectCode { kind: "direct"; addresses: string[]; port: number; fingerprint: string; token: string }
-export interface BucketCode { kind: "bucket"; nodeId: string; sealPublic: string }
+export interface BucketCode { kind: "bucket"; nodeId: string; sealPublic: string; /** One per code shown: names the bundle the primary leaves, so an old bundle is never collected. */ nonce?: string }
 export type PairingCode = DirectCode | BucketCode;
 
 const enc = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
@@ -11,7 +11,7 @@ const enc = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url")
 export function encodeCode(c: PairingCode): string {
   return c.kind === "direct"
     ? `VS1D.${enc({ a: c.addresses, p: c.port, f: c.fingerprint, t: c.token })}`
-    : `VS1B.${enc({ n: c.nodeId, k: c.sealPublic })}`;
+    : `VS1B.${enc({ n: c.nodeId, k: c.sealPublic, ...(c.nonce ? { o: c.nonce } : {}) })}`;
 }
 
 export class BadCodeError extends Error {}
@@ -31,9 +31,10 @@ export function decodeCode(text: string): PairingCode {
     }
     return { kind: "direct", addresses: a as string[], port: p, fingerprint: f, token: t };
   }
-  const n = o.n, k = o.k;
-  if (typeof n !== "string" || !/^[0-9a-f]{32}$/.test(n) || typeof k !== "string" || Buffer.from(k, "base64url").length !== 32) {
+  const n = o.n, k = o.k, nonce = o.o;
+  if (typeof n !== "string" || !/^[0-9a-f]{32}$/.test(n) || typeof k !== "string" || Buffer.from(k, "base64url").length !== 32
+    || (nonce !== undefined && (typeof nonce !== "string" || !/^[A-Za-z0-9_-]{8,64}$/.test(nonce)))) {
     throw new BadCodeError("The pairing code is damaged. Copy it again from the other box.");
   }
-  return { kind: "bucket", nodeId: n, sealPublic: k };
+  return { kind: "bucket", nodeId: n, sealPublic: k, ...(nonce ? { nonce: nonce as string } : {}) };
 }

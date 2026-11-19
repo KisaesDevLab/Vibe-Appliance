@@ -167,3 +167,127 @@ test("the peer channel listens only when direct mode gives it a reason to", { sk
   await bucketBox.rt.rebuild();
   assert.equal(await open(bucketBox.rt.config.peerPort), false, "bucket mode opens no port");
 });
+
+// ---- review 2026-11-18 ------------------------------------------------------
+
+test("a restart during a planned switchover's final copy does not leave the firm down: the apps come back and the flag clears", { skip }, async () => {
+  const b = await mkBox("interrupted", ["vibe-tb"]);
+  b.store.setRole("primary", "t", "t");
+  // What a crash during the final capture leaves: apps stopped, `operation` set, no `switchover` record.
+  await b.box.stopApps();
+  b.store.set("operation", "switchover");
+  await b.rt.tick(new Date());
+  assert.equal(b.store.get("operation"), undefined);
+  assert.equal((await b.box.listServices()).find((x) => x.name === "vibe-tb")!.running, true);
+  assert.ok(b.store.auditRecords().some((a) => a.kind === "switchover-interrupted"));
+  // A switchover that is simply waiting for the other box is left alone.
+  await b.box.stopApps();
+  b.store.set("operation", "switchover");
+  b.store.set("switchover", { snapshotId: "final", at: new Date().toISOString() });
+  await b.rt.tick(new Date(Date.now() + 10 * 60 * 1000));
+  assert.equal(b.store.get("operation"), "switchover");
+  assert.equal((await b.box.listServices()).find((x) => x.name === "vibe-tb")!.running, false);
+});
+
+test("a rejoin or Start anyway cut short by a restart no longer blocks every later operation", { skip }, async () => {
+  const b = await mkBox("stuck", []);
+  b.store.setRole("replaced", "t", "t");
+  b.store.set("operation", "rejoin");
+  await b.rt.tick(new Date());
+  assert.equal(b.store.get("operation"), undefined);
+  assert.equal(b.box.calls.includes("startApps"), false, "a held box is not started");
+  b.store.set("operation", "start-anyway");
+  await b.rt.tick(new Date(Date.now() + 10 * 60 * 1000));
+  assert.equal(b.store.get("operation"), undefined);
+});
+
+test("a promote that crashed after its last step did its work is finished, not stuck", { skip }, async () => {
+  const b = await mkBox("promoted", ["vibe-tb"]);
+  b.store.setRole("primary", "t", "promote");
+  b.store.set("operation", "promote");
+  b.store.set("promoteRunId", "2026-11-18T00:00:00.000Z");
+  const r = await call(b, "POST", "/api/promote/run", {});
+  assert.equal(r.status, 202);
+  assert.equal(b.store.get("operation"), undefined);
+  assert.equal(b.store.get("promoteRunId"), undefined);
+  const st = await call(b, "GET", "/api/status");
+  assert.equal(st.body.promote.result.ok, true);
+  await call(b, "POST", "/api/promote/dismiss");
+  assert.equal((await call(b, "GET", "/api/status")).body.promote.result, null);
+});
+
+test("pairing a new standby does not forget a replaced box that has not yet heard it was replaced", { skip }, async () => {
+  const b = await mkBox("keeps-former", ["vibe-tb"]);
+  const { setPairing } = await import("../src/pairing/state.ts");
+  b.store.setRole("primary", "t", "promote");
+  const former = { nodeId: "d".repeat(32), mode: "direct", promotedAt: new Date().toISOString(), fingerprint: "e".repeat(64), addresses: ["127.0.0.1"], port: 1, leaseDelivered: false };
+  b.store.set("formerPeer", former);
+  setPairing(b.store, { mode: "direct", peerNodeId: "c".repeat(32), repoPassword: "pw-pw-pw-pw", pairedAt: new Date().toISOString(), peerFingerprint: "f".repeat(64), peerAddresses: ["127.0.0.1"], peerPort: 1 });
+  await b.rt.rebuild();
+  assert.deepEqual(b.store.get("formerPeer"), former, "kept: it is the only box the old one can ask");
+  b.store.set("formerPeer", { ...former, leaseDelivered: true });
+  await b.rt.rebuild();
+  assert.equal(b.store.get("formerPeer"), undefined, "once it has heard, the new pairing closes that chapter");
+});
+
+test("nightly times follow the appliance's own time zone setting", { skip }, async () => {
+  const b = await mkBox("tz", []);
+  assert.equal(await b.rt.timezone(), "UTC");
+  const c = await mkBox("tz2", []);
+  writeFileSync(join(c.tree, "env/appliance.env"), "HOST_TAG=\nTZ=America/Chicago\n");
+  assert.equal(await c.rt.timezone(), "America/Chicago");
+  assert.equal((await call(c, "GET", "/api/status")).body.settings.timezone, "America/Chicago");
+  const d = await mkBox("tz3", []);
+  writeFileSync(join(d.tree, "env/appliance.env"), "TZ=Not/AZone\n");
+  assert.equal(await d.rt.timezone(), "UTC", "an unknown zone falls back rather than breaking the schedule");
+});
+
+// ---- boot hold (Q45-Q47) ------------------------------------------------------
+
+const heldFile = (b: Box) => join(b.data, "boot-held.json");
+const writeHeld = (b: Box, at: Date) => writeFileSync(heldFile(b), JSON.stringify({ bootId: "boot-X", at: at.toISOString(), containers: ["vibe-redis", "vibe-tb"], decision: null }));
+const bucketPair = async (b: Box) => {
+  const { setPairing } = await import("../src/pairing/state.ts");
+  b.store.setRole("primary", "t", "t");
+  // An endpoint nothing listens on: the role record cannot be read.
+  setPairing(b.store, { mode: "bucket", peerNodeId: "c".repeat(32), repoPassword: "pw-pw-pw-pw", pairedAt: new Date().toISOString(), bucket: { endpoint: "http://127.0.0.1:1", bucket: "b", prefix: "", keyId: "k", key: "kkkkkkkk" } });
+  // No nightly copy during these tests: the bucket is unreachable on purpose.
+  b.store.set("operation", "drill");
+  await b.rt.rebuild();
+};
+
+test("boot hold: the service tells the host to hold only a paired primary", { skip }, async () => {
+  const b = await mkBox("hold-marker", ["vibe-tb"]);
+  assert.deepEqual(JSON.parse(readFileSync(join(b.data, "boot-hold.json"), "utf8")), { hold: false });
+  await bucketPair(b);
+  assert.deepEqual(JSON.parse(readFileSync(join(b.data, "boot-hold.json"), "utf8")), { hold: true });
+});
+
+test("boot hold: an unreadable role record releases after 2 minutes, not before, and the decision is recorded first", { skip }, async () => {
+  const b = await mkBox("hold-wait", ["vibe-tb"]);
+  await bucketPair(b);
+  await b.box.stopApps();
+  const boot = new Date();
+  writeHeld(b, boot);
+  await b.rt.tick(new Date(boot.getTime() + 30_000));
+  assert.equal(b.box.calls.includes("releaseBootHold"), false, "still waiting for the record");
+  assert.equal(JSON.parse(readFileSync(heldFile(b), "utf8")).decision, null);
+  await b.rt.tick(new Date(boot.getTime() + 150_000));
+  assert.equal(b.box.calls.includes("releaseBootHold"), true);
+  assert.equal(JSON.parse(readFileSync(heldFile(b), "utf8")).decision, "release-unverified");
+  assert.equal((await b.box.listServices()).find((x) => x.name === "vibe-tb")!.running, true);
+});
+
+test("boot hold: an unpaired box is released at once; a standby or replaced box is recorded as held and nothing starts", { skip }, async () => {
+  const u = await mkBox("hold-unpaired", ["vibe-tb"]);
+  writeHeld(u, new Date());
+  await u.rt.tick(new Date());
+  assert.equal(u.box.calls.includes("releaseBootHold"), true);
+  assert.equal(JSON.parse(readFileSync(heldFile(u), "utf8")).decision, "release");
+  const r = await mkBox("hold-replaced", []);
+  r.store.setRole("replaced", "t", "t");
+  writeHeld(r, new Date());
+  await r.rt.tick(new Date());
+  assert.equal(r.box.calls.includes("releaseBootHold"), false);
+  assert.equal(JSON.parse(readFileSync(heldFile(r), "utf8")).decision, "held");
+});

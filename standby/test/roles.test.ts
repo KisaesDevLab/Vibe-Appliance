@@ -162,7 +162,7 @@ test("guard: a primary that BOOTS and finds it was replaced holds — tunnel fir
 test("guard: if the lease store cannot be reached, a primary starts and runs normally", async () => {
   const w = pair();
   w.bucket.down = true;
-  assert.equal(await checkRole({ store: w.ps, link: w.pLink, appliance: w.pBox, bootId: "boot-9", now: w.now }), "ok");
+  assert.equal(await checkRole({ store: w.ps, link: w.pLink, appliance: w.pBox, bootId: "boot-9", now: w.now }), "unreachable");
   assert.equal(w.ps.role, "primary");
   assert.ok(!w.pBox.calls.some((c) => /^stop/.test(c)));
 });
@@ -416,4 +416,160 @@ test("planned switchover: a failure before the lease moves brings the apps back 
   await cancelSwitchover({ ...sw, capture: async () => "x" }, "admin");
   assert.equal((await w.pBox.listServices()).find((s) => s.name === "vibe-tb")!.running, true);
   assert.equal(activeOperation(w.ps), undefined);
+});
+
+// ---- review 2026-11-18: the role lease must reach the other box ---------------
+
+test("promote (bucket): an unreachable bucket blocks the checks instead of reading as 'primary down'", async () => {
+  const w = pair();
+  w.clock.t += 20 * 60 * 1000;
+  w.bucket.down = true;
+  const c = await promoteChecks({ store: w.ss, link: w.sRead, now: w.now });
+  assert.equal(c.bucketUnreachable, true);
+  assert.equal(c.blocked, true);
+  assert.match(c.messages.join(" "), /cannot reach the storage bucket/);
+});
+
+test("promote (bucket): a lease that did not land in the bucket stops the promote at that step, and Continue retries it", async () => {
+  const w = pair();
+  w.clock.t += 20 * 60 * 1000;
+  // The write key is refused (FakeS3 read-only), as with a wrong or revoked key.
+  let r = await runPromote(w.promoteDeps({ takeWriteAccess: async () => w.sRead }), { confirm: "PROMOTE", actor: "admin" });
+  assert.equal(r.ok, false);
+  assert.equal(r.failedStep, "lease");
+  assert.match(r.error ?? "", /could not record the change in the storage bucket/);
+  assert.ok(!w.sBox.calls.includes("setStandbyMode:false"), "nothing was started");
+  assert.equal(w.ss.role, "standby");
+  r = await runPromote(w.promoteDeps(), { actor: "admin" });
+  assert.equal(r.ok, true);
+  assert.ok(w.bucket.objects.has(`control/lease/00000002-${S}.json`));
+});
+
+test("Start anyway (bucket): refused while the bucket cannot be written; a failed app start leaves the box held and can be retried", async () => {
+  const w = pair();
+  w.ps.set("lastBootId", "boot-1");
+  promotedElsewhere(w);
+  const g = { store: w.ps, link: w.pLink, appliance: w.pBox, bootId: "boot-2", now: w.now };
+  await checkRole(g);
+  assert.equal(w.ps.role, "replaced");
+  w.bucket.down = true;
+  await assert.rejects(startAnyway(g, "admin"), /could not record the change/);
+  assert.equal(w.ps.role, "replaced");
+  w.bucket.down = false;
+  w.pBox.failNext.set("startApps", new Error("docker refused"));
+  await assert.rejects(startAnyway(g, "admin"));
+  assert.equal(w.ps.role, "replaced", "still held, so the admin can try again");
+  assert.equal(w.pBox.standbyMode, true);
+  assert.equal(activeOperation(w.ps), undefined);
+  await startAnyway(g, "admin");
+  assert.equal(w.ps.role, "primary");
+});
+
+test("guard: a lease store that is unreachable right after boot keeps the boot check open, so the box still holds when it can read", async () => {
+  const w = pair();
+  w.ps.set("lastBootId", "boot-1");
+  promotedElsewhere(w);
+  const g = { store: w.ps, link: w.pLink, appliance: w.pBox, bootId: "boot-2", now: w.now };
+  w.bucket.down = true;
+  assert.equal(await checkRole(g), "unreachable");
+  assert.equal(w.ps.role, "primary");
+  w.clock.t += 5 * 60 * 1000;
+  w.bucket.down = false;
+  assert.equal(await checkRole(g), "held-at-boot");
+  assert.equal(w.ps.role, "replaced");
+});
+
+test("guard: after the grace period an unreachable store no longer counts as the boot check (a running box never stops itself)", async () => {
+  const w = pair();
+  w.ps.set("lastBootId", "boot-1");
+  promotedElsewhere(w);
+  const g = { store: w.ps, link: w.pLink, appliance: w.pBox, bootId: "boot-2", now: w.now };
+  w.bucket.down = true;
+  assert.equal(await checkRole(g), "unreachable");
+  w.clock.t += 20 * 60 * 1000;
+  assert.equal(await checkRole(g), "unreachable");
+  w.bucket.down = false;
+  assert.equal(await checkRole(g), "conflict-warned");
+  assert.equal(w.ps.role, "primary");
+});
+
+test("guard: hold-at-boot is recorded only once the apps really stopped; a console that is not up yet is retried", async () => {
+  const w = pair();
+  w.ps.set("lastBootId", "boot-1");
+  promotedElsewhere(w);
+  const g = { store: w.ps, link: w.pLink, appliance: w.pBox, bootId: "boot-2", now: w.now };
+  w.pBox.failNext.set("stopApps", new Error("docker refused"));
+  assert.equal(await checkRole(g), "unreachable");
+  assert.equal(w.ps.role, "primary", "not recorded as held while its apps are still running");
+  assert.equal(await checkRole(g), "held-at-boot");
+  assert.equal(w.pBox.standbyMode, true);
+});
+
+test("planned switchover: cancel is refused once the other box was promoted, and needs a deliberate override when that cannot be checked", async () => {
+  const w = pair();
+  const sw = { store: w.ps, appliance: w.pBox, capture: async () => "snap-final", announce: async () => {}, link: w.pLink, now: w.now };
+  await startSwitchover(sw, { confirm: SWITCHOVER_PHRASE, actor: "admin" });
+  w.bucket.down = true;
+  await assert.rejects(cancelSwitchover(sw, "admin"), (e: Error & { code?: string }) => e.code === "cannot-check");
+  assert.equal((await w.pBox.listServices()).find((s) => s.name === "vibe-tb")!.running, false);
+  w.bucket.down = false;
+  promotedElsewhere(w);
+  await assert.rejects(cancelSwitchover(sw, "admin", { force: true }), (e: Error & { code?: string }) => e.code === "promoted");
+  assert.equal((await w.pBox.listServices()).find((s) => s.name === "vibe-tb")!.running, false, "the apps stay stopped: the other box is live");
+});
+
+test("planned switchover: with the standby unreachable and not promoted, the override brings the apps back", async () => {
+  const w = pair();
+  const sw = { store: w.ps, appliance: w.pBox, capture: async () => "snap-final", announce: async () => { if (w.bucket.down) throw new Error("fetch failed"); }, link: w.pLink, now: w.now };
+  await startSwitchover(sw, { confirm: SWITCHOVER_PHRASE, actor: "admin" });
+  w.bucket.down = true;
+  await cancelSwitchover(sw, "admin", { force: true });
+  assert.equal((await w.pBox.listServices()).find((s) => s.name === "vibe-tb")!.running, true);
+  assert.equal(activeOperation(w.ps), undefined);
+});
+
+test("status: a retry in progress does not hide the failure before it (no 'back to normal' email mid-retry)", () => {
+  const w = pair();
+  const failed = w.ss.startSyncRun();
+  w.ss.finishSyncRun(failed, { ok: false, error: "restored files do not match the snapshot" });
+  w.ss.startSyncRun(); // the next attempt, still running
+  const s = computeStatus(w.ss, cfg, w.now());
+  assert.equal(s.health, "failed");
+  assert.equal(s.lastSync?.ok, false);
+  assert.match(s.lastSync?.error ?? "", /do not match/);
+});
+
+test("status: files skipped by a live capture are carried in the status for the panel, without raising an alert every night", () => {
+  const w = pair();
+  w.ps.set("lastCapture", { snapshotId: "s", at: w.now().toISOString(), ok: true, unreadable: 3 });
+  const s = computeStatus(w.ps, cfg, w.now());
+  assert.equal(s.health, "healthy");
+  assert.equal(s.lastCapture?.unreadable, 3);
+});
+
+// ---- review 2026-11-18: cancel, re-pair, interrupted operations ---------------
+
+test("promote: a cancel after the lease moved gives the lease back, so the primary is not left reading as replaced", async () => {
+  const w = pair();
+  w.clock.t += 20 * 60 * 1000;
+  w.sBox.failNext.set("setStandbyMode:false", new Error("host runner is not answering"));
+  const r = await runPromote(w.promoteDeps(), { confirm: "PROMOTE", actor: "admin" });
+  assert.equal(r.failedStep, "leave-standby-mode");
+  assert.equal(highest((await w.pLink.readLeases()).leases)!.holderNodeId, S, "the lease had moved");
+  let returned = 0;
+  await cancelPromote({ store: w.ss, appliance: w.sBox, returnLease: async () => {
+    returned++;
+    const top = highest((await w.sWrite.readLeases()).leases)!;
+    await w.sWrite.writeLease({ epoch: top.epoch + 1, holderNodeId: P, writtenAt: w.now().toISOString(), reason: "promote cancelled on the standby" });
+  } }, "admin");
+  assert.equal(returned, 1);
+  assert.equal(highest((await w.pLink.readLeases()).leases)!.holderNodeId, P);
+  assert.equal(await checkRole({ store: w.ps, link: w.pLink, appliance: w.pBox, bootId: "boot-next", now: w.now }), "ok", "the primary boots normally");
+  // A cancel whose hand-back cannot be recorded does not count, and can be repeated.
+  const w2 = pair();
+  w2.clock.t += 20 * 60 * 1000;
+  w2.sBox.failNext.set("setStandbyMode:false", new Error("x"));
+  await runPromote(w2.promoteDeps(), { confirm: "PROMOTE", actor: "admin" });
+  await assert.rejects(cancelPromote({ store: w2.ss, appliance: w2.sBox, returnLease: async () => { throw new Error("bucket unreachable"); } }, "admin"), /bucket unreachable/);
+  assert.ok(activePromote(w2.ss), "still in progress");
 });

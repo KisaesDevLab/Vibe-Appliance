@@ -72,8 +72,8 @@ One service, `vibe-standby`, runs on both boxes. Roles: `unpaired`, `primary`, `
 
 ## Appliance-side pieces (same repo)
 
-- Standby mode in `state.json`, enforced at boot by a root unit before Docker's restart policy matters, and honoured by bootstrap, `update.sh` and enable-app.
-- Console routes under `/api/v1/standby-control/`, authenticated by a service token that only the `standby` container holds: stop all apps, start all apps, start and stop `cloudflared`, pull images by digest, list running digests, per-app health, isolated start for the drill.
+- Standby mode in `state.json`, honoured by bootstrap, `update.sh`, enable-app, `infra/cloudflared-up.sh`, settings save and the console's update, tunnel and network-mode routes. A box in standby mode stays stopped because `docker stop` plus `unless-stopped` keeps containers down. A paired **primary** is held across a reboot by root systemd units (`infra/standby-boot-hold-install.sh`, the "boot hold" section of `lib/standby-host.sh`): its apps, Redis and tunnel are stopped at shutdown and at boot, and started again by this service once it has read the role record, or by the host's 10-minute safety timer. It does nothing on an unpaired box and never starts anything in standby mode.
+- Console routes under `/api/v1/standby-control/`, authenticated by a service token kept in `/opt/vibe/standby/local/control.token` (root only; read by the console and the `standby` container, never in `shared.env`): stop all apps, start all apps, start and stop `cloudflared`, pull images by digest, list running digests, per-app health, isolated start for the drill.
 - Host-runner actions (root): place the restored mirror into `/opt/vibe` at promote, check out a given appliance commit and rebuild, re-render env for this host, archive before rejoin.
 - Because the service is built from the repo, "version mirror" means: same appliance commit, same enabled apps, same image digests.
 

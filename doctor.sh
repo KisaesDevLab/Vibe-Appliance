@@ -819,6 +819,39 @@ check_system_updates() {
   esac
 }
 
+check_standby_boot_hold() {
+  _check_begin "Vibe Standby boot hold"
+  # Keeps a paired primary's apps stopped across a reboot until the role
+  # record has been read (infra/standby-boot-hold-install.sh). Does
+  # nothing on a box that is not paired, so a missing unit only matters
+  # once Standby is in use.
+  if state_in_container; then
+    case "$(state_get_host_service standby-boot-hold status)" in
+      active)   _check_pass "armed (per state.host_services)" ;;
+      inactive) _check_warn "not armed — a primary replaced while it was off would start its apps at boot until the Standby service stops them" \
+                  "Fix: sudo bash /opt/vibe/appliance/infra/standby-boot-hold-install.sh" ;;
+      *)        _check_warn "no host_services entry — this install predates the boot hold; re-run bootstrap" \
+                  "Fix: sudo bash /opt/vibe/appliance/infra/standby-boot-hold-install.sh" ;;
+    esac
+    return
+  fi
+  if systemctl is-enabled vibe-standby-boot-hold.service >/dev/null 2>&1 \
+     && systemctl is-active vibe-standby-boot-release.timer >/dev/null 2>&1; then
+    _check_pass "vibe-standby-boot-hold.service enabled, safety timer active"
+  else
+    _check_warn "the boot-hold units are not enabled — a primary replaced while it was off would start its apps at boot until the Standby service stops them" \
+      "Fix: sudo bash /opt/vibe/appliance/infra/standby-boot-hold-install.sh"
+  fi
+  if grep -q '"decision": *"held"' "${VIBE_DIR}/standby/boot-held.json" 2>/dev/null; then
+    _check_warn "this box is held: the other box was promoted while this one was off, so its apps stay stopped until an admin decides" \
+      "Open Standby in the console and choose Rejoin as standby, or Start anyway"
+  elif [[ -f "${VIBE_DIR}/standby/boot-held.json" ]]; then
+    _check_warn "apps are being held since boot (${VIBE_DIR}/standby/boot-held.json exists). The Standby service releases them after the role check, the host after 10 minutes." \
+      "Diagnose: sudo docker logs vibe-standby --tail 50; cat ${VIBE_DIR}/standby/boot-held.json" \
+      "Fix (starts everything): sudo bash /opt/vibe/appliance/bootstrap.sh"
+  fi
+}
+
 check_host_runner() {
   _check_begin "Host-action runner"
   # The bridge behind the console's Sentinel buttons: requests queue
@@ -1253,6 +1286,7 @@ check_emergency_proxy           # Workstream D
 check_ufw_rules                 # Workstream D
 check_system_updates            # host OS update picture (attestation)
 check_host_runner               # console → host bridge for Sentinel actions
+check_standby_boot_hold         # paired primary held at boot until the role check
 check_settings_audit_db         # Workstream C
 check_cookie_policy             # security-gate drift
 check_landing_gate              # client portal requires Vibe Auth (when on)

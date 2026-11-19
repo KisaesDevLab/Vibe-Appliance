@@ -56,11 +56,19 @@ export type SyncOutcome =
   | { status: "skipped"; reason: string };
 
 interface SwapPending { snapshotId: string; databases: string[]; copy: VerifiedCopy }
+/** What the "mirror-version" step still has to do for a snapshot whose data is already in place. */
+interface VersionPending { snapshotId: string; applianceCommit: string; enabledApps: string[]; imageDigests: Record<string, string>; cautions: string[] }
+
+/** The hard-link copy while it is still being made. Only a finished copy is ever named `mirror.prev`. */
+const partialPrev = (paths: Paths): string => `${paths.mirrorPrev}.partial`;
 
 /** An operation that must not overlap with a sync (promote, failback, drill). */
 export function activeOperation(store: Store): string | undefined { return store.get<string>("operation"); }
 
 async function rollbackMirror(paths: Paths): Promise<boolean> {
+  // A copy that was interrupted is not a copy: it is removed, never put in
+  // place of the verified mirror (invariant 5).
+  await rm(partialPrev(paths), { recursive: true, force: true });
   if (!existsSync(paths.mirrorPrev)) return false;
   await rm(paths.mirror, { recursive: true, force: true });
   await rename(paths.mirrorPrev, paths.mirror);
@@ -109,6 +117,23 @@ async function verifyFiles(d: SyncDeps, snapshotId: string): Promise<string[]> {
   return problems;
 }
 
+/** After the data is in place: prune the hosted repository and follow the primary's appliance version. Never fatal. */
+async function followVersion(d: SyncDeps, owed: VersionPending): Promise<string[]> {
+  const issues = [...owed.cautions];
+  try {
+    if (d.pruneHosted) await d.pruneHosted([owed.snapshotId]);
+  } catch (err) { issues.push(`could not prune the repository: ${(err as Error).message}`); }
+  try {
+    const mine = await d.appliance.version();
+    if (mine.applianceCommit !== owed.applianceCommit || mine.enabledApps.join() !== owed.enabledApps.join()) {
+      await d.appliance.mirrorVersion({ applianceCommit: owed.applianceCommit, enabledApps: owed.enabledApps, imageDigests: owed.imageDigests });
+    }
+  } catch (err) { issues.push(`could not follow the primary's version: ${(err as Error).message}`); }
+  d.store.set("versionIssues", issues);
+  d.store.unset("versionPending");
+  return issues;
+}
+
 let running = false;
 
 export async function runSync(d: SyncDeps): Promise<SyncOutcome> {
@@ -130,12 +155,27 @@ export async function runSync(d: SyncDeps): Promise<SyncOutcome> {
     await recover(d);
 
     await enter("select");
-    const latest = (await d.repo.listSnapshots())[0];
-    if (!latest) throw new Error("the primary has not sent a snapshot yet");
     const have = d.store.get<VerifiedCopy>("verifiedCopy");
+    // Nothing sent yet is the normal state after pairing (the first upload
+    // can take hours), not a failed sync. In direct mode the repository this
+    // box hosts does not even exist until the primary's first copy starts.
+    let latest: Awaited<ReturnType<Repository["listSnapshots"]>>[number] | undefined;
+    try { latest = (await d.repo.listSnapshots())[0]; }
+    catch (err) { if (have) throw err; d.store.set("waitingNote", (err as Error).message.split("\n")[0]); }
+    if (!latest && have) throw new Error("the repository no longer holds any copy from the primary, although this box received one before. The previous verified copy is still in place here");
+    if (!latest) {
+      d.store.finishSyncRun(runId, { ok: true, snapshotId: "" });
+      outcome = { status: "skipped", reason: "the primary has not sent a copy yet" };
+      return outcome;
+    }
+    d.store.unset("waitingNote");
     if (have?.snapshotId === latest.id) {
+      // The data is in place. If an earlier run was cut short after the swap,
+      // it still owes this snapshot the version step.
+      const owed = d.store.get<VersionPending>("versionPending");
+      const versionIssues = owed?.snapshotId === latest.id ? await followVersion(d, owed) : (d.store.get<string[]>("versionIssues") ?? []);
       d.store.finishSyncRun(runId, { ok: true, snapshotId: latest.id });
-      outcome = { status: "ok", snapshotId: latest.id, changed: false, versionIssues: [] };
+      outcome = { status: "ok", snapshotId: latest.id, changed: false, versionIssues };
       return outcome;
     }
 
@@ -150,7 +190,13 @@ export async function runSync(d: SyncDeps): Promise<SyncOutcome> {
     } catch (err) { versionIssues.push(`image pull failed: ${(err as Error).message}`); }
 
     await enter("restore-files");
-    if (existsSync(d.paths.mirror)) await run("cp", ["-al", d.paths.mirror, d.paths.mirrorPrev]);
+    if (existsSync(d.paths.mirror)) {
+      // Made under another name and renamed when complete, so that recovery
+      // can trust `mirror.prev` whenever it exists.
+      await rm(partialPrev(d.paths), { recursive: true, force: true });
+      await run("cp", ["-al", d.paths.mirror, partialPrev(d.paths)]);
+      await rename(partialPrev(d.paths), d.paths.mirrorPrev);
+    }
     await d.repo.restore(latest.id, d.paths.mirror);
 
     await enter("verify-files");
@@ -160,8 +206,15 @@ export async function runSync(d: SyncDeps): Promise<SyncOutcome> {
     if (fileProblems.length) throw new Error(`restored files do not match the snapshot: ${fileProblems.join("; ")}`);
 
     await enter("restore-databases");
-    await d.pg.applyGlobals(join(stage, "globals.sql"));
-    for (const db of manifest.databases) await d.pg.restoreIncoming(db.name, join(stage, "db", `${db.name}.dump`), db.owner);
+    // Problems the restore tools skipped past. Verification below covers
+    // tables, rows, indexes and extensions; it does not cover roles, grants,
+    // views, functions or triggers, so these are kept and shown, not dropped.
+    const globalsNote = await d.pg.applyGlobals(join(stage, "globals.sql"));
+    if (globalsNote) versionIssues.push(`roles and permissions were applied with errors: ${globalsNote}`);
+    for (const db of manifest.databases) {
+      const warn = await d.pg.restoreIncoming(db.name, join(stage, "db", `${db.name}.dump`), db.owner);
+      if (warn) versionIssues.push(`the database ${db.name} was restored with warnings: ${warn.split("\n").filter((l) => /error/i.test(l))[0] ?? warn.split("\n")[0]}`);
+    }
 
     await enter("verify-databases");
     const dbProblems: string[] = [];
@@ -178,6 +231,10 @@ export async function runSync(d: SyncDeps): Promise<SyncOutcome> {
       applianceCommit: manifest.applianceCommit, enabledApps: manifest.enabledApps, databases: manifest.databases.map((x) => x.name),
     };
     const pending: SwapPending = { snapshotId: latest.id, databases: copy.databases, copy };
+    // Recorded with the swap decision: if this run stops after the swap, the
+    // next one still follows the primary's version for this snapshot.
+    const owed: VersionPending = { snapshotId: latest.id, applianceCommit: manifest.applianceCommit, enabledApps: manifest.enabledApps, imageDigests: manifest.imageDigests, cautions: versionIssues };
+    d.store.set("versionPending", owed);
     d.store.set("swapPending", pending);
     committed = true; // from here a crash rolls forward, never back
 
@@ -186,18 +243,7 @@ export async function runSync(d: SyncDeps): Promise<SyncOutcome> {
     d.store.finishSyncRun(runId, { ok: true, snapshotId: latest.id });
 
     await enter("mirror-version");
-    try {
-      if (d.pruneHosted) await d.pruneHosted([latest.id]);
-    } catch (err) { versionIssues.push(`could not prune the repository: ${(err as Error).message}`); }
-    try {
-      const mine = await d.appliance.version();
-      if (mine.applianceCommit !== manifest.applianceCommit || mine.enabledApps.join() !== manifest.enabledApps.join()) {
-        await d.appliance.mirrorVersion({ applianceCommit: manifest.applianceCommit, enabledApps: manifest.enabledApps, imageDigests: manifest.imageDigests });
-      }
-    } catch (err) { versionIssues.push(`could not follow the primary's version: ${(err as Error).message}`); }
-    d.store.set("versionIssues", versionIssues);
-
-    outcome = { status: "ok", snapshotId: latest.id, changed: true, versionIssues };
+    outcome = { status: "ok", snapshotId: latest.id, changed: true, versionIssues: await followVersion(d, owed) };
     return outcome;
   } catch (err) {
     const error = (err as Error).message;
