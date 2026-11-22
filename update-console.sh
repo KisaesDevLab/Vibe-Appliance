@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # update-console.sh — rebuild and recreate the appliance's console container.
 #
-# Use this after a `git pull` (or any hand-edit under console/) to make
+# Use this after changing anything under console/ by hand (on a developer
+# box: after a `git pull`) to make
 # console source changes actually take effect at runtime. Required
 # because the console image bakes its source into /app/ at docker-build
 # time (console/Dockerfile:49-50). A plain `docker compose restart

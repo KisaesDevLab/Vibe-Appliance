@@ -1,5 +1,8 @@
 // tests/selfupdate/local-commit.test.js
 //
+// Git channel only (developer boxes, `bootstrap.sh --channel=git`).
+// Release-channel updates are covered by tests/release/self-update.test.js.
+//
 // An appliance may carry a local commit on top of upstream: a
 // host-specific override the operator committed so it survives updates.
 // That is a supported state, and self-update has to handle it.
@@ -79,7 +82,9 @@ function runSelfUpdate({ app, logs }) {
     execFileSync('bash', [SCRIPT], {
       cwd: app,
       encoding: 'utf8',
-      env: { ...process.env, APPLIANCE_DIR: app, VIBE_LOG_DIR: logs },
+      // A local commit on top of upstream only exists on the git channel
+      // (developer boxes); customer boxes are on the release channel.
+      env: { ...process.env, APPLIANCE_DIR: app, VIBE_LOG_DIR: logs, VIBE_APPLIANCE_CHANNEL: 'git' },
     });
   } catch { /* non-zero exit is a valid outcome; the status file is the assertion surface */ }
   return JSON.parse(fs.readFileSync(path.join(logs, 'self-update.status.json'), 'utf8'));

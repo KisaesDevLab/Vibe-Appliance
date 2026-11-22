@@ -2554,10 +2554,11 @@ app.post('/api/v1/admin/prune-images', requireAdmin, testRateLimit, globalOp('im
 
 // --- Appliance self-update -------------------------------------------
 //
-// Updates the APPLIANCE itself (this git checkout), as opposed to
-// /api/v1/update/:slug which updates a single app's GHCR image. Closes
-// the last routine operation that required SSH: `git pull` +
-// `bootstrap.sh`. The audience is novice CPAs — an operation only
+// Updates the APPLIANCE itself (the release installed at
+// /opt/vibe/appliance, from the public release channel; or, on a
+// developer box, the git checkout), as opposed to /api/v1/update/:slug
+// which updates a single app's GHCR image. Closes the last routine
+// operation that required SSH. The audience is novice CPAs — an operation only
 // reachable from a terminal may as well not exist.
 //
 // This cannot use runShell. bootstrap.sh recreates the console
@@ -2742,7 +2743,7 @@ app.post('/api/v1/admin/self-update', requireAdmin, testRateLimit, async (_req, 
     return res.status(500).json({
       ok: false,
       error: 'Could not start the update: ' + (trim(result.stderr, 300) || `exit ${result.code}`) +
-             '. SSH path: cd /opt/vibe/appliance && sudo git pull && sudo bash bootstrap.sh',
+             '. SSH path: sudo bash /opt/vibe/appliance/lib/self-update.sh',
     });
   }
   log('info', 'self-update launched (detached on host)');

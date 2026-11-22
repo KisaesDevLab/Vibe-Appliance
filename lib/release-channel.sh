@@ -50,6 +50,7 @@ RC_ASSET="vibe-appliance.tar.gz"
 RC_ERROR="" RC_HINT=""
 RC_VERSION="" RC_COMMIT="" RC_SHA256=""
 RC_CHANGED=""
+RC_BACKUP=""    # set by rc_install_next when it parks a git checkout
 
 _rc_fail() { RC_ERROR="$1"; RC_HINT="${2:-}"; return 1; }
 _rc_say() { printf '[release-channel] %s\n' "$*" >&2; }
@@ -299,6 +300,7 @@ rc_install_next() {
     rc_swap
   elif [[ -d "${RC_LIVE}/.git" ]]; then
     local backup="${RC_LIVE}.git-backup.${stamp}" edited
+    RC_BACKUP="$backup"
     edited="$(git -C "$RC_LIVE" status --porcelain --untracked-files=no 2>/dev/null || true)"
     rc_carry "$RC_LIVE" "$RC_NEXT" || return 1
     mv "$RC_LIVE" "$backup" || { _rc_fail "could not move the git checkout aside"; return 1; }
