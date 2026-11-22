@@ -2767,3 +2767,35 @@ Append to this list as phases complete. Format:
     different one; `docs/STANDBY_TWO_BOX_TEST.md`. Linux container: appliance
     suite 470/470, Standby suite 126/126, units pass `systemd-analyze verify`.
     Not run under real systemd or against Cloudflare.
+- 2026-11-22: Release channel, so the source repo can go private (branch `feat/release-channel`).
+  - **Why.** Install, self-update, the standby's version sync and the Sentinel
+    installer all did anonymous git against this repo. They now use a public
+    release channel (GitHub Releases on `KisaesDevLab/vibe-appliance-releases`);
+    design in PLAN.md §2a, runbook in `docs/RELEASING.md`.
+  - **Release tooling.** `tools/release.sh` + `tools/release-build.py`:
+    reproducible tarball from git objects, `RELEASE` + `RELEASE.files.sha256`,
+    the operator `CLAUDE.md` (`release/CLAUDE.operator.md`), Sentinel installer
+    bundled under `vendor/`. `.gitattributes` export-ignores the build plan,
+    tests and CI. New top-level `VERSION` (0.5.0).
+  - **On the box.** `lib/release-channel.sh` (fetch → verify → carry → swap,
+    recover, rollback). The one-liner installs no git. A git checkout converts on
+    its next bootstrap from disk. Deviation from the draft plan: the draft put
+    conversion only in the curl|bash path, which self-update and standby never
+    take. `--channel=git` (persisted) keeps developer boxes on git.
+    `lib/self-update.sh` updates by version, and the status file gains
+    `from_version`/`to_version`. The standby follows by version
+    (`applianceVersion` next to `applianceCommit`). The console, the
+    host-runner and `standby-host.sh` accept versions as refs. The Sentinel
+    installer is pinned to a commit (it was `main`) and is installed from the
+    bundle.
+  - **Verified.** Linux container (node:24-bookworm): appliance suite 492/492,
+    including new tests that build real release tarballs and serve them from a
+    file:// channel (install, update with carried overrides, hand-edit refusal,
+    tampered download, interrupted swap, rollback, git conversion, one-liner
+    hand-over, bundled Sentinel installer). Standby: `tsc` clean, client tests
+    pass. On Windows the suite fails the same 115 tests as `main`
+    (`python3`/file-mode environment), with no new failures.
+  - **Not verified.** No fresh Ubuntu droplet run of the one-liner, conversion
+    or self-update; no two-box standby run; no real GitHub release published
+    (`vibe-appliance-releases` does not exist yet). Releases are not signed.
+    That is the planned next step, and it must ship before the repo goes private.

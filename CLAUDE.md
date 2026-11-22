@@ -25,7 +25,8 @@ See `docs/PLAN.md` §1 for the canonical file tree. Key anchors:
 - `bootstrap.sh` — single entry point. Phased; each phase idempotent.
 - `doctor.sh` — diagnostic runner. Called by bootstrap, by console, and standalone.
 - `update.sh` — update orchestrator. Pre-update DB backup; rollback on health-check failure.
-- `lib/` — sourced helpers (`log.sh`, `state.sh`, `preflight.sh`, `secrets.sh`, `render-caddyfile.sh`, `enable-app.sh`, `disable-app.sh`, `db-bootstrap.sh`, `sentinel-module.sh`).
+- `lib/` — sourced helpers (`log.sh`, `state.sh`, `preflight.sh`, `secrets.sh`, `render-caddyfile.sh`, `enable-app.sh`, `disable-app.sh`, `db-bootstrap.sh`, `sentinel-module.sh`, `release-channel.sh`).
+- `tools/release.sh` — builds a release for the public channel (`KisaesDevLab/vibe-appliance-releases`); customer boxes install releases, not git. See `docs/RELEASING.md` and PLAN.md §2a. This CLAUDE.md is export-ignored; boxes get `release/CLAUDE.operator.md` as their CLAUDE.md. Keep that file in step when an operator-facing rule changes.
 - `docker-compose.yml` — core only (Caddy, Postgres, Redis, Console).
 - `apps/<slug>.yml` — per-app compose overlays. Use GHCR images. Do not duplicate per-app Postgres/Redis services — point them at the shared instances.
 - `caddy/Caddyfile.tmpl` + `caddy/snippets/{domain,lan,tailscale}.conf` — templated; rendered by bootstrap.
