@@ -124,12 +124,15 @@ os.replace(tmp, path)
 PYEOF
 }
 
-# git + jq are needed by the Sentinel checkout and its installer. On the
-# host, apt is real — install them if missing (the exact gap that made
-# the in-container path die with "git is not installed").
+# jq is needed by the Sentinel installer; git only to fetch the installer
+# on a developer box (a release install bundles it). On the host, apt is
+# real — install them if missing (the exact gap that made the in-container
+# path die with "git is not installed").
 _ha_ensure_tools() {
   local missing=()
-  command -v git >/dev/null 2>&1 || missing+=(git)
+  if [[ ! -f "$APPLIANCE_DIR/vendor/vibe-sentinel-installer.tar.gz" ]]; then
+    command -v git >/dev/null 2>&1 || missing+=(git)
+  fi
   command -v jq  >/dev/null 2>&1 || missing+=(jq)
   (( ${#missing[@]} )) || return 0
   log_step "installing required tools: ${missing[*]}"

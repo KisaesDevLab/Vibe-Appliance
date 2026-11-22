@@ -37,12 +37,14 @@ fi
 VIBE_DIR="${VIBE_DIR:-/opt/vibe}"
 VIBE_STATE_FILE="${VIBE_STATE_FILE:-$VIBE_DIR/state.json}"
 
-# The installer checkout. Pinned to a tag rather than tracking main: this
-# appliance's console offers buttons whose behaviour must not change because
-# somebody pushed to another repo. Bump deliberately, after the harness.
+# The installer. Pinned to a commit rather than tracking main (the repo has
+# no tags yet): this appliance's console offers buttons whose behaviour must
+# not change because somebody pushed to another repo. Bump deliberately,
+# after the harness. tools/release.sh bundles exactly this ref into each
+# appliance release; keep the line in this form, the release tool reads it.
 SENTINEL_INSTALLER_DIR="${SENTINEL_INSTALLER_DIR:-/opt/vibe-sentinel-installer}"
 SENTINEL_INSTALLER_REPO="${SENTINEL_INSTALLER_REPO:-https://github.com/KisaesDevLab/vibe-sentinel-installer.git}"
-SENTINEL_INSTALLER_REF="${SENTINEL_INSTALLER_REF:-main}"
+SENTINEL_INSTALLER_REF="${SENTINEL_INSTALLER_REF:-070ab3b7f0251835b9aacfd5c87507b3d38511cb}"
 
 # --- manifest helpers ------------------------------------------------------
 _sm_manifest() { printf '%s/console/manifests/%s.json' "$APPLIANCE_DIR" "$1"; }
@@ -352,9 +354,58 @@ _sm_check_host_prereqs() { # <slug> -> 0 ok, 1 unmet
 
 # --- installer checkout ----------------------------------------------------
 # Nothing is downloaded onto a firm's host until an operator asks for a
-# Sentinel action. Pinned to a ref so the buttons keep their behaviour.
+# Sentinel action. Pinned so the buttons keep their behaviour.
+#
+# Release installs carry the installer inside the appliance release
+# (vendor/vibe-sentinel-installer.tar.gz, a GitHub archive of
+# SENTINEL_INSTALLER_REF, checked against the sha256 in RELEASE): no git,
+# no second download, and the installer version moves only with an
+# appliance release. Developer boxes without the bundle fetch it with git.
+#
+# Idempotent: an installer already extracted from the same bundle is left
+# alone. Reverse: the previous installer tree is kept at <dir>.prev.
+_sm_vendored_tarball() { printf '%s/vendor/vibe-sentinel-installer.tar.gz' "$APPLIANCE_DIR"; }
+
+_sm_install_vendored() {
+  local tgz="$1" want got tmp="${SENTINEL_INSTALLER_DIR}.new"
+  want="$(python3 - "$APPLIANCE_DIR/RELEASE" <<'PYEOF' 2>/dev/null || true
+import json, sys
+try:
+    print((json.load(open(sys.argv[1])).get("sentinel_installer") or {}).get("sha256", ""))
+except Exception:
+    print("")
+PYEOF
+)"
+  got="$(sha256sum "$tgz" | cut -d' ' -f1)"
+  [[ -n "$want" && "$got" == "$want" ]] || die \
+    "The Sentinel installer bundled with this appliance release does not match its checksum." \
+    "diagnose: cd $APPLIANCE_DIR && sudo sha256sum -c --quiet RELEASE.files.sha256
+fix:      re-install the appliance release (the install one-liner keeps data and settings), then retry"
+  if [[ -f "$SENTINEL_INSTALLER_DIR/.vendored-sha256" && "$(cat "$SENTINEL_INSTALLER_DIR/.vendored-sha256")" == "$got" \
+        && -f "$SENTINEL_INSTALLER_DIR/modules/module.sh" ]]; then
+    log_step "Sentinel installer is the version bundled with this release" ref="$SENTINEL_INSTALLER_REF"
+    return 0
+  fi
+  log_step "installing the Sentinel installer bundled with this release" ref="$SENTINEL_INSTALLER_REF"
+  rm -rf "$tmp"
+  mkdir -p "$tmp"
+  tar -xzf - -C "$tmp" --strip-components=1 <"$tgz" || { rm -rf "$tmp"; die \
+    "Could not unpack the bundled Sentinel installer." \
+    "diagnose: df -h $(dirname "$SENTINEL_INSTALLER_DIR")
+fix:      free some disk space, then retry from the Apps tab"; }
+  printf '%s\n' "$got" > "$tmp/.vendored-sha256"
+  if [[ -e "$SENTINEL_INSTALLER_DIR" ]]; then
+    rm -rf "${SENTINEL_INSTALLER_DIR}.prev"
+    mv "$SENTINEL_INSTALLER_DIR" "${SENTINEL_INSTALLER_DIR}.prev"
+  fi
+  mv "$tmp" "$SENTINEL_INSTALLER_DIR"
+}
+
 _sm_ensure_installer() {
-  if [[ -d "$SENTINEL_INSTALLER_DIR/.git" ]]; then
+  local tgz; tgz="$(_sm_vendored_tarball)"
+  if [[ -f "$tgz" ]]; then
+    _sm_install_vendored "$tgz"
+  elif [[ -d "$SENTINEL_INSTALLER_DIR/.git" ]]; then
     log_step "updating the Sentinel installer checkout" ref="$SENTINEL_INSTALLER_REF"
     git -C "$SENTINEL_INSTALLER_DIR" fetch --quiet --tags origin 2>/dev/null || \
       log_warn "could not fetch; using the checkout already on disk" dir="$SENTINEL_INSTALLER_DIR"
@@ -362,18 +413,19 @@ _sm_ensure_installer() {
       log_warn "could not check out $SENTINEL_INSTALLER_REF; using the current worktree"
   else
     command -v git >/dev/null 2>&1 || die \
-      "git is not installed, so the Sentinel installer cannot be fetched." \
-      "fix: sudo apt-get install -y git"
+      "git is not installed, and this appliance has no bundled Sentinel installer to use instead." \
+      "fix: sudo apt-get install -y git   (or install the appliance from a release, which bundles it)"
     log_step "fetching the Sentinel installer" repo="$SENTINEL_INSTALLER_REPO" ref="$SENTINEL_INSTALLER_REF"
-    git clone --quiet --branch "$SENTINEL_INSTALLER_REF" --depth 1 \
-      "$SENTINEL_INSTALLER_REPO" "$SENTINEL_INSTALLER_DIR" || die \
-      "Could not clone $SENTINEL_INSTALLER_REPO." \
-      "diagnose: git clone $SENTINEL_INSTALLER_REPO /tmp/probe
-fix:      check outbound HTTPS to github.com, then retry from the Apps tab."
+    # A commit id cannot be cloned with --branch; clone, then check it out.
+    { git clone --quiet "$SENTINEL_INSTALLER_REPO" "$SENTINEL_INSTALLER_DIR" && \
+      git -C "$SENTINEL_INSTALLER_DIR" checkout --quiet "$SENTINEL_INSTALLER_REF"; } || die \
+      "Could not fetch $SENTINEL_INSTALLER_REPO at $SENTINEL_INSTALLER_REF." \
+      "diagnose: git clone $SENTINEL_INSTALLER_REPO /tmp/probe && git -C /tmp/probe checkout $SENTINEL_INSTALLER_REF
+fix:      check outbound HTTPS to github.com, then retry from the Apps tab"
   fi
   [[ -f "$SENTINEL_INSTALLER_DIR/modules/module.sh" ]] || die \
     "$SENTINEL_INSTALLER_DIR has no modules/module.sh." \
-    "The checkout is at a ref that predates per-module enable/disable. Set SENTINEL_INSTALLER_REF to a newer tag and retry."
+    "The installer is at a ref that predates per-module enable/disable. Set SENTINEL_INSTALLER_REF to a newer commit and retry."
 }
 
 _sm_installed() { [[ -f /etc/vibe-sentinel/config.json ]]; }
