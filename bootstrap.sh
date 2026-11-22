@@ -203,7 +203,7 @@ FLAGS
   -h | --help                     Show this help.
 
 DOCS
-  See docs/PLAN.md and docs/PHASES.md in the repo.
+  See docs/INSTALL.md and docs/TROUBLESHOOTING.md under /opt/vibe/appliance.
 EOF
 }
 

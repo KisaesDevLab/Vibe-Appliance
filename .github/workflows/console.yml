@@ -27,6 +27,11 @@ on:
       - 'tests/**'
       - 'lib/**'
       - 'caddy/**'
+      - 'tools/**'
+      - 'release/**'
+      - 'bootstrap.sh'
+      - 'VERSION'
+      - '.gitattributes'
       - '.github/workflows/console.yml'
   pull_request:
     paths:
@@ -34,6 +39,11 @@ on:
       - 'tests/**'
       - 'lib/**'
       - 'caddy/**'
+      - 'tools/**'
+      - 'release/**'
+      - 'bootstrap.sh'
+      - 'VERSION'
+      - '.gitattributes'
       - '.github/workflows/console.yml'
   workflow_dispatch:
 
