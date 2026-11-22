@@ -49,7 +49,7 @@ You will need, before you start:
    placeholder values:
 
    ```
-   curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh \
+   curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-appliance-releases/main/bootstrap.sh \
      | sudo bash -s -- \
        --mode domain \
        --domain firm.com \
@@ -347,7 +347,7 @@ Cloudflare API credentials in the install command and run the tunnel
 setup script directly:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh \
+curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-appliance-releases/main/bootstrap.sh \
   | sudo bash -s -- \
     --mode domain \
     --domain firm.com \
@@ -557,7 +557,7 @@ through. You finish the Cloudflare-side setup in the admin UI after
 bootstrap.
 
 ```
-curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-appliance-releases/main/bootstrap.sh | sudo bash -s -- \
   --mode domain \
   --domain firm.com \
   --tunnel-subdomain vibe \
@@ -571,7 +571,7 @@ host is publicly reachable). The Cloudflare token lets Caddy issue a
 real Let's Encrypt cert via DNS-01 — no port-80 traffic needed.
 
 ```
-curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-appliance-releases/main/bootstrap.sh | sudo bash -s -- \
   --mode domain \
   --domain firm.com \
   --tunnel-subdomain vibe \
@@ -586,7 +586,7 @@ from the public internet so Caddy can complete Let's Encrypt's
 HTTP-01 challenge.
 
 ```
-curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-appliance-releases/main/bootstrap.sh | sudo bash -s -- \
   --mode domain \
   --domain firm.com \
   --tunnel-subdomain vibe \
@@ -596,20 +596,25 @@ curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bo
 ### LAN mode (physical box, internal-only)
 
 ```
-curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-appliance-releases/main/bootstrap.sh | sudo bash
 ```
 
 (LAN is the default mode; no flags needed.)
 
 > **About the URL.** All four commands above pipe `bootstrap.sh` from
-> this repo's `main` branch into bash. The script detects it's running
-> from a pipe, `apt-install`s `git`, clones the repo to
-> `/opt/vibe/appliance`, and re-execs from disk. The shorter
-> `curl https://install.kisaes.com/vibe.sh | sudo bash` URL is the
-> v1.1 redirector plan — not yet live. Use the GitHub raw URL today.
+> the public release channel (`KisaesDevLab/vibe-appliance-releases`)
+> into bash. The script detects it's running from a pipe, downloads the
+> latest appliance release, verifies its SHA-256 and every file in it,
+> unpacks it to `/opt/vibe/appliance`, and re-execs from disk. No git is
+> needed on the box. To install a specific release instead of the latest,
+> run `curl -fsSL <url> | sudo env VIBE_APPLIANCE_VERSION=0.5.0 bash -s -- <flags>`.
+> The shorter `curl https://install.kisaes.com/vibe.sh | sudo bash` URL
+> is the v1.1 redirector plan — not yet live. Use the GitHub raw URL today.
 >
-> If you've already cloned the repo by hand, you can also run
-> `sudo /opt/vibe/appliance/bootstrap.sh` with the same flags.
+> Once installed, re-run `sudo /opt/vibe/appliance/bootstrap.sh` with the
+> same flags to reconfigure or recover. An appliance installed from git
+> before the release channel existed switches itself over on its next
+> bootstrap; its old checkout is kept at `/opt/vibe/appliance.git-backup.<timestamp>`.
 
 ### Tailscale mode
 
@@ -618,7 +623,7 @@ Generate an authkey at
 Make it reusable and ephemeral if you might re-install later.
 
 ```
-curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-appliance-releases/main/bootstrap.sh | sudo bash -s -- \
   --mode tailscale \
   --tailscale-authkey tskey-auth-XXXXXX
 ```
@@ -626,7 +631,7 @@ curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bo
 ### Domain + Tailscale (combo)
 
 ```
-curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-appliance-releases/main/bootstrap.sh | sudo bash -s -- \
   --mode domain \
   --domain firm.com \
   --tunnel-subdomain vibe \

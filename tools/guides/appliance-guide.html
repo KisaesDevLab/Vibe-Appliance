@@ -55,7 +55,7 @@ Tokens → Create Token → Custom token, with permissions
 your zone. Copy it immediately — Cloudflare shows it once.</li>
 <li><strong>Run the installer</strong> on the droplet, replacing the two
 placeholder values:
-<pre><code>curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh \
+<pre><code>curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-appliance-releases/main/bootstrap.sh \
   | sudo bash -s -- \
     --mode domain \
     --domain firm.com \
@@ -81,10 +81,10 @@ appliance is live at <code>https://vibe.firm.com/</code> with real TLS.</li>
 <h2>4. The other install commands</h2>
 <p>Same installer, different flags. Run on the server as root.</p>
 <h3>LAN mode (the default — no flags)</h3>
-<pre><code>curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash</code></pre>
+<pre><code>curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-appliance-releases/main/bootstrap.sh | sudo bash</code></pre>
 <h3>Tailscale mode</h3>
 <p>Generate an authkey at login.tailscale.com → Settings → Keys, then:</p>
-<pre><code>curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash -s -- \
+<pre><code>curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-appliance-releases/main/bootstrap.sh | sudo bash -s -- \
   --mode tailscale \
   --tailscale-authkey tskey-auth-XXXXXX</code></pre>
 <h3>Domain mode with your own port forwarding (no tunnel)</h3>
