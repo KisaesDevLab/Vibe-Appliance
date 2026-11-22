@@ -2771,6 +2771,7 @@ app.get('/api/v1/admin/self-update/status', requireAdmin, (_req, res) => {
     ok: true,
     running_sha:    running && running.sha ? running.sha.slice(0, 7) : null,
     running_branch: running ? running.branch : null,
+    running_version: running && running.version ? running.version : null,
     status: current,
   });
 });
@@ -2791,11 +2792,33 @@ app.post('/api/v1/admin/refresh-host-ip', requireAdmin, testRateLimit, async (_r
 // read .git/HEAD and .git/logs/HEAD directly via fs from the bind-
 // mounted appliance dir. No auth — non-sensitive metadata, useful
 // from a curl.
+// Release-channel installs have no .git: their RELEASE file (written by
+// tools/release-build.py) is the version source. A git checkout on a
+// developer box still reports branch and reflog date as before.
+let _releaseInfoCache;
+function _readReleaseInfo() {
+  if (_releaseInfoCache !== undefined) return _releaseInfoCache;
+  _releaseInfoCache = null;
+  try {
+    const r = JSON.parse(fs.readFileSync(path.join(APPLIANCE_DIR, 'RELEASE'), 'utf8'));
+    if (r && typeof r.version === 'string') {
+      _releaseInfoCache = { version: r.version, commit: r.commit || null, built_at: r.built_at || null };
+    }
+  } catch { /* not a release install */ }
+  return _releaseInfoCache;
+}
+
 let _gitInfoCache = null;
 function _readGitInfo() {
   if (_gitInfoCache) return _gitInfoCache;
+  const rel = _readReleaseInfo();
+  if (rel) {
+    _gitInfoCache = { sha: rel.commit ? rel.commit.slice(0, 7) : null, branch: null,
+      commit_date: rel.built_at, version: rel.version, channel: 'release' };
+    return _gitInfoCache;
+  }
   const gitDir = path.join(APPLIANCE_DIR, '.git');
-  const out = { sha: null, branch: null, commit_date: null };
+  const out = { sha: null, branch: null, commit_date: null, version: null, channel: 'git' };
   try {
     const head = fs.readFileSync(path.join(gitDir, 'HEAD'), 'utf8').trim();
     let sha;
@@ -2840,6 +2863,7 @@ app.get('/api/v1/version', (_req, res) => {
     started_at:  new Date(Date.now() - process.uptime() * 1000).toISOString(),
     uptime_s:    Math.floor(process.uptime()),
     git:         _readGitInfo(),
+    release:     _readReleaseInfo(),
   };
   try {
     out.settings_js = fs.statSync(path.join(__dirname, 'ui', 'static', 'settings.js')).mtime.toISOString();

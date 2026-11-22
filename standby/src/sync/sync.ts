@@ -57,7 +57,7 @@ export type SyncOutcome =
 
 interface SwapPending { snapshotId: string; databases: string[]; copy: VerifiedCopy }
 /** What the "mirror-version" step still has to do for a snapshot whose data is already in place. */
-interface VersionPending { snapshotId: string; applianceCommit: string; enabledApps: string[]; imageDigests: Record<string, string>; cautions: string[] }
+interface VersionPending { snapshotId: string; applianceCommit: string; applianceVersion?: string; enabledApps: string[]; imageDigests: Record<string, string>; cautions: string[] }
 
 /** The hard-link copy while it is still being made. Only a finished copy is ever named `mirror.prev`. */
 const partialPrev = (paths: Paths): string => `${paths.mirrorPrev}.partial`;
@@ -126,7 +126,11 @@ async function followVersion(d: SyncDeps, owed: VersionPending): Promise<string[
   try {
     const mine = await d.appliance.version();
     if (mine.applianceCommit !== owed.applianceCommit || mine.enabledApps.join() !== owed.enabledApps.join()) {
-      await d.appliance.mirrorVersion({ applianceCommit: owed.applianceCommit, enabledApps: owed.enabledApps, imageDigests: owed.imageDigests });
+      await d.appliance.mirrorVersion({
+        applianceCommit: owed.applianceCommit,
+        ...(owed.applianceVersion ? { applianceVersion: owed.applianceVersion } : {}),
+        enabledApps: owed.enabledApps, imageDigests: owed.imageDigests,
+      });
     }
   } catch (err) { issues.push(`could not follow the primary's version: ${(err as Error).message}`); }
   d.store.set("versionIssues", issues);
@@ -233,7 +237,11 @@ export async function runSync(d: SyncDeps): Promise<SyncOutcome> {
     const pending: SwapPending = { snapshotId: latest.id, databases: copy.databases, copy };
     // Recorded with the swap decision: if this run stops after the swap, the
     // next one still follows the primary's version for this snapshot.
-    const owed: VersionPending = { snapshotId: latest.id, applianceCommit: manifest.applianceCommit, enabledApps: manifest.enabledApps, imageDigests: manifest.imageDigests, cautions: versionIssues };
+    const owed: VersionPending = {
+      snapshotId: latest.id, applianceCommit: manifest.applianceCommit,
+      ...(manifest.applianceVersion ? { applianceVersion: manifest.applianceVersion } : {}),
+      enabledApps: manifest.enabledApps, imageDigests: manifest.imageDigests, cautions: versionIssues,
+    };
     d.store.set("versionPending", owed);
     d.store.set("swapPending", pending);
     committed = true; // from here a crash rolls forward, never back

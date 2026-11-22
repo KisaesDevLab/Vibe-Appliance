@@ -86,12 +86,13 @@ if not re.fullmatch(r"[a-z][a-z0-9-]+", slug):
 modules = str(args.get("modules", ""))
 if modules and not re.fullmatch(r"[a-z]+(,[a-z]+)*", modules):
     print("invalid modules list", file=sys.stderr); sys.exit(1)
-# Standby actions take the fixed slug and at most one argument: a git
-# commit for follow-version. Nothing else from the request is used.
+# Standby actions take the fixed slug and at most one argument: a release
+# version or a git commit for follow-version. Nothing else from the
+# request is used.
 ref = str(args.get("ref", ""))
 if action in STANDBY_ACTIONS and slug != "vibe-standby":
     print("invalid slug for a standby action", file=sys.stderr); sys.exit(1)
-if ref and not re.fullmatch(r"[0-9a-f]{7,40}", ref):
+if ref and not re.fullmatch(r"[0-9a-f]{7,40}|v?[0-9]+\.[0-9]+\.[0-9]+", ref):
     print("invalid ref", file=sys.stderr); sys.exit(1)
 reason   = str(args.get("reason", ""))[:500].replace("\x1f", " ").replace("\t", " ").replace("\n", " ")
 approver = str(args.get("approver", ""))[:200].replace("\x1f", " ").replace("\t", " ").replace("\n", " ")

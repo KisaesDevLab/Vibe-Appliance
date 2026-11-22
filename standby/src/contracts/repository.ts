@@ -8,8 +8,10 @@ export interface SnapshotManifest {
   createdAt: string;
   /** Node that captured it. */
   sourceNodeId: string;
-  /** Git commit of /opt/vibe/appliance on the primary; console and standby are built from it. */
+  /** Commit of /opt/vibe/appliance on the primary; console and standby are built from it. */
   applianceCommit: string;
+  /** Release version of that tree, when it came from the release channel. */
+  applianceVersion?: string;
   enabledApps: string[];
   /** Service name -> image digest (sha256:…) for every app service on the primary. */
   imageDigests: Record<string, string>;

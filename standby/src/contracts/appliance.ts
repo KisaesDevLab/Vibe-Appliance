@@ -18,7 +18,14 @@ export interface AppHealth {
 }
 
 export interface ApplianceVersion {
+  /** Commit the appliance tree was built from (RELEASE.commit, or git HEAD on a developer box). */
   applianceCommit: string;
+  /**
+   * Release version (e.g. "0.5.0") when the tree was installed from the
+   * release channel. Absent on a git checkout and on boxes older than the
+   * release channel, so a mixed pair still follows by commit.
+   */
+  applianceVersion?: string;
   enabledApps: string[];
   imageDigests: Record<string, string>;
 }
@@ -42,7 +49,7 @@ export interface ApplianceControl {
 
   /** Pull every image by digest. Returns the references that could not be pulled. */
   pullImages(digests: Record<string, string>): Promise<{ failed: string[] }>;
-  /** Check out the given appliance commit, rebuild the console, set the enabled apps. */
+  /** Move to the given appliance release (by version) or commit, rebuild the console, set the enabled apps. */
   mirrorVersion(v: ApplianceVersion): Promise<void>;
   /**
    * Promote: put the verified mirror into /opt/vibe and bring the box up as

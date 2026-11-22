@@ -74,6 +74,15 @@ test("console client: only digest-pinned images are sent to pull; follow-version
   assert.deepEqual(s.calls.slice(-1), ["POST /host-action"]);
 });
 
+test("console client: follow-version sends the release version when the primary has one, else the commit", async () => {
+  const refs: unknown[] = [];
+  const s = setup((_m, _p, b) => { refs.push((b as { ref?: string }).ref); return { status: 202, body: { id: "1700000000000-deadbeef" } }; });
+  await s.client.mirrorVersion({ applianceCommit: "a".repeat(40), applianceVersion: "0.5.0", enabledApps: [], imageDigests: {} });
+  // A primary still on a git checkout (or older than the release channel) has no version.
+  await s.client.mirrorVersion({ applianceCommit: "abc1234", enabledApps: [], imageDigests: {} });
+  assert.deepEqual(refs, ["0.5.0", "abc1234"]);
+});
+
 test("console client: this box's own token file wins over shared.env, which a promote replaces with the primary's", async () => {
   const tokens: string[] = [];
   const s = setup((_m, _p, _b, h) => { tokens.push(h["x-standby-token"]!); return { body: { standbyMode: false } }; });
