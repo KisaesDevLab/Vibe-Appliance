@@ -2793,7 +2793,14 @@ Append to this list as phases complete. Format:
     file:// channel (install, update with carried overrides, hand-edit refusal,
     tampered download, interrupted swap, rollback, git conversion, one-liner
     hand-over, bundled Sentinel installer). Standby: `tsc` clean, client tests
-    pass. On Windows the suite fails the same 115 tests as `main`
+    pass. Real `bootstrap.sh` in an `ubuntu:24.04` container against a
+    file:// channel built from HEAD: the curl|bash install (no git, re-exec into
+    pre-flight, shipped files still intact afterwards), a re-run over it (`.env`
+    carried, `.prev` kept), conversion of a git checkout (backup kept, override
+    carried), an unreachable channel (warns, stays on git), and `--channel=git`
+    (persisted). Pre-flight then stops each run, as it does in a container.
+    `doctor.sh` gained a release-channel check (reachable, installed version,
+    shipped files intact). On Windows the suite fails the same 115 tests as `main`
     (`python3`/file-mode environment), with no new failures.
   - **Not verified.** No fresh Ubuntu droplet run of the one-liner, conversion
     or self-update; no two-box standby run; no real GitHub release published

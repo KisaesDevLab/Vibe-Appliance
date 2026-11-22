@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tools/release.sh — build a Vibe Appliance release from HEAD.
 #
-# Runs on the developer's machine (Linux, WSL or Git Bash), never on a
+# Runs on the developer's machine (Linux or WSL), never on a
 # customer box. Builds the assets into dist/v<VERSION>/ and PRINTS the
 # publish commands; it publishes nothing itself, because a release reaches
 # every appliance that presses "Update" and that step deserves a human.
@@ -10,14 +10,15 @@
 #   tools/release.sh [--skip-tests] [--offline] [--sentinel-tarball PATH]
 #
 #   --skip-tests          don't run `npm --prefix console test` first
-#   --offline             skip the "tag already published?" check and use
+#   --offline             skip the origin/main and "tag already published?"
+#                         checks (local test builds only), and use
 #                         --sentinel-tarball instead of downloading one
 #   --sentinel-tarball P  use this vibe-sentinel-installer tarball (a GitHub
 #                         archive of SENTINEL_INSTALLER_REF) instead of
 #                         downloading it
 #
-# Refuses on: a dirty working tree, failing tests, a VERSION whose tag is
-# already published on the release channel.
+# Refuses on: a dirty working tree, a commit not on origin/main, failing
+# tests, or a VERSION whose tag is already published on the release channel.
 #
 # Idempotency: re-running for the same commit rebuilds byte-identical
 #   assets into the same directory.
@@ -34,7 +35,7 @@ while (( $# )); do
     --skip-tests) skip_tests=1; shift ;;
     --offline) offline=1; shift ;;
     --sentinel-tarball) sentinel_tarball="${2:?--sentinel-tarball needs a path}"; shift 2 ;;
-    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -52,6 +53,16 @@ done
 
 [[ -z "$(git status --porcelain)" ]] || die "the working tree has uncommitted changes; a release must describe exactly one commit" \
   "commit or stash them (git status), then re-run"
+
+# A release must be a commit on origin/main. A standby still on a git
+# checkout follows a converted primary by RELEASE.commit with
+# `git fetch && git cat-file -e <commit>`; a commit only on a feature
+# branch (or squashed away at merge) would strand it.
+if (( ! offline )); then
+  git fetch --quiet origin main || die "could not fetch origin/main to check this commit is on it" "check your network, or pass --offline for a local test build"
+  git merge-base --is-ancestor HEAD origin/main || die "HEAD is not on origin/main; releases are built from main" \
+    "merge first, then: git checkout main && git pull && tools/release.sh"
+fi
 
 version="$(git show HEAD:VERSION | tr -d '[:space:]')"
 tag="v${version}"
