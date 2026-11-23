@@ -90,7 +90,7 @@ preflight_root() {
       "cause:You ran the script directly as a regular user." \
       "diagnose:id" \
       "fix:sudo ${BASH_SOURCE[1]:-/opt/vibe/appliance/bootstrap.sh}" \
-      "fix:Or pipe the installer through sudo: curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash"
+      "fix:Or pipe the installer through sudo: curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-appliance-releases/main/bootstrap.sh | sudo bash"
     return 1
   fi
   log_check_pass "$title"
@@ -423,6 +423,46 @@ preflight_https() {
   log_check_pass "$title"
 }
 
+# ---- release channel reachability --------------------------------------
+# Appliance self-updates and standby syncs download releases from
+# VIBE_APPLIANCE_RELEASE_BASE (GitHub Releases by default). Release
+# downloads REDIRECT from github.com to a githubusercontent.com asset host,
+# so this follows redirects (-L) — a firewall that allows github.com but
+# not the asset host would otherwise pass here and fail at update time.
+#
+# WARN, not FAIL: the code is already on disk by the time this runs, so
+# the install itself does not need the channel; only later updates do.
+# Skipped on the git channel (developer boxes).
+preflight_release_channel() {
+  local title="Appliance release channel reachable"
+  local base="${VIBE_APPLIANCE_RELEASE_BASE:-$(state_get_config_kv appliance_release_base 2>/dev/null || true)}"
+  base="${base:-https://github.com/KisaesDevLab/vibe-appliance-releases/releases}"
+  local url="${base}/latest/download/release.json"
+  if [[ "$(state_get_config_kv appliance_channel 2>/dev/null)" == "git" ]]; then
+    return 0
+  fi
+  local http_code
+  if ! http_code="$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 15 "$url" 2>/dev/null)"; then
+    http_code="000"
+  fi
+  case "$http_code" in
+    200) log_check_pass "$title" ;;
+    000)
+      log_check_warn "$title" \
+        "Could not reach the appliance release channel (${url}). The install continues, but the admin page's Update button and standby syncs will fail until it is reachable. Usual cause: outbound 443 blocked to github.com or *.githubusercontent.com. Diagnose: curl -sSIL ${url}. Fix: allow both, then run sudo bash /opt/vibe/appliance/doctor.sh." \
+        "cause:Egress on 443 is blocked to github.com or to its download host (*.githubusercontent.com)." \
+        "diagnose:curl -sSIL ${url} 2>&1 | grep -iE '^(HTTP|location)'" \
+        "fix:Allow outbound 443 to github.com and *.githubusercontent.com, then run: sudo bash /opt/vibe/appliance/doctor.sh" ;;
+    *)
+      log_check_warn "$title" \
+        "The release channel answered HTTP ${http_code} for ${url}. Updates will not be found until it serves a release. Usual cause: no release published yet, or VIBE_APPLIANCE_RELEASE_BASE points at the wrong place." \
+        "cause:No release has been published yet, or VIBE_APPLIANCE_RELEASE_BASE points at the wrong place." \
+        "diagnose:curl -sSIL ${url}" \
+        "fix:Unset VIBE_APPLIANCE_RELEASE_BASE to use the default channel, or check the mirror." ;;
+  esac
+  return 0
+}
+
 # Phase 8.5 Workstream D — DigitalOcean cloud-firewall detection.
 # When this droplet runs behind DO's metadata-aware cloud firewall, the
 # emergency-access ports (5171-5198) are blocked at the cloud edge —
@@ -639,6 +679,7 @@ preflight_run_all() {
   if ! preflight_https ghcr.io;                                    then ((errors++)) || true; fi
   if ! preflight_https acme-v02.api.letsencrypt.org \
         https://acme-v02.api.letsencrypt.org/directory;            then ((errors++)) || true; fi
+  preflight_release_channel
 
   # Phase 8.5 Workstream D — DO cloud-firewall detection. Soft check;
   # only emits a WARN when a DO metadata service is reachable AND

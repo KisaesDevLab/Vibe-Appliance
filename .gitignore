@@ -52,3 +52,6 @@ tools/guides/build/
 
 # Python bytecode from lib/vibe_hosts.py (imported by the renderers and tests)
 __pycache__/
+
+# Release build output (tools/release.sh)
+/dist/

@@ -9,7 +9,7 @@
 #   mode-off         clear the mark (does not start anything)
 #   place            PROMOTE: put the verified mirror into /opt/vibe, then
 #                    re-run bootstrap so this box becomes a working primary
-#   follow-version   move the appliance checkout to VIBE_STANDBY_REF and
+#   follow-version   move the appliance to VIBE_STANDBY_REF (a release version, or a commit on a git-channel box) and
 #                    re-run bootstrap (the standby follows the primary)
 #   archive          REJOIN: set this box's current data aside, read-only
 #   tunnel-up        start cloudflared with the token already in shared.env
@@ -319,10 +319,75 @@ action_tunnel_teardown() {
   log_ok "this box's own tunnel and DNS records were removed"
 }
 
+# follow-version: become the same appliance version as the primary.
+#   ref = release version (0.5.0) — release channel: fetch that release,
+#         verify, carry .env/overrides, swap, bootstrap. The swapped-out
+#         tree is kept as appliance.prev.
+#   ref = commit id — git channel (developer boxes): fetch + reset, as
+#         before. A release-channel standby cannot install a bare commit,
+#         so it refuses with what to do (the primary is still on git).
+# Idempotent: a box already on the version is a no-op. Reverse: the
+# printed rollback command.
 action_follow_version() {
   local ref="${VIBE_STANDBY_REF:-}"
-  [[ "$ref" =~ ^[0-9a-f]{7,40}$ ]] || die "no valid appliance version was given" "this action is requested by the Standby service; re-run a sync"
-  local have
+  [[ "$ref" =~ ^[0-9a-f]{7,40}$ || "$ref" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || die "no valid appliance version was given" "this action is requested by the Standby service; re-run a sync"
+  # shellcheck source=lib/release-channel.sh
+  . "${APPLIANCE_DIR}/lib/release-channel.sh"
+  if [[ "$(rc_channel)" == "release" ]]; then
+    _follow_release "$ref"
+  else
+    _follow_git "$ref"
+  fi
+  # bootstrap itself skips apps and stops Redis on a standby; this is the
+  # second lock on the same door, in case an older bootstrap just ran.
+  if state_standby_mode; then _stop_non_core; fi
+  log_ok "now on the primary's appliance version"
+}
+
+_follow_release() {
+  local ref="$1" want have
+  if [[ ! "$ref" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    die "the primary sent a commit (${ref:0:7}), not a release version" \
+      "the primary is still on a git checkout or older appliance code; press Update the appliance on the primary (it moves to the release channel), then re-run a sync"
+  fi
+  want="${ref#v}"
+  rc_recover
+  have="$(rc_release_field "$APPLIANCE_DIR" version)"
+  if [[ -f "${APPLIANCE_DIR}/RELEASE" && "$have" == "$want" ]]; then
+    log_ok "already on the primary's appliance version (${want})"; return 0
+  fi
+  if [[ -f "${APPLIANCE_DIR}/RELEASE" ]] && ! rc_verify_tree "$APPLIANCE_DIR"; then
+    die "the appliance files have local changes: $(printf '%s' "$RC_CHANGED" | head -5 | paste -sd ' ' -)" \
+      "move host-specific changes into override files (docs/LOCAL_OVERRIDES.md), then re-run a sync"
+  fi
+  # A git checkout being converted: hand edits to tracked files would not
+  # survive the switch, so they block it, as they did on the git path.
+  if [[ ! -f "${APPLIANCE_DIR}/RELEASE" && -d "${APPLIANCE_DIR}/.git" ]]; then
+    local st
+    if ! st="$(git -c safe.directory="$APPLIANCE_DIR" -C "$APPLIANCE_DIR" status --porcelain --untracked-files=no)" || [[ -n "$st" ]]; then
+      die "the appliance checkout has local changes" \
+        "review with: cd $APPLIANCE_DIR && sudo git status — move host-specific changes into override files (docs/LOCAL_OVERRIDES.md), then re-run a sync"
+    fi
+  fi
+  log_step "moving the appliance to the primary's version" from="${have:-git}" to="$want"
+  rc_fetch "$want" || die "$RC_ERROR" "${RC_HINT:-the next sync retries}"
+  rc_install_next || die "$RC_ERROR" "${RC_HINT:-sudo bash ${APPLIANCE_DIR}/lib/release-channel.sh recover, then re-run a sync}"
+  local back
+  if [[ -n "$RC_BACKUP" ]]; then
+    # Converted from git: there is no .prev release; the checkout is the way back.
+    back="sudo mv ${APPLIANCE_DIR} ${APPLIANCE_DIR}.release-undo && sudo mv ${RC_BACKUP} ${APPLIANCE_DIR} && sudo bash ${APPLIANCE_DIR}/bootstrap.sh --channel=git"
+  else
+    back="$(rc_rollback_cmd)"
+  fi
+  bash "${APPLIANCE_DIR}/bootstrap.sh" || die "bootstrap failed on version ${want}" \
+    "to go back: ${back}"
+}
+
+_follow_git() {
+  local ref="$1" have
+  [[ "$ref" =~ ^[0-9a-f]{7,40}$ ]] || die "this developer box (git channel) cannot install release ${ref} by version" \
+    "switch it to the release channel: sudo bash ${APPLIANCE_DIR}/bootstrap.sh --channel=release"
   have="$(git -C "$APPLIANCE_DIR" rev-parse HEAD)"
   if [[ "$have" == "$ref"* ]]; then log_ok "already on the primary's appliance version"; return 0; fi
   [[ -z "$(git -C "$APPLIANCE_DIR" status --porcelain)" ]] || die "the appliance checkout has local changes" \
@@ -334,10 +399,6 @@ action_follow_version() {
   git -C "$APPLIANCE_DIR" reset --hard --quiet "$ref"
   bash "${APPLIANCE_DIR}/bootstrap.sh" || die "bootstrap failed on the new version" \
     "to go back: cd $APPLIANCE_DIR && sudo git reset --hard $have && sudo bash bootstrap.sh"
-  # bootstrap itself skips apps and stops Redis on a standby; this is the
-  # second lock on the same door, in case an older bootstrap just ran.
-  if state_standby_mode; then _stop_non_core; fi
-  log_ok "now on the primary's appliance version"
 }
 
 action_archive() {

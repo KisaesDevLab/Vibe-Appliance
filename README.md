@@ -9,12 +9,16 @@ A self-hosted meta-installer for the Vibe product family on Ubuntu 24.04 LTS. Co
 ## Install
 
 ```
-curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/Vibe-Appliance/main/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-appliance-releases/main/bootstrap.sh | sudo bash
 ```
 
-This pulls `bootstrap.sh` from this repo and pipes it to bash. The script
-detects it's running from a pipe, apt-installs `git`, clones the repo to
-`/opt/vibe/appliance`, and re-execs.
+This pulls `bootstrap.sh` from the public release channel
+([KisaesDevLab/vibe-appliance-releases](https://github.com/KisaesDevLab/vibe-appliance-releases))
+and pipes it to bash. The script downloads the latest release tarball,
+checks it against its published SHA-256 and every file against the
+release's file list, unpacks it to `/opt/vibe/appliance`, and re-execs.
+No git is installed. Pin a version with `VIBE_APPLIANCE_VERSION=0.5.0`
+(pass it through `sudo env VIBE_APPLIANCE_VERSION=0.5.0 bash`).
 
 The shorter `curl https://install.kisaes.com/vibe.sh | sudo bash` form is
 the v1-and-beyond plan (a tiny redirector to the URL above) — not yet

@@ -97,8 +97,9 @@ verified Caddy is actually serving tunnel-mode config.
 
 ### Symptom: the appliance needs updating and you don't want to use SSH
 
-Use **System → Maintenance → Update the appliance**. It pulls the latest
-appliance software from GitHub and re-runs bootstrap. Apps and their data
+Use **System → Maintenance → Update the appliance**. It downloads the
+latest appliance release, verifies it, swaps it into place (the previous
+release is kept at `/opt/vibe/appliance.prev`) and re-runs bootstrap. Apps and their data
 are untouched — that's a separate update on the Apps tab.
 
 The admin page goes blank for about a minute while the console restarts.
@@ -109,21 +110,30 @@ reconnects; closing the tab and coming back also works, because the panel
 re-attaches to a run already in progress.
 
 If it fails, the panel prints a plain-language reason plus the exact
-rollback command (`git reset --hard <previous-sha> && bootstrap.sh`).
-Common refusals, both deliberate:
+rollback command (`sudo bash /opt/vibe/appliance/lib/release-channel.sh rollback`),
+which puts the previous release back and re-runs bootstrap. Running it
+again undoes the rollback.
+
+Common refusals, all deliberate:
 
 - **"The appliance has local file changes."** Someone hand-edited files
   under `/opt/vibe/appliance`. Updating would overwrite them, so it stops
-  instead. Review with `sudo git status` in that directory; discard with
-  `sudo git reset --hard`, then update again.
-- **"Could not apply the update cleanly."** The local checkout has
-  diverged from GitHub and can't be fast-forwarded. The status includes
-  the recovery command.
+  and lists the files. See every changed file with
+  `cd /opt/vibe/appliance && sudo sha256sum -c --quiet RELEASE.files.sha256`.
+  Move host-specific changes into an override file (`docs/LOCAL_OVERRIDES.md`);
+  to throw the edits away instead, re-run the install one-liner, which
+  reinstalls the current release over them.
+- **"Could not reach the release channel."** No internet or DNS, or
+  outbound 443 to `github.com` / `*.githubusercontent.com` is blocked.
+  `sudo bash /opt/vibe/appliance/doctor.sh` checks this.
 
 SSH equivalent, if you prefer it or the console is down:
 ```
-cd /opt/vibe/appliance && sudo git pull && sudo bash bootstrap.sh
+sudo bash /opt/vibe/appliance/lib/self-update.sh && cat /opt/vibe/logs/self-update.status.json
 ```
+
+`sudo bash /opt/vibe/appliance/lib/release-channel.sh status` shows the
+installed release and the previous one.
 
 ### Symptom: provision fails with "the tunnel is running but N DNS record(s) could NOT be written"
 

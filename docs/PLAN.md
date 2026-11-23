@@ -150,6 +150,36 @@ It runs eight phases. Each phase is idempotent, prints a `[PHASE 3/8] …` banne
 
 ---
 
+## 2a. Release channel (where appliance code comes from)
+
+*Added 2026-11-22. Reality changed: the source repo is going private, and every box used to `git clone`/`git fetch` it anonymously, for install, self-update, the standby's version sync and the Sentinel installer.*
+
+Customer boxes get appliance code from a public **release channel**: GitHub Releases on `KisaesDevLab/vibe-appliance-releases`. That repo holds only `bootstrap.sh` (for the one-liner), a README and a LICENSE. Each release has fixed asset names, so `…/releases/latest/download/<asset>` always resolves and no GitHub API call (or rate limit) is involved:
+
+| Asset | Contents |
+|---|---|
+| `vibe-appliance.tar.gz` | `git archive` of one commit minus `export-ignore` paths (build plan, tests, CI), plus `RELEASE`, `RELEASE.files.sha256`, the operator `CLAUDE.md` and `vendor/vibe-sentinel-installer.tar.gz` |
+| `vibe-appliance.tar.gz.sha256` | `sha256sum -c` format |
+| `release.json` | `RELEASE` plus the tarball's `sha256` |
+
+Built by `tools/release.sh` (wrapping `tools/release-build.py`) from git objects, reproducibly; it prints the publish commands and runs none (see `docs/RELEASING.md`). The appliance version is the top-level `VERSION` file.
+
+On the box (`lib/release-channel.sh`, shared by bootstrap, self-update and standby follow-version):
+
+- `/opt/vibe/appliance/RELEASE` replaces `.git` as the version source; `RELEASE.files.sha256` replaces `git status` as the "hand-edited?" check.
+- An update downloads into `appliance.next.tmp`, checks the tarball sha256 and every file, renames to `appliance.next`, copies across every file no release ships (`.env`, `*.override.yml`), then swaps: live → `appliance.prev`, next → live. One `.prev` is kept; `release-channel.sh rollback` swaps it back. `rc_recover` converges a swap interrupted between its two renames.
+- `latest` is resolved to a version once per run, and the tarball fetched by that pinned version.
+- A box whose tree is still a git checkout converts on its next bootstrap (by hand, from the Update button, or from a standby sync), keeping the checkout at `appliance.git-backup.<ts>`. An unreachable channel leaves it on git with a warning.
+- **Git channel** for developer boxes: `bootstrap.sh --channel=git`, persisted as `state.config.appliance_channel`, keeps clone/fetch/rebase. It needs access to the private repo.
+- Knobs: `VIBE_APPLIANCE_RELEASE_BASE` (move hosting, e.g. to `install.kisaes.com`, without touching the fleet) and `VIBE_APPLIANCE_VERSION` (pin).
+- The standby follows the primary by **release version** (`applianceVersion` next to `applianceCommit` in the console's `/version` and the snapshot manifest). A release-channel standby refuses a bare commit from a primary still on git, telling the admin to update the primary.
+
+Not hidden by going private: the shipped code itself (bash, Python and a Node console built on the box). Every customer box holds readable copies. Going private hides history, issues, CI, tests and the build plan.
+
+Not yet: signed releases. A `.sha256` fetched from the same place as the tarball only catches corruption; signing `release.json` (minisign or cosign) with the public key embedded in `bootstrap.sh` and `self-update.sh` is the planned next step, and must ship before the source repo is made private.
+
+---
+
 ## 3. Toggling apps
 
 The console UI (admin section) shows each app from the manifest registry with an on/off toggle. Toggle ON does:

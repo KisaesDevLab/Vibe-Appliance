@@ -112,9 +112,13 @@ export class ConsoleClient implements ApplianceControl {
     return this.#call("POST", "/pull", { images }, 2 * 60 * 60 * 1000);
   }
 
-  /** Fire and return: following the primary's version rebuilds and restarts this very service. */
+  /**
+   * Fire and return: following the primary's version rebuilds and restarts this very service.
+   * A release version is sent when the primary has one (a release-channel standby can only
+   * install by version); a commit otherwise (a primary still on a git checkout).
+   */
   async mirrorVersion(v: ApplianceVersion): Promise<void> {
-    await this.#hostAction("standby-follow-version", { ref: v.applianceCommit, wait: false });
+    await this.#hostAction("standby-follow-version", { ref: v.applianceVersion || v.applianceCommit, wait: false });
   }
 
   async place(snapshotId: string): Promise<void> {

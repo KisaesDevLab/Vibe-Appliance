@@ -281,6 +281,49 @@ Fix:      open egress 443 in your cloud firewall"
     _check_pass "ghcr.io reachable (HTTP $code)"
   fi
 }
+# Appliance release channel: the Update button and standby syncs download
+# releases from here (lib/release-channel.sh). Follows redirects, because
+# GitHub serves release assets from a githubusercontent.com host. Also
+# reports which release is installed and whether its shipped files are
+# intact, since a hand edit is what makes the Update button refuse.
+check_release_channel() {
+  _check_begin "Appliance release channel"
+  local appl="${APPLIANCE_DIR:-${VIBE_DIR}/appliance}"
+  if [[ "$(_state_get config.appliance_channel)" == "git" && -d "$appl/.git" ]]; then
+    _check_pass "developer box on the git channel (--channel=git); release checks skipped"
+    return 0
+  fi
+  local base="${VIBE_APPLIANCE_RELEASE_BASE:-$(_state_get config.appliance_release_base 2>/dev/null || true)}"
+  base="${base:-https://github.com/KisaesDevLab/vibe-appliance-releases/releases}"
+  local url="${base}/latest/download/release.json" code installed=""
+  [[ -f "$appl/RELEASE" ]] && installed="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version",""))' "$appl/RELEASE" 2>/dev/null)"
+  if [[ "$GHCR_REACHABLE" == "0" ]]; then
+    # check_host_outbound already reported the dead route; another 15 s
+    # timeout would only say the same thing.
+    code="skip"
+  else
+    code="$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 15 "$url" 2>/dev/null)"
+    [[ -z "$code" ]] && code="000"
+  fi
+  case "$code" in
+    200) _check_pass "release channel reachable${installed:+; installed release ${installed}}" ;;
+    skip) _check_warn "release channel not checked: outbound HTTPS is down (see above)${installed:+; installed release ${installed}}" "Fix:      restore outbound HTTPS first; appliance updates and standby syncs need ${base}" ;;
+    000) _check_warn "release channel unreachable (${url}); appliance updates and standby syncs will fail" "Diagnose: curl -sSIL ${url} 2>&1 | grep -iE '^(HTTP|location)'
+Fix:      allow outbound 443 to github.com and *.githubusercontent.com" ;;
+    *)   _check_warn "release channel answered HTTP ${code} for ${url}" "Cause:    no release published yet, or VIBE_APPLIANCE_RELEASE_BASE points at the wrong place" ;;
+  esac
+  if [[ -f "$appl/RELEASE.files.sha256" ]]; then
+    local changed
+    if ! changed="$(cd "$appl" && sha256sum -c --quiet RELEASE.files.sha256 2>&1)"; then
+      _check_warn "shipped appliance files differ from release ${installed:-?}; the Update button will refuse" "Diagnose: cd $appl && sudo sha256sum -c --quiet RELEASE.files.sha256
+Fix:      move host-specific changes into override files (docs/LOCAL_OVERRIDES.md)
+$(printf '%s\n' "$changed" | head -5)"
+    fi
+  elif [[ -d "$appl/.git" ]]; then
+    _check_warn "this appliance is still a git checkout; its next bootstrap switches it to the release channel" "Fix:      sudo bash $appl/bootstrap.sh   (or press Update the appliance)"
+  fi
+}
+
 # Set by check_host_outbound; check_github_access skips its sweep when 0
 # (every probe would only re-time-out against the same dead route).
 GHCR_REACHABLE=1
@@ -1269,6 +1312,7 @@ check_host_disk
 check_host_dns
 check_host_outbound
 check_github_access
+check_release_channel
 
 check_core_container vibe-caddy    "Caddy"
 check_core_container vibe-postgres "Postgres"

@@ -94,7 +94,9 @@ export async function runCapture(d: CaptureDeps): Promise<CaptureResult> {
     const version = await d.appliance.version();
     const manifest: SnapshotManifest = {
       schemaVersion: 1, snapshotId, createdAt: now().toISOString(), sourceNodeId: d.store.nodeId,
-      applianceCommit: version.applianceCommit, enabledApps: version.enabledApps, imageDigests: version.imageDigests,
+      applianceCommit: version.applianceCommit,
+      ...(version.applianceVersion ? { applianceVersion: version.applianceVersion } : {}),
+      enabledApps: version.enabledApps, imageDigests: version.imageDigests,
       postgresImage: version.imageDigests.postgres ?? "", databases,
     };
     await writeFile(manifestPath(d.paths.stage), JSON.stringify(manifest, null, 2), { mode: 0o600 });

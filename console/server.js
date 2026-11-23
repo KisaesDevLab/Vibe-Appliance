@@ -2554,10 +2554,11 @@ app.post('/api/v1/admin/prune-images', requireAdmin, testRateLimit, globalOp('im
 
 // --- Appliance self-update -------------------------------------------
 //
-// Updates the APPLIANCE itself (this git checkout), as opposed to
-// /api/v1/update/:slug which updates a single app's GHCR image. Closes
-// the last routine operation that required SSH: `git pull` +
-// `bootstrap.sh`. The audience is novice CPAs — an operation only
+// Updates the APPLIANCE itself (the release installed at
+// /opt/vibe/appliance, from the public release channel; or, on a
+// developer box, the git checkout), as opposed to /api/v1/update/:slug
+// which updates a single app's GHCR image. Closes the last routine
+// operation that required SSH. The audience is novice CPAs — an operation only
 // reachable from a terminal may as well not exist.
 //
 // This cannot use runShell. bootstrap.sh recreates the console
@@ -2742,7 +2743,7 @@ app.post('/api/v1/admin/self-update', requireAdmin, testRateLimit, async (_req, 
     return res.status(500).json({
       ok: false,
       error: 'Could not start the update: ' + (trim(result.stderr, 300) || `exit ${result.code}`) +
-             '. SSH path: cd /opt/vibe/appliance && sudo git pull && sudo bash bootstrap.sh',
+             '. SSH path: sudo bash /opt/vibe/appliance/lib/self-update.sh',
     });
   }
   log('info', 'self-update launched (detached on host)');
@@ -2770,6 +2771,7 @@ app.get('/api/v1/admin/self-update/status', requireAdmin, (_req, res) => {
     ok: true,
     running_sha:    running && running.sha ? running.sha.slice(0, 7) : null,
     running_branch: running ? running.branch : null,
+    running_version: running && running.version ? running.version : null,
     status: current,
   });
 });
@@ -2790,11 +2792,33 @@ app.post('/api/v1/admin/refresh-host-ip', requireAdmin, testRateLimit, async (_r
 // read .git/HEAD and .git/logs/HEAD directly via fs from the bind-
 // mounted appliance dir. No auth — non-sensitive metadata, useful
 // from a curl.
+// Release-channel installs have no .git: their RELEASE file (written by
+// tools/release-build.py) is the version source. A git checkout on a
+// developer box still reports branch and reflog date as before.
+// Read on every call, never cached: a self-update swaps the tree under
+// this process, and bootstrap only recreates the console when console/
+// itself changed — a release that touched only lib/ leaves this process
+// running, and a cached value would report the old version as current.
+function _readReleaseInfo() {
+  try {
+    const r = JSON.parse(fs.readFileSync(path.join(APPLIANCE_DIR, 'RELEASE'), 'utf8'));
+    if (r && typeof r.version === 'string') {
+      return { version: r.version, commit: r.commit || null, built_at: r.built_at || null };
+    }
+  } catch { /* not a release install */ }
+  return null;
+}
+
 let _gitInfoCache = null;
 function _readGitInfo() {
+  const rel = _readReleaseInfo();
+  if (rel) {
+    return { sha: rel.commit ? rel.commit.slice(0, 7) : null, branch: null,
+      commit_date: rel.built_at, version: rel.version, channel: 'release' };
+  }
   if (_gitInfoCache) return _gitInfoCache;
   const gitDir = path.join(APPLIANCE_DIR, '.git');
-  const out = { sha: null, branch: null, commit_date: null };
+  const out = { sha: null, branch: null, commit_date: null, version: null, channel: 'git' };
   try {
     const head = fs.readFileSync(path.join(gitDir, 'HEAD'), 'utf8').trim();
     let sha;
@@ -2839,6 +2863,7 @@ app.get('/api/v1/version', (_req, res) => {
     started_at:  new Date(Date.now() - process.uptime() * 1000).toISOString(),
     uptime_s:    Math.floor(process.uptime()),
     git:         _readGitInfo(),
+    release:     _readReleaseInfo(),
   };
   try {
     out.settings_js = fs.statSync(path.join(__dirname, 'ui', 'static', 'settings.js')).mtime.toISOString();

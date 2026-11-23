@@ -1,21 +1,31 @@
 #!/usr/bin/env bash
-# lib/self-update.sh — update the APPLIANCE ITSELF (this git repo), then
-# re-run bootstrap so the new code takes effect.
+# lib/self-update.sh — update the APPLIANCE ITSELF, then re-run bootstrap
+# so the new code takes effect.
 #
 # Distinct from update.sh, which updates per-app GHCR images. This one
 # updates bootstrap.sh, lib/, console/, manifests — the appliance
 # machinery. Before this existed the only way to apply an appliance
-# update was SSH + `git pull` + `bootstrap.sh`, which put the one
+# update was SSH + a manual pull + `bootstrap.sh`, which put the one
 # remaining terminal dependency squarely in front of an audience that
 # doesn't have a terminal.
 #
+# Two channels (lib/release-channel.sh decides which):
+#   release (every customer box): download the latest release from the
+#     public release channel, verify it, carry .env and override files
+#     across, swap it in for the live tree (the old tree is kept as
+#     /opt/vibe/appliance.prev). A box still on a git checkout is converted
+#     the same way; its checkout is parked at appliance.git-backup.<ts>.
+#   git (developer boxes, --channel=git): fetch + rebase, as before.
+#
 # Idempotency: re-runnable. Already-current is a no-op that reports
-#   success. A run killed mid-flight leaves the repo either at the old
-#   or the new commit (git checkout is atomic enough for our purposes)
-#   and bootstrap.sh is itself idempotent, so re-running converges.
-# Reverse: git reset --hard <from_sha> && bootstrap.sh — the exact
-#   command is written into the status file as `rollback_cmd` on every
-#   run, so recovery never depends on the operator having scrolled back.
+#   success. A run killed mid-flight leaves the tree at the old or the new
+#   release; a swap stopped between its two renames is finished by
+#   rc_recover at the start of the next run. bootstrap.sh is itself
+#   idempotent, so re-running converges.
+# Reverse: release channel — `sudo bash /opt/vibe/appliance/lib/release-channel.sh rollback`;
+#   git channel — git reset --hard <from_sha> && bootstrap.sh. The exact
+#   command is written into the status file as `rollback_cmd`, so recovery
+#   never depends on the operator having scrolled back.
 #
 # MUST RUN ON THE HOST, DETACHED. bootstrap.sh recreates the console
 # container, which is what serves the admin UI — so anything running
@@ -47,6 +57,9 @@ RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 FROM_SHA=""
 TO_SHA=""
+FROM_VERSION=""
+TO_VERSION=""
+ROLLBACK_CMD=""
 
 # write_status <state> <phase> <message> [error]
 #
@@ -57,14 +70,11 @@ write_status() {
   local state="$1" phase="$2" message="$3" error="${4:-}"
   local finished=""
   case "$state" in success|failed) finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)" ;; esac
-  local rollback=""
-  if [[ -n "$FROM_SHA" ]]; then
-    rollback="cd ${APPLIANCE_DIR} && sudo git reset --hard ${FROM_SHA} && sudo bash ${APPLIANCE_DIR}/bootstrap.sh"
-  fi
   local tmp="${STATUS_FILE}.tmp.$$"
   RUN_ID="$RUN_ID" STATE="$state" PHASE="$phase" MSG="$message" ERR="$error" \
   STARTED="$STARTED_AT" FINISHED="$finished" FROM="$FROM_SHA" TO="$TO_SHA" \
-  ROLLBACK="$rollback" LOGF="$LOG_FILE" \
+  FROMV="$FROM_VERSION" TOV="$TO_VERSION" \
+  ROLLBACK="$ROLLBACK_CMD" LOGF="$LOG_FILE" \
   python3 -c '
 import json, os, sys
 out = {
@@ -77,6 +87,8 @@ out = {
   "finished_at": os.environ["FINISHED"] or None,
   "from_sha":    os.environ["FROM"] or None,
   "to_sha":      os.environ["TO"] or None,
+  "from_version":os.environ.get("FROMV") or None,
+  "to_version":  os.environ.get("TOV") or None,
   "rollback_cmd":os.environ["ROLLBACK"] or None,
   "log_file":    os.environ["LOGF"],
 }
@@ -142,94 +154,191 @@ else
   log "WARN: flock not found; proceeding without a lock"
 fi
 
-log "=== self-update ${RUN_ID} starting (branch ${BRANCH}) ==="
-write_status running preflight "Checking the appliance repository…"
+write_status running preflight "Checking the installed appliance…"
 
-# --- Pre-flight -------------------------------------------------------
-
-if [[ ! -d "${APPLIANCE_DIR}/.git" ]]; then
-  write_status failed preflight "Cannot update: ${APPLIANCE_DIR} is not a git checkout." \
-    "This appliance wasn't installed from git, so there's nothing to pull. Re-install with the documented bootstrap command, or update by hand."
+# The helper next to this script (on a box, the same file as
+# ${APPLIANCE_DIR}/lib/release-channel.sh). Its RC_LIVE follows APPLIANCE_DIR.
+_su_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/release-channel.sh"
+if [[ ! -f "$_su_lib" ]]; then
+  write_status failed preflight "Cannot update: ${_su_lib} is missing." \
+    "The appliance install is incomplete. Re-install with the one-liner from docs/INSTALL.md; it keeps your data and settings."
   exit 1
 fi
+# shellcheck source=lib/release-channel.sh
+. "$_su_lib"
 
-cd "$APPLIANCE_DIR" || { write_status failed preflight "Cannot enter ${APPLIANCE_DIR}." "Directory is missing or unreadable."; exit 1; }
+CHANNEL="$(rc_channel)"
+log "=== self-update ${RUN_ID} starting (channel ${CHANNEL}) ==="
 
-# Refuse on local modifications rather than destroying them. bootstrap.sh
-# does `git reset --hard` on its self-clone path, which is correct for a
-# machine that has never been touched — but a browser button that
-# silently discards an operator's hand-edit is a different thing. Tell
-# them instead.
-#
-# The recovery hint deliberately does NOT say `git reset --hard`. That
-# destroys the very edit we just refused to overwrite, and an operator
-# following it loses work. Host-specific customisation belongs in the
-# untracked override files (docker-compose.override.yml,
-# apps/<slug>.override.yml) — see docs/LOCAL_OVERRIDES.md — which keep
-# the tree clean and survive every update.
-if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
-  log "working tree dirty; refusing"
-  write_status failed preflight "The appliance has local file changes." \
-    "Someone edited files under ${APPLIANCE_DIR} directly. Updating would overwrite them. Review with: cd ${APPLIANCE_DIR} && sudo git status. Move host-specific changes into an untracked override file (see docs/LOCAL_OVERRIDES.md) so they survive updates, then try again. Only if you are certain the edits are disposable: sudo git checkout -- ."
-  exit 1
+# What to tell an operator whose shipped files were hand-edited. Never
+# "discard them" first: host-specific changes belong in the untracked
+# override files (docker-compose.override.yml, apps/<slug>.override.yml),
+# which keep the tree clean and survive every update.
+_edited_hint() { # <how to list the edits>
+  printf '%s' "Someone edited files under ${APPLIANCE_DIR} directly. Updating would overwrite them. Review with: $1. Move host-specific changes into an override file (see docs/LOCAL_OVERRIDES.md) so they survive updates, then try again."
+}
+
+# --- git channel (developer boxes) -----------------------------------
+_selfupdate_git() {
+  cd "$APPLIANCE_DIR" || { write_status failed preflight "Cannot enter ${APPLIANCE_DIR}." "Directory is missing or unreadable."; exit 1; }
+
+  # Refuse on local modifications rather than destroying them.
+  if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+    log "working tree dirty; refusing"
+    write_status failed preflight "The appliance has local file changes." \
+      "$(_edited_hint "cd ${APPLIANCE_DIR} && sudo git status") Only if you are certain the edits are disposable: sudo git checkout -- ."
+    exit 1
+  fi
+
+  FROM_SHA="$(git rev-parse HEAD 2>/dev/null || true)"
+  ROLLBACK_CMD="cd ${APPLIANCE_DIR} && sudo git reset --hard ${FROM_SHA} && sudo bash ${APPLIANCE_DIR}/bootstrap.sh"
+  log "current commit ${FROM_SHA}"
+
+  write_status running fetch "Contacting GitHub for updates…"
+  if ! git fetch --quiet origin "$BRANCH" >>"$LOG_FILE" 2>&1; then
+    write_status failed fetch "Could not reach GitHub." \
+      "git fetch failed. Usually no internet, DNS not resolving, GitHub unreachable, or no access to the source repository from this host. Check the appliance's network, then try again. Details in $LOG_FILE."
+    exit 1
+  fi
+
+  TO_SHA="$(git rev-parse "origin/${BRANCH}" 2>/dev/null || true)"
+  log "remote commit ${TO_SHA}"
+
+  # "Up to date" means HEAD already CONTAINS origin/<branch> — not that the
+  # two SHAs are equal. A dev box carrying a local commit is at
+  # origin/main + 1: never SHA-equal, yet nothing is pending.
+  if [[ -n "$TO_SHA" ]] && git merge-base --is-ancestor "$TO_SHA" HEAD 2>/dev/null; then
+    log "already up to date (HEAD contains ${TO_SHA})"
+    write_status success done "Already up to date. No changes to apply."
+    exit 0
+  fi
+
+  CHANGED="$(git diff --stat "${FROM_SHA}..${TO_SHA}" 2>/dev/null | tail -1 | sed 's/^ *//' || true)"
+  log "incoming: ${CHANGED:-unknown}"
+
+  write_status running pull "Downloading the update…"
+  # Rebase, not `merge --ff-only`: it replays a local commit on top of the
+  # new upstream instead of refusing it forever. A genuine conflict still
+  # stops us — recoverably.
+  if ! git rebase --autostash "origin/${BRANCH}" >>"$LOG_FILE" 2>&1; then
+    # Leave no half-finished rebase behind, or every later update fails
+    # at the dirty-tree preflight.
+    git rebase --abort >>"$LOG_FILE" 2>&1 || true
+    write_status failed pull "Could not apply the update cleanly." \
+      "This appliance carries local commits that conflict with the update, so they can't be replayed on top of it. Nothing was changed. Inspect with: cd ${APPLIANCE_DIR} && sudo git log --oneline origin/${BRANCH}..HEAD. Details in $LOG_FILE."
+    exit 1
+  fi
+  log "rebased onto ${TO_SHA}"
+  TO_LABEL="${TO_SHA:0:7}"
+}
+
+# --- release channel (every customer box) ----------------------------
+_selfupdate_release() {
+  rc_recover >>"$LOG_FILE" 2>&1 || true
+
+  local converting=0
+  if [[ -f "${APPLIANCE_DIR}/RELEASE" ]]; then
+    FROM_VERSION="$(rc_release_field "$APPLIANCE_DIR" version)"
+    FROM_SHA="$(rc_release_field "$APPLIANCE_DIR" commit)"
+    if ! rc_verify_tree "$APPLIANCE_DIR"; then
+      if [[ -z "$RC_CHANGED" ]]; then
+        # No file list to show: the manifest itself is missing.
+        write_status failed preflight "Cannot update: ${RC_ERROR}." \
+          "The install is incomplete. Re-run the install one-liner from docs/INSTALL.md; it installs the latest release and keeps your data and settings."
+        exit 1
+      fi
+      local files
+      files="$(printf '%s\n' "$RC_CHANGED" | head -10 | paste -sd ',' - | sed 's/,/, /g')"
+      log "shipped files differ from release ${FROM_VERSION}: ${RC_CHANGED//$'\n'/ }"
+      write_status failed preflight "The appliance has local file changes (${files})." \
+        "$(_edited_hint "cd ${APPLIANCE_DIR} && sudo sha256sum -c --quiet RELEASE.files.sha256") To discard the edits instead, re-run the install one-liner; it installs the latest release over them."
+      exit 1
+    fi
+  elif [[ -d "${APPLIANCE_DIR}/.git" ]]; then
+    # Installed from git before the release channel existed. Converting is
+    # an update like any other, but hand edits to tracked files would not
+    # survive it, so they block it just as they always have.
+    converting=1
+    FROM_SHA="$(git -C "$APPLIANCE_DIR" rev-parse HEAD 2>/dev/null || true)"
+    local _st
+    # safe.directory: a checkout owned by another user must not read as clean.
+    if ! _st="$(git -c safe.directory="$APPLIANCE_DIR" -C "$APPLIANCE_DIR" status --porcelain --untracked-files=no 2>>"$LOG_FILE")" \
+       || [[ -n "$_st" ]]; then
+      write_status failed preflight "The appliance has local file changes." \
+        "$(_edited_hint "cd ${APPLIANCE_DIR} && sudo git status")"
+      exit 1
+    fi
+  else
+    write_status failed preflight "Cannot update: ${APPLIANCE_DIR} has no RELEASE file." \
+      "This appliance was not installed from a release. Re-install with the one-liner from docs/INSTALL.md; it keeps your data and settings."
+    exit 1
+  fi
+  log "installed: ${FROM_VERSION:-git ${FROM_SHA:0:7}}"
+
+  write_status running fetch "Checking for a newer appliance release…"
+  if ! rc_resolve latest >>"$LOG_FILE" 2>&1; then
+    write_status failed fetch "Could not check for updates: ${RC_ERROR}." \
+      "${RC_HINT:-Check the network on this box, then try again.} Details in $LOG_FILE."
+    exit 1
+  fi
+  TO_VERSION="$RC_VERSION"
+  TO_SHA="$RC_COMMIT"
+  log "latest release ${TO_VERSION} (${TO_SHA:0:7})"
+
+  if (( ! converting )) && [[ "$FROM_VERSION" == "$TO_VERSION" ]]; then
+    log "already up to date (${FROM_VERSION})"
+    write_status success done "Already up to date (version ${FROM_VERSION}). No changes to apply."
+    exit 0
+  fi
+  # "latest" older than what is installed means a release was withdrawn.
+  # The Update button never downgrades: an older release may not run on
+  # databases a newer one already migrated. Going back is a deliberate
+  # operator step.
+  if (( ! converting )) && [[ -n "$FROM_VERSION" ]] \
+     && [[ "$(printf '%s\n%s\n' "${FROM_VERSION#v}" "${TO_VERSION#v}" | sort -V | tail -1)" != "${TO_VERSION#v}" ]]; then
+    log "latest release ${TO_VERSION} is older than installed ${FROM_VERSION}; not downgrading"
+    write_status success done "This appliance runs version ${FROM_VERSION}, newer than the latest published release (${TO_VERSION}). No changes made. If ${FROM_VERSION} was withdrawn and you want the previous version back, run: sudo bash ${APPLIANCE_DIR}/lib/release-channel.sh rollback — or install ${TO_VERSION} explicitly: curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-appliance-releases/main/bootstrap.sh | sudo VIBE_APPLIANCE_VERSION=${TO_VERSION} bash"
+    exit 0
+  fi
+  if (( converting )); then
+    CHANGED="switched from the git checkout to release ${TO_VERSION}"
+  else
+    CHANGED="${FROM_VERSION} → ${TO_VERSION}"
+  fi
+
+  write_status running pull "Downloading version ${TO_VERSION}…"
+  # Fetch the version just resolved, not "latest" again: a release
+  # published in between must not change what is installed mid-run.
+  if ! rc_fetch "$TO_VERSION" >>"$LOG_FILE" 2>&1; then
+    write_status failed pull "Could not download version ${TO_VERSION}: ${RC_ERROR}." \
+      "Nothing was changed. ${RC_HINT:-Try again.} Details in $LOG_FILE."
+    exit 1
+  fi
+  if ! rc_install_next >>"$LOG_FILE" 2>&1; then
+    # Point at a copy of the helper that exists: the live tree, unless the
+    # swap stopped with it moved aside.
+    local _rc_tree="$APPLIANCE_DIR"
+    [[ -f "${_rc_tree}/lib/release-channel.sh" ]] || _rc_tree="${APPLIANCE_DIR}.prev"
+    write_status failed pull "Could not switch to version ${TO_VERSION}: ${RC_ERROR}." \
+      "${RC_HINT:-Run: sudo bash ${_rc_tree}/lib/release-channel.sh recover — then try again.} Details in $LOG_FILE."
+    exit 1
+  fi
+  if (( converting )); then
+    ROLLBACK_CMD="sudo mv ${APPLIANCE_DIR} ${APPLIANCE_DIR}.release-undo && sudo mv ${RC_BACKUP} ${APPLIANCE_DIR} && sudo bash ${APPLIANCE_DIR}/bootstrap.sh --channel=git"
+  else
+    ROLLBACK_CMD="$(rc_rollback_cmd)"
+  fi
+  log "now on ${TO_VERSION}; previous tree kept (${RC_BACKUP:-${APPLIANCE_DIR}.prev})"
+  TO_LABEL="version ${TO_VERSION}"
+}
+
+CHANGED=""
+TO_LABEL=""
+if [[ "$CHANNEL" == "git" ]]; then
+  _selfupdate_git
+else
+  _selfupdate_release
 fi
-
-FROM_SHA="$(git rev-parse HEAD 2>/dev/null || true)"
-log "current commit ${FROM_SHA}"
-
-# --- Fetch ------------------------------------------------------------
-
-write_status running fetch "Contacting GitHub for updates…"
-if ! git fetch --quiet origin "$BRANCH" >>"$LOG_FILE" 2>&1; then
-  write_status failed fetch "Could not reach GitHub." \
-    "git fetch failed. Usually no internet, DNS not resolving, or GitHub is unreachable from this host. Check the appliance's network, then try again. Details in $LOG_FILE."
-  exit 1
-fi
-
-TO_SHA="$(git rev-parse "origin/${BRANCH}" 2>/dev/null || true)"
-log "remote commit ${TO_SHA}"
-
-# "Up to date" means HEAD already CONTAINS origin/<branch> — not that the
-# two SHAs are equal. An appliance carrying a local commit (a host-specific
-# override committed on top of upstream) is at origin/main + 1: never SHA-
-# equal, yet nothing is pending. Equality would report a phantom update
-# forever and then fail in the apply step every single time.
-#
-# `merge-base --is-ancestor` is the exact test and costs nothing.
-if [[ -n "$TO_SHA" ]] && git merge-base --is-ancestor "$TO_SHA" HEAD 2>/dev/null; then
-  log "already up to date (HEAD contains ${TO_SHA})"
-  write_status success done "Already up to date. No changes to apply."
-  exit 0
-fi
-
-CHANGED="$(git diff --stat "${FROM_SHA}..${TO_SHA}" 2>/dev/null | tail -1 | sed 's/^ *//' || true)"
-log "incoming: ${CHANGED:-unknown}"
-
-# --- Apply ------------------------------------------------------------
-
-write_status running pull "Downloading the update…"
-# Rebase, not `merge --ff-only`. Both refuse to silently discard local
-# work, which is the property that matters here — but ff-only ALSO
-# refuses the legitimate case of an appliance carrying a host-specific
-# commit on top of upstream, and refuses it permanently: there is no
-# sequence of button presses that recovers, and the error told operators
-# to `git reset --hard`, destroying the very commit they meant to keep.
-#
-# Rebase replays local commits on top of the new upstream instead. A
-# genuine content conflict still stops us — it just stops recoverably.
-# --autostash is belt-and-braces; the dirty-tree preflight above means
-# there should be nothing to stash.
-if ! git rebase --autostash "origin/${BRANCH}" >>"$LOG_FILE" 2>&1; then
-  # Leave no half-finished rebase behind. Without this the repo sits in
-  # a detached REBASE_HEAD state and every later update fails at the
-  # preflight with a dirty tree, turning one conflict into a permanent
-  # outage of the update button.
-  git rebase --abort >>"$LOG_FILE" 2>&1 || true
-  write_status failed pull "Could not apply the update cleanly." \
-    "This appliance carries local commits that conflict with the update, so they can't be replayed on top of it. Nothing was changed. Inspect with: cd ${APPLIANCE_DIR} && sudo git log --oneline origin/${BRANCH}..HEAD. Details in $LOG_FILE."
-  exit 1
-fi
-log "rebased onto ${TO_SHA}"
 
 # --- Rebuild ----------------------------------------------------------
 #
@@ -237,11 +346,12 @@ log "rebased onto ${TO_SHA}"
 # the browser that started this. That's expected and is precisely why
 # this script runs detached on the host: the UI reconnects and reads the
 # status file rather than waiting on a response.
+cd / || true
 write_status running bootstrap "Applying the update and restarting services. The admin page may go blank for a minute — it will come back."
 log "running bootstrap.sh"
 if ! bash "${APPLIANCE_DIR}/bootstrap.sh" >>"$LOG_FILE" 2>&1; then
   write_status failed bootstrap "The update downloaded but failed to install." \
-    "bootstrap.sh returned an error after updating to ${TO_SHA}. The appliance may be partly updated; bootstrap is safe to re-run. See $LOG_FILE. To go back to the previous version, run the rollback command in this status."
+    "bootstrap.sh returned an error after updating to ${TO_LABEL}. The appliance may be partly updated; bootstrap is safe to re-run. See $LOG_FILE. To go back to the previous version, run the rollback command in this status."
   exit 1
 fi
 log "bootstrap completed"
@@ -253,13 +363,13 @@ log "bootstrap completed"
 # means the operator can actually use the thing again.
 write_status running health "Waiting for the admin console to come back…"
 _healthy=0
-for _ in $(seq 1 60); do
+for _ in $(seq 1 "${VIBE_SELF_UPDATE_HEALTH_TRIES:-60}"); do
   # The console's own /health through Caddy, 200-only — the same probe
   # doctor.sh trusts. The previous gate passed on /caddy-health (Caddy up,
   # console possibly dead) or on the container merely existing in state
   # "running" (crashlooping counts), so "Updated successfully" could show
   # over an admin page that never came back.
-  if [[ "$(curl -s -o /dev/null -w '%{http_code}' -m 3 http://127.0.0.1/health 2>/dev/null)" == "200" ]]; then
+  if [[ "$(curl -s -o /dev/null -w '%{http_code}' -m 3 "${VIBE_SELF_UPDATE_HEALTH_URL:-http://127.0.0.1/health}" 2>/dev/null)" == "200" ]]; then
     _healthy=1
     break
   fi
@@ -272,6 +382,6 @@ if (( _healthy == 1 )); then
 else
   log "console did not come back within 120s"
   write_status failed health "Updated, but the admin console didn't restart." \
-    "Code is at ${TO_SHA} but vibe-console isn't running after 120s. Diagnose: sudo docker logs vibe-console --tail 50. Re-run: sudo bash ${APPLIANCE_DIR}/bootstrap.sh. Or roll back with the command in this status."
+    "Code is at ${TO_LABEL} but vibe-console isn't running after 120s. Diagnose: sudo docker logs vibe-console --tail 50. Re-run: sudo bash ${APPLIANCE_DIR}/bootstrap.sh. Or roll back with the command in this status."
   exit 1
 fi

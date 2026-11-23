@@ -40,7 +40,8 @@ function runWriteStatus(env) {
       RUN_ID: 'r1', STATE: 'running', PHASE: 'bootstrap', MSG: 'Applying…',
       ERR: '', STARTED: '2026-07-30T00:00:00Z', FINISHED: '',
       FROM: 'a'.repeat(40), TO: 'b'.repeat(40),
-      ROLLBACK: 'cd x && git reset --hard', LOGF: '/opt/vibe/logs/self-update.log',
+      FROMV: '1.0.0', TOV: '1.1.0',
+      ROLLBACK: 'sudo bash /opt/vibe/appliance/lib/release-channel.sh rollback', LOGF: '/opt/vibe/logs/self-update.log',
       ...env,
     },
   });
@@ -52,7 +53,7 @@ function runWriteStatus(env) {
 // file exists to catch.
 const UI_READS = [
   'state', 'phase', 'message', 'error',
-  'started_at', 'from_sha', 'to_sha', 'rollback_cmd',
+  'started_at', 'from_sha', 'to_sha', 'from_version', 'to_version', 'rollback_cmd',
 ];
 
 test('status file carries every field the UI renders', () => {
@@ -80,8 +81,10 @@ test('empty strings normalise to null, not ""', () => {
   // string is falsy in JS so this is not load-bearing today — but it
   // makes `error: ""` vs `error: null` unambiguous for anything reading
   // the file directly, including an operator with `cat`.
-  const s = runWriteStatus({ ERR: '', FROM: '', TO: '', ROLLBACK: '' });
+  const s = runWriteStatus({ ERR: '', FROM: '', TO: '', FROMV: '', TOV: '', ROLLBACK: '' });
   assert.equal(s.error, null);
+  assert.equal(s.from_version, null);
+  assert.equal(s.to_version, null);
   assert.equal(s.from_sha, null);
   assert.equal(s.to_sha, null);
   assert.equal(s.rollback_cmd, null);
@@ -96,7 +99,7 @@ test('a failed run still surfaces a rollback command', () => {
     ERR: 'bootstrap.sh returned an error.', FINISHED: '2026-07-30T00:02:00Z',
   });
   assert.equal(s.state, 'failed');
-  assert.ok(s.rollback_cmd && s.rollback_cmd.includes('git reset --hard'),
+  assert.ok(s.rollback_cmd && /release-channel\.sh rollback|git reset --hard/.test(s.rollback_cmd),
     'failure status must include a runnable rollback command');
   assert.ok(s.error, 'failure status must explain what went wrong');
 });

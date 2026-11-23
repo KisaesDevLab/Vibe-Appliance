@@ -4,6 +4,14 @@ Update this file at the end of every work session.
 
 ## Current status
 
+> **2026-11-22, release channel (appliance branch `feat/release-channel`).** "Version mirror" now
+> means the same *release version* on release-channel boxes: `/version` adds `applianceVersion` (from
+> `/opt/vibe/appliance/RELEASE`) next to `applianceCommit`. The snapshot manifest and the pending
+> version step carry it, and `mirrorVersion` sends it when present (a commit otherwise).
+> `standby-host.sh follow-version` installs a version from the release channel; a release-channel
+> standby refuses a bare commit from a primary still on git, telling the admin to update the primary.
+> Not run on two boxes yet. See the appliance's docs/PLAN.md §2a.
+
 - **Home:** `standby/` in Vibe-Appliance, branch `claude/vibe-standby`, draft PR #22 (Q40).
 - **Last session:** 2026-11-16 — plan revision 3, then the build described below.
 - **Where it stands:** the standby service and the appliance-side pieces are written and pass their automated tests. **Nothing has yet run on a real appliance.** The next step is Kurt's test on two boxes.

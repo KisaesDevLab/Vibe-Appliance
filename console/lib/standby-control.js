@@ -23,7 +23,9 @@ const path = require('path');
 // CORE_SERVICES in lib/standby-host.sh.
 const CORE_SERVICES = new Set(['caddy', 'postgres', 'console', 'standby', 'duplicati', 'portainer', 'emergency-proxy']);
 const HOST_ACTIONS = new Set(['standby-mode-on', 'standby-mode-off', 'standby-place', 'standby-tunnel-up', 'standby-follow-version', 'standby-archive', 'standby-boot-release', 'standby-tunnel-teardown']);
-const REF_RE = /^[0-9a-f]{7,40}$/;
+// follow-version takes a release version (release-channel boxes) or a
+// commit id (a primary still on a git checkout). Same rule as host-runner.
+const REF_RE = /^(?:[0-9a-f]{7,40}|v?[0-9]+\.[0-9]+\.[0-9]+)$/;
 const HA_ID_RE = /^[0-9]{10,16}-[a-f0-9]{8}$/;
 const IMAGE_RE = /^[a-z0-9][a-z0-9._\/:-]*@sha256:[0-9a-f]{64}$/;
 
@@ -40,8 +42,25 @@ function tokenOk(expected, given) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-// HEAD of the appliance checkout without needing git in the image.
+// The tree's RELEASE file (release-channel installs), or null.
+function readRelease(applianceDir) {
+  try {
+    const r = JSON.parse(fs.readFileSync(path.join(applianceDir, 'RELEASE'), 'utf8'));
+    return r && typeof r === 'object' ? r : null;
+  } catch { return null; }
+}
+
+// Release version of the installed tree ('' on a git checkout).
+function readVersion(applianceDir) {
+  const r = readRelease(applianceDir);
+  return r && typeof r.version === 'string' && /^[0-9]+\.[0-9]+\.[0-9]+$/.test(r.version) ? r.version : '';
+}
+
+// Commit the appliance tree was built from: RELEASE.commit on a release
+// install, else HEAD of the git checkout, read without git in the image.
 function readCommit(applianceDir) {
+  const r = readRelease(applianceDir);
+  if (r && typeof r.commit === 'string' && /^[0-9a-f]{40}$/.test(r.commit)) return r.commit;
   try {
     const gitDir = path.join(applianceDir, '.git');
     const head = fs.readFileSync(path.join(gitDir, 'HEAD'), 'utf8').trim();
@@ -110,7 +129,8 @@ function createStandbyControl(deps) {
         const d = await digestOf(c.imageId);
         if (d && c.service) imageDigests[c.service] = d;
       }
-      res.json({ applianceCommit: readCommit(deps.applianceDir), enabledApps, imageDigests });
+      const applianceVersion = readVersion(deps.applianceDir);
+      res.json({ applianceCommit: readCommit(deps.applianceDir), ...(applianceVersion ? { applianceVersion } : {}), enabledApps, imageDigests });
     } catch (err) { res.status(503).json({ error: 'could not read the appliance version: ' + err.message }); }
   });
 
@@ -239,7 +259,7 @@ function createStandbyControl(deps) {
     const action = String((req.body && req.body.action) || '');
     const ref = String((req.body && req.body.ref) || '');
     if (!HOST_ACTIONS.has(action)) return res.status(400).json({ error: 'unknown standby host action' });
-    if (action === 'standby-follow-version' && !REF_RE.test(ref)) return res.status(400).json({ error: 'follow-version needs a commit id' });
+    if (action === 'standby-follow-version' && !REF_RE.test(ref)) return res.status(400).json({ error: 'follow-version needs a release version or a commit id' });
     if (action !== 'standby-follow-version' && ref) return res.status(400).json({ error: 'this action takes no ref' });
     const id = deps.enqueueHostAction(action, 'vibe-standby', ref ? { ref } : {});
     res.status(202).json({ id });
@@ -253,4 +273,4 @@ function createStandbyControl(deps) {
   return router;
 }
 
-module.exports = { createStandbyControl, serviceKind, readCommit, CORE_SERVICES, HOST_ACTIONS };
+module.exports = { createStandbyControl, serviceKind, readCommit, readVersion, REF_RE, CORE_SERVICES, HOST_ACTIONS };

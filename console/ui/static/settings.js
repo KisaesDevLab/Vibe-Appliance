@@ -380,7 +380,7 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
 
   // ---- Appliance self-update -------------------------------------------
   //
-  // The last routine operation that required SSH (`git pull` +
+  // The last routine operation that required SSH (a manual pull +
   // `bootstrap.sh`). Everything else — tunnel, apps, modes, doctor,
   // per-app updates — was already point-and-click; this closes the gap.
   //
@@ -563,14 +563,20 @@ const SETTINGS_JS_VERSION = '2026-09-19-wizard-refusal-detail';
       if (!s) {
         statusLine.style.color = '';
         statusLine.textContent = 'No update has been run on this appliance yet.';
-        detail.textContent = data && data.running_sha
-          ? 'Currently running ' + data.running_sha + (data.running_branch ? ' (' + data.running_branch + ')' : '')
-          : '';
+        detail.textContent = data && data.running_version
+          ? 'Currently running version ' + data.running_version
+          : data && data.running_sha
+            ? 'Currently running ' + data.running_sha + (data.running_branch ? ' (' + data.running_branch + ')' : '')
+            : '';
         return;
       }
       detail.textContent = [
-        data.running_sha ? 'running ' + data.running_sha : '',
-        s.from_sha && s.to_sha ? s.from_sha.slice(0, 7) + ' → ' + s.to_sha.slice(0, 7) : '',
+        // Release installs report versions; git (developer) boxes report
+        // commits. Never slice a version: 0.10.12 is not a 7-char SHA.
+        data.running_version ? 'running version ' + data.running_version
+          : data.running_sha ? 'running ' + data.running_sha : '',
+        s.to_version ? (s.from_version || 'git checkout') + ' → ' + s.to_version
+          : s.from_sha && s.to_sha ? s.from_sha.slice(0, 7) + ' → ' + s.to_sha.slice(0, 7) : '',
         s.started_at ? 'started ' + s.started_at : '',
       ].filter(Boolean).join('  ·  ');
 

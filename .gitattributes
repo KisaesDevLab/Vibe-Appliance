@@ -17,6 +17,7 @@
 *.env       text eol=lf
 Dockerfile  text eol=lf
 LICENSE     text eol=lf
+VERSION     text eol=lf
 .gitignore  text eol=lf
 .gitattributes text eol=lf
 
@@ -24,3 +25,23 @@ LICENSE     text eol=lf
 bin/*       text eol=lf
 scripts/*   text eol=lf
 *.py        text eol=lf
+
+# Release tarball exclusions (tools/release.sh builds from `git archive`,
+# which honours export-ignore). These are build-plan notes, tests and CI —
+# nothing on a customer box reads them at runtime. The operator CLAUDE.md
+# shipped in releases comes from release/CLAUDE.operator.md instead.
+CLAUDE.md               export-ignore
+docs/PLAN.md            export-ignore
+docs/PHASES.md          export-ignore
+docs/RELEASE_v1.md      export-ignore
+standby/CLAUDE.md       export-ignore
+standby/PHASES.md       export-ignore
+standby/STATE.md        export-ignore
+standby/QUESTIONS.md    export-ignore
+standby/test            export-ignore
+tests                   export-ignore
+.github                 export-ignore
+.claude                 export-ignore
+release                 export-ignore
+tools/release.sh        export-ignore
+tools/release-build.py  export-ignore

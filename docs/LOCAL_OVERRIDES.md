@@ -11,23 +11,23 @@ override file instead.
 
 Because the edit fights every update, and eventually loses:
 
-- `lib/self-update.sh` refuses to run while the working tree is dirty. The
-  console's update button stops working until someone discards the edit.
-- Its recovery hint used to say `git reset --hard` — which deletes exactly
-  the customisation the operator meant to keep.
+- `lib/self-update.sh` refuses to run while any shipped file differs from
+  the installed release (`RELEASE.files.sha256`). The console's update
+  button stops working until someone moves or discards the edit.
+- An update replaces the whole tree with the new release, so an edit to a
+  shipped file could never survive one anyway.
 - `vibe update <slug>` recreates containers from the overlay. If the edit
   was ever lost, the app comes back **without** it, silently. A published
   port simply stops being published, and nothing reports an error.
 
-Committing the edit locally is better but still awkward: the appliance
-diverges from `origin/main` forever, and you carry a merge every update.
-
-An override file has none of those problems. It is gitignored, so the tree
-stays clean, `git pull` stays trivial, and the update button keeps working.
+An override file has none of those problems. No release ships a file by
+that name, so it is not checked against the release, and every update
+copies it into the new release before switching over (as it does with any
+file you add that no release ships, such as the `.env` bootstrap writes).
 
 ## The two files
 
-Both are optional and both are gitignored:
+Both are optional, and both are carried across appliance updates:
 
 | File | Applies to |
 |---|---|
