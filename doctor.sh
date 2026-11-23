@@ -293,13 +293,21 @@ check_release_channel() {
     _check_pass "developer box on the git channel (--channel=git); release checks skipped"
     return 0
   fi
-  local base="${VIBE_APPLIANCE_RELEASE_BASE:-https://github.com/KisaesDevLab/vibe-appliance-releases/releases}"
+  local base="${VIBE_APPLIANCE_RELEASE_BASE:-$(_state_get config.appliance_release_base 2>/dev/null || true)}"
+  base="${base:-https://github.com/KisaesDevLab/vibe-appliance-releases/releases}"
   local url="${base}/latest/download/release.json" code installed=""
   [[ -f "$appl/RELEASE" ]] && installed="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version",""))' "$appl/RELEASE" 2>/dev/null)"
-  code="$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 15 "$url" 2>/dev/null)"
-  [[ -z "$code" ]] && code="000"
+  if [[ "$GHCR_REACHABLE" == "0" ]]; then
+    # check_host_outbound already reported the dead route; another 15 s
+    # timeout would only say the same thing.
+    code="skip"
+  else
+    code="$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 15 "$url" 2>/dev/null)"
+    [[ -z "$code" ]] && code="000"
+  fi
   case "$code" in
     200) _check_pass "release channel reachable${installed:+; installed release ${installed}}" ;;
+    skip) _check_warn "release channel not checked: outbound HTTPS is down (see above)${installed:+; installed release ${installed}}" "Fix:      restore outbound HTTPS first; appliance updates and standby syncs need ${base}" ;;
     000) _check_warn "release channel unreachable (${url}); appliance updates and standby syncs will fail" "Diagnose: curl -sSIL ${url} 2>&1 | grep -iE '^(HTTP|location)'
 Fix:      allow outbound 443 to github.com and *.githubusercontent.com" ;;
     *)   _check_warn "release channel answered HTTP ${code} for ${url}" "Cause:    no release published yet, or VIBE_APPLIANCE_RELEASE_BASE points at the wrong place" ;;

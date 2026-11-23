@@ -50,7 +50,12 @@ set -euo pipefail
 VIBE_APPLIANCE_DIR_DEFAULT="/opt/vibe/appliance"
 # Release channel (default). RELEASE_BASE can point at a mirror;
 # VERSION pins a release (e.g. 0.5.0) instead of the latest one.
-export VIBE_APPLIANCE_RELEASE_BASE="${VIBE_APPLIANCE_RELEASE_BASE:-https://github.com/KisaesDevLab/vibe-appliance-releases/releases}"
+# An explicit RELEASE_BASE is persisted (config.appliance_release_base) so
+# self-update and standby syncs use the same mirror; when it is unset,
+# lib/release-channel.sh falls back to the persisted value, then GitHub.
+VIBE_APPLIANCE_RELEASE_BASE_DEFAULT="https://github.com/KisaesDevLab/vibe-appliance-releases/releases"
+CONFIG_RELEASE_BASE="${VIBE_APPLIANCE_RELEASE_BASE:-}"
+if [[ -n "$CONFIG_RELEASE_BASE" ]]; then export VIBE_APPLIANCE_RELEASE_BASE; fi
 export VIBE_APPLIANCE_VERSION="${VIBE_APPLIANCE_VERSION:-latest}"
 # Git channel (developer boxes only; needs access to the private repo).
 VIBE_APPLIANCE_REPO="${VIBE_APPLIANCE_REPO:-https://github.com/KisaesDevLab/Vibe-Appliance.git}"
@@ -222,7 +227,8 @@ FLAGS
 
 ENVIRONMENT
   VIBE_APPLIANCE_VERSION          Release to install (e.g. 0.5.0). Default: latest.
-  VIBE_APPLIANCE_RELEASE_BASE     Release channel URL. Default:
+  VIBE_APPLIANCE_RELEASE_BASE     Release channel URL (a mirror). Persisted,
+                                  so updates use it too. Default:
                                   https://github.com/KisaesDevLab/vibe-appliance-releases/releases
 
 DOCS
@@ -336,6 +342,15 @@ _self_clone_and_exec() {
   # operator is already somewhere else.
   cd / || _pre_die "cannot cd to / (filesystem in unusable state)"
 
+  # No --channel this run: a developer box that recorded --channel=git
+  # (and is still a checkout) stays on git rather than being converted.
+  if [[ -z "${VIBE_APPLIANCE_CHANNEL:-}" && -d "${VIBE_APPLIANCE_DIR_DEFAULT}/.git" ]]; then
+    if [[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("config",{}).get("appliance_channel","") or "")' \
+          "$VIBE_STATE_FILE" 2>/dev/null || true)" == "git" ]]; then
+      export VIBE_APPLIANCE_CHANNEL=git
+    fi
+  fi
+
   if [[ "${VIBE_APPLIANCE_CHANNEL:-}" != "git" ]]; then
     _self_install_release "$@"
   fi
@@ -389,7 +404,12 @@ _self_clone_and_exec() {
 # place (converting a git checkout, keeping it as a backup) and re-execs
 # bootstrap from /opt/vibe/appliance. No git is installed.
 _self_install_release() {
-  local base="$VIBE_APPLIANCE_RELEASE_BASE" want="$VIBE_APPLIANCE_VERSION"
+  local base="${VIBE_APPLIANCE_RELEASE_BASE:-}" want="$VIBE_APPLIANCE_VERSION"
+  # Re-running the one-liner on a box installed from a mirror keeps it.
+  if [[ -z "$base" ]]; then
+    base="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("config",{}).get("appliance_release_base","") or "")' "$VIBE_STATE_FILE" 2>/dev/null || true)"
+  fi
+  base="${base:-$VIBE_APPLIANCE_RELEASE_BASE_DEFAULT}"
   local live="$VIBE_APPLIANCE_DIR_DEFAULT"
   local tmp="${live}.next.tmp" dl="${live}.next.tar.gz" url meta parsed ver sha
   local curl_opts=(-fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 900)
@@ -445,7 +465,8 @@ print(v, s)' 2>/dev/null)" \
     || { rm -rf "$tmp"; _pre_die "release ${ver} is incomplete (no lib/release-channel.sh); report it."; }
 
   _pre_log "release ${ver} downloaded and verified; installing to ${live}"
-  exec bash "${tmp}/lib/release-channel.sh" adopt-staged --version "$ver" -- "$@"
+  # RC_LIVE pins the helper to the tree staged above, whatever VIBE_DIR says.
+  exec env RC_LIVE="$live" bash "${tmp}/lib/release-channel.sh" adopt-staged --version "$ver" -- "$@"
 }
 
 # On-disk conversion: bootstrap running from a git checkout at
@@ -467,6 +488,41 @@ _maybe_convert_git_checkout() {
     _pre_die "must run as root to switch this appliance to the release channel: sudo bash ${APPLIANCE_DIR}/bootstrap.sh"
   fi
 
+  # Take self-update's lock so a manual bootstrap can't clean up (rc_recover)
+  # or overwrite (rc_fetch) a download an Update-button run is making. When
+  # self-update itself started this bootstrap, it holds the lock on fd 9,
+  # which we inherited; flock on that same descriptor succeeds.
+  local lock="${VIBE_DIR:-/opt/vibe}/logs/self-update.lock" lockfd=8
+  if command -v flock >/dev/null 2>&1; then
+    if [[ "$(readlink /proc/$$/fd/9 2>/dev/null)" == "$lock" ]]; then
+      lockfd=9
+    else
+      mkdir -p "$(dirname "$lock")" 2>/dev/null || true
+      exec 8>"$lock" || lockfd=""
+    fi
+    if [[ -n "$lockfd" ]] && ! flock -n "$lockfd"; then
+      _pre_log "WARNING: an appliance update is running right now; not switching to the release channel this time."
+      _pre_log "  fix: wait for it to finish (Settings → Appliance update), then re-run: sudo bash ${APPLIANCE_DIR}/bootstrap.sh"
+      [[ "$lockfd" == 8 ]] && exec 8>&-
+      return 0
+    fi
+  fi
+
+  # Hand edits to tracked files would drop out of the running tree (they
+  # survive only in the parked git backup). Self-update and standby sync
+  # refuse such a tree; so does this. The one-liner converts it anyway.
+  local _edits
+  if ! _edits="$(git -c safe.directory="$APPLIANCE_DIR" -C "$APPLIANCE_DIR" status --porcelain --untracked-files=no 2>/dev/null)" \
+     || [[ -n "$_edits" ]]; then
+    _pre_log "WARNING: not switching to the release channel: this git checkout has local changes to shipped files${_edits:+:}"
+    [[ -n "$_edits" ]] && printf '%s\n' "$_edits" | head -10 | sed 's/^/    /' >&2
+    _pre_log "  diagnose: cd ${APPLIANCE_DIR} && sudo git status"
+    _pre_log "  fix: move host-specific changes into override files (docs/LOCAL_OVERRIDES.md) and re-run bootstrap; or, to discard them, re-run the install one-liner from docs/INSTALL.md (the checkout is kept as a backup)."
+    _pre_log "  Continuing on the git checkout; nothing was changed."
+    [[ "$lockfd" == 8 ]] && exec 8>&-
+    return 0
+  fi
+
   _pre_log "this appliance is a git checkout; switching it to the release channel (release '${VIBE_APPLIANCE_VERSION}')"
   _pre_log "  (a developer box can stay on git: sudo bash ${APPLIANCE_DIR}/bootstrap.sh --channel=git)"
   rc_recover
@@ -477,11 +533,13 @@ _maybe_convert_git_checkout() {
   if ! rc_fetch "$VIBE_APPLIANCE_VERSION"; then
     _pre_log "WARNING: could not switch to the release channel: ${RC_ERROR}."
     _pre_log "  fix: ${RC_HINT:-re-run bootstrap later}. Continuing on the git checkout; nothing was changed."
+    [[ "$lockfd" == 8 ]] && exec 8>&-
     return 0
   fi
   rc_install_next \
     || _pre_die "could not switch to the release channel: ${RC_ERROR}.
         fix: ${RC_HINT:-sudo bash ${APPLIANCE_DIR}/lib/release-channel.sh recover, then re-run bootstrap}"
+  [[ "$lockfd" == 8 ]] && exec 8>&-
   export VIBE_APPLIANCE_REEXECED=1
   exec "${RC_LIVE}/bootstrap.sh" "$@"
 }
@@ -1593,6 +1651,12 @@ main() {
   if [[ -n "$CONFIG_CHANNEL" ]]; then
     state_set_config_kv appliance_channel "$CONFIG_CHANNEL" \
       || die "could not record the appliance channel in state.json" "sudo python3 -m json.tool ${VIBE_STATE_FILE}"
+  fi
+  # Likewise an explicit release mirror. To go back to GitHub, re-run with
+  # VIBE_APPLIANCE_RELEASE_BASE set to the default URL (see --help).
+  if [[ -n "$CONFIG_RELEASE_BASE" ]]; then
+    state_set_config_kv appliance_release_base "$CONFIG_RELEASE_BASE" \
+      || die "could not record the release channel URL in state.json" "sudo python3 -m json.tool ${VIBE_STATE_FILE}"
   fi
 
   # Cookie policy, if the operator passed a flag this run. Deliberately

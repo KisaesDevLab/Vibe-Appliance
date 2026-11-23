@@ -409,6 +409,12 @@ _sm_ensure_installer() {
     log_step "updating the Sentinel installer checkout" ref="$SENTINEL_INSTALLER_REF"
     git -C "$SENTINEL_INSTALLER_DIR" fetch --quiet --tags origin 2>/dev/null || \
       log_warn "could not fetch; using the checkout already on disk" dir="$SENTINEL_INSTALLER_DIR"
+    # Checkouts made when the ref was "main" are shallow single-branch
+    # clones; a pinned commit older than their tip is not in them. Fetch
+    # it by id (GitHub serves any reachable commit).
+    if ! git -C "$SENTINEL_INSTALLER_DIR" cat-file -e "${SENTINEL_INSTALLER_REF}^{commit}" 2>/dev/null; then
+      git -C "$SENTINEL_INSTALLER_DIR" fetch --quiet origin "$SENTINEL_INSTALLER_REF" 2>/dev/null || true
+    fi
     git -C "$SENTINEL_INSTALLER_DIR" checkout --quiet "$SENTINEL_INSTALLER_REF" 2>/dev/null || \
       log_warn "could not check out $SENTINEL_INSTALLER_REF; using the current worktree"
   else

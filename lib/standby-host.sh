@@ -361,11 +361,27 @@ _follow_release() {
     die "the appliance files have local changes: $(printf '%s' "$RC_CHANGED" | head -5 | paste -sd ' ' -)" \
       "move host-specific changes into override files (docs/LOCAL_OVERRIDES.md), then re-run a sync"
   fi
+  # A git checkout being converted: hand edits to tracked files would not
+  # survive the switch, so they block it, as they did on the git path.
+  if [[ ! -f "${APPLIANCE_DIR}/RELEASE" && -d "${APPLIANCE_DIR}/.git" ]]; then
+    local st
+    if ! st="$(git -c safe.directory="$APPLIANCE_DIR" -C "$APPLIANCE_DIR" status --porcelain --untracked-files=no)" || [[ -n "$st" ]]; then
+      die "the appliance checkout has local changes" \
+        "review with: cd $APPLIANCE_DIR && sudo git status — move host-specific changes into override files (docs/LOCAL_OVERRIDES.md), then re-run a sync"
+    fi
+  fi
   log_step "moving the appliance to the primary's version" from="${have:-git}" to="$want"
   rc_fetch "$want" || die "$RC_ERROR" "${RC_HINT:-the next sync retries}"
   rc_install_next || die "$RC_ERROR" "${RC_HINT:-sudo bash ${APPLIANCE_DIR}/lib/release-channel.sh recover, then re-run a sync}"
+  local back
+  if [[ -n "$RC_BACKUP" ]]; then
+    # Converted from git: there is no .prev release; the checkout is the way back.
+    back="sudo mv ${APPLIANCE_DIR} ${APPLIANCE_DIR}.release-undo && sudo mv ${RC_BACKUP} ${APPLIANCE_DIR} && sudo bash ${APPLIANCE_DIR}/bootstrap.sh --channel=git"
+  else
+    back="$(rc_rollback_cmd)"
+  fi
   bash "${APPLIANCE_DIR}/bootstrap.sh" || die "bootstrap failed on version ${want}" \
-    "to go back: $(rc_rollback_cmd)"
+    "to go back: ${back}"
 }
 
 _follow_git() {

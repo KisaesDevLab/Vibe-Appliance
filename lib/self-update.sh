@@ -241,11 +241,17 @@ _selfupdate_release() {
     FROM_VERSION="$(rc_release_field "$APPLIANCE_DIR" version)"
     FROM_SHA="$(rc_release_field "$APPLIANCE_DIR" commit)"
     if ! rc_verify_tree "$APPLIANCE_DIR"; then
+      if [[ -z "$RC_CHANGED" ]]; then
+        # No file list to show: the manifest itself is missing.
+        write_status failed preflight "Cannot update: ${RC_ERROR}." \
+          "The install is incomplete. Re-run the install one-liner from docs/INSTALL.md; it installs the latest release and keeps your data and settings."
+        exit 1
+      fi
       local files
       files="$(printf '%s\n' "$RC_CHANGED" | head -10 | paste -sd ',' - | sed 's/,/, /g')"
       log "shipped files differ from release ${FROM_VERSION}: ${RC_CHANGED//$'\n'/ }"
       write_status failed preflight "The appliance has local file changes (${files})." \
-        "$(_edited_hint "cd ${APPLIANCE_DIR} && sudo sha256sum -c --quiet RELEASE.files.sha256") To discard the edits instead, re-run the install one-liner; it reinstalls the current release over them."
+        "$(_edited_hint "cd ${APPLIANCE_DIR} && sudo sha256sum -c --quiet RELEASE.files.sha256") To discard the edits instead, re-run the install one-liner; it installs the latest release over them."
       exit 1
     fi
   elif [[ -d "${APPLIANCE_DIR}/.git" ]]; then
@@ -254,7 +260,10 @@ _selfupdate_release() {
     # survive it, so they block it just as they always have.
     converting=1
     FROM_SHA="$(git -C "$APPLIANCE_DIR" rev-parse HEAD 2>/dev/null || true)"
-    if [[ -n "$(git -C "$APPLIANCE_DIR" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+    local _st
+    # safe.directory: a checkout owned by another user must not read as clean.
+    if ! _st="$(git -c safe.directory="$APPLIANCE_DIR" -C "$APPLIANCE_DIR" status --porcelain --untracked-files=no 2>>"$LOG_FILE")" \
+       || [[ -n "$_st" ]]; then
       write_status failed preflight "The appliance has local file changes." \
         "$(_edited_hint "cd ${APPLIANCE_DIR} && sudo git status")"
       exit 1
@@ -281,6 +290,16 @@ _selfupdate_release() {
     write_status success done "Already up to date (version ${FROM_VERSION}). No changes to apply."
     exit 0
   fi
+  # "latest" older than what is installed means a release was withdrawn.
+  # The Update button never downgrades: an older release may not run on
+  # databases a newer one already migrated. Going back is a deliberate
+  # operator step.
+  if (( ! converting )) && [[ -n "$FROM_VERSION" ]] \
+     && [[ "$(printf '%s\n%s\n' "${FROM_VERSION#v}" "${TO_VERSION#v}" | sort -V | tail -1)" != "${TO_VERSION#v}" ]]; then
+    log "latest release ${TO_VERSION} is older than installed ${FROM_VERSION}; not downgrading"
+    write_status success done "This appliance runs version ${FROM_VERSION}, newer than the latest published release (${TO_VERSION}). No changes made. If ${FROM_VERSION} was withdrawn and you want the previous version back, run: sudo bash ${APPLIANCE_DIR}/lib/release-channel.sh rollback — or install ${TO_VERSION} explicitly: curl -fsSL https://raw.githubusercontent.com/KisaesDevLab/vibe-appliance-releases/main/bootstrap.sh | sudo VIBE_APPLIANCE_VERSION=${TO_VERSION} bash"
+    exit 0
+  fi
   if (( converting )); then
     CHANGED="switched from the git checkout to release ${TO_VERSION}"
   else
@@ -296,8 +315,12 @@ _selfupdate_release() {
     exit 1
   fi
   if ! rc_install_next >>"$LOG_FILE" 2>&1; then
+    # Point at a copy of the helper that exists: the live tree, unless the
+    # swap stopped with it moved aside.
+    local _rc_tree="$APPLIANCE_DIR"
+    [[ -f "${_rc_tree}/lib/release-channel.sh" ]] || _rc_tree="${APPLIANCE_DIR}.prev"
     write_status failed pull "Could not switch to version ${TO_VERSION}: ${RC_ERROR}." \
-      "${RC_HINT:-Run: sudo bash ${APPLIANCE_DIR}.prev/lib/release-channel.sh recover — then try again.} Details in $LOG_FILE."
+      "${RC_HINT:-Run: sudo bash ${_rc_tree}/lib/release-channel.sh recover — then try again.} Details in $LOG_FILE."
     exit 1
   fi
   if (( converting )); then

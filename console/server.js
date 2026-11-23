@@ -2795,28 +2795,28 @@ app.post('/api/v1/admin/refresh-host-ip', requireAdmin, testRateLimit, async (_r
 // Release-channel installs have no .git: their RELEASE file (written by
 // tools/release-build.py) is the version source. A git checkout on a
 // developer box still reports branch and reflog date as before.
-let _releaseInfoCache;
+// Read on every call, never cached: a self-update swaps the tree under
+// this process, and bootstrap only recreates the console when console/
+// itself changed — a release that touched only lib/ leaves this process
+// running, and a cached value would report the old version as current.
 function _readReleaseInfo() {
-  if (_releaseInfoCache !== undefined) return _releaseInfoCache;
-  _releaseInfoCache = null;
   try {
     const r = JSON.parse(fs.readFileSync(path.join(APPLIANCE_DIR, 'RELEASE'), 'utf8'));
     if (r && typeof r.version === 'string') {
-      _releaseInfoCache = { version: r.version, commit: r.commit || null, built_at: r.built_at || null };
+      return { version: r.version, commit: r.commit || null, built_at: r.built_at || null };
     }
   } catch { /* not a release install */ }
-  return _releaseInfoCache;
+  return null;
 }
 
 let _gitInfoCache = null;
 function _readGitInfo() {
-  if (_gitInfoCache) return _gitInfoCache;
   const rel = _readReleaseInfo();
   if (rel) {
-    _gitInfoCache = { sha: rel.commit ? rel.commit.slice(0, 7) : null, branch: null,
+    return { sha: rel.commit ? rel.commit.slice(0, 7) : null, branch: null,
       commit_date: rel.built_at, version: rel.version, channel: 'release' };
-    return _gitInfoCache;
   }
+  if (_gitInfoCache) return _gitInfoCache;
   const gitDir = path.join(APPLIANCE_DIR, '.git');
   const out = { sha: null, branch: null, commit_date: null, version: null, channel: 'git' };
   try {

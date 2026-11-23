@@ -123,3 +123,17 @@ test('release channel: an unreachable channel fails at fetch and changes nothing
   assert.match(s.message, /could not reach the release channel/i);
   assert.strictEqual(version(host.live), '1.0.0');
 });
+
+test('release channel: never downgrades when "latest" moves back to an older release', { skip }, async () => {
+  const ch = makeChannel();
+  ch.publish('1.1.0');
+  const host = makeHost(ch);
+  rc(host, 'rc_fetch latest && rc_install_next');
+  ch.publish('1.0.0'); // a withdrawn 1.1.0: latest now points at 1.0.0
+  const s = await selfUpdate(host);
+  assert.strictEqual(s.state, 'success', s.error || s.message);
+  assert.match(s.message, /newer than the latest published release \(1\.0\.0\)/);
+  assert.match(s.message, /release-channel\.sh rollback/);
+  assert.strictEqual(version(host.live), '1.1.0');
+  assert.ok(!fs.existsSync(host.marker), 'bootstrap must not run');
+});

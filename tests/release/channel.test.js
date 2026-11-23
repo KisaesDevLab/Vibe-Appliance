@@ -179,3 +179,29 @@ test('adopt-staged (the one-liner\'s hand-over) installs and re-execs bootstrap 
   assert.strictEqual(version(host.live), '1.0.0');
   assert.match(read(host.marker), /appliance 1\.0\.0 --mode lan/);
 });
+
+test('rollback carries override files added after the update', { skip }, () => {
+  const ch = makeChannel();
+  ch.publish('1.0.0');
+  const host = makeHost(ch);
+  installed(ch, host, '1.0.0');
+  write(host.live, 'apps/old.override.yml', 'old: 1\n');
+  ch.publish('1.1.0');
+  rc(host, 'rc_fetch latest && rc_install_next');
+  write(host.live, 'apps/old.override.yml', 'old: 2\n');
+  write(host.live, 'apps/new.override.yml', 'new: 1\n');
+  rc(host, 'rc_rollback');
+  assert.strictEqual(version(host.live), '1.0.0');
+  assert.strictEqual(fs.readFileSync(host.live + '/apps/new.override.yml', 'utf8'), 'new: 1\n');
+  assert.strictEqual(fs.readFileSync(host.live + '/apps/old.override.yml', 'utf8'), 'old: 2\n');
+});
+
+test('a release mirror persisted in state.json is used when the environment does not name one', { skip }, () => {
+  const ch = makeChannel();
+  ch.publish('1.0.0');
+  const host = makeHost(ch);
+  fs.writeFileSync(host.vibe + '/state.json', JSON.stringify({ config: { appliance_release_base: ch.baseUrl } }));
+  const out = rc(host, 'rc_resolve latest && printf "%s|%s" "$VIBE_APPLIANCE_RELEASE_BASE" "$RC_VERSION"',
+    { VIBE_APPLIANCE_RELEASE_BASE: '' });
+  assert.strictEqual(out.trim(), `${ch.baseUrl}|1.0.0`);
+});

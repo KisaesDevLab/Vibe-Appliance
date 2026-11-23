@@ -43,7 +43,16 @@ RC_TMP="${RC_LIVE}.next.tmp"
 RC_DL="${RC_LIVE}.next.tar.gz"
 RC_PREV="${RC_LIVE}.prev"
 RC_RB="${RC_LIVE}.rollback"
-VIBE_APPLIANCE_RELEASE_BASE="${VIBE_APPLIANCE_RELEASE_BASE:-https://github.com/KisaesDevLab/vibe-appliance-releases/releases}"
+RC_DEFAULT_BASE="https://github.com/KisaesDevLab/vibe-appliance-releases/releases"
+# A mirror chosen at install time (bootstrap persists an explicit
+# VIBE_APPLIANCE_RELEASE_BASE as config.appliance_release_base) applies to
+# every later fetch: self-update and standby syncs never see bootstrap's
+# environment. An explicit environment value still wins.
+if [[ -z "${VIBE_APPLIANCE_RELEASE_BASE:-}" ]]; then
+  VIBE_APPLIANCE_RELEASE_BASE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("config",{}).get("appliance_release_base","") or "")' \
+    "$VIBE_STATE_FILE" 2>/dev/null || true)"
+fi
+VIBE_APPLIANCE_RELEASE_BASE="${VIBE_APPLIANCE_RELEASE_BASE:-$RC_DEFAULT_BASE}"
 VIBE_APPLIANCE_VERSION="${VIBE_APPLIANCE_VERSION:-latest}"
 RC_ASSET="vibe-appliance.tar.gz"
 
@@ -255,24 +264,41 @@ for d, dirs, files in os.walk(root):
             print(rel)
 PYEOF
   elif [[ -d "${tree}/.git" ]]; then
-    git -C "$tree" ls-files --others 2>/dev/null | grep -v '/__pycache__/\|^__pycache__/' || true
+    # safe.directory: a checkout cloned by another user would otherwise make
+    # git refuse ("dubious ownership") and the .env/override files would
+    # silently not be carried. quotePath off: print paths as-is, not C-quoted.
+    local out
+    out="$(git -c safe.directory="$tree" -c core.quotePath=false -C "$tree" ls-files --others)" || return 1
+    printf '%s\n' "$out" | grep -v '/__pycache__/\|^__pycache__/' || true
   fi
 }
 
-# rc_carry <from> <to> — copy <from>'s untracked files into <to>. A path
-# the new release now ships itself is left as shipped (and reported).
+# _rc_ships <tree> <rel> — true when <tree>'s release ships <rel>.
+_rc_ships() {
+  [[ -f "${1}/RELEASE.files.sha256" ]] || return 1
+  cut -c67- "${1}/RELEASE.files.sha256" | grep -qxF -- "$2"
+}
+
+# rc_carry <from> <to> [replace] — copy <from>'s untracked files into <to>.
+# A path the new release now ships itself is left as shipped (and
+# reported). With "replace", an untracked file that <to> also has but does
+# not ship (an older copy of the same override) is replaced by <from>'s.
 rc_carry() {
-  local from="$1" to="$2" rel
+  local from="$1" to="$2" replace="${3:-}" rel list
   [[ -d "$from" ]] || return 0
+  list="$(rc_untracked "$from")" || { _rc_fail "could not list the .env and override files in ${from}" \
+    "diagnose: sudo git -C ${from} status — then try again"; return 1; }
   while IFS= read -r rel; do
     [[ -n "$rel" ]] || continue
     if [[ -e "${to}/${rel}" ]]; then
-      _rc_say "not carrying ${rel}: the new release ships its own copy (yours stays in ${from})"
-      continue
+      if [[ "$replace" != "replace" ]] || _rc_ships "$to" "$rel"; then
+        _rc_say "not carrying ${rel}: the new release ships its own copy (yours stays in ${from})"
+        continue
+      fi
     fi
     mkdir -p "$(dirname "${to}/${rel}")"
     cp -a "${from}/${rel}" "${to}/${rel}" || { _rc_fail "could not carry ${rel} into the new release" "check free space: df -h ${VIBE_DIR}"; return 1; }
-  done < <(rc_untracked "$from")
+  done <<<"$list"
   return 0
 }
 
@@ -282,7 +308,7 @@ rc_swap() {
   cd / || return 1
   [[ -d "$RC_NEXT" ]] || { _rc_fail "there is no verified release to switch to" "fetch it again"; return 1; }
   rm -rf "$RC_PREV"
-  if [[ -d "$RC_LIVE" ]]; then mv "$RC_LIVE" "$RC_PREV" || { _rc_fail "could not move the current release aside"; return 1; }; fi
+  if [[ -d "$RC_LIVE" ]]; then mv "$RC_LIVE" "$RC_PREV" || { _rc_fail "could not move the current release aside" "check the disk and permissions: ls -ld ${RC_LIVE}* && df -h ${VIBE_DIR} — then try again"; return 1; }; fi
   mv "$RC_NEXT" "$RC_LIVE" || { _rc_fail "could not move the new release into place" "run: sudo bash ${RC_PREV}/lib/release-channel.sh recover"; return 1; }
 }
 
@@ -301,7 +327,7 @@ rc_install_next() {
   elif [[ -d "${RC_LIVE}/.git" ]]; then
     local backup="${RC_LIVE}.git-backup.${stamp}" edited
     RC_BACKUP="$backup"
-    edited="$(git -C "$RC_LIVE" status --porcelain --untracked-files=no 2>/dev/null || true)"
+    edited="$(git -c safe.directory="$RC_LIVE" -C "$RC_LIVE" status --porcelain --untracked-files=no 2>/dev/null || true)"
     rc_carry "$RC_LIVE" "$RC_NEXT" || return 1
     mv "$RC_LIVE" "$backup" || { _rc_fail "could not move the git checkout aside"; return 1; }
     mv "$RC_NEXT" "$RC_LIVE" || { mv "$backup" "$RC_LIVE"; _rc_fail "could not move the release into place; the git checkout is back"; return 1; }
@@ -326,8 +352,11 @@ rc_rollback() {
   cd / || return 1
   [[ -d "$RC_PREV" ]] || { _rc_fail "there is no previous release at ${RC_PREV} to go back to" "list what exists: ls -d ${RC_LIVE}*"; return 1; }
   rm -rf "$RC_RB"
-  mv "$RC_LIVE" "$RC_RB" || { _rc_fail "could not move the current release aside"; return 1; }
+  mv "$RC_LIVE" "$RC_RB" || { _rc_fail "could not move the current release aside" "check the disk and permissions: ls -ld ${RC_LIVE}* && df -h ${VIBE_DIR} — then try again"; return 1; }
   mv "$RC_PREV" "$RC_LIVE" || { _rc_fail "could not put the previous release back" "run: sudo bash ${RC_RB}/lib/release-channel.sh recover"; return 1; }
+  # .env and override files written or changed since the update live in
+  # the tree being rolled back; bring them along, as an update does.
+  rc_carry "$RC_RB" "$RC_LIVE" replace || _rc_say "WARNING: ${RC_ERROR}; your override files are still in ${RC_PREV}"
   mv "$RC_RB" "$RC_PREV"
 }
 

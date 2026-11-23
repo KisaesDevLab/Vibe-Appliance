@@ -435,7 +435,8 @@ preflight_https() {
 # Skipped on the git channel (developer boxes).
 preflight_release_channel() {
   local title="Appliance release channel reachable"
-  local base="${VIBE_APPLIANCE_RELEASE_BASE:-https://github.com/KisaesDevLab/vibe-appliance-releases/releases}"
+  local base="${VIBE_APPLIANCE_RELEASE_BASE:-$(state_get_config_kv appliance_release_base 2>/dev/null || true)}"
+  base="${base:-https://github.com/KisaesDevLab/vibe-appliance-releases/releases}"
   local url="${base}/latest/download/release.json"
   if [[ "$(state_get_config_kv appliance_channel 2>/dev/null)" == "git" ]]; then
     return 0
