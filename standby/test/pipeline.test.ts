@@ -299,3 +299,21 @@ test("a repository that lost every copy is a failed sync once this box holds one
   assert.match((out as { error: string }).error, /no longer holds any copy/);
   assert.ok(w.standby.store.get<VerifiedCopy>("verifiedCopy"), "the verified copy is kept");
 });
+
+test("ready to start: images missing after a sync are fetched again with no new copy, and the panel can tell", { skip }, async () => {
+  const w = await world();
+  w.standby.box.unpullable.add("vibe-tb");
+  await w.capture();
+  await w.sync();
+  assert.deepEqual(w.standby.store.get<{ failed: string[] }>("imagesReady")!.failed, ["vibe-tb"]);
+  // The registry answers again; the primary sent nothing new.
+  w.standby.box.unpullable.clear();
+  const pulls = () => w.standby.box.calls.filter((c) => c === "pullImages").length;
+  const before = pulls();
+  await w.sync();
+  assert.equal(pulls(), before + 1, "a failed image is retried even when the copy is unchanged");
+  assert.deepEqual(w.standby.store.get<{ failed: string[] }>("imagesReady")!.failed, []);
+  // All present and checked recently: not pulled on every sync.
+  await w.sync();
+  assert.equal(pulls(), before + 1);
+});

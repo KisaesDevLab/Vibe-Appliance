@@ -172,13 +172,16 @@ print((json.load(open('${manifest}')).get('runtime') or 'appliance'))
   # at every sync and tagged them. When all of them are here, use them:
   # no registry round trip while the firm is down, and no newer "latest"
   # than the primary ran.
-  local _have_all=0 _img
+  # "Here" means the exact image the primary ran: when the copy's manifest
+  # (VIBE_EXPECTED_IMAGES) names a digest for an image's repository, the
+  # local image must carry that digest; a stale tag left by a failed pull
+  # does not count.
+  local _have_all=0 _imgs
   if [[ "${VIBE_ENABLE_SKIP_PULL_IF_PRESENT:-0}" == "1" ]]; then
-    _have_all=1
-    while read -r _img; do
-      [[ -n "$_img" ]] || continue
-      docker image inspect "$_img" >/dev/null 2>&1 || { _have_all=0; break; }
-    done < <(cd "$APPLIANCE_DIR" && compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" config --images 2>/dev/null || echo "missing-image-list")
+    _imgs="$(cd "$APPLIANCE_DIR" && compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" config --images 2>/dev/null)" || _imgs=""
+    # shellcheck disable=SC2086
+    if [[ -n "$_imgs" ]] && python3 "${APPLIANCE_DIR}/lib/images_ready.py" "${VIBE_EXPECTED_IMAGES:-}" $_imgs
+    then _have_all=1; fi
   fi
   local _pull_out
   _pull_out="$(mktemp)"

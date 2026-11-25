@@ -292,7 +292,8 @@ PYEOF
   # side, and the images this box already pulled at the last sync are used
   # as they are (no registry round trip, no newer version than the primary's).
   local t0=$SECONDS
-  VIBE_PARALLEL_APPS=1 VIBE_ENABLE_SKIP_PULL_IF_PRESENT=1 bash "${APPLIANCE_DIR}/bootstrap.sh" || die "bootstrap did not finish after the restored data was placed" \
+  VIBE_PARALLEL_APPS=1 VIBE_ENABLE_SKIP_PULL_IF_PRESENT=1 VIBE_EXPECTED_IMAGES="${MIRROR_ROOT}${SB_DIR}/stage/manifest.json" \
+    bash "${APPLIANCE_DIR}/bootstrap.sh" || die "bootstrap did not finish after the restored data was placed" \
     "it is safe to re-run: sudo bash ${APPLIANCE_DIR}/bootstrap.sh — then reopen the Promote wizard, which resumes"
   log_info "apps brought up after placing the copy" seconds="$((SECONDS - t0))"
   ( cd "$APPLIANCE_DIR" && docker compose up -d --force-recreate caddy console ) >>"$VIBE_LOG_FILE" 2>&1 || true
@@ -932,6 +933,16 @@ PYEOF
       "use the ordinary practice drill"
   fi
 
+  # Nothing could be drilled (every app left out, each with its reason):
+  # report that at once; there is nothing to start or isolate.
+  if [[ "$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))['apps']))" "$DRILL_DIR/plan.json")" == "0" ]]; then
+    python3 "$APPLIANCE_DIR/lib/standby_drill.py" report "$DRILL_DIR" "$DRILL_REPORT" "$DRILL_SNAPSHOT" "$DRILL_STARTED"       0 "" /dev/null 0 || _drill_fail "could not write the drill report" "sudo tail -30 $VIBE_LOG_FILE"
+    trap - EXIT
+    action_drill_clean
+    log_warn "no app could be drilled; see the Standby panel for why"
+    return 0
+  fi
+
   # ---- throwaway database, restored from the verified copy's dumps -------
   log_step "restoring the copy's databases into a throwaway database server"
   _drill_check_cancel
@@ -965,18 +976,21 @@ PYEOF
   # and leaves the others never started. Watched so a cancel is not kept waiting.
   ( "${dc[@]}" create ) >>"$VIBE_LOG_FILE" 2>&1 || log_warn "not every drill container could be created; the report says which"
   local pids=() line svcs pid up_rc=0
+  # Each app's own output too: the report quotes Docker's reason when an
+  # app's containers could not even be created.
+  install -d -m 700 "$DRILL_DIR/up"
   while read -r line; do
     [[ -n "$line" ]] || continue
     read -r slug svcs <<<"$line"
     # shellcheck disable=SC2086
-    timeout "$DRILL_TIMEOUT" "${dc[@]}" up -d $svcs >>"$VIBE_LOG_FILE" 2>&1 &
+    { timeout "$DRILL_TIMEOUT" "${dc[@]}" up -d $svcs 2>&1 | tee "$DRILL_DIR/up/$slug.log" >>"$VIBE_LOG_FILE"; exit "${PIPESTATUS[0]}"; } &
     pids+=("$!")
   done < <(python3 -c "import json,sys; [print(a['slug'], ' '.join(a['services'])) for a in json.load(open(sys.argv[1]))['apps']]" "$DRILL_DIR/plan.json")
   while :; do
     local alive=0
     for pid in "${pids[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
     (( alive )) || break
-    if [[ -f "$DRILL_CANCEL" ]]; then kill "${pids[@]}" 2>/dev/null || true; fi
+    if [[ -f "$DRILL_CANCEL" ]]; then kill "${pids[@]}" 2>/dev/null || true; pkill -f "docker compose -p ${DRILL_PROJECT} " 2>/dev/null || true; fi
     sleep 2
   done
   for pid in "${pids[@]}"; do wait "$pid" || up_rc=1; done

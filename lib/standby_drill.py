@@ -200,6 +200,13 @@ def build(drill, vibe, appliance, handson=False):
         own = [n for n in all_svcs if n not in core]
         if not own:
             skipped.append({"slug": slug, "reason": "its overlay declares no services"}); continue
+        # The drill never downloads (pull_policy "never"): an image this box
+        # does not have makes the app "not drilled", with the reason.
+        missing = sorted({all_svcs[n].get("image") for n in own if all_svcs[n].get("image") and _docker("image", "inspect", all_svcs[n]["image"])[0] != 0})
+        if missing:
+            skipped.append({"slug": slug, "reason": "not drilled: its image%s %s %s not on this box. The next sync downloads %s; to fetch %s now, choose Sync now." % (
+                "s" if len(missing) > 1 else "", ", ".join(missing), "are" if len(missing) > 1 else "is", "them" if len(missing) > 1 else "it", "them" if len(missing) > 1 else "it")})
+            continue
         try:
             rendered = {n: drill_service(n, all_svcs[n], vibe, drill, top_volumes) for n in own}
             shared = {n: drill_service(n, all_svcs[n], vibe, drill, top_volumes) for n in SHARED if n in all_svcs and n not in services}
@@ -265,19 +272,36 @@ def _containers():
     """{service: {"running", "exit", "health"}} for the drill project, straight from Docker."""
     rc, out = _docker("ps", "-aq", "--filter", "label=com.docker.compose.project=" + PROJECT)
     ids = out.split()
-    if rc != 0 or not ids:
-        return {}
-    rc, out = _docker("inspect", *ids)
     if rc != 0:
+        return None
+    if not ids:
         return {}
+    # A container removed between the two calls makes inspect exit 1 but it
+    # still prints the others. Unreadable output: unknown (None), not "none".
+    rc, out = _docker("inspect", *ids)
+    try:
+        found = json.loads(out or "[]")
+    except ValueError:
+        return None
     got = {}
-    for c in json.loads(out):
+    for c in found:
         svc = (c.get("Config", {}).get("Labels") or {}).get("com.docker.compose.service", "")
         st = c.get("State") or {}
         got[svc] = {"running": bool(st.get("Running")), "exit": st.get("ExitCode"),
                     "health": (st.get("Health") or {}).get("Status"), "status": st.get("Status"),
                     "name": (c.get("Name") or "").lstrip("/")}
     return got
+
+
+def _up_error(drill, slug):
+    """The last error compose printed while starting this app, if any."""
+    try:
+        with open(os.path.join(drill, "up", slug + ".log")) as f:
+            lines = [l.strip() for l in f if l.strip()]
+    except OSError:
+        return ""
+    errs = [l for l in lines if "rror" in l or "failed" in l.lower()]
+    return (errs or lines or [""])[-1][:300]
 
 
 def service_state(c, is_job):
@@ -309,14 +333,20 @@ def wait(drill, timeout, cancel_file=None, poll=5):
     detail = {}
     while True:
         cs = _containers()
+        if cs is None:  # Docker did not answer clearly this time: look again
+            time.sleep(poll)
+            if time.time() - start > timeout:
+                break
+            continue
         for a in plan["apps"]:
             if result[a["slug"]] is not None:
                 continue
             states = {n: service_state(cs.get(n), n in a["jobs"]) for n in a["services"]}
             bad = {n: s for n, s in states.items() if s not in ("ready", "waiting")}
             if bad:
+                why = _up_error(drill, a["slug"]) if any(s == "was not created" for s in bad.values()) else ""
                 result[a["slug"]] = {"ok": False, "seconds": round(time.time() - start),
-                                     "detail": "; ".join("%s %s" % kv for kv in sorted(bad.items()))}
+                                     "detail": "; ".join("%s %s" % kv for kv in sorted(bad.items())) + (" (Docker said: %s)" % why if why else "")}
             elif all(s == "ready" for s in states.values()):
                 result[a["slug"]] = {"ok": True, "seconds": round(time.time() - start), "detail": "ready"}
             else:
@@ -343,7 +373,7 @@ def save_logs(drill, plan, result, lines=60):
     logs = os.path.join(os.path.dirname(drill.rstrip("/")), "drill-logs")
     subprocess.run(["rm", "-rf", logs])
     os.makedirs(logs, mode=0o700, exist_ok=True)
-    cs = _containers()
+    cs = _containers() or {}
     for a in plan["apps"]:
         r = result.get(a["slug"])
         if r and r.get("ok"):
@@ -410,8 +440,11 @@ def report(drill, out_path, snapshot, started, restored, restore_warnings, probe
         "ok": isolated and bool(apps) and all(a["ok"] for a in apps),
         "apps": apps, "skipped": plan["skipped"], "databasesRestored": restored, "restoreWarnings": restore_warnings,
         "isolation": {"outsideReachable": {k: v != "000" for k, v in egress.items()}, "tunnelRunning": tunnel_running, "ok": isolated},
-        "error": None if apps else "no app could be drilled",
+        "error": None if apps else "no app could be drilled; the list below says why for each",
     }
+    if not apps:  # nothing ran, so there was nothing to isolate
+        del body["isolation"]
+        isolated = True
     failed = [a["slug"] for a in apps if not a["ok"]]
     if failed:
         logs = os.path.join(os.path.dirname(drill.rstrip("/")), "drill-logs")

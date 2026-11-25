@@ -51,12 +51,21 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
-log_info "pruning unused Docker images (docker image prune -af)"
+# A standby keeps the primary's app images ready for a drill or a promote,
+# and no container uses them, so `-a` would delete every one of them (and
+# the next drill or promote would have nothing to start). There, only
+# dangling layers are removed.
+prune_flags="-af"
+if python3 -c "import json,sys; sys.exit(0 if (json.load(open(sys.argv[1])).get('config') or {}).get('standby_mode') else 1)" "${VIBE_DIR}/state.json" 2>/dev/null; then
+  prune_flags="-f"
+  log_info "this box is a standby: keeping the primary's app images, removing only unused leftover layers"
+fi
+log_info "pruning unused Docker images (docker image prune ${prune_flags})"
 
 # `-a` removes images not referenced by any container (running OR
 # stopped). `-f` skips the interactive confirmation prompt — required
 # when invoked from the console daemon, which has no TTY.
-prune_out="$(docker image prune -af 2>&1)"
+prune_out="$(docker image prune ${prune_flags} 2>&1)"
 rc=$?
 
 # Echo the docker output through to stderr so the operator sees the

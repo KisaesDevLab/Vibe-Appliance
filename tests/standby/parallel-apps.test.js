@@ -70,3 +70,30 @@ test('an ordinary bootstrap still re-enables apps one at a time, in dependency o
     ['start vibe-a', 'end vibe-a', 'start vibe-b', 'start vibe-c', 'end vibe-c']);
   assert.ok(calls.includes('state vibe-b status failed'));
 });
+
+test('promote: no more than VIBE_PARALLEL_APPS_MAX apps start at once', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vb-cap-'));
+  const man = path.join(root, 'appliance', 'console', 'manifests');
+  fs.mkdirSync(man, { recursive: true });
+  const apps = {};
+  for (const s of ['vibe-a', 'vibe-b', 'vibe-c', 'vibe-d']) { fs.writeFileSync(path.join(man, `${s}.json`), JSON.stringify({ slug: s })); apps[s] = { enabled: true }; }
+  fs.writeFileSync(path.join(root, 'state.json'), JSON.stringify({ apps }));
+  const src = fs.readFileSync(path.join(REPO, 'bootstrap.sh'), 'utf8');
+  const script = `
+set -euo pipefail
+calls="${root}/calls"
+log_set_phase() { :; }; log_info() { :; }; log_step() { :; }; log_ok() { :; }; log_warn() { :; }
+state_standby_mode() { return 1; }; prune_orphans() { :; }; _state_app_set() { :; }
+enable_app() { echo "start $1" >> "$calls"; sleep 1; echo "end $1" >> "$calls"; }
+VIBE_STATE_FILE="${root}/state.json"; APPLIANCE_DIR="${root}/appliance"; VIBE_LOG_DIR="${root}"
+${fnBody(src, '_enable_apps_by_level')}
+${fnBody(src, 'phase_apps')}
+phase_apps
+`;
+  execFileSync('bash', ['-c', script], { env: { ...process.env, VIBE_PARALLEL_APPS: '1', VIBE_PARALLEL_APPS_MAX: '2' } });
+  const calls = fs.readFileSync(path.join(root, 'calls'), 'utf8').trim().split('\n');
+  let running = 0, most = 0;
+  for (const l of calls) { running += l.startsWith('start') ? 1 : -1; most = Math.max(most, running); }
+  assert.equal(most, 2, calls.join(' | '));
+  assert.equal(calls.filter((l) => l.startsWith('end')).length, 4);
+});

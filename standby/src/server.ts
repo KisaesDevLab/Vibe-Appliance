@@ -74,6 +74,7 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
       formerPeer: store.get("formerPeer") ?? null,
       formerLive: store.get("formerLive") ?? null,
       tunnelCleanup: store.get("tunnelCleanup") ?? null,
+      imagesReady: store.get("imagesReady") ?? null,
       drill: { running: store.get("drillRunning") ?? null, blocked: drillBlocked(store), history: drillHistory(store).slice(0, 12), handsOn: handsOnState(store) },
       phrases: { promote: CONFIRM_PHRASE, rejoin: REJOIN_PHRASE, skipArchive: SKIP_ARCHIVE_PHRASE, switchover: SWITCHOVER_PHRASE, unpair: UNPAIR_PHRASE, startAnyway: START_ANYWAY_PHRASE },
     };

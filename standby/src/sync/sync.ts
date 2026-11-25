@@ -57,6 +57,22 @@ export type SyncOutcome =
 
 interface SwapPending { snapshotId: string; databases: string[]; copy: VerifiedCopy }
 /** What the "mirror-version" step still has to do for a snapshot whose data is already in place. */
+/** Are the primary's exact images on this box, ready for a drill or a promote? */
+export interface ImagesReady { at: string; total: number; failed: string[] }
+
+/** Pull the primary's images by digest (present ones cost a registry check) and record the result. */
+async function ensureImages(d: SyncDeps, digests: Record<string, string>): Promise<string[]> {
+  const at = (d.now ?? (() => new Date()))().toISOString();
+  try {
+    const { failed } = await d.appliance.pullImages(digests);
+    d.store.set("imagesReady", { at, total: Object.keys(digests).length, failed } satisfies ImagesReady);
+    return failed.map((ref) => `could not pull the image for ${ref}`);
+  } catch (err) {
+    d.store.set("imagesReady", { at, total: Object.keys(digests).length, failed: Object.keys(digests) } satisfies ImagesReady);
+    return [`image pull failed: ${(err as Error).message}`];
+  }
+}
+
 interface VersionPending { snapshotId: string; applianceCommit: string; enabledApps: string[]; imageDigests: Record<string, string>; cautions: string[] }
 
 /** The hard-link copy while it is still being made. Only a finished copy is ever named `mirror.prev`. */
@@ -170,7 +186,14 @@ export async function runSync(d: SyncDeps): Promise<SyncOutcome> {
     }
     d.store.unset("waitingNote");
     if (have?.snapshotId === latest.id) {
-      // The data is in place. If an earlier run was cut short after the swap,
+      // The data is in place. The primary's images must stay here too, ready
+      // for a drill or a promote: something on this box (an image clean-up)
+      // may have removed them since. Checked twice a day, or sooner after a failure.
+      const ready = d.store.get<ImagesReady>("imagesReady");
+      if (!ready || ready.failed.length || (d.now ?? (() => new Date()))().getTime() - Date.parse(ready.at) > 12 * 3600e3) {
+        await ensureImages(d, (await readManifest(d.repo, latest)).imageDigests);
+      }
+      // If an earlier run was cut short after the swap,
       // it still owes this snapshot the version step.
       const owed = d.store.get<VersionPending>("versionPending");
       const versionIssues = owed?.snapshotId === latest.id ? await followVersion(d, owed) : (d.store.get<string[]>("versionIssues") ?? []);
@@ -183,11 +206,7 @@ export async function runSync(d: SyncDeps): Promise<SyncOutcome> {
     const manifest: SnapshotManifest = await readManifest(d.repo, latest);
 
     // Images first: slow, harmless, and a registry problem must not block the data.
-    const versionIssues: string[] = [];
-    try {
-      const { failed } = await d.appliance.pullImages(manifest.imageDigests);
-      for (const ref of failed) versionIssues.push(`could not pull the image for ${ref}`);
-    } catch (err) { versionIssues.push(`image pull failed: ${(err as Error).message}`); }
+    const versionIssues: string[] = [...(await ensureImages(d, manifest.imageDigests))];
 
     await enter("restore-files");
     if (existsSync(d.paths.mirror)) {

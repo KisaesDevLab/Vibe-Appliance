@@ -1106,21 +1106,23 @@ phase_claude_code() {
 # Each app still runs in its own subshell with the same failure handling
 # as the one-at-a-time loop. Input: "<level> TAB <slug>" lines, level order.
 _enable_apps_by_level() {
-  local lines="$1" lvl slug cur="" pids=() names=() i
-  _finish_level() {
-    for i in "${!pids[@]}"; do
-      if wait "${pids[$i]}"; then
-        log_ok "app re-enabled" slug="${names[$i]}"
-      else
-        _state_app_set "${names[$i]}" status failed
-        log_warn "app re-enable failed; marked status=failed in state — see ${VIBE_LOG_DIR}/bootstrap.log" slug="${names[$i]}"
-      fi
-    done
-    pids=(); names=()
+  # At most this many at once: every app starting together on a small box
+  # can push one past its health timeout, which marks it failed.
+  local lines="$1" lvl slug cur="" pids=() names=() max="${VIBE_PARALLEL_APPS_MAX:-3}"
+  _finish_oldest() {
+    if wait "${pids[0]}"; then
+      log_ok "app re-enabled" slug="${names[0]}"
+    else
+      _state_app_set "${names[0]}" status failed
+      log_warn "app re-enable failed; marked status=failed in state — see ${VIBE_LOG_DIR}/bootstrap.log" slug="${names[0]}"
+    fi
+    pids=("${pids[@]:1}"); names=("${names[@]:1}")
   }
+  _finish_level() { while (( ${#pids[@]} )); do _finish_oldest; done; }
   while IFS=$'\t' read -r lvl slug; do
     [[ -n "$slug" ]] || continue
     if [[ -n "$cur" && "$lvl" != "$cur" ]]; then _finish_level; fi
+    while (( ${#pids[@]} >= max )); do _finish_oldest; done
     cur="$lvl"
     ( enable_app "$slug" </dev/null ) &
     pids+=("$!"); names+=("$slug")

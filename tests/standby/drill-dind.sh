@@ -252,6 +252,14 @@ wait "$dpid" && fail "a cancelled drill reported success"
 [[ ! -e "$VIBE/standby/drill.cancel" ]] || fail "the cancel marker was left behind"
 [[ "$(sum)" == "$before" ]] || fail "the mirror changed after a cancelled drill"
 
+echo "== an app whose image is not on this box is reported as such, not as 'was not created'"
+docker rmi busybox:1.36 >/dev/null
+ready; run drill >/tmp/noimg.out 2>&1 || true
+report '[x["reason"] for x in d["skipped"] if x["slug"] == "vibe-demo"][0]' | grep -q "busybox:1.36 is not on this box" \
+  || fail "missing image not reported: $(report 'd["skipped"]') $(report 'd.get("apps")')"
+[[ -z "$(docker ps -aq --filter label=com.docker.compose.project=vibe-drill)" ]] || fail "drill containers left"
+docker pull -q busybox:1.36 >/dev/null
+
 echo "== hands-on: opens to one computer, practice notice first, the drill's own app behind it"
 # The admin's computer: its own network namespace, like a PC on the LAN,
 # reaching this box at 10.200.0.1 (Docker's port mapping keeps its address).

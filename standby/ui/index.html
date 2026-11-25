@@ -205,7 +205,8 @@ function standby() {
       S.dataAt ? P("It holds the primary's data as of ", h("strong", {}, when(S.dataAt)), " (", age(S.dataAgeHours), ").") : P("It has not received a copy yet."),
       h("dl", {}, h("dt", {}, "Last check"), h("dd", {}, run ? `${run.ok ? "succeeded" : "failed"} ${when(run.at)}` : "not yet"),
         h("dt", {}, "Copies arrive"), h("dd", {}, S.pairing.mode === "direct" ? "directly from the primary" : "through the storage bucket"),
-        h("dt", {}, "Apps on this box"), h("dd", {}, "stopped, as they should be")),
+        h("dt", {}, "Apps on this box"), h("dd", {}, "stopped, as they should be"),
+        h("dt", {}, "Ready to start"), h("dd", {}, readyLine(S.imagesReady))),
       h("div", { class: "row" }, btn(S.busy === "sync" ? "Syncing…" : "Sync now", () => act(() => api("POST", "api/sync/run")), "", !!S.busy), btn("Unpair…", () => go("unpair")))),
     card(h("h2", {}, "If the primary is down"), P("Promote makes this box the live one, using the copy it holds. Only do this when the primary cannot be used."),
       h("div", { class: "row" }, btn("Promote…", () => go("promote-checks"), "primary", !S.dataAt))),
@@ -242,6 +243,13 @@ function drillCard() {
     d.handsOn ? null : handsOnStart(d),
     drillGuide());
   return card(...kids);
+}
+
+// Are the primary's exact images here, so a drill or a promote can start the apps at once?
+function readyLine(r) {
+  if (!r) return "not checked yet (at the next sync)";
+  if (!r.failed.length) return `yes: all ${r.total} of the primary's app images are on this box (checked ${when(r.at)})`;
+  return h("span", { class: "err" }, `no: ${r.failed.length} of ${r.total} images could not be fetched (${r.failed.slice(0, 3).join(", ")}${r.failed.length > 3 ? ", …" : ""}). Choose Sync now to try again; check this box's internet connection.`);
 }
 
 // Hands-on drill: the same drill, left running for the admin's own computer.
