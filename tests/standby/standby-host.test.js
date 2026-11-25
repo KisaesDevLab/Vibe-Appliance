@@ -23,7 +23,7 @@ function box() {
   // appliance checkout: the real libs, a stub bootstrap that records it ran
   fs.mkdirSync(path.join(appl, 'lib'), { recursive: true });
   for (const f of ['log.sh', 'state.sh', 'standby-host.sh']) fs.copyFileSync(path.join(REPO, 'lib', f), path.join(appl, 'lib', f));
-  w(path.join(appl, 'bootstrap.sh'), `#!/usr/bin/env bash\necho ran >> "${root}/bootstrap.calls"\n`, 0o755);
+  w(path.join(appl, 'bootstrap.sh'), `#!/usr/bin/env bash\necho "ran\${VIBE_PARALLEL_APPS:+ parallel}\${VIBE_ENABLE_SKIP_PULL_IF_PRESENT:+ local-images}" >> "${root}/bootstrap.calls"\n`, 0o755);
   // stub docker: records calls, plays a postgres container, lists one app + tunnel as running
   w(path.join(bin, 'docker'), `#!/usr/bin/env bash
 echo "$*" >> "${root}/docker.calls"
@@ -109,7 +109,8 @@ test('place: restored data and settings go in, this box keeps its identity, boot
   assert.deepEqual(st.phases, { core_up: { status: 'ok' } }, "bootstrap phases describe this host, not the primary's");
   assert.ok(st.host_services);
 
-  assert.deepEqual(b.calls('bootstrap.calls'), ['ran']);
+  // A promote: apps side by side, and the images pulled at the last sync used as they are.
+  assert.deepEqual(b.calls('bootstrap.calls'), ['ran parallel local-images']);
   const docker = b.calls('docker.calls');
   assert.ok(docker.some((c) => c.startsWith('stop') && c.includes('vibe-cloudflared')), 'tunnel stopped first');
   assert.ok(docker.some((c) => c.startsWith('exec') && c.includes('vibe-postgres')), 'database password aligned');
@@ -168,7 +169,7 @@ test('place: a repeat request for the copy that was already placed answers "done
   const again = b.run('place');
   assert.equal(again.status, 0, again.stderr);
   assert.match(again.stdout + again.stderr, /already placed/);
-  assert.deepEqual(b.calls('bootstrap.calls'), ['ran'], 'bootstrap did not run a second time');
+  assert.deepEqual(b.calls('bootstrap.calls'), ['ran parallel local-images'], 'bootstrap did not run a second time');
   assert.equal(b.read('data/apps/vibe-tb/uploads/doc.pdf'), 'client document');
   // A DIFFERENT snapshot with no mirror is still refused: nothing to place.
   fs.writeFileSync(path.join(b.vibe, 'standby/place.ready'), '{"snapshotId":"s2"}');

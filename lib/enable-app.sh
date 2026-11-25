@@ -167,10 +167,25 @@ print((json.load(open('${manifest}')).get('runtime') or 'appliance'))
   # Output is captured as well as logged, so the failure can say WHY
   # (private image without a token, revoked token, missing image, rate
   # limit) instead of guessing.
+  # A promote (VIBE_ENABLE_SKIP_PULL_IF_PRESENT=1, set by the standby's
+  # place step): the standby pulled the primary's exact images by digest
+  # at every sync and tagged them. When all of them are here, use them:
+  # no registry round trip while the firm is down, and no newer "latest"
+  # than the primary ran.
+  local _have_all=0 _img
+  if [[ "${VIBE_ENABLE_SKIP_PULL_IF_PRESENT:-0}" == "1" ]]; then
+    _have_all=1
+    while read -r _img; do
+      [[ -n "$_img" ]] || continue
+      docker image inspect "$_img" >/dev/null 2>&1 || { _have_all=0; break; }
+    done < <(cd "$APPLIANCE_DIR" && compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" config --images 2>/dev/null || echo "missing-image-list")
+  fi
   local _pull_out
   _pull_out="$(mktemp)"
+  if (( _have_all )); then
+    log_info "every image for $slug is already on this box (pulled at the last sync); not contacting the registry" slug="$slug"
   # shellcheck disable=SC2086
-  if ! ( cd "$APPLIANCE_DIR" && \
+  elif ! ( cd "$APPLIANCE_DIR" && \
          compose_files "$slug" && docker compose "${COMPOSE_FILES[@]}" pull --include-deps $services ) >"$_pull_out" 2>&1; then
     cat "$_pull_out" >>"$VIBE_LOG_FILE" 2>/dev/null || true
     local _hint

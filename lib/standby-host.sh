@@ -288,8 +288,13 @@ PYEOF
   log_step "running bootstrap to bring the apps up (this is the long part)"
   # Services that read the replaced env at start must be recreated.
   ( cd "$APPLIANCE_DIR" && docker compose up -d --force-recreate redis ) >>"$VIBE_LOG_FILE" 2>&1 || true
-  bash "${APPLIANCE_DIR}/bootstrap.sh" || die "bootstrap did not finish after the restored data was placed" \
+  # The firm is down: apps with no dependency on each other come up side by
+  # side, and the images this box already pulled at the last sync are used
+  # as they are (no registry round trip, no newer version than the primary's).
+  local t0=$SECONDS
+  VIBE_PARALLEL_APPS=1 VIBE_ENABLE_SKIP_PULL_IF_PRESENT=1 bash "${APPLIANCE_DIR}/bootstrap.sh" || die "bootstrap did not finish after the restored data was placed" \
     "it is safe to re-run: sudo bash ${APPLIANCE_DIR}/bootstrap.sh — then reopen the Promote wizard, which resumes"
+  log_info "apps brought up after placing the copy" seconds="$((SECONDS - t0))"
   ( cd "$APPLIANCE_DIR" && docker compose up -d --force-recreate caddy console ) >>"$VIBE_LOG_FILE" 2>&1 || true
 
   _drop_pre_promote

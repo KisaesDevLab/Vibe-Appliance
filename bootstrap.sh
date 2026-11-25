@@ -1101,6 +1101,33 @@ phase_claude_code() {
 #
 # Failures here do NOT abort bootstrap — the core stack and console
 # admin URL still need to come up so the operator can investigate.
+# Re-enable apps side by side, one dependency level at a time (a promote:
+# the firm is down, and one app's health wait must not hold up the next).
+# Each app still runs in its own subshell with the same failure handling
+# as the one-at-a-time loop. Input: "<level> TAB <slug>" lines, level order.
+_enable_apps_by_level() {
+  local lines="$1" lvl slug cur="" pids=() names=() i
+  _finish_level() {
+    for i in "${!pids[@]}"; do
+      if wait "${pids[$i]}"; then
+        log_ok "app re-enabled" slug="${names[$i]}"
+      else
+        _state_app_set "${names[$i]}" status failed
+        log_warn "app re-enable failed; marked status=failed in state — see ${VIBE_LOG_DIR}/bootstrap.log" slug="${names[$i]}"
+      fi
+    done
+    pids=(); names=()
+  }
+  while IFS=$'\t' read -r lvl slug; do
+    [[ -n "$slug" ]] || continue
+    if [[ -n "$cur" && "$lvl" != "$cur" ]]; then _finish_level; fi
+    cur="$lvl"
+    ( enable_app "$slug" </dev/null ) &
+    pids+=("$!"); names+=("$slug")
+  done <<<"$lines"
+  _finish_level
+}
+
 phase_apps() {
   log_set_phase "apps"
 
@@ -1128,9 +1155,13 @@ phase_apps() {
   # tiebreak; a manifest cycle falls back to alphabetical rather than
   # hanging).
   local slugs
-  slugs="$(python3 - "$VIBE_STATE_FILE" "${APPLIANCE_DIR}/console/manifests" "${NAMING_CHANGED:-false}" <<'PYEOF' || true
+  # A promote (VIBE_PARALLEL_APPS=1, set by the standby's place step) gets
+  # "<level> TAB <slug>" lines instead: apps on one level have no dependency
+  # on each other and are re-enabled side by side.
+  slugs="$(python3 - "$VIBE_STATE_FILE" "${APPLIANCE_DIR}/console/manifests" "${NAMING_CHANGED:-false}" "${VIBE_PARALLEL_APPS:-0}" <<'PYEOF' || true
 import json, os, sys
 state_path, manifests_dir, naming_changed = sys.argv[1:4]
+with_levels = len(sys.argv) > 4 and sys.argv[4] == "1"
 try:
     with open(state_path) as f:
         s = json.load(f)
@@ -1199,8 +1230,16 @@ while remaining:
     if not progressed:
         emitted.extend(remaining)  # dependency cycle: alphabetical fallback
         break
+level = {}
 for slug in emitted:
-    print(slug)
+    # A dependency not yet placed (a cycle) puts this app one level after
+    # everything placed so far: such apps run one at a time, as before.
+    if all(d in level for d in deps[slug]):
+        level[slug] = 1 + max([level[d] for d in deps[slug]] or [-1])
+    else:
+        level[slug] = 1 + max(list(level.values()) or [-1])
+for slug in emitted:
+    print("%d\t%s" % (level[slug], slug) if with_levels else slug)
 PYEOF
 )"
 
@@ -1212,6 +1251,9 @@ PYEOF
   log_step "re-enabling apps from state.json"
 
   local slug
+  if [[ "${VIBE_PARALLEL_APPS:-0}" == "1" ]]; then
+    _enable_apps_by_level "$slugs"
+  else
   while IFS= read -r slug; do
     [[ -z "$slug" ]] && continue
     # Subshell isolation: `enable_app` calls `die` (which `exit 1`s the
@@ -1233,6 +1275,7 @@ PYEOF
       log_warn "app re-enable failed; marked status=failed in state — see ${VIBE_LOG_DIR}/bootstrap.log" slug="$slug"
     fi
   done <<<"$slugs"
+  fi
 
   # Every app is up: now the leftovers are knowable. Each per-app compose call
   # above saw the other apps as "orphan containers" (all apps share the project
