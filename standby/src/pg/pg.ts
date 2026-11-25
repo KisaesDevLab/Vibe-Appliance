@@ -81,10 +81,16 @@ export class Pg {
 
   async serverVersion(): Promise<string> { return (await this.sql("postgres", "SHOW server_version"))[0]![0]!; }
 
-  /** Every application database: not templates, not `postgres`, not our own working copies. */
+  /**
+   * Every application database: not templates, not `postgres`, not our own
+   * working copies, and not databases closed to connections. An app closes a
+   * database (ALLOW_CONNECTIONS false) to park it; Tax Research, for one,
+   * keeps its pre-restore copy as `<db>_prev_<id>`. No one can connect to
+   * read a closed database, so trying to copy it failed the whole capture.
+   */
   async listDatabases(): Promise<string[]> {
     const rows = await this.sql("postgres",
-      `SELECT datname FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres' AND datname NOT LIKE '%\\_\\_incoming' AND datname NOT LIKE '%\\_\\_old' ORDER BY datname`);
+      `SELECT datname FROM pg_database WHERE NOT datistemplate AND datallowconn AND datname <> 'postgres' AND datname NOT LIKE '%\\_\\_incoming' AND datname NOT LIKE '%\\_\\_old' ORDER BY datname`);
     return rows.map((r) => r[0]!);
   }
 

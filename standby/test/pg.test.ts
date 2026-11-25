@@ -30,6 +30,16 @@ test("pg: lists application databases only", { skip }, async () => {
   assert.deepEqual(await p.listDatabases(), ["vibe_tb_db"]);
 });
 
+test("pg: skips databases closed to connections (an app's parked copy)", { skip }, async () => {
+  await p.sql("postgres", "CREATE DATABASE vibe_tax_research_db_prev_r_1");
+  await p.sql("postgres", "ALTER DATABASE vibe_tax_research_db_prev_r_1 ALLOW_CONNECTIONS false");
+  try {
+    assert.deepEqual(await p.listDatabases(), ["vibe_tb_db"]);
+  } finally {
+    await p.sql("postgres", "DROP DATABASE vibe_tax_research_db_prev_r_1");
+  }
+});
+
 test("pg: capture figures describe the dump even when rows are written during the dump", { skip }, async () => {
   const dump = join(dir, "race.dump");
   // Writer keeps inserting while the capture runs.
