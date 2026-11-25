@@ -145,3 +145,26 @@ test("drill: one left recorded by a restart is cleared away and recorded as inte
   assert.match(h!.error!, /Interrupted/);
   assert.equal(await finishInterruptedDrill({ store: w.store, appliance: w.box }), false, "nothing left to do");
 });
+
+test("drill: an interrupted drill's clean-up never clears a promote that started meanwhile, and the admin is told", async () => {
+  const w = await setup();
+  w.store.set("operation", "drill");
+  w.store.set("drillRunning", { startedAt: "2026-11-23T05:00:00.000Z", trigger: "schedule", snapshotId: "snap-1" });
+  // The host still runs the old drill; the clean-up waits behind it while the admin starts a promote.
+  w.box.cleanDrill = async () => { w.store.set("operation", "promote"); };
+  assert.equal(await finishInterruptedDrill({ store: w.store, appliance: w.box, mailer: w.deps().mailer, to: () => "it@firm.example" }), true);
+  assert.equal(activeOperation(w.store), "promote");
+  assert.match(w.sent[0]!.subject, /FAILED/);
+  assert.match(w.sent[0]!.text, /Interrupted/);
+});
+
+test("drill: apps left out are named in the subject of a passing drill, and restore warnings are reported", async () => {
+  const w = await setup();
+  const base = w.box.drillResult;
+  w.box.drillResult = (req) => ({ ...base(req), skipped: [{ slug: "vibe-backup", reason: "not drilled: it is not copied to the standby (it stays with the primary)" }], restoreWarnings: ["vibe_tb_db was restored with warnings"] });
+  const r = await runDrill(w.deps(), { actor: "admin", trigger: "admin" });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.restoreWarnings, ["vibe_tb_db was restored with warnings"]);
+  assert.match(w.sent[0]!.subject, /passed, 1 app not drilled/);
+  assert.match(w.sent[0]!.text, /database: vibe_tb_db was restored with warnings/);
+});

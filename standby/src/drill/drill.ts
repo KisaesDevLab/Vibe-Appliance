@@ -34,6 +34,8 @@ export interface DrillRecord {
   apps: DrillAppResult[];
   skipped: { slug: string; reason: string }[];
   isolated: boolean | null;
+  /** Databases the drill's restore could not apply cleanly. */
+  restoreWarnings: string[];
   /** After the drill: is the copy still exactly the verified one? */
   copyUnchanged: boolean;
   error: string | null;
@@ -71,7 +73,8 @@ export function drillBlocked(store: Store): string | null {
 
 export function composeDrillEmail(r: DrillRecord, boxName: string): { subject: string; text: string } {
   const failed = r.apps.filter((a) => !a.ok);
-  const subject = r.ok ? `Vibe Standby: practice drill passed (${boxName})` : `Vibe Standby: practice drill FAILED (${boxName})`;
+  const left = r.skipped.length ? `, ${r.skipped.length} app${r.skipped.length === 1 ? "" : "s"} not drilled` : "";
+  const subject = r.ok ? `Vibe Standby: practice drill passed${left} (${boxName})` : `Vibe Standby: practice drill FAILED (${boxName})`;
   const lines = [r.ok
     ? "The monthly practice drill passed: every app started from the standby's copy, answered its health check and showed its sign-in page."
     : "The practice drill did not pass. If the primary failed now, a promote would probably run into the same problem."];
@@ -81,6 +84,7 @@ export function composeDrillEmail(r: DrillRecord, boxName: string): { subject: s
     for (const a of r.apps) lines.push(`- ${a.slug}: ${a.ok ? `passed${a.secondsToReady != null ? ` (ready in ${a.secondsToReady} s)` : ""}` : `FAILED: ${a.detail}`}`);
   }
   for (const s of r.skipped) lines.push(`- ${s.slug}: ${s.reason}`);
+  for (const w of r.restoreWarnings) lines.push(`- database: ${w}`);
   if (r.error) lines.push("", "What went wrong:", r.error);
   if (r.fix) lines.push("", "What to do:", r.fix);
   if (!r.copyUnchanged) lines.push("", "The standby's copy no longer matches what was verified. Run a sync from the Standby panel before relying on it.");
@@ -126,6 +130,7 @@ export async function runDrill(d: DrillDeps, opts: { actor: string; trigger: "ad
       snapshotId: copy.snapshotId, dataAt: copy.createdAt,
       apps: report?.apps ?? [], skipped: report?.skipped ?? [],
       isolated: report?.isolation ? report.isolation.ok : null,
+      restoreWarnings: report?.restoreWarnings ?? [],
       copyUnchanged: problems.length === 0,
       error: error ?? report?.error ?? (problems.length ? `after the drill, the copy did not match: ${problems.slice(0, 3).join("; ")}` : null),
       fix: report?.fix ?? null,
@@ -133,16 +138,7 @@ export async function runDrill(d: DrillDeps, opts: { actor: string; trigger: "ad
     remember(d.store, record);
     d.store.audit("drill", opts.actor, record.ok, { trigger: opts.trigger, failed: record.apps.filter((a) => !a.ok).map((a) => a.slug), skipped: record.skipped.map((s) => s.slug), error: record.error });
 
-    const to = d.to?.() ?? "";
-    if (to && d.mailer && !d.signal?.aborted) {
-      const mailer = await d.mailer().catch(() => null);
-      if (mailer) {
-        const { subject, text } = composeDrillEmail(record, d.boxName?.() ?? "standby");
-        await mailer.send(to, subject, text).then(
-          () => d.store.audit("alert-email", "drill", true, { subject }),
-          (e: Error) => d.store.audit("alert-email", "drill", false, { subject, error: e.message }));
-      }
-    }
+    if (!d.signal?.aborted) await emailDrill(d, record);
     return record;
   } finally {
     d.store.unset("drillRunning");
@@ -151,24 +147,40 @@ export async function runDrill(d: DrillDeps, opts: { actor: string; trigger: "ad
   }
 }
 
+async function emailDrill(d: Pick<DrillDeps, "store" | "mailer" | "to" | "boxName">, record: DrillRecord): Promise<void> {
+  const to = d.to?.() ?? "";
+  if (!to || !d.mailer) return;
+  const mailer = await d.mailer().catch(() => null);
+  if (!mailer) return;
+  const { subject, text } = composeDrillEmail(record, d.boxName?.() ?? "standby");
+  await mailer.send(to, subject, text).then(
+    () => d.store.audit("alert-email", "drill", true, { subject }),
+    (e: Error) => d.store.audit("alert-email", "drill", false, { subject, error: e.message }));
+}
+
 /** A drill that a restart of this service left recorded: clear it away and record it as interrupted. */
-export async function finishInterruptedDrill(d: Pick<DrillDeps, "store" | "appliance" | "now">): Promise<boolean> {
+export async function finishInterruptedDrill(d: Pick<DrillDeps, "store" | "appliance" | "now" | "mailer" | "to" | "boxName">): Promise<boolean> {
   if (activeOperation(d.store) !== "drill") return false;
+  // The host's drill can outlive this service; this waits behind it in the host runner.
   await d.appliance.cleanDrill();
   const running = d.store.get<{ startedAt: string; trigger: "admin" | "schedule"; snapshotId: string }>("drillRunning");
   const copy = d.store.get<VerifiedCopy>("verifiedCopy");
+  let record: DrillRecord | null = null;
   if (running) {
-    remember(d.store, {
+    record = {
       id: running.startedAt, trigger: running.trigger, startedAt: running.startedAt, finishedAt: (d.now ?? (() => new Date()))().toISOString(),
       ok: false, snapshotId: running.snapshotId, dataAt: copy?.snapshotId === running.snapshotId ? copy.createdAt : null,
-      apps: [], skipped: [], isolated: null, copyUnchanged: true,
+      apps: [], skipped: [], isolated: null, restoreWarnings: [], copyUnchanged: true,
       error: "Interrupted: the standby service stopped during the drill. Everything the drill started has been removed.",
       fix: "Run the drill again from the Standby panel.",
-    });
+    };
+    remember(d.store, record);
   }
   d.store.unset("drillRunning");
-  d.store.unset("operation");
+  // A promote may have started while the clean-up waited: its flag stays.
+  if (activeOperation(d.store) === "drill") d.store.unset("operation");
   d.store.audit("drill-interrupted", "schedule", true, {});
+  if (record) await emailDrill(d, record);
   return true;
 }
 

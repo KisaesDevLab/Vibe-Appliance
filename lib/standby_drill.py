@@ -79,6 +79,8 @@ def drill_service(name, svc, vibe, drill, top_volumes):
         "dns", "dns_search", "links", "external_links", "profiles")}
     out["restart"] = "no"
     out["pull_policy"] = "never"
+    # If memory runs out, the kernel kills drill containers before anything real.
+    out["oom_score_adj"] = 800
     vols = []
     for v in svc.get("volumes") or []:
         v = dict(v)
@@ -140,6 +142,14 @@ def build(drill, vibe, appliance):
     slugs = sorted(f[:-5] for f in os.listdir(render) if f.endswith(".json") and not f.startswith("_"))
     services, networks, volumes = {}, {}, {}
     apps, skipped = [], []
+    try:
+        with open(os.path.join(render, "_skipped.json")) as f:
+            skipped.extend(json.load(f))
+    except Exception:
+        pass
+    for f in sorted(os.listdir(render)):
+        if f.endswith(".failed"):
+            skipped.append({"slug": f[:-7], "reason": "not drilled: its service definitions could not be read (see the standby host log)"})
     core_names = None
 
     def add_networks(svc_out, cfg):
@@ -147,8 +157,11 @@ def build(drill, vibe, appliance):
             networks[net] = {"driver": "bridge", "internal": True}
 
     for slug in slugs:
-        with open(os.path.join(render, slug + ".json")) as f:
-            cfg = json.load(f)
+        try:
+            with open(os.path.join(render, slug + ".json")) as f:
+                cfg = json.load(f)
+        except Exception:
+            skipped.append({"slug": slug, "reason": "not drilled: its service definitions could not be read"}); continue
         all_svcs = cfg.get("services") or {}
         top_volumes = cfg.get("volumes") or {}
         hurl, surl, not_ours = manifest_checks(appliance, slug)

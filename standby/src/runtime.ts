@@ -446,7 +446,14 @@ export class Runtime {
     const tz = await this.timezone();
     if (!isFirstSunday(now, tz) || !dueDaily(now, this.config.syncFallbackAt, tz, this.store.get<string>("lastScheduledDrillAt"))) return false;
     const run = this.store.recentSyncRuns(1)[0];
-    return run?.status === "ok" && !!run.finishedAt && now.getTime() - Date.parse(run.finishedAt) < 24 * 3_600_000;
+    if (!(run?.status === "ok" && !!run.finishedAt && now.getTime() - Date.parse(run.finishedAt) < 24 * 3_600_000)) return false;
+    // A sync that changed version has asked the host to rebuild this very
+    // service; a drill started now would be cut off. Wait until this box
+    // runs the version of the copy.
+    if (this.store.get("versionPending")) return false;
+    const copy = this.store.get<VerifiedCopy>("verifiedCopy");
+    const mine = (await this.appliance.version().catch(() => null))?.applianceCommit ?? "";
+    return !!copy && !!mine && (mine.startsWith(copy.applianceCommit) || copy.applianceCommit.startsWith(mine));
   }
 
   status(now: Date = new Date()): Status { return computeStatus(this.store, this.config, now); }
@@ -490,6 +497,9 @@ export class Runtime {
     // stopped, its own failure handling rolls the copy back to the last
     // verified one, and the promote's first step checks that again.
     const clear = async (): Promise<void> => {
+      // A drill may be running on the host even when this process is not
+      // waiting for it (it outlives a restart): ask it to stop either way.
+      if (activeOperation(this.store) === "drill") await this.appliance.cancelDrill().catch(() => { /* place clears any drill itself */ });
       if (!this.#busy) return;
       const what = this.#busy;
       this.#interrupting = true;
@@ -667,7 +677,11 @@ export class Runtime {
     }
     if (op === "start-anyway") { this.store.unset("operation"); return; }
     if (op === "drill") {
-      if (await finishInterruptedDrill({ store: this.store, appliance: this.appliance })) this.#log("warn", "a practice drill was interrupted by a restart; everything it started was removed");
+      const done = await this.#track("drill", () => finishInterruptedDrill({
+        store: this.store, appliance: this.appliance,
+        mailer: () => this.#mailer(), to: () => this.store.get<string>("alertEmail") ?? this.config.alertEmail, boxName: () => this.store.nodeId.slice(0, 8),
+      }));
+      if (done) this.#log("warn", "a practice drill was interrupted by a restart; everything it started was removed");
       return;
     }
 

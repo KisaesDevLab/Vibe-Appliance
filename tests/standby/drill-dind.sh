@@ -144,6 +144,11 @@ sed -i 's/"standby_mode":true/"standby_mode":false/' "$VIBE/state.json"; ready
 run drill >/dev/null 2>&1 && fail "drill ran on a primary"
 sed -i 's/"standby_mode":false/"standby_mode":true/' "$VIBE/state.json"
 
+echo "== refuses a box short of memory, with a hint"
+ready; VIBE_DRILL_MIN_MEM_MB=99999999 run drill >/tmp/mem.out 2>&1 && fail "drill ran without enough memory"
+grep -q "not enough free memory" /tmp/mem.out || fail "no memory message: $(tail -3 /tmp/mem.out)"
+[[ -z "$(docker ps -aq --filter label=com.docker.compose.project=vibe-drill)" ]] || fail "a refused drill started containers"
+
 echo "== a drill of the demo app passes"
 ready; run drill >/tmp/drill.out 2>&1 || { cat /tmp/drill.out; cat "$VIBE/logs/standby-host.log" 2>/dev/null | tail -40; fail "drill exited non-zero"; }
 [[ "$(report 'd["ok"]')" == "True" ]] || { cat "$VIBE/standby/drill-report.json"; fail "drill did not pass"; }
@@ -151,6 +156,7 @@ ready; run drill >/tmp/drill.out 2>&1 || { cat /tmp/drill.out; cat "$VIBE/logs/s
 [[ "$(report 'd["apps"][0]["health"]')" == "200" && "$(report 'd["apps"][0]["signIn"]')" == "200" ]] || fail "health/sign-in not checked"
 [[ "$(report 'd["isolation"]["outsideReachable"]')" == "{'ip': False, 'name': False}" ]] || fail "outside reachable: $(report 'd["isolation"]')"
 [[ "$(report 'd["databasesRestored"]')" == "1" ]] || fail "database not restored"
+[[ "$(report '[x["slug"] for x in d["skipped"]]')" == "['vibe-backup']" ]] || fail "an enabled app left out was not reported: $(report 'd["skipped"]')"
 
 echo "== the verified copy and this box's own containers are unchanged"
 [[ "$(sum)" == "$before" ]] || fail "the mirror changed during the drill"

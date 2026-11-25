@@ -200,8 +200,9 @@ action_place() {
 
   # A real disaster can strike during a practice drill. The drill's file
   # view sits on the mirror this step is about to use, so it goes first.
-  action_drill_clean >/dev/null || die "a practice drill on this box could not be cleared away before promoting" \
-    "sudo bash ${APPLIANCE_DIR}/lib/standby-host.sh drill-clean — then reopen the Promote wizard, which resumes"
+  # A drill never writes to the mirror (overlayfs leaves the lower layer
+  # alone), so a clean-up problem is reported, not allowed to stop a promote.
+  action_drill_clean >/dev/null 2>&1 || log_warn "a practice drill could not be fully cleared away; the promote continues. Afterwards: sudo bash ${APPLIANCE_DIR}/lib/standby-host.sh drill-clean"
 
   _stop_non_core
 
@@ -631,7 +632,7 @@ _drill_ids() { # <kind: ps|volume|network>
   esac
 }
 
-action_drill_clean() {
+action_drill_clean() { # [keep-cancel]: the drill's own opening clean must not eat a cancel that came first
   local ids
   docker rm -f vibe-drill-probe >/dev/null 2>&1 || true
   if [[ -f "$DRILL_DIR/compose.json" ]]; then
@@ -651,7 +652,8 @@ action_drill_clean() {
   if mountpoint -q "$DRILL_DIR/data" 2>/dev/null; then
     die "the drill's file view is still mounted at $DRILL_DIR/data" "sudo umount -l $DRILL_DIR/data, then run the drill clean-up again"
   fi
-  rm -rf "$DRILL_DIR" "$DRILL_READY" "$DRILL_CANCEL"
+  rm -rf "$DRILL_DIR"
+  if [[ "${1:-}" != "keep-cancel" ]]; then rm -f "$DRILL_READY" "$DRILL_CANCEL"; fi
   log_ok "no drill is left on this box"
 }
 
@@ -694,12 +696,21 @@ action_drill() {
     _drill_fail "the tunnel is running on this standby, which must never happen" \
       "the Standby service stops it within 5 minutes; then start the drill again. If it keeps running: sudo docker stop vibe-cloudflared"
   fi
-  action_drill_clean >/dev/null || _drill_fail "an earlier drill could not be cleared away" "sudo tail -30 $VIBE_LOG_FILE"
+  _drill_check_cancel
+  action_drill_clean keep-cancel >/dev/null || _drill_fail "an earlier drill could not be cleared away" "sudo tail -30 $VIBE_LOG_FILE"
+  _drill_check_cancel
   local need have
   need="$( (du -sk "$stage/db" 2>/dev/null || echo 0) | cut -f1)"; need=$(( ${need:-0} * 4 + 2097152 ))
   have="$(df -Pk "$SB_DIR" | awk 'NR==2 {print $4}')"
   [[ "$have" =~ ^[0-9]+$ ]] && (( have > need )) || _drill_fail "not enough free disk for a drill (need about $((need/1024)) MB)" \
     "free some disk on this box (df -h $SB_DIR), then start the drill again"
+  # Every app plus a second Postgres. The drill's containers are also the
+  # kernel's first choice if memory runs out (oom_score_adj), never the
+  # standby's own Postgres, but a box that is short of memory is refused.
+  local mem_kb min_mb="${VIBE_DRILL_MIN_MEM_MB:-1024}"
+  mem_kb="$(awk '/^(MemAvailable|SwapFree):/ {s += $2} END {print s+0}' /proc/meminfo 2>/dev/null || echo 0)"
+  (( mem_kb / 1024 >= min_mb )) || _drill_fail "not enough free memory for a drill (about $((mem_kb / 1024)) MB free, $min_mb MB needed)" \
+    "a drill starts every app at once. Give this box more memory (or swap), or run the drill when nothing else is running on it"
   trap 'action_drill_clean >/dev/null 2>&1 || true' EXIT
 
   # ---- the drill's own copy of files and settings -------------------------
@@ -730,6 +741,18 @@ PYEOF
   # mounts are resolved later by dockerd on the host, which is why
   # standby_drill.py rewrites every one of them.
   local slug tag
+  # Every enabled app is either drilled or listed with the reason it was not.
+  python3 - "$SRC/state.json" "$APPLIANCE_DIR" "$SKIP_APPS" "$DRILL_DIR/render/_skipped.json" <<'PYEOF' || true
+import json, os, sys
+state, appl, skip, out = sys.argv[1:5]
+apps = (json.load(open(state)).get("apps") or {})
+left = []
+for slug, a in sorted(apps.items()):
+    if not (a and a.get("enabled")): continue
+    if slug in skip.split(): left.append({"slug": slug, "reason": "not drilled: it is not copied to the standby (it stays with the primary)"})
+    elif not os.path.isfile(os.path.join(appl, "apps", slug + ".yml")): left.append({"slug": slug, "reason": "not drilled: this appliance version has no definition for it"})
+json.dump(left, open(out, "w"))
+PYEOF
   ( cd "$APPLIANCE_DIR" && unshare -m --propagation private bash -c '
       set -euo pipefail
       mount --bind "$1" "$2/env"
@@ -744,9 +767,10 @@ PYEOF
         set -euo pipefail
         mount --bind "$1" "$2/env"
         . "$3/lib/compose-files.sh"
-        compose_files "$5"; docker compose "${COMPOSE_FILES[@]}" config --format json > "$4/$5.json"
+        compose_files "$5"; docker compose "${COMPOSE_FILES[@]}" config --format json > "$4/$5.json.tmp"
+        mv "$4/$5.json.tmp" "$4/$5.json"
       ' _ "$DRILL_DIR/env" "$VIBE_DIR" "$APPLIANCE_DIR" "$DRILL_DIR/render" "$slug" ) >>"$VIBE_LOG_FILE" 2>&1 \
-      || log_warn "could not render the services of $slug for the drill" slug="$slug"
+      || { log_warn "could not render the services of $slug for the drill" slug="$slug"; rm -f "$DRILL_DIR/render/$slug.json.tmp"; : > "$DRILL_DIR/render/$slug.failed"; }
   done <<<"$slugs"
   python3 "$APPLIANCE_DIR/lib/standby_drill.py" render "$DRILL_DIR" "$VIBE_DIR" "$APPLIANCE_DIR" >>"$VIBE_LOG_FILE" 2>&1 \
     || _drill_fail "could not build the isolated drill from the primary's apps" "sudo tail -30 $VIBE_LOG_FILE"
