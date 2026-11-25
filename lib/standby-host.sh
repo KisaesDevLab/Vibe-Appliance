@@ -12,6 +12,9 @@
 #   follow-version   move the appliance checkout to VIBE_STANDBY_REF and
 #                    re-run bootstrap (the standby follows the primary)
 #   archive          REJOIN: set this box's current data aside, read-only
+#   drill            PRACTICE: start the primary's apps from the verified copy
+#                    in an isolated, throwaway project, check them, remove it
+#   drill-clean      remove every trace of a drill (safe at any time)
 #   tunnel-up        start cloudflared with the token already in shared.env
 #   tunnel-teardown  a new standby removes its OWN tunnel and DNS records
 #   boot-hold, shutdown-hold, boot-release, boot-release-safety
@@ -194,6 +197,11 @@ action_place() {
   new_pg_pass="$(_env_get "$new_shared" POSTGRES_PASSWORD)"
   [[ -n "$new_pg_pass" ]] || die "the restored shared.env has no POSTGRES_PASSWORD" \
     "the snapshot is incomplete; run a new sync before promoting"
+
+  # A real disaster can strike during a practice drill. The drill's file
+  # view sits on the mirror this step is about to use, so it goes first.
+  action_drill_clean >/dev/null || die "a practice drill on this box could not be cleared away before promoting" \
+    "sudo bash ${APPLIANCE_DIR}/lib/standby-host.sh drill-clean — then reopen the Promote wizard, which resumes"
 
   _stop_non_core
 
@@ -585,7 +593,206 @@ action_boot_release_safety() {
   _release_held "safety net: no decision from the Standby service"
 }
 
+# ---- practice drill ------------------------------------------------------------
+# Starts the primary's apps from this standby's verified copy in a separate,
+# throwaway compose project (`vibe-drill`) on networks with no way out,
+# checks that each one comes up and answers, then removes all of it.
+#
+# The verified copy is never written to:
+#   - databases are restored from the copy's dumps into a THROWAWAY Postgres
+#     (the standby's own Postgres and its verified databases are not used);
+#   - Redis is a throwaway, empty one;
+#   - app files are an overlayfs view: the mirror is the read-only lower
+#     layer, every write lands in a scratch upper layer that is deleted;
+#   - settings are a copy of the restored env, without the tunnel token.
+# Isolation: every drill network is `internal` (Docker gives it no route out,
+# and external names do not resolve); no ports are published; restart "no",
+# so a reboot mid-drill starts nothing. The drill checks this itself: a
+# probe on the drill network must fail to reach an outside address and name.
+#
+# Idempotency: `drill` first runs `drill-clean`, so a drill interrupted by a
+# crash, a kill or a reboot is cleared by the next one. `drill-clean` alone
+# removes every trace and is safe to run at any time, on any box.
+# Reverse: drill-clean.
+DRILL_DIR="${SB_DIR}/drill"
+DRILL_READY="${SB_DIR}/drill.ready"
+DRILL_REPORT="${SB_DIR}/drill-report.json"
+DRILL_PROJECT="vibe-drill"
+DRILL_TIMEOUT="${VIBE_DRILL_TIMEOUT:-900}"
+
+_drill_ids() { # <kind: ps|volume|network>
+  case "$1" in
+    ps)      docker ps -aq --filter "label=com.docker.compose.project=${DRILL_PROJECT}" 2>/dev/null ;;
+    volume)  docker volume ls -q --filter "label=com.docker.compose.project=${DRILL_PROJECT}" 2>/dev/null ;;
+    network) docker network ls -q --filter "label=com.docker.compose.project=${DRILL_PROJECT}" 2>/dev/null ;;
+  esac
+}
+
+action_drill_clean() {
+  local ids
+  docker rm -f vibe-drill-probe >/dev/null 2>&1 || true
+  if [[ -f "$DRILL_DIR/compose.json" ]]; then
+    docker compose -p "$DRILL_PROJECT" -f "$DRILL_DIR/compose.json" down -v --remove-orphans -t 10 >>"$VIBE_LOG_FILE" 2>&1 || true
+  fi
+  # Whatever compose missed (no compose file left, or a half-created project).
+  ids="$(_drill_ids ps || true)";      [[ -z "$ids" ]] || docker rm -f $ids >/dev/null 2>&1 || true
+  ids="$(_drill_ids volume || true)";  [[ -z "$ids" ]] || docker volume rm -f $ids >/dev/null 2>&1 || true
+  ids="$(_drill_ids network || true)"; [[ -z "$ids" ]] || docker network rm $ids >/dev/null 2>&1 || true
+  if mountpoint -q "$DRILL_DIR/data" 2>/dev/null; then
+    umount "$DRILL_DIR/data" 2>/dev/null || umount -l "$DRILL_DIR/data" 2>/dev/null || true
+  fi
+  # Believe the result, not the commands.
+  [[ -z "$(_drill_ids ps || true)" ]] || die "drill containers are still present after clean-up" \
+    "sudo docker ps -a --filter label=com.docker.compose.project=${DRILL_PROJECT} — remove them with sudo docker rm -f <id>, then run the drill clean-up again from the Standby panel"
+  # Never delete through a live mount: the lower layer is the verified mirror.
+  if mountpoint -q "$DRILL_DIR/data" 2>/dev/null; then
+    die "the drill's file view is still mounted at $DRILL_DIR/data" "sudo umount -l $DRILL_DIR/data, then run the drill clean-up again"
+  fi
+  rm -rf "$DRILL_DIR" "$DRILL_READY"
+  log_ok "no drill is left on this box"
+}
+
+_drill_fail() { # <what failed> <fix>  — record the failure for the panel, clean up, stop
+  python3 - "$DRILL_REPORT" "$1" "$2" "${DRILL_SNAPSHOT:-}" "${DRILL_STARTED:-}" <<'PYEOF' || true
+import datetime, json, os, sys
+out, err, fix, snap, started = sys.argv[1:6]
+body = {"snapshotId": snap, "startedAt": started or None,
+        "finishedAt": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "ok": False, "apps": [], "skipped": [], "error": err, "fix": fix}
+with open(out + ".tmp", "w") as f: json.dump(body, f, indent=1)
+os.chmod(out + ".tmp", 0o644); os.replace(out + ".tmp", out)
+PYEOF
+  action_drill_clean >/dev/null 2>&1 || true
+  die "$1" "$2"
+}
+
+action_drill() {
+  # ---- pre-flight: do nothing unless everything is in order -------------
+  state_standby_mode || die "this box is not in standby mode; a practice drill only runs on a standby" \
+    "run the drill from the Standby panel on the standby box"
+  [[ -f "$DRILL_READY" ]] || die "no drill was requested ($DRILL_READY is missing)" \
+    "start the drill from the Standby panel; it marks the verified copy first"
+  local stage_path
+  DRILL_SNAPSHOT="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('snapshotId',''))" "$DRILL_READY" 2>/dev/null || true)"
+  stage_path="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('stagePath',''))" "$DRILL_READY" 2>/dev/null || true)"
+  [[ "$stage_path" =~ ^/[A-Za-z0-9/_.-]+$ && "$stage_path" != *..* ]] || die "the drill request names no valid copy" \
+    "start the drill again from the Standby panel"
+  local stage="${MIRROR_ROOT}${stage_path}"
+  DRILL_STARTED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  rm -f "$DRILL_REPORT"
+  [[ -d "$SRC/data" && -d "$SRC/env" && -f "$SRC/state.json" && -d "$stage/db" ]] || _drill_fail "this box holds no complete verified copy to drill with" \
+    "run a sync from the Standby panel and wait for it to verify, then start the drill again"
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx vibe-cloudflared; then
+    _drill_fail "the tunnel is running on this standby, which must never happen" \
+      "the Standby service stops it within 5 minutes; then start the drill again. If it keeps running: sudo docker stop vibe-cloudflared"
+  fi
+  action_drill_clean >/dev/null || _drill_fail "an earlier drill could not be cleared away" "sudo tail -30 $VIBE_LOG_FILE"
+  local need have
+  need="$( (du -sk "$stage/db" 2>/dev/null || echo 0) | cut -f1)"; need=$(( ${need:-0} * 4 + 2097152 ))
+  have="$(df -Pk "$SB_DIR" | awk 'NR==2 {print $4}')"
+  [[ "$have" =~ ^[0-9]+$ ]] && (( have > need )) || _drill_fail "not enough free disk for a drill (need about $((need/1024)) MB)" \
+    "free some disk on this box (df -h $SB_DIR), then start the drill again"
+  trap 'action_drill_clean >/dev/null 2>&1 || true' EXIT
+
+  # ---- the drill's own copy of files and settings -------------------------
+  log_step "preparing an isolated copy for the practice drill" snapshot="$DRILL_SNAPSHOT"
+  install -d -m 700 "$DRILL_DIR" "$DRILL_DIR/upper" "$DRILL_DIR/work" "$DRILL_DIR/data" "$DRILL_DIR/fresh" "$DRILL_DIR/render"
+  mount -t overlay overlay -o "lowerdir=$SRC/data,upperdir=$DRILL_DIR/upper,workdir=$DRILL_DIR/work" "$DRILL_DIR/data" \
+    || _drill_fail "could not make a copy-on-write view of the restored files (overlayfs)" \
+         "check that the overlay module is available: sudo modprobe overlay — then start the drill again"
+  cp -a "$SRC/env" "$DRILL_DIR/env"
+  chmod 700 "$DRILL_DIR/env"
+  local f
+  for f in "$DRILL_DIR"/env/*; do [[ -f "$f" ]] && sed -i '/^TUNNEL_TOKEN=/d' "$f"; done
+
+  # ---- the primary's apps, rendered as the appliance would run them ------
+  local slugs
+  slugs="$(python3 - "$SRC/state.json" "$APPLIANCE_DIR" "$SKIP_APPS" <<'PYEOF'
+import json, os, sys
+state, appl, skip = sys.argv[1], sys.argv[2], sys.argv[3].split()
+apps = (json.load(open(state)).get("apps") or {})
+for slug, a in sorted(apps.items()):
+    if a and a.get("enabled") and slug not in skip and os.path.isfile(os.path.join(appl, "apps", slug + ".yml")):
+        print(slug)
+PYEOF
+)" || _drill_fail "could not read which apps the primary runs" "the copy may be damaged; run a sync, then start the drill again"
+  [[ -n "$slugs" ]] || _drill_fail "the primary runs no apps this box could start" "enable apps on the primary first"
+  # Compose reads env files itself, so the restored settings are bound over
+  # /opt/vibe/env in a private mount namespace for the rendering only. Bind
+  # mounts are resolved later by dockerd on the host, which is why
+  # standby_drill.py rewrites every one of them.
+  local slug tag
+  ( cd "$APPLIANCE_DIR" && unshare -m --propagation private bash -c '
+      set -euo pipefail
+      mount --bind "$1" "$2/env"
+      . "$3/lib/compose-files.sh"
+      compose_files; docker compose "${COMPOSE_FILES[@]}" config --format json > "$4/_core.json"
+    ' _ "$DRILL_DIR/env" "$VIBE_DIR" "$APPLIANCE_DIR" "$DRILL_DIR/render" ) >>"$VIBE_LOG_FILE" 2>&1 \
+    || _drill_fail "could not read the appliance's own service definitions" "sudo tail -30 $VIBE_LOG_FILE"
+  while read -r slug; do
+    [[ -n "$slug" ]] || continue
+    tag="$(python3 -c "import json,sys; print(((json.load(open(sys.argv[1])).get('image') or {}).get('defaultTag')) or 'latest')" "$APPLIANCE_DIR/console/manifests/${slug}.json" 2>/dev/null || echo latest)"
+    ( cd "$APPLIANCE_DIR" && APP_TAG="$tag" unshare -m --propagation private bash -c '
+        set -euo pipefail
+        mount --bind "$1" "$2/env"
+        . "$3/lib/compose-files.sh"
+        compose_files "$5"; docker compose "${COMPOSE_FILES[@]}" config --format json > "$4/$5.json"
+      ' _ "$DRILL_DIR/env" "$VIBE_DIR" "$APPLIANCE_DIR" "$DRILL_DIR/render" "$slug" ) >>"$VIBE_LOG_FILE" 2>&1 \
+      || log_warn "could not render the services of $slug for the drill" slug="$slug"
+  done <<<"$slugs"
+  python3 "$APPLIANCE_DIR/lib/standby_drill.py" render "$DRILL_DIR" "$VIBE_DIR" "$APPLIANCE_DIR" >>"$VIBE_LOG_FILE" 2>&1 \
+    || _drill_fail "could not build the isolated drill from the primary's apps" "sudo tail -30 $VIBE_LOG_FILE"
+  local dc=(docker compose -p "$DRILL_PROJECT" -f "$DRILL_DIR/compose.json")
+
+  # ---- throwaway database, restored from the verified copy's dumps -------
+  log_step "restoring the copy's databases into a throwaway database server"
+  ( "${dc[@]}" up -d --wait --wait-timeout 240 postgres redis ) >>"$VIBE_LOG_FILE" 2>&1 \
+    || _drill_fail "the drill's throwaway database server did not start" "sudo tail -30 $VIBE_LOG_FILE"
+  local pgc pg_user restored=0 warns="" dump
+  pgc="$("${dc[@]}" ps -q postgres)"
+  pg_user="$(_env_get "$DRILL_DIR/env/shared.env" POSTGRES_USER)"; pg_user="${pg_user:-postgres}"
+  if [[ -f "$stage/globals.sql" ]]; then
+    grep -vE "^(CREATE|ALTER|DROP|COMMENT ON) ROLE \"?${pg_user}\"?[ ;]" "$stage/globals.sql" \
+      | docker exec -i "$pgc" psql -X -q -U "$pg_user" -d postgres >/dev/null 2>>"$VIBE_LOG_FILE" || true
+  fi
+  shopt -s nullglob
+  for dump in "$stage"/db/*.dump; do
+    local rc=0
+    docker exec -i "$pgc" pg_restore -U "$pg_user" -C -d postgres <"$dump" >>"$VIBE_LOG_FILE" 2>&1 || rc=$?
+    if (( rc == 0 )); then restored=$((restored + 1))
+    elif (( rc == 1 )); then restored=$((restored + 1)); warns+="$(basename "$dump" .dump) was restored with warnings"$'\x1f'
+    else warns+="$(basename "$dump" .dump) could not be restored"$'\x1f'
+    fi
+  done
+  shopt -u nullglob
+
+  # ---- start the apps, wait, probe --------------------------------------
+  log_step "starting the primary's apps in isolation (no internet, no tunnel)"
+  ( timeout "$DRILL_TIMEOUT" "${dc[@]}" up -d ) >>"$VIBE_LOG_FILE" 2>&1 \
+    || log_warn "not every drill service started; the report says which"
+  python3 "$APPLIANCE_DIR/lib/standby_drill.py" wait "$DRILL_DIR" "$DRILL_TIMEOUT" >>"$VIBE_LOG_FILE" 2>&1 || true
+  local probe_net probe_img tunnel=0
+  probe_net="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('probeNetwork') or '')" "$DRILL_DIR/plan.json")"
+  probe_img="$(docker inspect vibe-console --format '{{.Config.Image}}' 2>/dev/null || true)"
+  if [[ -n "$probe_net" && -n "$probe_img" ]]; then
+    python3 "$APPLIANCE_DIR/lib/standby_drill.py" probe-script "$DRILL_DIR" \
+      | docker run --rm -i --name vibe-drill-probe --network "$probe_net" --entrypoint sh "$probe_img" -s \
+      >"$DRILL_DIR/probe.txt" 2>>"$VIBE_LOG_FILE" || true
+  fi
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx vibe-cloudflared && tunnel=1
+  python3 "$APPLIANCE_DIR/lib/standby_drill.py" report "$DRILL_DIR" "$DRILL_REPORT" "$DRILL_SNAPSHOT" "$DRILL_STARTED" \
+    "$restored" "$warns" "$DRILL_DIR/probe.txt" "$tunnel" || _drill_fail "could not write the drill report" "sudo tail -30 $VIBE_LOG_FILE"
+
+  # ---- remove every trace -----------------------------------------------
+  log_step "removing the drill"
+  trap - EXIT
+  action_drill_clean
+  log_ok "practice drill finished; see the Standby panel for the result"
+}
+
 case "${1:-}" in
+  drill)          action_drill ;;
+  drill-clean)    action_drill_clean ;;
   mode-on)        action_mode_on ;;
   boot-hold)      action_boot_hold ;;
   shutdown-hold)  action_shutdown_hold ;;
@@ -597,5 +804,5 @@ case "${1:-}" in
   tunnel-teardown) action_tunnel_teardown ;;
   follow-version) action_follow_version ;;
   archive)        action_archive ;;
-  *) die "unknown standby action '${1:-}'" "valid: mode-on mode-off place tunnel-up tunnel-teardown follow-version archive boot-hold shutdown-hold boot-release boot-release-safety" ;;
+  *) die "unknown standby action '${1:-}'" "valid: drill drill-clean mode-on mode-off place tunnel-up tunnel-teardown follow-version archive boot-hold shutdown-hold boot-release boot-release-safety" ;;
 esac

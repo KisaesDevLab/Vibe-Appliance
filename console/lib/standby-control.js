@@ -22,7 +22,7 @@ const path = require('path');
 // tunnel — i.e. something a standby must not run. Keep in step with
 // CORE_SERVICES in lib/standby-host.sh.
 const CORE_SERVICES = new Set(['caddy', 'postgres', 'console', 'standby', 'duplicati', 'portainer', 'emergency-proxy']);
-const HOST_ACTIONS = new Set(['standby-mode-on', 'standby-mode-off', 'standby-place', 'standby-tunnel-up', 'standby-follow-version', 'standby-archive', 'standby-boot-release', 'standby-tunnel-teardown']);
+const HOST_ACTIONS = new Set(['standby-mode-on', 'standby-mode-off', 'standby-place', 'standby-tunnel-up', 'standby-follow-version', 'standby-archive', 'standby-boot-release', 'standby-tunnel-teardown', 'standby-drill', 'standby-drill-clean']);
 const REF_RE = /^[0-9a-f]{7,40}$/;
 const HA_ID_RE = /^[0-9]{10,16}-[a-f0-9]{8}$/;
 const IMAGE_RE = /^[a-z0-9][a-z0-9._\/:-]*@sha256:[0-9a-f]{64}$/;
