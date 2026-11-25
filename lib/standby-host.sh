@@ -59,6 +59,9 @@ MIRROR_ROOT="${SB_DIR}/mirror"
 SRC="${MIRROR_ROOT}/host/vibe"
 READY="${SB_DIR}/place.ready"
 DONE="${SB_DIR}/place.done"
+# What the promote screen should know about the placement (read by the
+# Standby service after `place`): today, whether single sign-on was moved.
+PLACE_REPORT="${SB_DIR}/place-report.json"
 PG_CONTAINER="${VIBE_PG_CONTAINER:-vibe-postgres}"
 
 # Never placed (standby/src/paths.ts NOT_REPLICATED — keep the two in step).
@@ -172,6 +175,43 @@ _marker_snapshot() { # <file>
   python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('snapshotId',''))" "$1" 2>/dev/null || true
 }
 
+# Single sign-on after a promote. Bootstrap rendered Vibe Auth's settings
+# for THIS box, but the sign-in records it keeps (each app's issuer and
+# return address) still name the primary's address. With the firm's own web
+# addresses (domain mode) nothing changed and nothing is done; by IP address
+# or Tailscale the address did change, and the same "re-derive" the console's
+# Single sign-on panel offers is run here. Never fatal: the firm's apps are
+# up; the promote screen says what to do if this failed.
+_place_sso_rebase() { # <primary's Vibe Auth origin, empty when it had none>
+  local from="$1" to="" status err=""
+  if [[ -z "$from" ]] || ! python3 -c "import json,sys; sys.exit(0 if ((json.load(open(sys.argv[1])).get('apps') or {}).get('vibe-auth') or {}).get('enabled') else 1)" "$VIBE_STATE_FILE" 2>/dev/null; then
+    printf '{"signIn":null}\n' > "$PLACE_REPORT"
+    return 0
+  fi
+  to="$(_env_get "${VIBE_DIR}/env/vibe-auth.env" VIBE_AUTH_APPLIANCE_ORIGIN)"
+  if [[ "$from" == "$to" ]]; then
+    status="unchanged"
+    log_info "single sign-on keeps its address; nothing to move" origin="$to"
+  else
+    log_step "moving single sign-on to this box's address" from="$from" to="$to"
+    if bash "${APPLIANCE_DIR}/lib/identity.sh" rebase >>"$VIBE_LOG_FILE" 2>&1; then
+      status="rebased"
+      log_ok "single sign-on now sends staff to this box"
+    else
+      status="failed"
+      err="the sign-in service did not accept the new address (see $VIBE_LOG_FILE)"
+      log_warn "single sign-on still names the old address. Fix: console → Single sign-on → Re-derive issuers, or: sudo vibe identity rebase"
+    fi
+  fi
+  python3 - "$PLACE_REPORT" "$status" "$from" "$to" "$err" <<'PYEOF'
+import json, os, sys
+out, status, frm, to, err = sys.argv[1:6]
+body = {"signIn": {"status": status, "from": frm, "to": to, **({"error": err} if err else {})}}
+with open(out + ".tmp", "w") as f: json.dump(body, f)
+os.chmod(out + ".tmp", 0o644); os.replace(out + ".tmp", out)
+PYEOF
+}
+
 action_place() {
   # ---- already done? ----------------------------------------------------
   # Placement removes the mirror when it succeeds. If the Standby service
@@ -196,6 +236,11 @@ action_place() {
     "sudo bash ${APPLIANCE_DIR}/bootstrap.sh, then promote again"
   [[ "$(stat -c %d "$SRC")" == "$(stat -c %d "${VIBE_DIR}/data")" ]] || die "$SB_DIR and ${VIBE_DIR}/data are on different filesystems" \
     "keep /opt/vibe on one filesystem; placement links files instead of copying them"
+
+  rm -f "$PLACE_REPORT"
+  # Vibe Auth's address on the primary, before this box's own is rendered.
+  local sso_from
+  sso_from="$(_env_get "$SRC/env/vibe-auth.env" VIBE_AUTH_APPLIANCE_ORIGIN)"
 
   local old_shared="${VIBE_DIR}/env/shared.env" new_shared="$SRC/env/shared.env"
   local pg_user new_pg_pass
@@ -299,6 +344,8 @@ PYEOF
     "it is safe to re-run: sudo bash ${APPLIANCE_DIR}/bootstrap.sh — then reopen the Promote wizard, which resumes"
   log_info "apps brought up after placing the copy" seconds="$((SECONDS - t0))"
   ( cd "$APPLIANCE_DIR" && docker compose up -d --force-recreate caddy console ) >>"$VIBE_LOG_FILE" 2>&1 || true
+
+  _place_sso_rebase "$sso_from"
 
   _drop_pre_promote
   # Record success BEFORE the mirror goes, so a repeat request is answered

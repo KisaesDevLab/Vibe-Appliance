@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { redactor } from "../logger.ts";
 import {
   StandbyModeError,
-  type AppHealth, type ApplianceControl, type ApplianceVersion, type DrillReport, type DrillRequest, type ServiceState,
+  type AppHealth, type ApplianceControl, type ApplianceVersion, type DrillReport, type DrillRequest, type PlaceReport, type ServiceState,
 } from "../contracts/appliance.ts";
 
 export interface ConsoleClientOptions {
@@ -118,11 +118,22 @@ export class ConsoleClient implements ApplianceControl {
     await this.#hostAction("standby-follow-version", { ref: v.applianceCommit, wait: false });
   }
 
-  async place(snapshotId: string): Promise<void> {
+  async place(snapshotId: string): Promise<PlaceReport> {
     if (await this.getStandbyMode()) throw new StandbyModeError("place");
     // The host script refuses to place anything without this marker.
     await writeFile(join(this.#o.dataDir, "place.ready"), JSON.stringify({ snapshotId, at: new Date().toISOString() }), { mode: 0o600 });
     await this.#hostAction("standby-place");
+    // Written by the host during placement. Missing (an older host script,
+    // or a repeat that found the copy already placed): nothing to report.
+    const raw = await readFile(join(this.#o.dataDir, "place-report.json"), "utf8").catch(() => "");
+    try {
+      const r = JSON.parse(raw) as Partial<PlaceReport>;
+      const s = r.signIn;
+      if (s && ["unchanged", "rebased", "failed"].includes(s.status) && typeof s.from === "string" && typeof s.to === "string") {
+        return { signIn: { status: s.status, from: s.from, to: s.to, ...(typeof s.error === "string" ? { error: s.error } : {}) } };
+      }
+    } catch { /* nothing to report */ }
+    return { signIn: null };
   }
 
   async archive(): Promise<void> { await this.#hostAction("standby-archive"); }

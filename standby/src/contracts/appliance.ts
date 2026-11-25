@@ -49,7 +49,7 @@ export interface ApplianceControl {
    * a primary (apps re-enabled, env re-rendered for this host, Redis empty).
    * `snapshotId` is recorded as the copy being placed.
    */
-  place(snapshotId: string): Promise<void>;
+  place(snapshotId: string): Promise<PlaceReport>;
   /** Rejoin: set this box's current data aside, read-only, before it is overwritten. */
   archive(): Promise<void>;
   /** A new standby: remove this box's OWN Cloudflare tunnel and its DNS records. Refused unless the box is in standby mode. */
@@ -68,6 +68,20 @@ export interface ApplianceControl {
   cleanDrill(): Promise<void>;
   /** Ask a running drill to stop at its next check (a promote is starting). */
   cancelDrill(): Promise<void>;
+}
+
+/** Single sign-on after a promote: moved to this box's address, or not. */
+export interface SignInMove {
+  /** unchanged: same address (the firm's own web addresses); rebased: moved; failed: still names the old box. */
+  status: "unchanged" | "rebased" | "failed";
+  from: string;
+  to: string;
+  error?: string;
+}
+
+export interface PlaceReport {
+  /** null: Vibe Auth is not used. */
+  signIn: SignInMove | null;
 }
 
 export interface DrillRequest {

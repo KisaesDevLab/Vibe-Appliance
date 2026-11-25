@@ -262,6 +262,22 @@ test("promote: LAN mode starts no tunnel and reports this box's address", async 
   assert.equal(r.deployment!.address, "10.0.0.52");
 });
 
+test("promote: single sign-on moved to this box's address is shown on the Done screen, also after a resume", async () => {
+  const w = pair();
+  w.sBox.placeReport = { signIn: { status: "failed", from: "http://10.0.0.51", to: "http://10.0.0.52", error: "the sign-in service did not accept the new address" } };
+  w.sBox.failNext.set("startTunnel", new Error("host action interrupted"));
+  const first = await runPromote(w.promoteDeps(), { confirm: "PROMOTE", actor: "admin" });
+  assert.equal(first.ok, false);
+  assert.equal(first.signIn!.status, "failed");
+  // Resumed after placement: the report comes from the recorded step, not a second placement.
+  const second = await runPromote(w.promoteDeps(), { actor: "admin" });
+  assert.equal(second.ok, true, second.error);
+  assert.deepEqual(second.signIn, { status: "failed", from: "http://10.0.0.51", to: "http://10.0.0.52", error: "the sign-in service did not accept the new address" });
+  assert.equal(w.sBox.calls.filter((c) => c === "place").length, 1);
+  const none = pair();
+  assert.equal((await runPromote(none.promoteDeps(), { confirm: "PROMOTE", actor: "admin" })).signIn, null, "no Vibe Auth: nothing to say");
+});
+
 test("promote: can be cancelled before data is placed, not after", async () => {
   const w = pair();
   w.sBox.failNext.set("setStandbyMode:false", new Error("host runner not answering"));

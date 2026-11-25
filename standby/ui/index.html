@@ -381,6 +381,18 @@ function promoteRun() {
     stuck ? [h("div", { class: "banner bad", style: "margin-top:12px" }, P("It stopped at “", STEP_NAMES[(res && res.failedStep) || ""] || "a step", "”."), res && res.error ? M(res.error) : null, P("Nothing is lost. Continue picks up at that step.")),
       errLine(), h("div", { class: "row" }, btn("Continue", () => act(() => api("POST", "api/promote/run", {})), "primary"), btn("Cancel the promote", () => act(() => api("POST", "api/promote/cancel"))))] : M("This takes several minutes. You can leave this page open."));
 }
+// Single sign-on after a promote: the host moves it to this box's address
+// when that changed (by IP address or Tailscale), or says how to.
+function signInDone(si) {
+  if (!si) return null;
+  if (si.status === "unchanged") return M("Single sign-on (Vibe Auth) came over with the apps; its address did not change.");
+  if (si.status === "rebased") return M("Single sign-on (Vibe Auth) was moved to this box's address (", si.to, "), so signing in brings staff back here, not to the old box.");
+  return h("div", { class: "banner warn" }, h("p", { class: "big" }, "Single sign-on still sends staff to the old box"),
+    P("Vibe Auth is running here, but it could not be moved to this box's address (", si.to, "). Until it is, signing in to an app that uses it returns staff to ", si.from, "."),
+    M("Fix: open the console, go to the Single sign-on section and press “Re-derive issuers (after host/IP change)”. Or on this box run: sudo vibe identity rebase"),
+    si.error ? M(si.error) : null);
+}
+
 function promoteDone(res) {
   const d = res.deployment || {};
   return [h("div", { class: "banner ok" }, h("p", { class: "big" }, "This box is now live"), res.dataAt ? P("It is running the firm's apps with data from ", when(res.dataAt), ".") : P("It is running the firm's apps.")),
@@ -388,7 +400,8 @@ function promoteDone(res) {
       d.tunnel ? P("Nothing changes for them: the usual web address now leads to this box. They need to sign in again.")
         : d.mode === "domain" ? [P("The firm's web address still points at the old box. Change its DNS record so it points at this box:"), h("div", { class: "code" }, d.address || "this box's public address"), M("Ask whoever manages the firm's domain name if you are not sure how. Until that is done, staff can use this box's address directly.")]
         : [P("Staff now reach the apps at this box's address:"), h("div", { class: "code" }, d.address || "see Configuration → Network"), M("They need to sign in again.")],
-      res.unhealthyApps.length ? h("div", { class: "banner warn" }, P("These apps did not report healthy yet. Check them on the Apps page:"), h("ul", {}, res.unhealthyApps.map((a) => h("li", {}, `${a.name}: ${a.detail}`)))) : null),
+      res.unhealthyApps.length ? h("div", { class: "banner warn" }, P("These apps did not report healthy yet. Check them on the Apps page:"), h("ul", {}, res.unhealthyApps.map((a) => h("li", {}, `${a.name}: ${a.detail}`)))) : null,
+      signInDone(res.signIn)),
     card(h("h2", {}, "Two things to do soon"), h("ul", {},
       h("li", {}, "Set up Vibe Backup on this box. Backups do not carry over from the old box."),
       h("li", {}, "When the old box is repaired, do not just switch it on and use it. Open its console, choose Standby, then “Rejoin as standby”. Its old data is set aside for ", String(S.settings.archiveDays), " days before being replaced.")),

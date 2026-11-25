@@ -3,7 +3,7 @@
 // or the tunnel was NEVER running at any point, not just at the end.
 import {
   StandbyModeError,
-  type AppHealth, type ApplianceControl, type ApplianceVersion, type DrillReport, type DrillRequest, type ServiceState,
+  type AppHealth, type ApplianceControl, type ApplianceVersion, type DrillReport, type DrillRequest, type PlaceReport, type ServiceState,
 } from "../appliance.ts";
 
 export interface FakeApplianceInit {
@@ -131,7 +131,9 @@ export class FakeAppliance implements ApplianceControl {
   placed: string | null = null;
   archived = 0;
   /** What the real placement does: the primary's apps appear and start, Redis comes up empty. */
-  async place(snapshotId: string): Promise<void> {
+  /** What the host reports about single sign-on after placing. */
+  placeReport: PlaceReport = { signIn: null };
+  async place(snapshotId: string): Promise<PlaceReport> {
     this.#call("place");
     if (this.standbyMode) throw new StandbyModeError("place");
     this.placed = snapshotId;
@@ -139,6 +141,7 @@ export class FakeAppliance implements ApplianceControl {
       if (!this.services.has(a)) this.services.set(a, { name: a, kind: "app", running: false, digest: this.current.imageDigests[a] ?? null });
     }
     this.#set("redis", true); this.#set("app", true);
+    return this.placeReport;
   }
   async archive(): Promise<void> { this.#call("archive"); this.archived++; }
 

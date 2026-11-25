@@ -532,3 +532,47 @@ test('boot hold: a recorded container that no longer exists is skipped, not a pe
   assert.doesNotMatch(b.dockerOps().join(' '), /start vibe-gone/);
   assert.equal(b.held(), null);
 });
+
+// Single sign-on after a promote: the copy's Vibe Auth still names the
+// primary's address. When this box's own address differs (by IP address or
+// Tailscale), place moves it; never fatal; the promote screen is told.
+function ssoBox({ from, to, identityFails = false, enabled = true }) {
+  const b = box();
+  const appl = path.join(b.root, 'appliance');
+  const st = JSON.parse(fs.readFileSync(path.join(b.src, 'state.json'), 'utf8'));
+  if (enabled) st.apps['vibe-auth'] = { enabled: true };
+  fs.writeFileSync(path.join(b.src, 'state.json'), JSON.stringify(st));
+  fs.writeFileSync(path.join(b.src, 'env/vibe-auth.env'), `VIBE_AUTH_APPLIANCE_ORIGIN=${from}\n`, { mode: 0o600 });
+  // Bootstrap renders Vibe Auth's settings for THIS box.
+  fs.writeFileSync(path.join(appl, 'bootstrap.sh'), `#!/usr/bin/env bash\nprintf 'VIBE_AUTH_APPLIANCE_ORIGIN=%s\n' '${to}' > "$VIBE_DIR/env/vibe-auth.env"\n`, { mode: 0o755 });
+  fs.writeFileSync(path.join(appl, 'lib/identity.sh'), `#!/usr/bin/env bash\necho "$*" >> "${b.root}/identity.calls"\n${identityFails ? 'exit 1' : 'exit 0'}\n`, { mode: 0o755 });
+  b.ready();
+  const r = b.run('place');
+  const report = JSON.parse(b.read('standby/place-report.json'));
+  return { ...b, r, report };
+}
+
+test('place: single sign-on is moved to this box when its address changed', () => {
+  const b = ssoBox({ from: 'http://10.0.0.10', to: 'http://10.0.0.52' });
+  assert.equal(b.r.status, 0, b.r.stderr);
+  assert.deepEqual(b.calls('identity.calls'), ['rebase']);
+  assert.deepEqual(b.report, { signIn: { status: 'rebased', from: 'http://10.0.0.10', to: 'http://10.0.0.52' } });
+});
+
+test('place: a failed sign-in move does not fail the promote, and is reported with the fix', () => {
+  const b = ssoBox({ from: 'http://10.0.0.10', to: 'http://10.0.0.52', identityFails: true });
+  assert.equal(b.r.status, 0, 'the firm\'s apps are up; the promote continues');
+  assert.equal(b.report.signIn.status, 'failed');
+  assert.match(b.report.signIn.error, /did not accept the new address/);
+  assert.match(b.r.stderr + b.r.stdout, /vibe identity rebase/);
+});
+
+test('place: the same address (the firm\'s own web addresses) or no Vibe Auth: nothing is moved', () => {
+  const same = ssoBox({ from: 'https://auth.firm.example', to: 'https://auth.firm.example' });
+  assert.equal(same.r.status, 0, same.r.stderr);
+  assert.deepEqual(same.calls('identity.calls'), []);
+  assert.equal(same.report.signIn.status, 'unchanged');
+  const off = ssoBox({ from: 'http://10.0.0.10', to: 'http://10.0.0.52', enabled: false });
+  assert.deepEqual(off.calls('identity.calls'), []);
+  assert.deepEqual(off.report, { signIn: null });
+});

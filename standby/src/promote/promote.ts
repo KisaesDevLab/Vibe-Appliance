@@ -4,7 +4,7 @@
 // a wizard interrupted by a crash continues where it stopped (invariant 6).
 // From the first step until the last, the `operation` flag blocks the
 // nightly sync: once the restored data is live, a sync would overwrite it.
-import type { ApplianceControl, AppHealth } from "../contracts/appliance.ts";
+import type { ApplianceControl, AppHealth, SignInMove } from "../contracts/appliance.ts";
 import { highest, type Lease } from "../link/lease.ts";
 import { knownLease, type Link, type PrimarySighting } from "../link/link.ts";
 import type { Store } from "../overlay/store.ts";
@@ -99,6 +99,8 @@ export interface PromoteResult {
   error?: string;
   unhealthyApps: AppHealth[];
   deployment?: { mode: string; tunnel: boolean; address: string };
+  /** Single sign-on: moved to this box's address, or what to do if it could not be. */
+  signIn?: SignInMove | null;
   leaseWrittenTo: string[];
   dataAt: string | null;
 }
@@ -158,11 +160,11 @@ export async function runPromote(d: PromoteDeps, opts: { confirm?: string; actor
 
     await step("leave-standby-mode", async () => { await d.appliance.setStandbyMode(false); return {}; });
 
-    await step("place", async () => {
+    result.signIn = (await step("place", async () => {
       if (!copy) throw new Error("there is no verified copy to place");
-      await d.appliance.place(copy.snapshotId);
-      return { snapshotId: copy.snapshotId };
-    });
+      const placed = await d.appliance.place(copy.snapshotId);
+      return { snapshotId: copy.snapshotId, signIn: placed.signIn };
+    })).signIn ?? null;
 
     result.unhealthyApps = (await step("health", async () => {
       const deadline = Date.now() + (d.healthTimeoutMs ?? 10 * 60 * 1000);
