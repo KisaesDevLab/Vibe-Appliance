@@ -13,6 +13,7 @@ import type { Config } from "./config.ts";
 import type { ApplianceControl } from "./contracts/appliance.ts";
 import type { Repository } from "./contracts/repository.ts";
 import type { Identity } from "./crypto/identity.ts";
+import { drillBlocked, finishInterruptedDrill, runDrill, type DrillRecord } from "./drill/drill.ts";
 import { highest, isLease, type Lease } from "./link/lease.ts";
 import { BucketLink, DirectLink, knownLease, rememberLease, type Link, type StatusReport } from "./link/link.ts";
 import { S3Client } from "./link/s3.ts";
@@ -27,7 +28,7 @@ import { cancelSwitchover, expireArchives, listArchives, prepareRejoin, startSwi
 import { activePromote, cancelPromote, promoteChecks, runPromote, type PromoteDeps, type PromoteResult } from "./promote/promote.ts";
 import { ResticRepository } from "./repo/restic.ts";
 import { checkRole, readBootId, requireRecorded, startAnyway, type GuardDeps } from "./role/guard.ts";
-import { dueDaily } from "./schedule.ts";
+import { dueDaily, isFirstSunday } from "./schedule.ts";
 import { computeStatus, type LastCapture, type Status } from "./status.ts";
 import { activeOperation, recover, runSync, type SyncDeps, type SyncOutcome, type VerifiedCopy } from "./sync/sync.ts";
 import { killRunning } from "./util/run.ts";
@@ -78,6 +79,8 @@ export class Runtime {
   #inProcess = new Set<string>();
   #tzCache: { at: number; tz: string } | null = null;
   #bootHoldBusy = false;
+  /** Aborted when a promote starts during a drill. */
+  #drillAbort: AbortController | null = null;
   /** Result of the last promote attempt, for the wizard to show. */
   promoteResult: PromoteResult | null = null;
   promoteRunning = false;
@@ -412,6 +415,40 @@ export class Runtime {
     return this.#exclusive("sync", async () => runSync(await this.#syncDeps()));
   }
 
+  // ---- practice drill (standby) ----------------------------------------------------
+
+  async #mailer() {
+    const mirrorTree = join(this.paths.mirror, this.config.applianceDir);
+    return loadMailer([this.config.applianceDir, ...(existsSync(mirrorTree) ? [mirrorTree] : [])]);
+  }
+
+  /** Run a practice drill now. Rejects at once if one may not start. */
+  async drillNow(actor: string, trigger: "admin" | "schedule"): Promise<DrillRecord> {
+    const blocked = drillBlocked(this.store);
+    if (blocked) throw new Error(blocked);
+    return this.#exclusive("drill", async () => {
+      const abort = new AbortController();
+      this.#drillAbort = abort;
+      try {
+        const pg = await this.pg();
+        return await runDrill({
+          store: this.store, appliance: this.appliance, paths: this.paths, signal: abort.signal,
+          listDatabases: () => pg.listDatabases(),
+          mailer: () => this.#mailer(), to: () => this.store.get<string>("alertEmail") ?? this.config.alertEmail, boxName: () => this.store.nodeId.slice(0, 8),
+        }, { actor, trigger });
+      } finally { this.#drillAbort = null; }
+    });
+  }
+
+  /** The scheduled drill: first Sunday of the month, after that night's sync succeeded. */
+  async #drillDue(now: Date): Promise<boolean> {
+    if (this.config.drillSchedule !== "first-sunday" || drillBlocked(this.store)) return false;
+    const tz = await this.timezone();
+    if (!isFirstSunday(now, tz) || !dueDaily(now, this.config.syncFallbackAt, tz, this.store.get<string>("lastScheduledDrillAt"))) return false;
+    const run = this.store.recentSyncRuns(1)[0];
+    return run?.status === "ok" && !!run.finishedAt && now.getTime() - Date.parse(run.finishedAt) < 24 * 3_600_000;
+  }
+
   status(now: Date = new Date()): Status { return computeStatus(this.store, this.config, now); }
   statusReport(): StatusReport {
     const s = this.status();
@@ -456,6 +493,11 @@ export class Runtime {
       if (!this.#busy) return;
       const what = this.#busy;
       this.#interrupting = true;
+      // A drill holds the host runner: ask it to stop at its next check, and stop waiting for it.
+      if (what === "drill") {
+        await this.appliance.cancelDrill().catch(() => { /* place clears any drill itself */ });
+        this.#drillAbort?.abort("a promote started");
+      }
       try {
         for (let i = 0; this.#busy && i < 600; i++) { killRunning(); await new Promise((r) => setTimeout(r, 200)); }
       } finally { this.#interrupting = false; }
@@ -554,6 +596,12 @@ export class Runtime {
         const out = await this.syncNow();
         this.#log(out.status === "failed" ? "error" : "info", "sync finished", { ...out });
       }
+      if (!this.#busy && await this.#drillDue(now)) {
+        this.store.set("lastScheduledDrillAt", now.toISOString());
+        await this.drillNow("schedule", "schedule").then(
+          (r) => this.#log(r.ok ? "info" : "error", "monthly practice drill finished", { ok: r.ok, failed: r.apps.filter((a) => !a.ok).map((a) => a.slug) }),
+          (e: Error) => this.#log("error", "monthly practice drill could not run", { error: e.message }));
+      }
     }
 
     if (role === "replaced" && slow) await this.#enforceDormant();
@@ -567,10 +615,7 @@ export class Runtime {
     if (slow) {
       await evaluateAlerts({
         store: this.store, to: () => this.store.get<string>("alertEmail") ?? this.config.alertEmail, boxName: () => this.store.nodeId.slice(0, 8),
-        mailer: async () => {
-          const mirrorTree = join(this.paths.mirror, this.config.applianceDir);
-          return loadMailer([this.config.applianceDir, ...(existsSync(mirrorTree) ? [mirrorTree] : [])]);
-        },
+        mailer: () => this.#mailer(),
       }, this.status(now)).catch(() => "failed");
     }
   }
@@ -621,6 +666,10 @@ export class Runtime {
       return;
     }
     if (op === "start-anyway") { this.store.unset("operation"); return; }
+    if (op === "drill") {
+      if (await finishInterruptedDrill({ store: this.store, appliance: this.appliance })) this.#log("warn", "a practice drill was interrupted by a restart; everything it started was removed");
+      return;
+    }
 
     const interruptedSwitchover = op === "switchover" && !this.store.get("switchover");
     if (!interruptedSwitchover && op !== "rejoin") return; // a switchover waiting for the other box is not interrupted

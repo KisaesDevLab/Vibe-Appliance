@@ -6,6 +6,7 @@ import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import type { Config } from "./config.ts";
+import { drillBlocked, drillHistory, drillHistoryCsv } from "./drill/drill.ts";
 import { loggerOptions } from "./logger.ts";
 import type { Store } from "./overlay/store.ts";
 import { BadCodeError } from "./pairing/codes.ts";
@@ -71,6 +72,7 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
       formerPeer: store.get("formerPeer") ?? null,
       formerLive: store.get("formerLive") ?? null,
       tunnelCleanup: store.get("tunnelCleanup") ?? null,
+      drill: { running: store.get("drillRunning") ?? null, blocked: drillBlocked(store), history: drillHistory(store).slice(0, 12) },
       phrases: { promote: CONFIRM_PHRASE, rejoin: REJOIN_PHRASE, skipArchive: SKIP_ARCHIVE_PHRASE, switchover: SWITCHOVER_PHRASE, unpair: UNPAIR_PHRASE, startAnyway: START_ANYWAY_PHRASE },
     };
   });
@@ -137,6 +139,17 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
     void r.syncNow().catch(() => { /* recorded in status */ });
     return reply.code(202).send({ started: true });
   });
+
+  // ---- practice drill ------------------------------------------------------------
+  app.post("/api/drill/run", async (_req, reply) => {
+    const r = rt(reply); if (!r) return;
+    const blocked = drillBlocked(store) ?? (r.busy() ? `A ${r.busy()} is already running.` : null);
+    if (blocked) return reply.code(409).send({ error: blocked, code: "busy" });
+    void r.drillNow(ACTOR, "admin").catch(() => { /* recorded in the history */ });
+    return reply.code(202).send({ started: true });
+  });
+  app.get("/api/drills", async () => drillHistory(store));
+  app.get("/api/drills.csv", async (_req, reply) => reply.type("text/csv").header("content-disposition", "attachment; filename=vibe-standby-drills.csv").send(drillHistoryCsv(drillHistory(store))));
 
   // ---- promote ---------------------------------------------------------------
   app.get("/api/promote/checks", async (_req, reply) => { const r = rt(reply); if (!r) return; try { return await r.promoteChecks(); } catch (e) { return fail(reply, e); } });

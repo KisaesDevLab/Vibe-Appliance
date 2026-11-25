@@ -3,12 +3,12 @@
 // box's own root-only file (<dataDir>/local/control.token), which a promote
 // never replaces. shared.env is the fallback for a box whose bootstrap has
 // not yet moved the token out of it.
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { redactor } from "../logger.ts";
 import {
   StandbyModeError,
-  type AppHealth, type ApplianceControl, type ApplianceVersion, type ServiceState,
+  type AppHealth, type ApplianceControl, type ApplianceVersion, type DrillReport, type DrillRequest, type ServiceState,
 } from "../contracts/appliance.ts";
 
 export interface ConsoleClientOptions {
@@ -62,12 +62,13 @@ export class ConsoleClient implements ApplianceControl {
   }
 
   /** Queue a root action on the host and wait for it. Survives the console restarting mid-way. */
-  async #hostAction(action: string, opts: { ref?: string; wait?: boolean } = {}): Promise<void> {
+  async #hostAction(action: string, opts: { ref?: string; wait?: boolean; signal?: AbortSignal } = {}): Promise<void> {
     const { id } = await this.#call<{ id: string }>("POST", "/host-action", { action, ...(opts.ref ? { ref: opts.ref } : {}) });
     if (opts.wait === false) return;
     const deadline = Date.now() + (this.#o.hostActionTimeoutMs ?? 2 * 60 * 60 * 1000);
     for (;;) {
       await new Promise((r) => setTimeout(r, this.#o.pollMs ?? 3000));
+      if (opts.signal?.aborted) throw new Error(`stopped waiting for ${action}: ${String(opts.signal.reason ?? "cancelled")}`);
       let st: { state: string; result?: { exit_code?: number; note?: string } | null; log?: string; runner?: string | null };
       try { st = await this.#call("GET", `/host-action/${id}`); }
       catch (err) {
@@ -128,6 +129,19 @@ export class ConsoleClient implements ApplianceControl {
   async removeOwnTunnel(): Promise<void> { await this.#hostAction("standby-tunnel-teardown"); }
   async releaseBootHold(): Promise<void> { await this.#hostAction("standby-boot-release"); }
 
-  async startAppsIsolated(): Promise<void> { throw new Error("The test promote (drill) is not available in this version."); }
-  async stopAppsIsolated(): Promise<void> { /* nothing was started */ }
+  async runDrill(req: DrillRequest, signal?: AbortSignal): Promise<DrillReport> {
+    const report = join(this.#o.dataDir, "drill-report.json");
+    await rm(join(this.#o.dataDir, "drill.cancel"), { force: true });
+    await rm(report, { force: true });
+    // The host script refuses to run without this marker.
+    await writeFile(join(this.#o.dataDir, "drill.ready"), JSON.stringify({ ...req, at: new Date().toISOString() }), { mode: 0o600 });
+    let failure: Error | null = null;
+    try { await this.#hostAction("standby-drill", { signal }); } catch (err) { failure = err as Error; }
+    // A drill that failed part-way still writes its report; prefer it, it says why in plain words.
+    const got = await readFile(report, "utf8").then((s) => JSON.parse(s) as DrillReport, () => null);
+    if (got && got.snapshotId === req.snapshotId) return got;
+    throw failure ?? new Error("the drill finished but left no report");
+  }
+  async cleanDrill(): Promise<void> { await this.#hostAction("standby-drill-clean"); }
+  async cancelDrill(): Promise<void> { await writeFile(join(this.#o.dataDir, "drill.cancel"), new Date().toISOString(), { mode: 0o644 }); }
 }

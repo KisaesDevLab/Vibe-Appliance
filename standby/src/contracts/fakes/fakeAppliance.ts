@@ -3,7 +3,7 @@
 // or the tunnel was NEVER running at any point, not just at the end.
 import {
   StandbyModeError,
-  type AppHealth, type ApplianceControl, type ApplianceVersion, type ServiceState,
+  type AppHealth, type ApplianceControl, type ApplianceVersion, type DrillReport, type DrillRequest, type ServiceState,
 } from "../appliance.ts";
 
 export interface FakeApplianceInit {
@@ -18,9 +18,19 @@ export class FakeAppliance implements ApplianceControl {
   services = new Map<string, ServiceState>();
   current: ApplianceVersion;
   calls: string[] = [];
-  /** Every service name that was ever observed running, including isolated starts. */
+  /** Every service name that was ever observed running (the drill's throwaway project is not this box's services). */
   everRunning = new Set<string>();
-  everRunningIsolated = new Set<string>();
+  /** Drills asked for, the result the next one gives, and whether one is "running" now. */
+  drills: DrillRequest[] = [];
+  drillResult: (req: DrillRequest) => DrillReport = (req) => ({
+    snapshotId: req.snapshotId, startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), ok: true,
+    apps: this.current.enabledApps.map((slug) => ({ slug, ok: true, secondsToReady: 30, health: "200", signIn: "200", detail: "ready" })),
+    skipped: [], databasesRestored: 1, isolation: { outsideReachable: { ip: false, name: false }, tunnelRunning: false, ok: true }, error: null,
+  });
+  /** When set, runDrill waits for this promise (to test what happens meanwhile). */
+  drillGate: Promise<void> | null = null;
+  drillCancelled = false;
+  drillsCleaned = 0;
   tunnelTokenSeen: string | null = null;
   unpullable = new Set<string>();
   unhealthy = new Set<string>();
@@ -132,9 +142,15 @@ export class FakeAppliance implements ApplianceControl {
   }
   async archive(): Promise<void> { this.#call("archive"); this.archived++; }
 
-  async startAppsIsolated(): Promise<void> {
-    this.#call("startAppsIsolated");
-    for (const s of this.services.values()) if (s.kind === "app") this.everRunningIsolated.add(s.name);
+  async runDrill(req: DrillRequest, signal?: AbortSignal): Promise<DrillReport> {
+    this.#call("runDrill");
+    this.drills.push(req);
+    this.drillCancelled = false;
+    if (this.drillGate) {
+      await Promise.race([this.drillGate, new Promise<void>((_, reject) => signal?.addEventListener("abort", () => reject(new Error("stopped waiting for standby-drill"))))]);
+    }
+    return this.drillResult(req);
   }
-  async stopAppsIsolated(): Promise<void> { this.#call("stopAppsIsolated"); }
+  async cleanDrill(): Promise<void> { this.#call("cleanDrill"); this.drillsCleaned++; }
+  async cancelDrill(): Promise<void> { this.#call("cancelDrill"); this.drillCancelled = true; }
 }

@@ -28,7 +28,8 @@ function box() {
   w(path.join(bin, 'docker'), `#!/usr/bin/env bash
 echo "$*" >> "${root}/docker.calls"
 case "$1" in
-  ps) { cat "${vibe}/standby/boot-held.json" 2>/dev/null || echo none; } >> "${root}/held-at-ps"
+  ps) [[ "$*" == *project=vibe-drill* ]] && exit 0  # no practice drill on this box
+      { cat "${vibe}/standby/boot-held.json" 2>/dev/null || echo none; } >> "${root}/held-at-ps"
       if [[ -f "${root}/stopped" && ! -f "${root}/stop-ignored" ]]; then printf 'postgres vibe-postgres\\n';
       else printf 'vibe-tb vibe-tb\\ncloudflared vibe-cloudflared\\npostgres vibe-postgres\\nredis vibe-redis\\n'; fi ;;
   stop) touch "${root}/stopped" ;;
@@ -467,6 +468,36 @@ test('tunnel-teardown runs only on a box in standby mode, and is in every allowl
     assert.match(fs.readFileSync(path.join(REPO, f), 'utf8'), /standby-tunnel-teardown/, f);
   }
   assert.equal((fs.readFileSync(path.join(REPO, 'lib/host-runner.sh'), 'utf8').match(/standby-tunnel-teardown/g) || []).length, 2, 'the validator and the dispatcher');
+});
+
+test('drill runs only on a box in standby mode, only when asked, and is in every allowlist', () => {
+  const b = box();
+  const st = JSON.parse(b.read('state.json')); st.config.standby_mode = false;
+  fs.writeFileSync(path.join(b.vibe, 'state.json'), JSON.stringify(st));
+  fs.writeFileSync(path.join(b.vibe, 'standby/drill.ready'), '{"snapshotId":"s1","stagePath":"/opt/vibe/standby/stage"}');
+  let r = b.run('drill');
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /not in standby mode/);
+  assert.match(r.stderr, /fix: /);
+  st.config.standby_mode = true;
+  fs.writeFileSync(path.join(b.vibe, 'state.json'), JSON.stringify(st));
+  fs.rmSync(path.join(b.vibe, 'standby/drill.ready'));
+  r = b.run('drill');
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /no drill was requested/);
+  // A stage path from the request must not reach outside the mirror.
+  fs.writeFileSync(path.join(b.vibe, 'standby/drill.ready'), '{"snapshotId":"s1","stagePath":"/opt/../../etc"}');
+  r = b.run('drill');
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /names no valid copy/);
+  assert.equal(b.calls('docker.calls').some((c) => /compose|run /.test(c)), false, 'nothing was started');
+  const runner = fs.readFileSync(path.join(REPO, 'lib/host-runner.sh'), 'utf8');
+  const control = fs.readFileSync(path.join(REPO, 'console/lib/standby-control.js'), 'utf8');
+  for (const action of ['standby-drill', 'standby-drill-clean']) {
+    assert.ok(runner.includes(`"${action}"`), `${action} in the runner's validator`);
+    assert.ok(runner.includes(`|${action}|`) || runner.includes(`|${action})`), `${action} in the runner's dispatcher`);
+    assert.ok(control.includes(`'${action}'`), `${action} in the console's allowlist`);
+  }
 });
 
 test('boot hold: the record gets its boot ID only after the last pass, so the service cannot release in between', () => {

@@ -57,9 +57,48 @@ export interface ApplianceControl {
   /** After a reboot: start the app, Redis and tunnel containers the host held back until the role record was read. */
   releaseBootHold(): Promise<void>;
 
-  /** Test promote: start apps on a network with no egress and no tunnel. */
-  startAppsIsolated(): Promise<void>;
-  stopAppsIsolated(): Promise<void>;
+  /**
+   * Practice drill: start the primary's apps from the verified copy in an
+   * isolated, throwaway project (no way out, no tunnel), check them, and
+   * remove it all. The verified copy is not written to. Resolves with the
+   * host's report, also when the drill itself failed.
+   */
+  runDrill(req: DrillRequest, signal?: AbortSignal): Promise<DrillReport>;
+  /** Remove every trace of a drill. Safe at any time. */
+  cleanDrill(): Promise<void>;
+  /** Ask a running drill to stop at its next check (a promote is starting). */
+  cancelDrill(): Promise<void>;
+}
+
+export interface DrillRequest {
+  snapshotId: string;
+  /** Where the copy's database dumps are, as captured (same absolute path on both boxes). */
+  stagePath: string;
+}
+
+export interface DrillAppResult {
+  slug: string;
+  ok: boolean;
+  secondsToReady: number | null;
+  /** HTTP status of the health check and of the sign-in page, as the probe saw them. */
+  health: string | null;
+  signIn: string | null;
+  detail: string;
+}
+
+export interface DrillReport {
+  snapshotId: string;
+  startedAt: string | null;
+  finishedAt: string;
+  ok: boolean;
+  apps: DrillAppResult[];
+  /** Apps the drill would not start, and why (for example a host mount it could not isolate). */
+  skipped: { slug: string; reason: string }[];
+  databasesRestored?: number;
+  restoreWarnings?: string[];
+  isolation?: { outsideReachable: Record<string, boolean>; tunnelRunning: boolean; ok: boolean };
+  error: string | null;
+  fix?: string;
 }
 
 export class StandbyModeError extends Error {
