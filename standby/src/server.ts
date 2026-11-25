@@ -14,7 +14,8 @@ import type { Store } from "./overlay/store.ts";
 import { BadCodeError } from "./pairing/codes.ts";
 import { PairingError } from "./pairing/service.ts";
 import { removeArchive, REJOIN_PHRASE, SKIP_ARCHIVE_PHRASE, SWITCHOVER_PHRASE } from "./promote/failback.ts";
-import { CONFIRM_PHRASE } from "./promote/promote.ts";
+import { afterPromoteList, CONFIRM_PHRASE, type AfterPromote, type AfterPromoteItem } from "./promote/promote.ts";
+import { getPairing } from "./pairing/state.ts";
 import type { Runtime } from "./runtime.ts";
 import { computeStatus } from "./status.ts";
 import type { VerifiedCopy } from "./sync/sync.ts";
@@ -76,6 +77,8 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
       formerLive: store.get("formerLive") ?? null,
       tunnelCleanup: store.get("tunnelCleanup") ?? null,
       imagesReady: store.get("imagesReady") ?? null,
+      // After a promote: what is left before the firm is protected again.
+      afterPromote: store.role === "primary" ? afterPromoteList(store.get<AfterPromote>("afterPromote"), !!getPairing(store)) : null,
       // The primary's apps in the verified copy, and each one's latest test.
       apps: { enabled: store.get<VerifiedCopy>("verifiedCopy")?.enabledApps ?? [], ready: appReadiness(store) },
       drill: { running: store.get("drillRunning") ?? null, blocked: drillBlocked(store), history: drillHistory(store).slice(0, 12), handsOn: handsOnState(store) },
@@ -144,6 +147,24 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
     if (r.busy()) return reply.code(409).send({ error: `A ${r.busy()} is already running.`, code: "busy" });
     void r.syncNow().catch(() => { /* recorded in status */ });
     return reply.code(202).send({ started: true });
+  });
+
+  // ---- after a promote: the checklist --------------------------------------------
+  app.post("/api/after-promote/done", async (req, reply) => {
+    const item = (req.body as { item?: unknown } | undefined)?.item;
+    const a = store.get<AfterPromote>("afterPromote");
+    if (!a) return reply.code(409).send({ error: "There is no promote checklist on this box." });
+    if (item !== "backup" && item !== "dns" && item !== "signIn") return reply.code(400).send({ error: "Unknown checklist item." });
+    store.set("afterPromote", { ...a, done: { ...a.done, [item as AfterPromoteItem]: new Date().toISOString() } });
+    store.audit("after-promote-done", ACTOR, true, { item });
+    return { ok: true };
+  });
+  app.post("/api/after-promote/hide", async (_req, reply) => {
+    const a = store.get<AfterPromote>("afterPromote");
+    if (!a) return reply.code(409).send({ error: "There is no promote checklist on this box." });
+    store.set("afterPromote", { ...a, hidden: true });
+    store.audit("after-promote-hide", ACTOR, true, {});
+    return { ok: true };
   });
 
   // ---- practice drill ------------------------------------------------------------

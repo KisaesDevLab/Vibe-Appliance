@@ -3,7 +3,7 @@
 // or the tunnel was NEVER running at any point, not just at the end.
 import {
   StandbyModeError,
-  type AppHealth, type ApplianceControl, type ApplianceVersion, type DrillReport, type DrillRequest, type PlaceReport, type ServiceState,
+  type AppHealth, type ApplianceControl, type ApplianceVersion, type ArchiveRequest, type DrillReport, type DrillRequest, type PlaceReport, type ServiceState,
 } from "../appliance.ts";
 
 export interface FakeApplianceInit {
@@ -143,7 +143,8 @@ export class FakeAppliance implements ApplianceControl {
     this.#set("redis", true); this.#set("app", true);
     return this.placeReport;
   }
-  async archive(): Promise<void> { this.#call("archive"); this.archived++; }
+  archiveRequests: ArchiveRequest[] = [];
+  async archive(opts: ArchiveRequest = {}): Promise<void> { this.#call("archive"); this.archived++; this.archiveRequests.push(opts); }
 
   async runDrill(req: DrillRequest, signal?: AbortSignal): Promise<DrillReport> {
     this.#call("runDrill");

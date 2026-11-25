@@ -8,12 +8,13 @@
 //   takes a final copy and announces it. The admin then promotes the standby,
 //   which is allowed because it holds that exact copy. No work is lost,
 //   because nothing was written after the final copy.
-import { readdir, rm } from "node:fs/promises";
+import { readdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { ApplianceControl } from "../contracts/appliance.ts";
-import { highest } from "../link/lease.ts";
+import { highest, type Lease } from "../link/lease.ts";
 import type { Link } from "../link/link.ts";
 import type { Store } from "../overlay/store.ts";
+import type { RoleConflict } from "../status.ts";
 import { clearPairing } from "../pairing/state.ts";
 
 export const REJOIN_PHRASE = "REPLACE THIS BOX";
@@ -39,7 +40,7 @@ export async function prepareRejoin(d: RejoinDeps, opts: { confirm: string; skip
     // Stop first so the archive is of data that is no longer changing.
     await d.appliance.stopTunnel().catch(() => {});
     await d.appliance.stopApps();
-    if (!skip) await d.appliance.archive();
+    if (!skip) await d.appliance.archive(changedSince(d.store));
     await d.appliance.setStandbyMode(true);
     clearPairing(d.store);
     for (const k of ["leases", "verifiedCopy", "versionIssues", "peerReport", "roleConflict", "replacedBy", "switchover", "lastCapture"]) d.store.unset(k);
@@ -68,7 +69,29 @@ export async function prepareRejoin(d: RejoinDeps, opts: { confirm: string; skip
   }
 }
 
-export interface ArchiveInfo { name: string; expiresAt: string }
+/**
+ * Work entered here after this time is not on the live box. Best: the time
+ * of the copy the other box went live with (in its role record). Else this
+ * box's own last nightly copy: the other box may have gone live with an
+ * older one, so the list can miss a little, and says so.
+ */
+function changedSince(store: Store): { changedSince?: string; source?: "copy" | "capture" } {
+  const copyAt = store.get<Lease>("replacedBy")?.dataAt ?? store.get<RoleConflict>("roleConflict")?.dataAt;
+  if (typeof copyAt === "string") return { changedSince: copyAt, source: "copy" };
+  const last = store.get<{ at?: string; ok?: boolean }>("lastCapture");
+  if (last?.ok && typeof last.at === "string") return { changedSince: last.at, source: "capture" };
+  return {};
+}
+
+/** What an archive lists as entered on this box after the last copy (from the host's CHANGES.json). */
+export interface ArchiveChanges {
+  since: string;
+  source: "copy" | "capture" | null;
+  databases: { db: string; tables: { table: string; column: string; rows: number; newest: string | null }[] }[];
+  files: { app: string; count: number; paths: string[] }[];
+}
+
+export interface ArchiveInfo { name: string; expiresAt: string; changes?: ArchiveChanges | null }
 
 /** Archives kept on this box, with the date each will be removed. */
 export async function listArchives(archiveDir: string, keepDays: number): Promise<ArchiveInfo[]> {
@@ -79,7 +102,8 @@ export async function listArchives(archiveDir: string, keepDays: number): Promis
     const m = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})$/.exec(name);
     if (!m) continue;
     const at = Date.UTC(+m[1]!, +m[2]! - 1, +m[3]!, +m[4]!, +m[5]!, +m[6]!);
-    out.push({ name, expiresAt: new Date(at + keepDays * 86_400_000).toISOString() });
+    const changes = await readFile(join(archiveDir, name, "CHANGES.json"), "utf8").then((t) => JSON.parse(t) as ArchiveChanges, () => null);
+    out.push({ name, expiresAt: new Date(at + keepDays * 86_400_000).toISOString(), changes });
   }
   return out;
 }

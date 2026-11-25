@@ -408,6 +408,92 @@ action_follow_version() {
   log_ok "now on the primary's appliance version"
 }
 
+# Rejoin: what was entered on this box after the copy the other box went
+# live with. That work is not on the live box and is never merged; listing
+# it lets the firm look it up in the archive and type it in again. From the
+# databases (rows whose created/updated time is after the copy, per table,
+# for tables that have such a column) and the app files (changed after it).
+# Generic: no app is named. Written to CHANGES.json and CHANGES.txt in the
+# archive. Never fatal: the archive itself is what matters.
+ARCHIVE_REQUEST="${SB_DIR}/archive.request.json"
+_archive_changes() { # <archive dir> <pg user>
+  local dest="$1" pg_user="$2" since source db
+  [[ -f "$ARCHIVE_REQUEST" ]] || { log_info "no time of the last copy was given; work after it is not listed"; return 0; }
+  since="$(python3 -c "import json,re,sys; v=json.load(open(sys.argv[1])).get('changedSince') or ''; print(v if re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z', v) else '')" "$ARCHIVE_REQUEST" 2>/dev/null || true)"
+  source="$(python3 -c "import json,sys; v=json.load(open(sys.argv[1])).get('source'); print(v if v in ('copy','capture') else '')" "$ARCHIVE_REQUEST" 2>/dev/null || true)"
+  [[ -n "$since" ]] || { log_warn "the time of the last copy was not valid; work after it is not listed"; return 0; }
+  log_step "listing work entered on this box after the last copy" since="$since"
+  : > "$dest/.changes-db.tsv"
+  while read -r db; do
+    [[ -n "$db" ]] || continue
+    docker exec -i "$PG_CONTAINER" psql -X -U "$pg_user" -d "$db" -At -F $'\t' -v ON_ERROR_STOP=1 -v since="$since" 2>>"$VIBE_LOG_FILE" <<'SQL' \
+      | sed "s/^/${db}\t/" >> "$dest/.changes-db.tsv" || log_warn "could not list recent rows in $db" db="$db"
+WITH cols AS (
+  SELECT c.table_schema AS s, c.table_name AS t, c.column_name AS col,
+         row_number() OVER (PARTITION BY c.table_schema, c.table_name ORDER BY
+           CASE lower(c.column_name) WHEN 'updated_at' THEN 1 WHEN 'updatedat' THEN 1 WHEN 'modified_at' THEN 2
+             WHEN 'last_modified' THEN 2 WHEN 'created_at' THEN 3 WHEN 'createdat' THEN 3 ELSE 4 END) AS rn
+  FROM information_schema.columns c
+  JOIN information_schema.tables tb ON tb.table_schema = c.table_schema AND tb.table_name = c.table_name
+  WHERE tb.table_type = 'BASE TABLE' AND c.table_schema NOT IN ('pg_catalog', 'information_schema')
+    AND c.data_type IN ('timestamp with time zone', 'timestamp without time zone', 'date')
+    AND lower(c.column_name) IN ('updated_at', 'updatedat', 'modified_at', 'last_modified', 'created_at', 'createdat', 'inserted_at')
+)
+SELECT s, t, col, n, newest FROM (
+  SELECT s, t, col,
+    (xpath('/row/n/text()', query_to_xml(format('SELECT count(*) AS n FROM %I.%I WHERE %I > %L::timestamptz', s, t, col, :'since'), false, true, '')))[1]::text::bigint AS n,
+    (xpath('/row/m/text()', query_to_xml(format('SELECT max(%I)::text AS m FROM %I.%I WHERE %I > %L::timestamptz', col, s, t, col, :'since'), false, true, '')))[1]::text AS newest
+  FROM cols WHERE rn = 1) x
+WHERE n > 0 ORDER BY n DESC;
+SQL
+  done <<<"$(docker exec "$PG_CONTAINER" psql -U "$pg_user" -At -d postgres \
+    -c "SELECT datname FROM pg_database WHERE NOT datistemplate AND datallowconn AND datname <> 'postgres'" 2>>"$VIBE_LOG_FILE" || true)"
+  python3 - "$dest" "$since" "$source" <<'PYEOF' || log_warn "could not write the list of work entered after the last copy"
+import datetime, json, os, sys
+dest, since, source = sys.argv[1:4]
+cut = datetime.datetime.strptime(since[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc).timestamp()
+dbs = {}
+with open(os.path.join(dest, ".changes-db.tsv")) as f:
+    for line in f:
+        p = line.rstrip("\n").split("\t")
+        if len(p) != 6 or not p[4].isdigit(): continue
+        db, sch, table, col, n, newest = p
+        dbs.setdefault(db, []).append({"table": table if sch == "public" else "%s.%s" % (sch, table), "column": col, "rows": int(n), "newest": newest or None})
+os.remove(os.path.join(dest, ".changes-db.tsv"))
+files = []
+apps = os.path.join(dest, "apps")
+if os.path.isdir(apps):
+    for app in sorted(os.listdir(apps)):
+        changed = []
+        for root, _, names in os.walk(os.path.join(apps, app)):
+            for n in names:
+                fp = os.path.join(root, n)
+                try: m = os.lstat(fp).st_mtime
+                except OSError: continue
+                if m > cut: changed.append((m, os.path.relpath(fp, apps)))
+        if changed:
+            changed.sort(reverse=True)
+            files.append({"app": app, "count": len(changed), "paths": [p for _, p in changed[:50]]})
+body = {"since": since, "source": source or None,
+        "databases": [{"db": d, "tables": t} for d, t in sorted(dbs.items())], "files": files}
+with open(os.path.join(dest, "CHANGES.json"), "w") as f: json.dump(body, f, indent=1)
+lines = ["Work entered on this box after %s (%s)." % (since, "the copy the other box went live with" if source == "copy" else "this box's last nightly copy; the other box may have gone live with an older one"),
+         "It is NOT on the live box. Look it up here and type it in again there.", ""]
+if not dbs and not files: lines.append("Nothing was found: no database row or app file changed after that time.")
+for d, t in sorted(dbs.items()):
+    lines.append("Database %s:" % d)
+    lines += ["  %s: %d row(s) by %s, newest %s" % (x["table"], x["rows"], x["column"], x["newest"]) for x in t]
+for x in files:
+    lines.append("Files of %s: %d changed" % (x["app"], x["count"]))
+    lines += ["  " + p for p in x["paths"]]
+    if x["count"] > len(x["paths"]): lines.append("  ... and %d more" % (x["count"] - len(x["paths"])))
+lines += ["", "Tables with no created/updated time column are not listed; changes there cannot be told apart."]
+with open(os.path.join(dest, "CHANGES.txt"), "w") as f: f.write("\n".join(lines) + "\n")
+PYEOF
+  rm -f "$ARCHIVE_REQUEST"
+  log_ok "work entered after the last copy is listed in the archive" file="$dest/CHANGES.txt"
+}
+
 action_archive() {
   local stamp dest
   stamp="$(date -u +%Y%m%d-%H%M%S)"
@@ -455,10 +541,12 @@ action_archive() {
   [[ -d "${VIBE_DIR}/data/apps" ]] && cp -al "${VIBE_DIR}/data/apps" "$dest/apps"
   cp -a "${VIBE_DIR}/env" "$dest/env"
   cp -a "$VIBE_STATE_FILE" "$dest/state.json"
+  _archive_changes "$dest" "$pg_user" || log_warn "could not list the work entered after the last copy"
   date -u +%Y-%m-%dT%H:%M:%SZ > "$dest/ARCHIVED_AT"
   # Read-only where the archive owns the bytes (real copies); the archive
   # directory itself is root-only, which is what keeps people out of it.
   chmod -R a-w "$dest/db" "$dest/env" "$dest/state.json" "$dest/ARCHIVED_AT" 2>/dev/null || true
+  chmod a-w "$dest/CHANGES.json" "$dest/CHANGES.txt" 2>/dev/null || true
   printf '%s\n' "$dest" > "${SB_DIR}/local/archive/LATEST"
   log_ok "archive written" dest="$dest"
 }

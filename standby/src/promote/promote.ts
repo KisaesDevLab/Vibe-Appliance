@@ -107,6 +107,31 @@ export interface PromoteResult {
 
 const WIZARD = "promote";
 
+/** After a promote: what is left to do before the firm is protected again. Kept until done or hidden. */
+export interface AfterPromote {
+  at: string;
+  mode: string | null;
+  tunnel: boolean | null;
+  address: string | null;
+  signInFailed: boolean;
+  /** Items the admin marked done, with when. */
+  done: Partial<Record<AfterPromoteItem, string>>;
+  hidden?: boolean;
+}
+export type AfterPromoteItem = "backup" | "dns" | "signIn";
+
+/** The checklist as the panel shows it. `standby` is done when a standby is paired again. */
+export function afterPromoteList(a: AfterPromote | undefined, paired: boolean): { item: AfterPromoteItem | "standby"; done: boolean; at: string | null }[] | null {
+  if (!a || a.hidden) return null;
+  const out: { item: AfterPromoteItem | "standby"; done: boolean; at: string | null }[] = [
+    { item: "backup", done: !!a.done.backup, at: a.done.backup ?? null },
+    { item: "standby", done: paired, at: null },
+  ];
+  if (a.mode === "domain" && a.tunnel === false) out.push({ item: "dns", done: !!a.done.dns, at: a.done.dns ?? null });
+  if (a.signInFailed) out.push({ item: "signIn", done: !!a.done.signIn, at: a.done.signIn ?? null });
+  return out.every((x) => x.done) ? null : out;
+}
+
 /** The run in progress, if a promote was started and not finished. */
 export function activePromote(store: Store): string | undefined { return store.get<string>("promoteRunId"); }
 
@@ -152,7 +177,7 @@ export async function runPromote(d: PromoteDeps, opts: { confirm?: string; actor
       const prior = highest([...leases, ...(knownLease(d.store) ? [knownLease(d.store)!] : [])]);
       // Repeating this step must not burn another epoch.
       const lease: Lease = prior?.holderNodeId === d.store.nodeId ? prior
-        : { epoch: (prior?.epoch ?? 0) + 1, holderNodeId: d.store.nodeId, writtenAt: now().toISOString(), reason: "promote" };
+        : { epoch: (prior?.epoch ?? 0) + 1, holderNodeId: d.store.nodeId, writtenAt: now().toISOString(), reason: "promote", ...(copy ? { dataAt: copy.createdAt } : {}) };
       const writtenTo = await link.writeLease(lease);
       requireRecorded(link, writtenTo);
       return { epoch: lease.epoch, writtenTo };
@@ -199,6 +224,12 @@ export async function runPromote(d: PromoteDeps, opts: { confirm?: string; actor
         leaseDelivered: result.leaseWrittenTo.includes("peer"),
       });
       clearPairing(d.store);
+      // The checklist the panel keeps until the firm is protected again.
+      const dep = result.deployment;
+      d.store.set("afterPromote", {
+        at: now().toISOString(), mode: dep?.mode ?? null, tunnel: dep?.tunnel ?? null, address: dep?.address ?? null,
+        signInFailed: result.signIn?.status === "failed", done: {},
+      } satisfies AfterPromote);
       for (const k of ["verifiedCopy", "versionIssues", "switchoverAnnounced", "swapPending"]) d.store.unset(k);
       return {};
     });

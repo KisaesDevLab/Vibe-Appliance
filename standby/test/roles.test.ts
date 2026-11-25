@@ -1,7 +1,7 @@
 // Status, alerts, the role guard, promote, rejoin and planned switchover,
 // against the fake appliance and an in-memory bucket.
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -13,7 +13,7 @@ import { BucketLink, knownLease, rememberLease, type Link } from "../src/link/li
 import { Store } from "../src/overlay/store.ts";
 import { getPairing, setPairing } from "../src/pairing/state.ts";
 import { expireArchives, listArchives, prepareRejoin, REJOIN_PHRASE, SKIP_ARCHIVE_PHRASE, startSwitchover, cancelSwitchover, SWITCHOVER_PHRASE } from "../src/promote/failback.ts";
-import { activePromote, cancelPromote, PROMOTE_STEPS, promoteChecks, runPromote, type PromoteDeps } from "../src/promote/promote.ts";
+import { activePromote, afterPromoteList, cancelPromote, PROMOTE_STEPS, promoteChecks, runPromote, type AfterPromote, type PromoteDeps } from "../src/promote/promote.ts";
 import { checkRole, startAnyway } from "../src/role/guard.ts";
 import { computeStatus } from "../src/status.ts";
 import { activeOperation, type VerifiedCopy } from "../src/sync/sync.ts";
@@ -385,6 +385,59 @@ test("promote records how to recognise and reach the box it replaced (direct mod
   const f = w.ss.get<{ fingerprint: string; addresses: string[]; port: number; mode: string; leaseDelivered: boolean }>("formerPeer")!;
   assert.deepEqual([f.mode, f.fingerprint, f.addresses, f.port], ["direct", "ab".repeat(32), ["10.0.0.10"], 4480]);
   assert.equal(f.leaseDelivered, false, "the test link reaches the bucket, not the peer");
+});
+
+test("rejoin: the archive lists work after the exact copy the other box went live with (from its role record)", async () => {
+  const w = pair();
+  const r = await runPromote(w.promoteDeps(), { confirm: "PROMOTE", actor: "admin" });
+  assert.equal(r.ok, true, r.error);
+  w.ps.set("lastCapture", { snapshotId: "s-newer", at: new Date(T0).toISOString(), ok: true });
+  // The old primary boots, finds it was replaced, and the admin rejoins it.
+  w.ps.set("lastBootId", "boot-1");
+  await checkRole({ store: w.ps, link: w.pLink, appliance: w.pBox, bootId: "boot-2", now: w.now });
+  assert.equal(w.ps.role, "replaced");
+  await prepareRejoin({ store: w.ps, appliance: w.pBox, now: w.now }, { confirm: REJOIN_PHRASE, actor: "admin" });
+  assert.deepEqual(w.pBox.archiveRequests, [{ changedSince: w.copy.createdAt, source: "copy" }], "the promoted copy's time, not this box's own later capture");
+});
+
+test("rejoin: with no role record to go by, this box's own last good copy is used and named as such; none, none", async () => {
+  const w = pair();
+  w.ps.set("lastCapture", { snapshotId: "s", at: new Date(T0).toISOString(), ok: true });
+  await prepareRejoin({ store: w.ps, appliance: w.pBox, now: w.now }, { confirm: REJOIN_PHRASE, actor: "admin" });
+  assert.deepEqual(w.pBox.archiveRequests, [{ changedSince: new Date(T0).toISOString(), source: "capture" }]);
+  const v = pair();
+  v.ps.set("lastCapture", { snapshotId: "s", at: new Date(T0).toISOString(), ok: false, error: "x" });
+  await prepareRejoin({ store: v.ps, appliance: v.pBox, now: v.now }, { confirm: REJOIN_PHRASE, actor: "admin" });
+  assert.deepEqual(v.pBox.archiveRequests, [{}], "a failed capture's time says nothing about the data");
+});
+
+test("after promote: the checklist lists what is left, ticks the standby itself, and goes when all is done", async () => {
+  const w = pair();
+  w.sBox.placeReport = { signIn: { status: "failed", from: "http://10.0.0.51", to: "http://10.0.0.52" } };
+  const r = await runPromote(w.promoteDeps({ deployment: async () => ({ mode: "domain", tunnel: false, address: "203.0.113.7" }) }), { confirm: "PROMOTE", actor: "admin" });
+  assert.equal(r.ok, true, r.error);
+  const a = () => w.ss.get<AfterPromote>("afterPromote");
+  assert.deepEqual(afterPromoteList(a(), false)!.map((x) => [x.item, x.done]), [["backup", false], ["standby", false], ["dns", false], ["signIn", false]]);
+  w.ss.set("afterPromote", { ...a()!, done: { backup: "t", dns: "t", signIn: "t" } });
+  assert.deepEqual(afterPromoteList(a(), false)!.filter((x) => !x.done).map((x) => x.item), ["standby"]);
+  assert.equal(afterPromoteList(a(), true), null, "everything done: the list goes");
+  // With a tunnel, and single sign-on moved: no DNS or sign-in item.
+  const t = pair();
+  await runPromote(t.promoteDeps(), { confirm: "PROMOTE", actor: "admin" });
+  assert.deepEqual(afterPromoteList(t.ss.get<AfterPromote>("afterPromote"), false)!.map((x) => x.item), ["backup", "standby"]);
+  t.ss.set("afterPromote", { ...t.ss.get<AfterPromote>("afterPromote")!, hidden: true });
+  assert.equal(afterPromoteList(t.ss.get<AfterPromote>("afterPromote"), false), null, "hidden by the admin");
+});
+
+test("archives: the list of work entered after the last copy is read from the archive", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "vs-arch-"));
+  mkdirSync(join(dir, "20261126-020000"), { recursive: true });
+  const changes = { since: "2026-11-24T02:30:00Z", source: "copy", databases: [{ db: "vibe_tb_db", tables: [{ table: "clients", column: "updated_at", rows: 2, newest: "2026-11-25 11:00:00+00" }] }], files: [] };
+  writeFileSync(join(dir, "20261126-020000", "CHANGES.json"), JSON.stringify(changes));
+  mkdirSync(join(dir, "20261127-020000"), { recursive: true });
+  const list = await listArchives(dir, 14);
+  assert.deepEqual(list[0]!.changes, changes);
+  assert.equal(list[1]!.changes, null, "an archive without the list (skipped or older) says so");
 });
 
 test("archives: listed with their expiry and removed when it passes, never before", async () => {

@@ -1,7 +1,11 @@
 // The role lease: who the admin last made primary. Append-only; the highest
 // epoch wins. It never causes a running box to stop (CLAUDE.md, "Role
 // conflict"); it drives hold-at-boot and warnings.
-export interface Lease { epoch: number; holderNodeId: string; writtenAt: string; reason: string }
+export interface Lease {
+  epoch: number; holderNodeId: string; writtenAt: string; reason: string;
+  /** Promote: when the primary took the copy the new holder went live with. A box that rejoins lists its work after this. */
+  dataAt?: string;
+}
 
 export function highest(leases: Lease[]): Lease | undefined {
   return [...leases].sort((a, b) => b.epoch - a.epoch || b.writtenAt.localeCompare(a.writtenAt))[0];

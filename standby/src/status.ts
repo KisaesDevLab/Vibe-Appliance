@@ -7,7 +7,7 @@ import type { VerifiedCopy } from "./sync/sync.ts";
 
 export type Health = "not paired" | "healthy" | "degraded" | "stale" | "failed" | "replaced";
 
-export interface RoleConflict { epoch: number; holderNodeId: string; writtenAt: string; seenAt: string }
+export interface RoleConflict { epoch: number; holderNodeId: string; writtenAt: string; seenAt: string; dataAt?: string }
 export interface LastCapture { snapshotId: string; at: string; ok: boolean; error?: string; files?: number; bytes?: number; unreadable?: number }
 
 export interface Status {

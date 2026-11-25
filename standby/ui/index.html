@@ -177,6 +177,27 @@ function primary() {
   ];
 }
 
+// After a promote: kept on this box's panel until the firm is protected again.
+function afterPromoteCard() {
+  const list = S.afterPromote;
+  if (!list) return null;
+  const ITEMS = {
+    backup: ["Set up Vibe Backup on this box", "Backups do not carry over from the old box. Open Vibe Backup from the console's Apps page and set up its storage and schedule.", "I have set it up"],
+    standby: ["Pair a standby again", "Until then nothing copies this box anywhere. Use the repaired old box (open its console, choose Standby, then “Rejoin as standby”) or a new one, then pair it below.", null],
+    dns: ["Point the firm's web address at this box", "Change the firm's DNS record so it points at this box's public address. Until then, the usual address leads to the old box, or nowhere.", "DNS now points here"],
+    signIn: ["Move single sign-on to this box", "Open the console's Single sign-on section and press “Re-derive issuers (after host/IP change)”, or run: sudo vibe identity rebase", "Done"],
+  };
+  return card(h("h2", {}, "Finish taking over"),
+    P("This box was promoted. A few things are needed before the firm is protected again:"),
+    h("ol", { class: "steps" }, list.map((x) => {
+      const [title, how, doneLabel] = ITEMS[x.item];
+      return h("li", {}, h("span", {}, h("strong", {}, x.done ? "✓ " : "", title), x.done ? M(x.at ? "done " + when(x.at) : "done") : M(how)),
+        !x.done && doneLabel ? btn(doneLabel, () => act(() => api("POST", "api/after-promote/done", { item: x.item }))) : null);
+    })),
+    errLine(),
+    h("div", { class: "row" }, btn("Hide this list", () => { if (confirm("Hide the list? Anything not done stays undone.")) act(() => api("POST", "api/after-promote/hide")); })));
+}
+
 function unpairScreen() {
   return card(h("h2", {}, "Unpair these boxes"), P("The nightly copy stops. Neither box's data is deleted. You can pair them again later."),
     ...typed(S.phrases.unpair, "Unpair", (t) => act(async () => { await api("POST", "api/unpair", { confirm: t }); view = { name: "home" }; })));
@@ -408,6 +429,23 @@ function promoteDone(res) {
       h("div", { class: "row" }, btn("Done", () => { view = { name: "home" }; S.promote.result = null; render(); api("POST", "api/promote/dismiss").catch(() => {}); }, "primary")))];
 }
 
+// Work entered on the old box after the copy the other box went live with:
+// not on the live box, so someone types it in again there.
+function archiveChanges(c) {
+  if (!c) return M("Work entered after the last copy was not listed for this archive.");
+  const rows = c.databases.reduce((n, d) => n + d.tables.reduce((m, t) => m + t.rows, 0), 0);
+  const files = c.files.reduce((n, f) => n + f.count, 0);
+  const since = c.source === "copy" ? "the copy the live box started from (" + when(c.since) + ")" : "this box's last nightly copy (" + when(c.since) + "); the live box may have started from an older one";
+  if (!rows && !files) return M("Nothing was entered here after ", since, ". Nothing needs typing in again.");
+  return h("div", { class: "banner warn", style: "margin-top:8px" },
+    P(h("strong", {}, "Work here that is not on the live box: "), `${rows} database row${rows === 1 ? "" : "s"} and ${files} file${files === 1 ? "" : "s"} changed after ${since}.`),
+    M("Look these up in this archive and type them in again on the live box. The full list is in CHANGES.txt in the archive folder."),
+    h("details", { class: "guide" }, h("summary", {}, "Show the list"),
+      c.databases.map((d) => [h("h3", {}, "Database ", d.db), h("ul", {}, d.tables.map((t) => h("li", {}, h("strong", {}, t.table), `: ${t.rows} row${t.rows === 1 ? "" : "s"}, newest ${t.newest || "?"}`)))]),
+      c.files.map((f) => [h("h3", {}, "Files of ", f.app), h("ul", {}, f.paths.slice(0, 20).map((p) => h("li", {}, h("code", {}, p))), f.count > 20 ? h("li", {}, `… and ${f.count - 20} more`) : null)]),
+      M("Tables with no created or updated time are not listed; changes there cannot be told apart.")));
+}
+
 function rejoinScreen() {
   return card(h("h2", {}, "Rejoin as standby"),
     P("This box will become the standby of the box that is now live. Its apps are stopped and its data is then replaced by a copy of the live box."),
@@ -430,7 +468,7 @@ function replaced() {
 function footer() {
   const out = [];
   if (S.archives.length) out.push(card(h("h2", {}, "Data set aside on this box"), M("Read-only copies kept when this box rejoined as a standby. To look something up, ask your IT person to open the folder named below under /opt/vibe/standby/local/archive."),
-    h("ol", { class: "steps" }, S.archives.map((a) => h("li", {}, h("span", {}, a.name, h("span", { class: "muted" }, " · removed ", when(a.expiresAt))), btn("Delete now", () => { if (confirm("Delete this archive now? It cannot be recovered.")) act(() => api("POST", "api/archives/delete", { name: a.name })); }))))));
+    h("ol", { class: "steps" }, S.archives.map((a) => h("li", {}, h("span", {}, a.name, h("span", { class: "muted" }, " · removed ", when(a.expiresAt)), archiveChanges(a.changes)), btn("Delete now", () => { if (confirm("Delete this archive now? It cannot be recovered.")) act(() => api("POST", "api/archives/delete", { name: a.name })); }))))));
   out.push(h("p", { class: "muted small" }, "Box ID ", S.nodeId.slice(0, 8), " · version ", S.version, " · ", h("a", { href: "api/audit.csv" }, "Download the activity record")));
   return out;
 }
@@ -444,8 +482,8 @@ function render() {
   // closing screen is shown first, whatever the role is by now.
   if (S.promote && S.promote.result && S.promote.result.ok) body = [promoteDone(S.promote.result)];
   else if (S.role === "replaced") body = [replaced()];
-  else if (!S.pairing) body = [unpaired()];
-  else body = [view.name === "home" || view.name === "home-email" ? banner() : null, S.role === "primary" ? primary() : standby()];
+  else if (!S.pairing) body = [view.name === "home" ? afterPromoteCard() : null, unpaired()];
+  else body = [view.name === "home" || view.name === "home-email" ? banner() : null, view.name === "home" ? afterPromoteCard() : null, S.role === "primary" ? primary() : standby()];
   $app.replaceChildren(...[body, footer()].flat(3).filter(Boolean));
   for (const [id, v] of Object.entries(keep)) { const el = document.getElementById(id); if (el) { if (el.type === "checkbox") el.checked = v; else el.value = v; } }
   if (focus && document.getElementById(focus)) document.getElementById(focus).focus();

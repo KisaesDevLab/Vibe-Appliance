@@ -203,6 +203,10 @@ Two paths, chosen in the console of the current primary.
 
 ---
 
+**Added 2026-11-26 (Kurt asked):**
+- *After-promote checklist.* The promote's last step stores `afterPromote`; the new primary's panel keeps a "Finish taking over" list until every item is done or the admin hides it: set up Vibe Backup (ticked by the admin: this service never reads Vibe Backup's state, invariant 9), pair a standby again (ticks itself when paired), point DNS here (domain mode without a tunnel only), move single sign-on (only when the promote's automatic move failed).
+- *Work entered after the last copy.* A promote's lease now carries `dataAt` (when the primary took the copy the new holder went live with). On Rejoin, the archive step is given that time (or this box's own last good capture, named as such) and writes `CHANGES.json`/`CHANGES.txt` into the archive: per database, the tables with rows whose created/updated time is after it (generic: columns named updated_at, modified_at, last_modified, created_at, inserted_at and camelCase forms), and the app files changed after it. The panel shows the counts and the list beside the archive. Tables with no such column cannot be listed; the list says so. Never merged: someone types the work in again on the live box.
+
 ## Phase 10 — Scheduled test promote (drill)
 
 **Built 2026-11-24.** Deviation from the first plan: the drill does not run

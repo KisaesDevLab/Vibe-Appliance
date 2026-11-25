@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { redactor } from "../logger.ts";
 import {
   StandbyModeError,
-  type AppHealth, type ApplianceControl, type ApplianceVersion, type DrillReport, type DrillRequest, type PlaceReport, type ServiceState,
+  type AppHealth, type ApplianceControl, type ApplianceVersion, type ArchiveRequest, type DrillReport, type DrillRequest, type PlaceReport, type ServiceState,
 } from "../contracts/appliance.ts";
 
 export interface ConsoleClientOptions {
@@ -136,7 +136,12 @@ export class ConsoleClient implements ApplianceControl {
     return { signIn: null };
   }
 
-  async archive(): Promise<void> { await this.#hostAction("standby-archive"); }
+  async archive(opts: ArchiveRequest = {}): Promise<void> {
+    const req = join(this.#o.dataDir, "archive.request.json");
+    if (opts.changedSince) await writeFile(req, JSON.stringify(opts), { mode: 0o600 });
+    else await rm(req, { force: true });
+    await this.#hostAction("standby-archive");
+  }
   async removeOwnTunnel(): Promise<void> { await this.#hostAction("standby-tunnel-teardown"); }
   async releaseBootHold(): Promise<void> { await this.#hostAction("standby-boot-release"); }
 

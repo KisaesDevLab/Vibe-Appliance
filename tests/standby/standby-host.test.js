@@ -576,3 +576,46 @@ test('place: the same address (the firm\'s own web addresses) or no Vibe Auth: n
   assert.deepEqual(off.calls('identity.calls'), []);
   assert.deepEqual(off.report, { signIn: null });
 });
+
+// Rejoin: the archive lists what was entered here after the copy the other
+// box went live with (rows by created/updated time, app files by mtime).
+test('archive: lists the work entered after the last copy, from the databases and the app files', () => {
+  const b = box();
+  const bin = path.join(b.root, 'bin');
+  // A Postgres that has one database with two recent rows in "clients".
+  fs.writeFileSync(path.join(bin, 'docker'), `#!/usr/bin/env bash
+echo "$*" >> "${b.root}/docker.calls"
+case "$1" in
+  exec) if [[ "$*" == *"SELECT datname"* ]]; then echo vibe_tb_db
+        elif [[ "$*" == *pg_dump* ]]; then echo dump
+        elif [[ "$*" == *"since=2026-11-24T02:30:00Z"* ]]; then cat >/dev/null; printf 'public\tclients\tupdated_at\t2\t2026-11-25 11:00:00+00\n'
+        else cat >/dev/null 2>&1 || true; fi ;;
+esac
+exit 0
+`, { mode: 0o755 });
+  const doc = path.join(b.vibe, 'data/apps/vibe-tb/uploads');
+  fs.mkdirSync(doc, { recursive: true });
+  fs.writeFileSync(path.join(doc, 'old.pdf'), 'before the copy');
+  fs.utimesSync(path.join(doc, 'old.pdf'), new Date('2026-11-20T00:00:00Z'), new Date('2026-11-20T00:00:00Z'));
+  fs.writeFileSync(path.join(doc, 'new.pdf'), 'after the copy');
+  fs.writeFileSync(path.join(b.vibe, 'standby/archive.request.json'), JSON.stringify({ changedSince: '2026-11-24T02:30:00Z', source: 'copy' }));
+  const r = b.run('archive');
+  assert.equal(r.status, 0, r.stderr + r.stdout);
+  const dir = fs.readFileSync(path.join(b.vibe, 'standby/local/archive/LATEST'), 'utf8').trim();
+  const c = JSON.parse(fs.readFileSync(path.join(dir, 'CHANGES.json'), 'utf8'));
+  assert.equal(c.since, '2026-11-24T02:30:00Z');
+  assert.deepEqual(c.databases, [{ db: 'vibe_tb_db', tables: [{ table: 'clients', column: 'updated_at', rows: 2, newest: '2026-11-25 11:00:00+00' }] }]);
+  assert.deepEqual(c.files, [{ app: 'vibe-tb', count: 1, paths: ['vibe-tb/uploads/new.pdf'] }]);
+  assert.match(fs.readFileSync(path.join(dir, 'CHANGES.txt'), 'utf8'), /NOT on the live box[\s\S]*clients: 2 row/);
+  assert.ok(!fs.existsSync(path.join(b.vibe, 'standby/archive.request.json')), 'the request is used once');
+  assert.ok(!fs.existsSync(path.join(dir, '.changes-db.tsv')));
+});
+
+test('archive: with no time of the last copy, the archive is still made, without a list', () => {
+  const b = box();
+  const r = b.run('archive');
+  assert.equal(r.status, 0, r.stderr + r.stdout);
+  const dir = fs.readFileSync(path.join(b.vibe, 'standby/local/archive/LATEST'), 'utf8').trim();
+  assert.ok(!fs.existsSync(path.join(dir, 'CHANGES.json')));
+  assert.ok(fs.existsSync(path.join(dir, 'ARCHIVED_AT')));
+});

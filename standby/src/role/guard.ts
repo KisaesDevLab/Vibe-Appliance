@@ -81,7 +81,7 @@ export async function checkRole(d: GuardDeps): Promise<GuardResult> {
     d.store.setRole("replaced", "lease-check", `planned switchover completed (lease ${top.epoch})`);
     return done("switchover-completed");
   }
-  const conflict: RoleConflict = { epoch: top.epoch, holderNodeId: top.holderNodeId, writtenAt: top.writtenAt, seenAt: now.toISOString() };
+  const conflict: RoleConflict = { epoch: top.epoch, holderNodeId: top.holderNodeId, writtenAt: top.writtenAt, seenAt: now.toISOString(), ...(typeof top.dataAt === "string" ? { dataAt: top.dataAt } : {}) };
   if (d.store.get<RoleConflict>("roleConflict")?.epoch !== top.epoch) {
     d.store.set("roleConflict", conflict);
     d.store.audit("role-conflict", "lease-check", false, conflict);

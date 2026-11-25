@@ -50,8 +50,12 @@ export interface ApplianceControl {
    * `snapshotId` is recorded as the copy being placed.
    */
   place(snapshotId: string): Promise<PlaceReport>;
-  /** Rejoin: set this box's current data aside, read-only, before it is overwritten. */
-  archive(): Promise<void>;
+  /**
+   * Rejoin: set this box's current data aside, read-only, before it is
+   * overwritten. With `changedSince`, the archive also lists what was
+   * entered here after that time (CHANGES.json / CHANGES.txt).
+   */
+  archive(opts?: ArchiveRequest): Promise<void>;
   /** A new standby: remove this box's OWN Cloudflare tunnel and its DNS records. Refused unless the box is in standby mode. */
   removeOwnTunnel(): Promise<void>;
   /** After a reboot: start the app, Redis and tunnel containers the host held back until the role record was read. */
@@ -68,6 +72,13 @@ export interface ApplianceControl {
   cleanDrill(): Promise<void>;
   /** Ask a running drill to stop at its next check (a promote is starting). */
   cancelDrill(): Promise<void>;
+}
+
+export interface ArchiveRequest {
+  /** When the copy the other box went live with was taken. */
+  changedSince?: string;
+  /** copy: exactly that copy (from the role record); capture: this box's last nightly copy (the other box may have used an older one). */
+  source?: "copy" | "capture";
 }
 
 /** Single sign-on after a promote: moved to this box's address, or not. */
