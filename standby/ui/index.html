@@ -28,6 +28,12 @@
   label { display:block; margin:10px 0 4px; font-weight:600; }
   input[type=text], input[type=password], textarea { width:100%; font:inherit; padding:10px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--text); }
   textarea { min-height:5.5rem; font-family:ui-monospace, monospace; font-size:.9rem; }
+  details.guide { margin-top:12px; border-top:1px solid var(--line); padding-top:10px; }
+  details.guide summary { cursor:pointer; font-weight:600; }
+  details.guide h3 { font-size:1rem; margin:16px 0 4px; }
+  details.guide ul { margin:4px 0; padding-left:20px; }
+  details.guide li { margin:4px 0; }
+  details.guide code { font-family:ui-monospace, monospace; font-size:.85rem; overflow-wrap:anywhere; }
   .code { font-family:ui-monospace, monospace; font-size:.9rem; overflow-wrap:anywhere; background:var(--bg); border:1px dashed var(--line); border-radius:8px; padding:12px; user-select:all; }
   ol.steps { list-style:none; padding:0; margin:0; } ol.steps li { padding:6px 0; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:12px; }
   .err { color:var(--bad); margin-top:10px; } ul { margin:0 0 12px; padding-left:1.2rem; }
@@ -227,8 +233,45 @@ function drillCard() {
   kids.push(errLine(), h("div", { class: "row" },
     btn(d.running ? "Drill running…" : "Run a practice drill", () => act(() => api("POST", "api/drill/run")), "", !!d.running || !!S.busy || !!d.blocked || !S.dataAt),
     d.history.length ? h("a", { href: "api/drills.csv", download: "vibe-standby-drills.csv", style: "align-self:center" }, "Download drill history") : null),
-    M("A drill does not test DNS, the Cloudflare tunnel or this box's own web address; those change only at a real promote."));
+    M("A drill does not test DNS, the Cloudflare tunnel or this box's own web address; those change only at a real promote."),
+    drillGuide());
   return card(...kids);
+}
+
+// The drill, explained for the admin: what it does, how to read a result,
+// what to do about each kind of failure.
+function drillGuide() {
+  const sec = (title, ...body) => [h("h3", {}, title), ...body];
+  const li = (...items) => h("ul", {}, items.map((x) => h("li", {}, x)));
+  const code = (t) => h("code", {}, t);
+  return h("details", { class: "guide" }, h("summary", {}, "How the practice drill works"),
+    ...sec("What it does",
+      li("Starts every app the primary runs, from this box's last verified copy, in a separate, throwaway setup.",
+        "Databases go into a throwaway database server; files are a copy-on-write view of the copy. Nothing is ever written to the copy itself.",
+        "The drill's network has no way out: no internet, no tunnel, no route to your staff or the primary. Every drill tests this itself.",
+        "Each app is started on its own, so one broken app does not stop the others.",
+        "When it finishes (usually 5 to 15 minutes) everything it started is removed, and the result is emailed to the alert address.")),
+    ...sec("What it checks, per app",
+      li("Every container of the app started and stayed up; one-off jobs (database migrations) finished without an error.",
+        "The app's health check answers 200.",
+        "Its sign-in page answers. A setup page that is gone because the firm already ran setup (404) is fine.",
+        "Afterwards: this box's copy still matches exactly what was verified.")),
+    ...sec("Reading a failed result",
+      li(h("span", {}, h("strong", {}, "stopped (exit 1)"), ": the app crashed while starting. Its last log lines are kept on this box until the next drill: ", code("sudo ls /opt/vibe/standby/drill-logs"), ", then ", code("sudo tail -40 /opt/vibe/standby/drill-logs/<container>.log"), "."),
+        h("span", {}, h("strong", {}, "was never started"), ": something it depends on (usually the same app's server) did not come up. Fix that one first."),
+        h("span", {}, h("strong", {}, "health check / sign-in page answered 000"), ": nothing answered, normally because the app is not running. See the line before it."),
+        h("span", {}, h("strong", {}, "a log that mentions registry.npmjs.org, getaddrinfo or EAI_AGAIN"), ": the app tries to download something from the internet when it starts. It would fail the same way on any box without internet. Fix it in the app (ask its maintainer), not here."),
+        h("span", {}, h("strong", {}, "Database: … restored with warnings"), ": the database came back, but the restore tool skipped something. Usually harmless; the nightly sync checks tables and row counts."),
+        h("span", {}, h("strong", {}, "the copy did not match"), ": something other than the drill changed the copy, or a file was left in it. The next nightly sync replaces the copy; Sync now does so too when the primary has sent a newer one."),
+        h("span", {}, h("strong", {}, "NOT isolated"), ": the drill could reach the outside. This must never happen: run no further drills and contact support with the drill history."))),
+    ...sec("Before you rely on a pass",
+      li("A pass means the apps start on the copy and answer. It does not mean someone checked the data by hand.",
+        "It does not test DNS, the Cloudflare tunnel or this box's web address; only a real promote does. A planned switchover after hours tests everything.",
+        "A drill needs memory for every app plus a second database server. On a small box it may refuse with \"not enough free memory\".",
+        "A promote never waits for a drill: it stops it within seconds and takes over.")),
+    ...sec("Records",
+      li("Download drill history gives a spreadsheet of every drill (date, result, apps, isolation, problems) for the firm's WISP.",
+        "The last 100 drills are kept.")));
 }
 
 function promoteChecks() {
