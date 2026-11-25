@@ -76,6 +76,8 @@ export interface AppReadiness {
   ok: boolean | null;
   detail: string | null;
   secondsToReady: number | null;
+  /** Single sign-on through Vibe Auth, when the app uses it (see DrillAppResult.sso). */
+  sso?: "ok" | "failed" | "not checked" | null;
   /** When the primary took the copy that was tested. */
   dataAt: string | null;
 }
@@ -86,7 +88,7 @@ function recordReadiness(store: Store, r: DrillRecord): void {
   // A drill that did not get as far as the apps says nothing about them.
   if (!r.apps.length && !r.skipped.length) return;
   const ready = { ...appReadiness(store) };
-  for (const a of r.apps) ready[a.slug] = { at: r.finishedAt, ok: a.ok, detail: a.ok ? null : a.detail, secondsToReady: a.secondsToReady ?? null, dataAt: r.dataAt };
+  for (const a of r.apps) ready[a.slug] = { at: r.finishedAt, ok: a.ok, detail: a.ok ? null : a.detail, secondsToReady: a.secondsToReady ?? null, sso: a.sso ?? null, dataAt: r.dataAt };
   for (const s of r.skipped) ready[s.slug] = { at: r.finishedAt, ok: null, detail: s.reason, secondsToReady: null, dataAt: r.dataAt };
   store.set("appReady", ready);
 }

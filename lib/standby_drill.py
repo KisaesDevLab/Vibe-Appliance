@@ -147,6 +147,39 @@ def manifest_checks(appliance, slug):
     return hurl, surl, None, first.get("type") == "setup-wizard"
 
 
+def sso_check(appliance, slug, all_svcs, own):
+    """Single sign-on, for an app registered with Vibe Auth: where its sign-in
+    routes are, and what Vibe Auth handed it (client id, issuer, the internal
+    address of Vibe Auth's sign-in server). From the manifest's sso block and
+    the app's rendered settings only. None: the app does not use Vibe Auth."""
+    try:
+        with open(os.path.join(appliance, "console", "manifests", slug + ".json")) as f:
+            m = json.load(f)
+    except Exception:
+        return None
+    sso = m.get("sso") or {}
+    if not sso.get("capable"):
+        return None
+    base = sso.get("internalUrl") or ("http://%s" % (m.get("routing") or {}).get("default_upstream") if (m.get("routing") or {}).get("default_upstream") else None)
+    if not base:
+        return None
+    host = base.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+    env = None
+    for n in own:
+        svc = all_svcs[n]
+        aliases = [n, svc.get("container_name")] + [a for c in (svc.get("networks") or {}).values() for a in ((c or {}).get("aliases") or [])]
+        if host in aliases:
+            env = svc.get("environment") or {}
+            break
+    if env is None:
+        return None
+    client = env.get("VIBE_OIDC_CLIENT_ID") or ""
+    if not client:
+        return {"registered": False}
+    return {"registered": True, "base": base.rstrip("/"), "clientId": client, "issuer": env.get("VIBE_OIDC_ISSUER") or "",
+            "internalBase": (env.get("VIBE_OIDC_INTERNAL_BASE") or "").rstrip("/")}
+
+
 def edge_service(drill, vibe, core_cfg):
     """The copy's own Caddy for a hands-on drill: the primary's routing,
     served over plain HTTP on the drill network, its config from
@@ -220,7 +253,8 @@ def build(drill, vibe, appliance, handson=False):
                 volumes[vname] = {k: x for k, x in (vdecl or {}).items() if k not in ("name", "external")}
         # Run-to-completion jobs (migrate, seed) have no restart policy of their own.
         jobs = [n for n in own if str(all_svcs[n].get("restart") or "no") == "no"]
-        apps.append({"slug": slug, "services": own, "jobs": jobs, "health": hurl, "signIn": surl, "signInIsWizard": wizard})
+        apps.append({"slug": slug, "services": own, "jobs": jobs, "health": hurl, "signIn": surl, "signInIsWizard": wizard,
+                     "sso": sso_check(appliance, slug, all_svcs, own)})
 
     # A dependency on a service of an app that was not drilled is dropped,
     # so one unsafe app does not take the others down with it.
@@ -389,6 +423,67 @@ def save_logs(drill, plan, result, lines=60):
             os.chmod(path, 0o600)
 
 
+def _q(v):
+    return "'" + str(v).replace("'", "'\\''") + "'"
+
+
+def _sso_probe(slug, sso):
+    """Ask the app to start a single sign-on, as a browser would; then ask
+    Vibe Auth's copy, by its internal address, whether it accepts that
+    request (the app's own server-to-server route to it). Two lines:
+    `sso:<slug> <mode> <code> <location>` and `idp:<slug> <code> <location>`."""
+    return "\n".join([
+        "st=$(curl -s --max-time 10 %s | tr -d '\\n')" % _q(sso["base"] + "/auth/status"),
+        "mode=$(printf '%s' \"$st\" | sed -n 's/.*\"mode\":\"\\([a-z_]*\\)\".*/\\1/p')",
+        "sp=$(printf '%s' \"$st\" | sed -n 's/.*\"startPath\":\"\\([^\"]*\\)\".*/\\1/p')",
+        "[ -n \"$sp\" ] || sp=/auth/oidc/start",
+        "out=$(curl -s -o /dev/null -w '%%{http_code} %%{redirect_url}' --max-time 15 %s\"$sp\")" % _q(sso["base"]),
+        "printf '%%s %%s %%s\\n' %s \"${mode:-unknown}\" \"$out\"" % _q("sso:" + slug),
+        "case \"$out\" in 30[23]\\ *)",
+        "  loc=${out#* }; scheme=${loc%%://*}; rest=${loc#*://}; host=${rest%%/*}; path=/${rest#*/}",
+        "  [ \"$path\" = \"/$rest\" ] && path=/",
+        "  ib=%s; [ -n \"$ib\" ] || ib=\"$scheme://$host\"" % _q(sso.get("internalBase") or ""),
+        "  printf '%%s %%s\\n' %s \"$(curl -s -o /dev/null -w '%%{http_code} %%{redirect_url}' --max-time 15 -H \"X-Forwarded-Host: $host\" -H \"X-Forwarded-Proto: $scheme\" \"$ib$path\")\" ;;" % _q("idp:" + slug),
+        "esac",
+    ])
+
+
+def _host(url):
+    return url.split("://", 1)[-1].split("/", 1)[0].lower() if url else ""
+
+
+def sso_result(sso, line, idp):
+    """(failed, note) for an app's single sign-on, from the probe's lines."""
+    from urllib.parse import parse_qs, urlparse
+    if not sso:
+        return False, None
+    if not sso.get("registered"):
+        return False, "single sign-on: not registered with Vibe Auth on the primary, so not checked"
+    parts = (line or "").split(" ", 2)
+    mode = parts[0] if parts else ""
+    code = parts[1] if len(parts) > 1 else "000"
+    loc = parts[2] if len(parts) > 2 else ""
+    if mode == "local" or code == "409":
+        return False, "single sign-on: switched off for this app (local sign-in), so not checked"
+    if code == "503":
+        return True, "single sign-on: the app could not reach Vibe Auth, so staff would see 'sign-in unavailable'"
+    if code not in ("302", "303"):
+        return False, "single sign-on: its sign-in routes answered %s, so it was not checked" % (code or "nothing")
+    want = _host(sso.get("issuer"))
+    q = parse_qs(urlparse(loc).query)
+    if want and _host(loc) != want:
+        return True, "single sign-on: the app sends staff to %s, not to Vibe Auth at %s" % (_host(loc), want)
+    if (q.get("client_id") or [""])[0] != sso.get("clientId"):
+        return True, "single sign-on: the app's sign-in request does not carry its registered id"
+    icode, _, iloc = (idp or "").partition(" ")
+    if icode in ("302", "303") and ("/flow/" in iloc or "/if/" in iloc):
+        return False, "single sign-on: Vibe Auth accepted the app's sign-in request"
+    if icode[:1] == "4":
+        return True, ("single sign-on: Vibe Auth refused the app's sign-in request (answered %s): the app may not be "
+                      "registered there any more, or its return address changed. On the primary: console, Single sign-on, Fix" % icode)
+    return False, "single sign-on: the app handed over to Vibe Auth; Vibe Auth's answer could not be read (%s)" % (icode or "nothing")
+
+
 def probe_script(plan):
     """Shell run inside the probe container: one `<key> <http code>` line per check."""
     lines = []
@@ -396,6 +491,9 @@ def probe_script(plan):
         for key, url in (("health", a.get("health")), ("signin", a.get("signIn"))):
             if url:
                 lines.append("printf '%%s %%s\\n' '%s:%s' \"$(curl -s -o /dev/null -w '%%{http_code}' --max-time 10 '%s')\"" % (key, a["slug"], url))
+        sso = a.get("sso") or {}
+        if sso.get("registered"):
+            lines.append(_sso_probe(a["slug"], sso))
     # The outside world must be unreachable: an address, and a name.
     for key, url in (("egress:ip", "https://1.1.1.1/"), ("egress:name", "https://example.com/")):
         lines.append("printf '%%s %%s\\n' '%s' \"$(curl -s -o /dev/null -w '%%{http_code}' --max-time 8 '%s')\"" % (key, url))
@@ -431,8 +529,15 @@ def report(drill, out_path, snapshot, started, restored, restore_warnings, probe
         s = codes.get("signin:" + a["slug"]) if a.get("signIn") else None
         if a.get("signIn") and not (s and s[0] in "23" or s in ("401", "403") or (s == "404" and a.get("signInIsWizard"))):
             ok = False; notes.append("sign-in page answered %s" % (s or "nothing"))
+        sso_failed, sso_note = sso_result(a.get("sso"), codes.get("sso:" + a["slug"]), codes.get("idp:" + a["slug"]))
+        if sso_failed:
+            ok = False
+        detail = "; ".join(notes) if notes else "ready, health check and sign-in page answered"
+        if sso_note:
+            detail += "; " + sso_note
         apps.append({"slug": a["slug"], "ok": ok, "secondsToReady": w.get("seconds"), "health": h, "signIn": s,
-                     "detail": "; ".join(notes) if notes else "ready, health check and sign-in page answered"})
+                     "sso": None if not a.get("sso") else ("failed" if sso_failed else "ok" if sso_note and "accepted" in sso_note else "not checked"),
+                     "detail": detail})
     egress = {k.split(":", 1)[1]: v for k, v in codes.items() if k.startswith("egress:")}
     isolated = bool(egress) and all(v == "000" for v in egress.values()) and not tunnel_running
     body = {

@@ -129,6 +129,13 @@ export interface DrillAppResult {
   /** HTTP status of the health check and of the sign-in page, as the probe saw them. */
   health: string | null;
   signIn: string | null;
+  /**
+   * Single sign-on, for an app registered with Vibe Auth: ok (the app handed
+   * a sign-in to Vibe Auth's copy and it was accepted), failed, or not
+   * checked (switched off for the app, or the answer could not be read).
+   * null/absent: the app does not use Vibe Auth.
+   */
+  sso?: "ok" | "failed" | "not checked" | null;
   detail: string;
 }
 

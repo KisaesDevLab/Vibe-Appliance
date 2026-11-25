@@ -252,7 +252,8 @@ function appsCard() {
     if (running && running.includes(slug)) return h("span", {}, "Testing now…");
     const r = a.ready[slug];
     if (!r) return h("span", { class: "muted" }, "not tested yet");
-    if (r.ok === true) return [h("span", { class: "pass" }, "Ready"), M("tested ", when(r.at), r.secondsToReady != null ? `, came up in ${r.secondsToReady} s` : "")];
+    if (r.ok === true) return [h("span", { class: "pass" }, "Ready"), M("tested ", when(r.at), r.secondsToReady != null ? `, came up in ${r.secondsToReady} s` : "",
+      r.sso === "ok" ? "; sign-in through Vibe Auth works" : r.sso === "not checked" ? "; sign-in through Vibe Auth not checked (see the drill result)" : "")];
     if (r.ok === false) return [h("span", { class: "fail" }, "Did not start"), M(when(r.at), ": ", r.detail || "")];
     return [h("span", { class: "muted" }, "Not tested"), M(r.detail || "")];
   };
@@ -280,7 +281,7 @@ function drillCard() {
     kids.push(h("div", { class: "banner " + (last.ok ? "ok" : "bad") },
       h("p", { class: "big" }, (last.only ? `Last app test (${last.only.join(", ")}) ` : "Last drill ") + (last.ok ? "passed" + (last.skipped.length ? `, ${last.skipped.length} app${last.skipped.length === 1 ? "" : "s"} not drilled` : "") : "did not pass")),
       M(when(last.finishedAt), last.trigger === "schedule" ? " (monthly)" : "", last.dataAt ? ` · copy from ${when(last.dataAt)}` : ""),
-      last.apps.length ? h("ul", {}, last.apps.map((a) => h("li", {}, h("strong", {}, a.slug), a.ok ? ` passed${a.secondsToReady != null ? `, ready in ${a.secondsToReady} s` : ""}` : `: ${a.detail}`))) : null,
+      last.apps.length ? h("ul", {}, last.apps.map((a) => h("li", {}, h("strong", {}, a.slug), a.ok ? ` passed${a.secondsToReady != null ? `, ready in ${a.secondsToReady} s` : ""}${a.sso === "ok" ? "; sign-in through Vibe Auth works" : a.sso === "not checked" ? `; ${(a.detail.split("; ").find((x) => x.startsWith("single sign-on")) || "single sign-on not checked")}` : ""}` : `: ${a.detail}`))) : null,
       last.skipped.length ? h("ul", {}, last.skipped.map((x) => h("li", {}, h("strong", {}, x.slug), `: ${x.reason}`))) : null,
       (last.restoreWarnings || []).length ? h("ul", {}, last.restoreWarnings.map((x) => h("li", {}, "Database: ", x))) : null,
       last.error ? P(last.error) : null, last.fix ? M(last.fix) : null,
@@ -352,6 +353,7 @@ function drillGuide() {
       li("Every container of the app started and stayed up; one-off jobs (database migrations) finished without an error.",
         "The app's health check answers 200.",
         "Its sign-in page answers. A setup page that is gone because the firm already ran setup (404) is fine.",
+        "Apps that sign staff in through Vibe Auth: the app is asked to start a sign-in, and Vibe Auth's copy must accept it (right app, right return address). Nobody is actually signed in. An app still on its own local sign-in is not checked.",
         "Afterwards: this box's copy still matches exactly what was verified.")),
     ...sec("Reading a failed result",
       li(h("span", {}, h("strong", {}, "stopped (exit 1)"), ": the app crashed while starting. Its last log lines are kept on this box until the next drill: ", code("sudo ls /opt/vibe/standby/drill-logs"), ", then ", code("sudo tail -40 /opt/vibe/standby/drill-logs/<container>.log"), "."),
@@ -360,6 +362,8 @@ function drillGuide() {
         h("span", {}, h("strong", {}, "a log that mentions registry.npmjs.org, getaddrinfo or EAI_AGAIN"), ": the app tries to download something from the internet when it starts. It would fail the same way on any box without internet. Fix it in the app (ask its maintainer), not here."),
         h("span", {}, h("strong", {}, "Database: … restored with warnings"), ": the database came back, but the restore tool skipped something. Usually harmless; the nightly sync checks tables and row counts."),
         h("span", {}, h("strong", {}, "the copy did not match"), ": something other than the drill changed the copy, or a file was left in it. The next nightly sync replaces the copy; Sync now does so too when the primary has sent a newer one."),
+        h("span", {}, h("strong", {}, "single sign-on: Vibe Auth refused the app's sign-in request"), ": the app is not (or no longer) registered with Vibe Auth, or its address changed since. On the primary: console, Single sign-on, Fix for that app; the next sync brings the fix here."),
+        h("span", {}, h("strong", {}, "single sign-on: the app could not reach Vibe Auth"), ": Vibe Auth did not start in the drill (see its own line), or the app points at the wrong internal address."),
         h("span", {}, h("strong", {}, "NOT isolated"), ": the drill could reach the outside. This must never happen: run no further drills and contact support with the drill history."))),
     ...sec("Before you rely on a pass",
       li("A pass means the apps start on the copy and answer. It does not mean someone checked the data by hand.",
