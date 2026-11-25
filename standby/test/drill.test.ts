@@ -9,14 +9,14 @@ import { test } from "node:test";
 import type { Mailer } from "../src/alerts/mailer.ts";
 import { sealStage } from "../src/capture/capture.ts";
 import { FakeAppliance } from "../src/contracts/fakes/fakeAppliance.ts";
-import { composeDrillEmail, drillBlocked, drillHistory, drillHistoryCsv, endHandsOn, finishInterruptedDrill, forgetHandsOn, handsOnState, runDrill, type DrillDeps } from "../src/drill/drill.ts";
+import { appReadiness, composeDrillEmail, drillBlocked, drillHistory, drillHistoryCsv, endHandsOn, finishInterruptedDrill, forgetHandsOn, handsOnState, runDrill, type DrillDeps } from "../src/drill/drill.ts";
 import { Store } from "../src/overlay/store.ts";
 import type { Paths } from "../src/paths.ts";
 import { activeOperation, type VerifiedCopy } from "../src/sync/sync.ts";
 
 const COPY: VerifiedCopy = { snapshotId: "snap-1", createdAt: "2026-11-22T02:30:00.000Z", verifiedAt: "2026-11-22T04:10:00.000Z", applianceCommit: "abc1234", enabledApps: ["vibe-tb", "vibe-mybooks"], databases: ["vibe_tb_db"] };
 
-async function setup(opts: { role?: "standby" | "primary"; copy?: boolean } = {}) {
+async function setup(opts: { role?: "standby" | "primary"; copy?: boolean; images?: Record<string, string> } = {}) {
   const root = mkdtempSync(join(tmpdir(), "vs-drill-"));
   const stage = join(root, "stage");
   const paths: Paths = { appliance: join(root, "tree"), stage, mirror: join(root, "mirror"), mirrorPrev: join(root, "mirror.prev"), hostedRepo: join(root, "repo"), archive: join(root, "archive"), cache: join(root, "cache") };
@@ -24,6 +24,7 @@ async function setup(opts: { role?: "standby" | "primary"; copy?: boolean } = {}
   const inMirror = join(paths.mirror, stage);
   mkdirSync(join(inMirror, "db"), { recursive: true });
   writeFileSync(join(inMirror, "db", "vibe_tb_db.dump"), "dump bytes");
+  if (opts.images) writeFileSync(join(inMirror, "manifest.json"), JSON.stringify({ imageDigests: opts.images }));
   await sealStage(inMirror);
   const store = new Store(":memory:");
   store.setRole(opts.role ?? "standby", "test", "setup");
@@ -257,4 +258,61 @@ test("hands-on: never opened when the drill could reach the outside", async () =
   assert.equal(handsOnState(w.store), null);
   assert.equal(activeOperation(w.store), undefined);
   assert.equal(r.handsOn, undefined);
+});
+
+test("app test: only the chosen apps go to the host, the result is kept per app, no email", async () => {
+  const w = await setup({ images: { "ghcr.io/kisaesdevlab/vibe-tb": "sha256:aa" } });
+  w.box.drillResult = (req) => ({
+    snapshotId: req.snapshotId, startedAt: null, finishedAt: new Date().toISOString(), ok: true, error: null,
+    apps: [{ slug: "vibe-tb", ok: true, secondsToReady: 31, health: "200", signIn: "200", detail: "ready" }],
+    skipped: [], isolation: { outsideReachable: { ip: false, name: false }, tunnelRunning: false, ok: true },
+  });
+  const r = await runDrill(w.deps(), { actor: "admin", trigger: "admin", apps: ["vibe-tb"] });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.only, ["vibe-tb"]);
+  assert.deepEqual(w.box.drills, [{ snapshotId: "snap-1", stagePath: w.paths.stage, apps: ["vibe-tb"] }]);
+  assert.ok(w.box.calls.indexOf("pullImages") < w.box.calls.indexOf("runDrill"), "the primary's images are fetched first");
+  assert.deepEqual((w.store.get("imagesReady") as { failed: string[] }).failed, []);
+  assert.equal(w.sent.length, 0, "the admin is at the screen");
+  const ready = appReadiness(w.store);
+  assert.equal(ready["vibe-tb"]!.ok, true);
+  assert.equal(ready["vibe-tb"]!.secondsToReady, 31);
+  assert.equal(ready["vibe-mybooks"], undefined, "an app not tested keeps no result");
+  assert.ok(w.store.auditRecords().some((a) => a.kind === "app-test" && a.ok));
+  assert.match(drillHistoryCsv(drillHistory(w.store)), /app test: vibe-tb/);
+  assert.equal(activeOperation(w.store), undefined);
+});
+
+test("app test: a later failure replaces the app's earlier pass; apps not drilled say why", async () => {
+  const w = await setup();
+  await runDrill(w.deps(), { actor: "admin", trigger: "admin", apps: ["vibe-tb"] });
+  w.box.drillResult = (req) => ({
+    snapshotId: req.snapshotId, startedAt: null, finishedAt: new Date().toISOString(), ok: false, error: null,
+    apps: [{ slug: "vibe-tb", ok: false, secondsToReady: null, health: "502", signIn: null, detail: "vibe-tb-server reports unhealthy" }],
+    skipped: [{ slug: "vibe-mybooks", reason: "not drilled: its image x is not on this box" }],
+    isolation: { outsideReachable: { ip: false, name: false }, tunnelRunning: false, ok: true },
+  });
+  await runDrill(w.deps(), { actor: "admin", trigger: "admin", apps: ["vibe-tb", "vibe-mybooks"] });
+  const ready = appReadiness(w.store);
+  assert.equal(ready["vibe-tb"]!.ok, false);
+  assert.match(ready["vibe-tb"]!.detail!, /unhealthy/);
+  assert.equal(ready["vibe-mybooks"]!.ok, null);
+  assert.match(ready["vibe-mybooks"]!.detail!, /not on this box/);
+});
+
+test("app test: an app the primary does not run, or a hands-on drill limited to some apps, is refused", async () => {
+  const w = await setup();
+  await assert.rejects(runDrill(w.deps(), { actor: "admin", trigger: "admin", apps: ["vibe-nope"] }), /does not run vibe-nope/);
+  await assert.rejects(runDrill(w.deps(), { actor: "admin", trigger: "admin", apps: ["vibe-tb"], handsOn: { minutes: 60, allow: ["10.0.0.5"], address: "10.0.0.2" } }), /cannot be limited/);
+  assert.equal(w.box.drills.length, 0);
+  assert.equal(activeOperation(w.store), undefined);
+});
+
+test("drill: images the registry would not give are recorded, and the drill still runs", async () => {
+  const w = await setup({ images: { "ghcr.io/kisaesdevlab/vibe-tb": "sha256:aa" } });
+  w.box.unpullable.add("ghcr.io/kisaesdevlab/vibe-tb");
+  const r = await runDrill(w.deps(), { actor: "admin", trigger: "admin" });
+  assert.equal(w.box.drills.length, 1);
+  assert.equal(r.copyUnchanged, true, "the manifest is part of the sealed copy and is only read");
+  assert.deepEqual((w.store.get("imagesReady") as { failed: string[] }).failed, ["ghcr.io/kisaesdevlab/vibe-tb"]);
 });

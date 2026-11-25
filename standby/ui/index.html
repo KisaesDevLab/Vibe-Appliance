@@ -38,6 +38,9 @@
   details.guide li { margin:4px 0; }
   details.guide code { font-family:ui-monospace, monospace; font-size:.85rem; overflow-wrap:anywhere; }
   .code { font-family:ui-monospace, monospace; font-size:.9rem; overflow-wrap:anywhere; background:var(--bg); border:1px dashed var(--line); border-radius:8px; padding:12px; user-select:all; }
+  table.apps { width:100%; border-collapse:collapse; margin:8px 0; } table.apps td { padding:8px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
+  table.apps td:last-child { text-align:right; white-space:nowrap; } table.apps button { min-height:36px; padding:6px 12px; }
+  .pass { color:var(--ok); font-weight:600; } .fail { color:var(--bad); font-weight:600; }
   ol.steps { list-style:none; padding:0; margin:0; } ol.steps li { padding:6px 0; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:12px; }
   .err { color:var(--bad); margin-top:10px; } ul { margin:0 0 12px; padding-left:1.2rem; }
   a { color:var(--accent); }
@@ -210,8 +213,37 @@ function standby() {
       h("div", { class: "row" }, btn(S.busy === "sync" ? "Syncing…" : "Sync now", () => act(() => api("POST", "api/sync/run")), "", !!S.busy), btn("Unpair…", () => go("unpair")))),
     card(h("h2", {}, "If the primary is down"), P("Promote makes this box the live one, using the copy it holds. Only do this when the primary cannot be used."),
       h("div", { class: "row" }, btn("Promote…", () => go("promote-checks"), "primary", !S.dataAt))),
+    appsCard(),
     drillCard(),
   ];
+}
+
+// Each of the primary's apps: was it tested ready to start from this box's
+// copy? "Test" runs the practice drill for that app alone (and the apps it
+// needs, such as sign-in), in the same sandbox: no internet, a throwaway copy
+// of its data, everything removed afterwards.
+function appsCard() {
+  const d = S.drill || {}, a = S.apps || { enabled: [], ready: {} };
+  if (!a.enabled.length) return null;
+  const off = !!d.running || !!S.busy || !!d.blocked || !S.dataAt;
+  const running = d.running && d.running.only ? d.running.only : null;
+  const status = (slug) => {
+    if (running && running.includes(slug)) return h("span", {}, "Testing now…");
+    const r = a.ready[slug];
+    if (!r) return h("span", { class: "muted" }, "not tested yet");
+    if (r.ok === true) return [h("span", { class: "pass" }, "Ready"), M("tested ", when(r.at), r.secondsToReady != null ? `, came up in ${r.secondsToReady} s` : "")];
+    if (r.ok === false) return [h("span", { class: "fail" }, "Did not start"), M(when(r.at), ": ", r.detail || "")];
+    return [h("span", { class: "muted" }, "Not tested"), M(r.detail || "")];
+  };
+  const test = (apps) => act(() => api("POST", "api/drill/test", { apps }));
+  return card(h("h2", {}, "Apps ready to start"),
+    P("Test that an app would start here before you need it: it downloads the primary's exact version if needed, starts the app from this box's copy in a sealed-off sandbox, waits for it to say it is healthy, then removes it."),
+    M("The test never runs the app for real: it has no internet, cannot be reached by your staff, and works on a throwaway copy of its data. An app that needs another one (for example the sign-in app) is started with it. A test usually takes 2 to 5 minutes."),
+    h("table", { class: "apps" }, h("tbody", {}, a.enabled.map((slug) => h("tr", {},
+      h("td", {}, h("strong", {}, slug)), h("td", {}, status(slug)),
+      h("td", {}, btn("Test", () => test([slug]), "", off)))))),
+    errLine(),
+    h("div", { class: "row" }, btn(running ? "Testing…" : "Test all apps", () => test(a.enabled), "", off)));
 }
 
 // Practice drill: starts the primary's apps from this box's copy, cut off from
@@ -222,10 +254,10 @@ function drillCard() {
     P("Checks that this box could really take over: it starts the firm's apps from its copy, cut off from the internet and from your staff, checks that each one comes up and shows its sign-in page, then removes everything. Your copy, the primary and your staff are not affected."),
     M(S.settings && S.settings.drillSchedule === "first-sunday" ? "Runs by itself on the first Sunday of each month, after that night's sync." : "Not scheduled; run it here when you want.")];
   if (d.running) {
-    kids.push(h("p", { class: "big" }, "Drill running…"), M("Started ", when(d.running.startedAt), ". This usually takes 5 to 15 minutes. If the primary fails meanwhile, Promote still works: it stops the drill first."));
+    kids.push(h("p", { class: "big" }, d.running.only ? `Testing ${d.running.only.join(", ")}…` : "Drill running…"), M("Started ", when(d.running.startedAt), ". This usually takes 5 to 15 minutes. If the primary fails meanwhile, Promote still works: it stops the drill first."));
   } else if (last) {
     kids.push(h("div", { class: "banner " + (last.ok ? "ok" : "bad") },
-      h("p", { class: "big" }, last.ok ? "Last drill passed" + (last.skipped.length ? `, ${last.skipped.length} app${last.skipped.length === 1 ? "" : "s"} not drilled` : "") : "Last drill did not pass"),
+      h("p", { class: "big" }, (last.only ? `Last app test (${last.only.join(", ")}) ` : "Last drill ") + (last.ok ? "passed" + (last.skipped.length ? `, ${last.skipped.length} app${last.skipped.length === 1 ? "" : "s"} not drilled` : "") : "did not pass")),
       M(when(last.finishedAt), last.trigger === "schedule" ? " (monthly)" : "", last.dataAt ? ` · copy from ${when(last.dataAt)}` : ""),
       last.apps.length ? h("ul", {}, last.apps.map((a) => h("li", {}, h("strong", {}, a.slug), a.ok ? ` passed${a.secondsToReady != null ? `, ready in ${a.secondsToReady} s` : ""}` : `: ${a.detail}`))) : null,
       last.skipped.length ? h("ul", {}, last.skipped.map((x) => h("li", {}, h("strong", {}, x.slug), `: ${x.reason}`))) : null,

@@ -84,3 +84,21 @@ test("hands-on drill: opened for the computer the web server saw, mapped to the 
   assert.equal((await app.inject({ method: "GET", url: "/api/drill/ca.crt" })).statusCode, 404);
   assert.equal((await app.inject({ method: "POST", url: "/api/drill/hands-on/end" })).statusCode, 409);
 });
+
+test("app test: only the primary's apps can be chosen; status lists them with their latest result", async () => {
+  const store = new Store(":memory:");
+  store.setRole("standby", "test", "setup");
+  store.set("verifiedCopy", { snapshotId: "s", createdAt: "2026-11-25T02:00:00Z", verifiedAt: "2026-11-25T03:00:00Z", applianceCommit: "a", enabledApps: ["vibe-tb", "vibe-auth"], databases: [] });
+  store.set("appReady", { "vibe-tb": { at: "2026-11-25T14:00:00Z", ok: true, detail: null, secondsToReady: 30, dataAt: null } });
+  const asked: unknown[] = [];
+  const runtime = { busy: () => null, status: () => ({}), timezone: async () => "UTC", archives: async () => [], promoteState: () => null, drillNow: async (...a: unknown[]) => { asked.push(a); return {}; } };
+  const app = buildServer({ config: loadConfig({}), store, quiet: true, runtime: runtime as never });
+  const post = (apps: unknown) => app.inject({ method: "POST", url: "/api/drill/test", payload: { apps } });
+  assert.equal((await post(["vibe-tb"])).statusCode, 202);
+  assert.deepEqual(asked.at(-1), ["admin", "admin", undefined, ["vibe-tb"]]);
+  for (const bad of [[], ["vibe-nope"], "vibe-tb", [1]]) assert.equal((await post(bad)).statusCode, 400, JSON.stringify(bad));
+  assert.equal(asked.length, 1);
+  const apps = (await app.inject({ method: "GET", url: "/api/status" })).json().apps;
+  assert.deepEqual(apps.enabled, ["vibe-tb", "vibe-auth"]);
+  assert.equal(apps.ready["vibe-tb"].ok, true);
+});

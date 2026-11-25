@@ -260,6 +260,43 @@ report '[x["reason"] for x in d["skipped"] if x["slug"] == "vibe-demo"][0]' | gr
 [[ -z "$(docker ps -aq --filter label=com.docker.compose.project=vibe-drill)" ]] || fail "drill containers left"
 docker pull -q busybox:1.36 >/dev/null
 
+echo "== app test: only the chosen app (and the apps it needs), with only their databases"
+mpatch() { python3 - "$APPL/console/manifests/$1.json" "$2" <<'PYEOF'
+import json, sys
+m = json.load(open(sys.argv[1])); m.update(json.loads(sys.argv[2])); json.dump(m, open(sys.argv[1], "w"))
+PYEOF
+}
+app_ready() { printf '{"snapshotId":"s1","stagePath":"/opt/vibe/standby/stage","apps":%s}' "$1" > "$VIBE/standby/drill.ready"; }
+sed -i 's/"vibe-demo":{"enabled":true}/"vibe-demo":{"enabled":true},"vibe-broken":{"enabled":true}/' "$SRC/state.json"
+mpatch vibe-demo '{"provides":["identity"],"depends":["postgres","redis"],"database":{"name":"demo_db","user":"demo"}}'
+mpatch vibe-broken '{"depends":["postgres"],"database":{"name":"broken_db","user":"broken"}}'
+before="$(sum)"
+app_ready '["vibe-demo"]'; run drill >/tmp/one.out 2>&1 || fail "an app test could not run: $(tail -5 /tmp/one.out)"
+[[ "$(report 'd["ok"]')" == "True" ]] || fail "the app test of a good app did not pass: $(report 'd')"
+[[ "$(report '[a["slug"] for a in d["apps"]]')" == "['vibe-demo']" ]] || fail "apps not chosen were started: $(report 'd["apps"]')"
+[[ "$(report 'd["skipped"]')" == "[]" ]] || fail "apps not chosen were listed as not drilled: $(report 'd["skipped"]')"
+[[ "$(report 'd["databasesRestored"]')" == "1" ]] || fail "the chosen app's database was not restored"
+grep -q "app test (vibe-demo)" /tmp/one.out || fail "the host log does not say it was an app test"
+# The broken app requires sign-in, which vibe-demo provides: both are started,
+# and only the broken app's own database (there is none in the copy) is restored.
+mpatch vibe-broken '{"requires":["identity"]}'
+app_ready '["vibe-broken"]'; run drill >/tmp/two.out 2>&1 || fail "an app test could not run: $(tail -5 /tmp/two.out)"
+[[ "$(report 'sorted(a["slug"] for a in d["apps"])')" == "['vibe-broken', 'vibe-demo']" ]] || fail "the app it needs was not started with it: $(report 'd["apps"]')"
+[[ "$(report '[a["slug"] for a in d["apps"] if not a["ok"]]')" == "['vibe-broken']" ]] || fail "wrong result: $(report 'd["apps"]')"
+[[ "$(report 'd["databasesRestored"]')" == "1" ]] || fail "the needed app's database was not restored: $(report 'd["databasesRestored"]')"
+mpatch vibe-demo '{"database":{"name":"not_in_copy","user":"x"}}'
+app_ready '["vibe-demo"]'; run drill >/dev/null 2>&1 || true
+[[ "$(report 'd["databasesRestored"]')" == "0" ]] || fail "a database of an app not tested was restored"
+printf '{"snapshotId":"s1","stagePath":"/opt/vibe/standby/stage","apps":["../x"]}' > "$VIBE/standby/drill.ready"
+run drill >/dev/null 2>&1 && fail "a bad app name was accepted"
+printf '{"snapshotId":"s1","stagePath":"/opt/vibe/standby/stage","apps":["vibe-demo"],"handsOn":{"minutes":15,"allow":["10.200.0.2"],"address":"10.0.0.52"}}' > "$VIBE/standby/drill.ready"
+run drill >/tmp/hoapp.out 2>&1 && fail "a hands-on drill limited to some apps was accepted"
+grep -q "cannot be limited" /tmp/hoapp.out || fail "no reason given: $(tail -3 /tmp/hoapp.out)"
+[[ "$(sum)" == "$before" ]] || fail "the mirror changed during an app test"
+[[ -z "$(docker ps -aq --filter label=com.docker.compose.project=vibe-drill)" ]] || fail "app test containers left"
+sed -i 's/,"vibe-broken":{"enabled":true}//' "$SRC/state.json"
+mpatch vibe-demo '{"database":{"name":"demo_db","user":"demo"}}'
+
 echo "== hands-on: opens to one computer, practice notice first, the drill's own app behind it"
 # The admin's computer: its own network namespace, like a PC on the LAN,
 # reaching this box at 10.200.0.1 (Docker's port mapping keeps its address).

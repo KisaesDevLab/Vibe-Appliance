@@ -80,6 +80,11 @@ export interface DrillRequest {
    * only (the standby's own web server, in memory; drill-clean undoes it).
    */
   handsOn?: { minutes: number; allow: string[]; address: string };
+  /**
+   * Test only these apps (plus the enabled apps they need, such as the sign-in
+   * app), with only their databases restored. Absent: every enabled app.
+   */
+  apps?: string[];
 }
 
 export interface HandsOnOpen {

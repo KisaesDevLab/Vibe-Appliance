@@ -14,6 +14,8 @@
 #   archive          REJOIN: set this box's current data aside, read-only
 #   drill            PRACTICE: start the primary's apps from the verified copy
 #                    in an isolated, throwaway project, check them, remove it.
+#                    App test (apps in drill.ready): only those apps and the
+#                    apps they need, with only their databases restored.
 #                    Hands-on (handsOn in drill.ready): leave it running and
 #                    put it in front of the admin's computer only
 #   drill-clean      remove every trace of a drill, and give this box's web
@@ -808,6 +810,19 @@ print("%d\t%s\t%s" % (m, ",".join("%s/%d" % (a, a.max_prefixlen) for a in allow)
 PYEOF
 )" || die "the hands-on drill request is not valid" "start the hands-on drill again from the Standby panel"
   [[ -z "$handson" ]] || IFS=$'\t' read -r ho_min ho_allow ho_addr <<<"$handson"
+  # App test: only these apps (plus the enabled apps they need), and only
+  # their databases. Empty: every enabled app.
+  local only=""
+  only="$(python3 - "$DRILL_READY" <<'PYEOF'
+import json, re, sys
+a = json.load(open(sys.argv[1])).get("apps")
+if not a: sys.exit(0)
+if not isinstance(a, list) or len(a) > 50 or not all(isinstance(s, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", s) for s in a): sys.exit("apps")
+print(" ".join(sorted(set(a))))
+PYEOF
+)" || die "the app test request is not valid" "start the test again from the Standby panel"
+  [[ -z "$only" || -z "$handson" ]] || die "a hands-on drill starts every app; it cannot be limited to some of them" \
+    "start the hands-on drill without choosing apps"
   DRILL_STARTED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   rm -f "$DRILL_REPORT"
   [[ -d "$SRC/data" && -d "$SRC/env" && -f "$SRC/state.json" && -d "$stage/db" ]] || _drill_fail "this box holds no complete verified copy to drill with" \
@@ -867,29 +882,70 @@ PYEOF
 
   # ---- the primary's apps, rendered as the appliance would run them ------
   local slugs
-  slugs="$(python3 - "$SRC/state.json" "$APPLIANCE_DIR" "$SKIP_APPS" <<'PYEOF'
+  slugs="$(python3 - "$SRC/state.json" "$APPLIANCE_DIR" "$SKIP_APPS" "$only" <<'PYEOF'
 import json, os, sys
-state, appl, skip = sys.argv[1], sys.argv[2], sys.argv[3].split()
+state, appl, skip, only = sys.argv[1], sys.argv[2], sys.argv[3].split(), sys.argv[4].split()
 apps = (json.load(open(state)).get("apps") or {})
-for slug, a in sorted(apps.items()):
-    if a and a.get("enabled") and slug not in skip and os.path.isfile(os.path.join(appl, "apps", slug + ".yml")):
-        print(slug)
+enabled = [slug for slug, a in sorted(apps.items())
+           if a and a.get("enabled") and slug not in skip and os.path.isfile(os.path.join(appl, "apps", slug + ".yml"))]
+def man(slug):
+    try:
+        with open(os.path.join(appl, "console", "manifests", slug + ".json")) as f: return json.load(f)
+    except Exception: return {}
+if only:
+    # The chosen apps, and every enabled app they need: one they depend on
+    # by name, or one that provides a capability they require (sign-in).
+    providers = {}
+    for s in enabled:
+        for cap in man(s).get("provides") or []: providers.setdefault(cap, []).append(s)
+    want = set(only) & set(enabled)
+    todo = list(want)
+    while todo:
+        m = man(todo.pop())
+        need = [d for d in (m.get("depends") or []) if d in enabled]
+        need += [p for cap in (m.get("requires") or []) for p in providers.get(cap, [])]
+        for n in need:
+            if n not in want: want.add(n); todo.append(n)
+    enabled = [s for s in enabled if s in want]
+for slug in enabled: print(slug)
 PYEOF
 )" || _drill_fail "could not read which apps the primary runs" "the copy may be damaged; run a sync, then start the drill again"
-  [[ -n "$slugs" ]] || _drill_fail "the primary runs no apps this box could start" "enable apps on the primary first"
+  [[ -n "$slugs" || -n "$only" ]] || _drill_fail "the primary runs no apps this box could start" "enable apps on the primary first"
+  # An app test restores only the databases of the apps it starts ("ALL"
+  # when an app that uses the database names none in its manifest).
+  local only_dbs=""
+  if [[ -n "$only" && -n "$slugs" ]]; then
+    # shellcheck disable=SC2086
+    only_dbs="$(python3 - "$APPLIANCE_DIR" $slugs <<'PYEOF'
+import json, os, sys
+appl, names = sys.argv[1], set()
+for slug in sys.argv[2:]:
+    try:
+        with open(os.path.join(appl, "console", "manifests", slug + ".json")) as f: m = json.load(f)
+    except Exception:
+        print("ALL"); sys.exit(0)
+    db = m.get("database")
+    name = db.get("name") if isinstance(db, dict) else None
+    if name: names.add(name)
+    elif "postgres" in (m.get("depends") or []): print("ALL"); sys.exit(0)
+print(" ".join(sorted(names)))
+PYEOF
+)" || only_dbs="ALL"
+  fi
   # Compose reads env files itself, so the restored settings are bound over
   # /opt/vibe/env in a private mount namespace for the rendering only. Bind
   # mounts are resolved later by dockerd on the host, which is why
   # standby_drill.py rewrites every one of them.
   local slug tag
   # Every enabled app is either drilled or listed with the reason it was not.
-  python3 - "$SRC/state.json" "$APPLIANCE_DIR" "$SKIP_APPS" "$DRILL_DIR/render/_skipped.json" <<'PYEOF' || true
+  python3 - "$SRC/state.json" "$APPLIANCE_DIR" "$SKIP_APPS" "$DRILL_DIR/render/_skipped.json" "$only" <<'PYEOF' || true
 import json, os, sys
-state, appl, skip, out = sys.argv[1:5]
+state, appl, skip, out, only = sys.argv[1:6]
 apps = (json.load(open(state)).get("apps") or {})
 left = []
 for slug, a in sorted(apps.items()):
     if not (a and a.get("enabled")): continue
+    if only.split() and slug not in only.split(): continue
     if slug in skip.split(): left.append({"slug": slug, "reason": "not drilled: it is not copied to the standby (it stays with the primary)"})
     elif not os.path.isfile(os.path.join(appl, "apps", slug + ".yml")): left.append({"slug": slug, "reason": "not drilled: this appliance version has no definition for it"})
 json.dump(left, open(out, "w"))
@@ -958,6 +1014,7 @@ PYEOF
   shopt -s nullglob
   for dump in "$stage"/db/*.dump; do
     _drill_check_cancel
+    if [[ -n "$only" && "$only_dbs" != "ALL" && " $only_dbs " != *" $(basename "$dump" .dump) "* ]]; then continue; fi
     local rc=0
     # --clean: a database the image itself creates (paradedb) is replaced, not reported as a clash.
     docker exec -i "$pgc" pg_restore -U "$pg_user" -C --clean --if-exists -d postgres <"$dump" >>"$VIBE_LOG_FILE" 2>&1 || rc=$?
@@ -1023,7 +1080,7 @@ PYEOF
   log_step "removing the drill"
   trap - EXIT
   action_drill_clean
-  log_ok "practice drill finished; see the Standby panel for the result"
+  log_ok "${only:+app test ($only): }practice drill finished; see the Standby panel for the result"
 }
 
 case "${1:-}" in

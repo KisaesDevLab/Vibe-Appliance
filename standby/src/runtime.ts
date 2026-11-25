@@ -425,7 +425,7 @@ export class Runtime {
   }
 
   /** Run a practice drill now. Rejects at once if one may not start. */
-  async drillNow(actor: string, trigger: "admin" | "schedule", handsOn?: { minutes: number; allow: string[]; address: string }): Promise<DrillRecord> {
+  async drillNow(actor: string, trigger: "admin" | "schedule", handsOn?: { minutes: number; allow: string[]; address: string }, apps?: string[]): Promise<DrillRecord> {
     const blocked = drillBlocked(this.store);
     if (blocked) throw new Error(blocked);
     return this.#exclusive("drill", async () => {
@@ -437,7 +437,7 @@ export class Runtime {
           store: this.store, appliance: this.appliance, paths: this.paths, signal: abort.signal,
           listDatabases: () => pg.listDatabases(),
           mailer: () => this.#mailer(), to: () => this.store.get<string>("alertEmail") ?? this.config.alertEmail, boxName: () => this.store.nodeId.slice(0, 8),
-        }, { actor, trigger, ...(handsOn ? { handsOn } : {}) }).then((r) => { if (handsOnState(this.store)) this.#handsOnOwned = true; return r; });
+        }, { actor, trigger, ...(handsOn ? { handsOn } : {}), ...(apps?.length ? { apps } : {}) }).then((r) => { if (handsOnState(this.store)) this.#handsOnOwned = true; return r; });
       } finally { this.#drillAbort = null; }
     });
   }

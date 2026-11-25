@@ -8,7 +8,7 @@ import { isIP } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Config } from "./config.ts";
-import { drillBlocked, drillHistory, drillHistoryCsv, handsOnState } from "./drill/drill.ts";
+import { appReadiness, drillBlocked, drillHistory, drillHistoryCsv, handsOnState } from "./drill/drill.ts";
 import { loggerOptions } from "./logger.ts";
 import type { Store } from "./overlay/store.ts";
 import { BadCodeError } from "./pairing/codes.ts";
@@ -17,6 +17,7 @@ import { removeArchive, REJOIN_PHRASE, SKIP_ARCHIVE_PHRASE, SWITCHOVER_PHRASE } 
 import { CONFIRM_PHRASE } from "./promote/promote.ts";
 import type { Runtime } from "./runtime.ts";
 import { computeStatus } from "./status.ts";
+import type { VerifiedCopy } from "./sync/sync.ts";
 
 export const VERSION = "0.2.0";
 export const UNPAIR_PHRASE = "UNPAIR";
@@ -75,6 +76,8 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
       formerLive: store.get("formerLive") ?? null,
       tunnelCleanup: store.get("tunnelCleanup") ?? null,
       imagesReady: store.get("imagesReady") ?? null,
+      // The primary's apps in the verified copy, and each one's latest test.
+      apps: { enabled: store.get<VerifiedCopy>("verifiedCopy")?.enabledApps ?? [], ready: appReadiness(store) },
       drill: { running: store.get("drillRunning") ?? null, blocked: drillBlocked(store), history: drillHistory(store).slice(0, 12), handsOn: handsOnState(store) },
       phrases: { promote: CONFIRM_PHRASE, rejoin: REJOIN_PHRASE, skipArchive: SKIP_ARCHIVE_PHRASE, switchover: SWITCHOVER_PHRASE, unpair: UNPAIR_PHRASE, startAnyway: START_ANYWAY_PHRASE },
     };
@@ -149,6 +152,20 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
     const blocked = drillBlocked(store) ?? (r.busy() ? `A ${r.busy()} is already running.` : null);
     if (blocked) return reply.code(409).send({ error: blocked, code: "busy" });
     void r.drillNow(ACTOR, "admin").catch(() => { /* recorded in the history */ });
+    return reply.code(202).send({ started: true });
+  });
+  // App test: the same drill for the chosen apps only (and the apps they
+  // need), with only their databases restored. Nothing runs outside the sandbox.
+  app.post("/api/drill/test", async (req, reply) => {
+    const r = rt(reply); if (!r) return;
+    const apps = (req.body as { apps?: unknown } | undefined)?.apps;
+    const enabled = store.get<VerifiedCopy>("verifiedCopy")?.enabledApps ?? [];
+    if (!Array.isArray(apps) || !apps.length || apps.length > 50 || !apps.every((a) => typeof a === "string" && enabled.includes(a))) {
+      return reply.code(400).send({ error: "Choose one or more of the primary's apps to test." });
+    }
+    const blocked = drillBlocked(store) ?? (r.busy() ? `A ${r.busy()} is already running.` : null);
+    if (blocked) return reply.code(409).send({ error: blocked, code: "busy" });
+    void r.drillNow(ACTOR, "admin", undefined, apps as string[]).catch(() => { /* recorded in the history */ });
     return reply.code(202).send({ started: true });
   });
   // Hands-on: the same drill, left running for the admin's computer only.

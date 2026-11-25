@@ -11,6 +11,7 @@
 //
 // While a drill runs, `operation` is "drill", so no sync replaces the copy
 // under it. A promote does not wait for a drill: it asks it to stop.
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Mailer } from "../alerts/mailer.ts";
 import { verifySeal } from "../capture/capture.ts";
@@ -40,6 +41,8 @@ export interface DrillRecord {
   copyUnchanged: boolean | null;
   error: string | null;
   fix: string | null;
+  /** An app test: only these apps were chosen (the apps they need came along). Absent: every app. */
+  only?: string[];
   /** A hands-on drill: left running after the checks for the admin to use. */
   handsOn?: { until: string; hosts: string[]; address: string; endedAt: string | null; endReason: string | null };
 }
@@ -65,6 +68,44 @@ export interface DrillDeps {
 }
 
 export function drillHistory(store: Store): DrillRecord[] { return store.get<DrillRecord[]>("drills") ?? []; }
+
+/** Each app's latest result from a drill or an app test: is it ready to start at a promote? */
+export interface AppReadiness {
+  at: string;
+  /** null: not tested, with the reason in `detail`. */
+  ok: boolean | null;
+  detail: string | null;
+  secondsToReady: number | null;
+  /** When the primary took the copy that was tested. */
+  dataAt: string | null;
+}
+
+export function appReadiness(store: Store): Record<string, AppReadiness> { return store.get<Record<string, AppReadiness>>("appReady") ?? {}; }
+
+function recordReadiness(store: Store, r: DrillRecord): void {
+  // A drill that did not get as far as the apps says nothing about them.
+  if (!r.apps.length && !r.skipped.length) return;
+  const ready = { ...appReadiness(store) };
+  for (const a of r.apps) ready[a.slug] = { at: r.finishedAt, ok: a.ok, detail: a.ok ? null : a.detail, secondsToReady: a.secondsToReady ?? null, dataAt: r.dataAt };
+  for (const s of r.skipped) ready[s.slug] = { at: r.finishedAt, ok: null, detail: s.reason, secondsToReady: null, dataAt: r.dataAt };
+  store.set("appReady", ready);
+}
+
+/**
+ * Before a drill: make sure the primary's exact images are on this box (the
+ * drill itself never downloads). Problems are not fatal: the drill names
+ * each app whose image is still missing.
+ */
+async function ensureDrillImages(d: Pick<DrillDeps, "store" | "appliance" | "paths" | "now">): Promise<void> {
+  let digests: Record<string, string>;
+  try {
+    digests = (JSON.parse(await readFile(join(d.paths.mirror, d.paths.stage, "manifest.json"), "utf8")) as { imageDigests?: Record<string, string> }).imageDigests ?? {};
+  } catch { return; }
+  if (!Object.keys(digests).length) return;
+  const at = (d.now ?? (() => new Date()))().toISOString();
+  const { failed } = await d.appliance.pullImages(digests).catch(() => ({ failed: Object.keys(digests) }));
+  d.store.set("imagesReady", { at, total: Object.keys(digests).length, failed });
+}
 
 function remember(store: Store, r: DrillRecord): void {
   store.set("drills", [r, ...drillHistory(store).filter((x) => x.id !== r.id)].slice(0, DRILL_HISTORY_MAX));
@@ -149,22 +190,30 @@ export function forgetHandsOn(store: Store, reason: string): void {
 }
 
 /** Run a drill now. Resolves with the record; throws only if the drill may not start. */
-export async function runDrill(d: DrillDeps, opts: { actor: string; trigger: "admin" | "schedule"; handsOn?: { minutes: number; allow: string[]; address: string } }): Promise<DrillRecord> {
+export async function runDrill(d: DrillDeps, opts: { actor: string; trigger: "admin" | "schedule"; handsOn?: { minutes: number; allow: string[]; address: string }; apps?: string[] }): Promise<DrillRecord> {
   const now = d.now ?? (() => new Date());
   const blocked = drillBlocked(d.store);
   if (blocked) throw new Error(blocked);
   const copy = d.store.get<VerifiedCopy>("verifiedCopy")!;
+  const only = opts.apps?.length ? [...new Set(opts.apps)].sort() : null;
+  if (only) {
+    if (opts.handsOn) throw new Error("A hands-on drill starts every app; it cannot be limited to some of them.");
+    const unknown = only.filter((s) => !copy.enabledApps.includes(s));
+    if (unknown.length) throw new Error(`The primary does not run ${unknown.join(", ")}, so there is nothing to test.`);
+  }
   const startedAt = now().toISOString();
   d.store.set("operation", "drill");
-  d.store.set("drillRunning", { startedAt, trigger: opts.trigger, snapshotId: copy.snapshotId });
-  d.store.audit("drill-start", opts.actor, true, { trigger: opts.trigger, snapshotId: copy.snapshotId, dataAt: copy.createdAt });
+  d.store.set("drillRunning", { startedAt, trigger: opts.trigger, snapshotId: copy.snapshotId, ...(only ? { only } : {}) });
+  d.store.audit("drill-start", opts.actor, true, { trigger: opts.trigger, snapshotId: copy.snapshotId, dataAt: copy.createdAt, ...(only ? { only } : {}) });
 
   let report: DrillReport | null = null;
   let error: string | null = null;
   let opened: HandsOnOpen | null = null;
   try {
     try {
-      report = await d.appliance.runDrill({ snapshotId: copy.snapshotId, stagePath: d.paths.stage, ...(opts.handsOn ? { handsOn: opts.handsOn } : {}) }, d.signal);
+      await ensureDrillImages(d);
+      if (d.signal?.aborted) throw new Error("The drill was stopped because a promote started.");
+      report = await d.appliance.runDrill({ snapshotId: copy.snapshotId, stagePath: d.paths.stage, ...(opts.handsOn ? { handsOn: opts.handsOn } : {}), ...(only ? { apps: only } : {}) }, d.signal);
     } catch (err) {
       error = (err as Error).message;
       // A promote that stopped this drill clears it away itself (`place` runs drill-clean first).
@@ -190,14 +239,16 @@ export async function runDrill(d: DrillDeps, opts: { actor: string; trigger: "ad
       copyUnchanged: opened ? null : problems.length === 0,
       error: error ?? report?.error ?? (problems.length ? `after the drill, the copy did not match: ${problems.slice(0, 3).join("; ")}` : null),
       fix: report?.fix ?? null,
+      ...(only ? { only } : {}),
       ...(opened ? { handsOn: { until: opened.until, hosts: opened.hosts, address: opened.address, endedAt: null, endReason: null } } : {}),
     };
     remember(d.store, record);
-    d.store.audit(opened ? "drill-hands-on-open" : "drill", opts.actor, record.ok, { trigger: opts.trigger, failed: record.apps.filter((a) => !a.ok).map((a) => a.slug), skipped: record.skipped.map((s) => s.slug), error: record.error, ...(opened ? { until: opened.until, allow: opened.allow } : {}) });
+    recordReadiness(d.store, record);
+    d.store.audit(opened ? "drill-hands-on-open" : only ? "app-test" : "drill", opts.actor, record.ok, { trigger: opts.trigger, failed: record.apps.filter((a) => !a.ok).map((a) => a.slug), skipped: record.skipped.map((s) => s.slug), error: record.error, ...(opened ? { until: opened.until, allow: opened.allow } : {}) });
     if (opened) d.store.set("handsOn", { ...opened, recordId: record.id, openedAt: record.finishedAt } satisfies HandsOnState);
 
-    // The admin is at the screen for a hands-on drill; no email.
-    if (!d.signal?.aborted && !opts.handsOn) await emailDrill(d, record);
+    // The admin is at the screen for a hands-on drill or an app test; no email.
+    if (!d.signal?.aborted && !opts.handsOn && !only) await emailDrill(d, record);
     return record;
   } finally {
     d.store.unset("drillRunning");
@@ -259,7 +310,7 @@ export async function finishInterruptedDrill(d: Pick<DrillDeps, "store" | "appli
 export function drillHistoryCsv(records: DrillRecord[]): string {
   const esc = (v: unknown) => `"${String(v ?? "").replace(/"/g, '""')}"`;
   const rows = records.map((r) => [
-    r.startedAt, r.finishedAt, r.trigger, r.ok ? "passed" : "failed", r.dataAt ?? "",
+    r.startedAt, r.finishedAt, r.only ? `app test: ${r.only.join(", ")}` : r.trigger, r.ok ? "passed" : "failed", r.dataAt ?? "",
     r.apps.filter((a) => a.ok).map((a) => `${a.slug} (${a.secondsToReady ?? "?"} s)`).join("; "),
     r.apps.filter((a) => !a.ok).map((a) => `${a.slug}: ${a.detail}`).join("; "),
     r.skipped.map((s) => `${s.slug}: ${s.reason}`).join("; "),
