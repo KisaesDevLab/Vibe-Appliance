@@ -1,7 +1,9 @@
 // Postgres operations for capture (primary) and restore (standby), done
 // with the stock client tools over the network. No Docker access.
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { redactor } from "../logger.ts";
 import { run, trackChild } from "../util/run.ts";
 import type { DatabaseFigures } from "../contracts/repository.ts";
@@ -169,9 +171,17 @@ export class Pg {
     const su = this.#c.user.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const own = new RegExp(`^(CREATE|ALTER|DROP|COMMENT ON) ROLE "?${su}"?[ ;]`);
     const filtered = (await readFile(file, "utf8")).split("\n").filter((l) => !own.test(l)).join("\n");
-    const tmp = `${file}.filtered`;
-    await writeFile(tmp, filtered, { mode: 0o600 });
-    const r = await run(this.#bin("psql"), ["-X", "-q", "-d", "postgres", "-f", tmp], { env: this.#env() });
+    // Never next to `file`: that folder is the sealed copy, and an extra file
+    // in it makes the practice drill report the copy as changed.
+    const dir = await mkdtemp(join(tmpdir(), "vs-globals-"));
+    const tmp = join(dir, "globals.sql");
+    let r;
+    try {
+      await writeFile(tmp, filtered, { mode: 0o600 });
+      r = await run(this.#bin("psql"), ["-X", "-q", "-d", "postgres", "-f", tmp], { env: this.#env() });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
     // psql carries on past an error here on purpose (see above). What is
     // left after the expected "already exists" is returned for the caller
     // to show: a role or grant that did not apply only bites after Promote.

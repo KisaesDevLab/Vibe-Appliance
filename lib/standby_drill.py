@@ -123,18 +123,20 @@ def manifest_checks(appliance, slug):
         with open(os.path.join(appliance, "console", "manifests", slug + ".json")) as f:
             m = json.load(f)
     except Exception:
-        return None, None, None
+        return None, None, None, False
     if m.get("runtime", "appliance") != "appliance":
-        return None, None, "it is installed by %s, not by the appliance" % m.get("runtime")
+        return None, None, "it is installed by %s, not by the appliance" % m.get("runtime"), False
     routing = m.get("routing") or {}
     matchers = routing.get("matchers") or []
     up = matchers[0].get("upstream") if matchers else routing.get("default_upstream")
     health = m.get("health") if isinstance(m.get("health"), str) else None
     hurl = "http://%s%s" % (up, health) if up and health else None
     web = routing.get("default_upstream")
-    login = ((m.get("firstLogin") or {}).get("url")) or "/"
+    first = m.get("firstLogin") or {}
+    login = first.get("url") or "/"
     surl = "http://%s%s" % (web, login if login.startswith("/") else "/" + login) if web else None
-    return hurl, surl, None
+    # A setup wizard's page is gone once the firm has run it (404 is normal).
+    return hurl, surl, None, first.get("type") == "setup-wizard"
 
 
 def build(drill, vibe, appliance):
@@ -164,7 +166,7 @@ def build(drill, vibe, appliance):
             skipped.append({"slug": slug, "reason": "not drilled: its service definitions could not be read"}); continue
         all_svcs = cfg.get("services") or {}
         top_volumes = cfg.get("volumes") or {}
-        hurl, surl, not_ours = manifest_checks(appliance, slug)
+        hurl, surl, not_ours, wizard = manifest_checks(appliance, slug)
         if not_ours:
             skipped.append({"slug": slug, "reason": not_ours}); continue
         with open(os.path.join(render, "_core.json")) as f:
@@ -187,7 +189,7 @@ def build(drill, vibe, appliance):
                 volumes[vname] = {k: x for k, x in (vdecl or {}).items() if k not in ("name", "external")}
         # Run-to-completion jobs (migrate, seed) have no restart policy of their own.
         jobs = [n for n in own if str(all_svcs[n].get("restart") or "no") == "no"]
-        apps.append({"slug": slug, "services": own, "jobs": jobs, "health": hurl, "signIn": surl})
+        apps.append({"slug": slug, "services": own, "jobs": jobs, "health": hurl, "signIn": surl, "signInIsWizard": wizard})
 
     # A dependency on a service of an app that was not drilled is dropped,
     # so one unsafe app does not take the others down with it.
@@ -237,7 +239,8 @@ def _containers():
         svc = (c.get("Config", {}).get("Labels") or {}).get("com.docker.compose.service", "")
         st = c.get("State") or {}
         got[svc] = {"running": bool(st.get("Running")), "exit": st.get("ExitCode"),
-                    "health": (st.get("Health") or {}).get("Status")}
+                    "health": (st.get("Health") or {}).get("Status"), "status": st.get("Status"),
+                    "name": (c.get("Name") or "").lstrip("/")}
     return got
 
 
@@ -245,6 +248,10 @@ def service_state(c, is_job):
     """'ready', 'waiting' or a failure sentence."""
     if c is None:
         return "was not created"
+    # Created but never started: compose gave up on it because something it
+    # depends on did not come up. Its exit code (0) means nothing.
+    if c.get("status") == "created":
+        return "was never started (a service it depends on did not come up)"
     if is_job:
         if c["running"]:
             return "waiting"
@@ -283,12 +290,37 @@ def wait(drill, timeout, cancel_file=None, poll=5):
         if cancel_file and os.path.exists(cancel_file):
             break
         time.sleep(poll)
+    save_logs(drill, plan, result)
     for slug, r in result.items():
         if r is None:
             result[slug] = {"ok": False, "seconds": None, "detail": "not ready after %d minutes: %s" % (timeout // 60, detail.get(slug, "still starting"))}
     with open(os.path.join(drill, "wait.json"), "w") as f:
         json.dump(result, f)
     return result
+
+
+def save_logs(drill, plan, result, lines=60):
+    """The last lines of every drill container of an app that did not pass,
+    in a root-only folder beside the drill (kept until the next drill), so
+    the admin can see why without the containers, which are removed."""
+    import subprocess
+    logs = os.path.join(os.path.dirname(drill.rstrip("/")), "drill-logs")
+    subprocess.run(["rm", "-rf", logs])
+    os.makedirs(logs, mode=0o700, exist_ok=True)
+    cs = _containers()
+    for a in plan["apps"]:
+        r = result.get(a["slug"])
+        if r and r.get("ok"):
+            continue
+        for n in a["services"]:
+            c = cs.get(n)
+            if not c or c.get("status") == "created":
+                continue
+            out = subprocess.run(["docker", "logs", "--tail", str(lines), c["name"]], capture_output=True, text=True)
+            path = os.path.join(logs, "%s.log" % n)
+            with open(path, "w") as f:
+                f.write(out.stdout + out.stderr)
+            os.chmod(path, 0o600)
 
 
 def probe_script(plan):
@@ -331,7 +363,7 @@ def report(drill, out_path, snapshot, started, restored, restore_warnings, probe
         if a.get("health") and h != "200":
             ok = False; notes.append("health check answered %s" % (h or "nothing"))
         s = codes.get("signin:" + a["slug"]) if a.get("signIn") else None
-        if a.get("signIn") and not (s and s[0] in "23" or s in ("401", "403")):
+        if a.get("signIn") and not (s and s[0] in "23" or s in ("401", "403") or (s == "404" and a.get("signInIsWizard"))):
             ok = False; notes.append("sign-in page answered %s" % (s or "nothing"))
         apps.append({"slug": a["slug"], "ok": ok, "secondsToReady": w.get("seconds"), "health": h, "signIn": s,
                      "detail": "; ".join(notes) if notes else "ready, health check and sign-in page answered"})
@@ -344,6 +376,11 @@ def report(drill, out_path, snapshot, started, restored, restore_warnings, probe
         "isolation": {"outsideReachable": {k: v != "000" for k, v in egress.items()}, "tunnelRunning": tunnel_running, "ok": isolated},
         "error": None if apps else "no app could be drilled",
     }
+    failed = [a["slug"] for a in apps if not a["ok"]]
+    if failed:
+        logs = os.path.join(os.path.dirname(drill.rstrip("/")), "drill-logs")
+        body["fix"] = ("The last lines each failed app wrote are kept on the standby until the next drill: "
+                       "sudo ls %s — then for example: sudo tail -40 %s/<service>.log" % (logs, logs))
     if not isolated:
         body["error"] = "the drill network was NOT isolated: something outside answered, or the tunnel was running"
     tmp = out_path + ".tmp"

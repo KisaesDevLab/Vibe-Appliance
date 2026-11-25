@@ -68,7 +68,8 @@ services:
     volumes: ["/opt/vibe:/opt/vibe", "/var/run/docker.sock:/var/run/docker.sock:ro"]
     networks: [vibe_net]
 YML
-demo_overlay() { # <slug> <web command>
+demo_overlay() { # <slug> <web command> [migrate command]
+local migrate="${3:-test \\\"\$\$(psql -h vibe-postgres -U demo -d demo_db -Atc 'select count(*) from t')\\\" = 3}"
 w "$APPL/apps/$1.yml" <<YML
 name: vibe
 networks:
@@ -79,7 +80,7 @@ services:
     container_name: $1-migrate
     restart: "no"
     env_file: [/opt/vibe/env/shared.env, /opt/vibe/env/$1.env]
-    entrypoint: ["sh", "-c", "test \"\$\$(psql -h vibe-postgres -U demo -d demo_db -Atc 'select count(*) from t')\" = 3"]
+    entrypoint: ["sh", "-c", "$migrate"]
     networks: [vibe_net]
     depends_on: { postgres: { condition: service_healthy } }
   $1-web:
@@ -103,7 +104,9 @@ w "$APPL/console/manifests/$1.json" <<JSON
 JSON
 }
 demo_overlay vibe-demo 'echo changed-by-drill > /www/index.html; httpd -f -p 8080 -h /www'
-demo_overlay vibe-broken 'exit 3'
+# Like a real app whose api fails at start: its migrate step fails, so its
+# web tier is never started. That must not stop any other app starting.
+demo_overlay vibe-broken 'exit 3' 'echo broken-app-says-why >&2; exit 1'
 
 # ---- this box: a standby, with its own (stopped) containers ------------------
 w "$VIBE/state.json" <<<'{"config":{"standby_mode":true,"host_ip":"10.0.0.52"},"apps":{}}'
@@ -176,7 +179,10 @@ before="$(sum)"
 run drill >/tmp/drill2.out 2>&1 || fail "a drill with a broken app could not run: $(tail -5 /tmp/drill2.out)"
 [[ "$(report 'd["ok"]')" == "False" ]] || fail "report says ok with a broken app"
 [[ "$(report '[a["slug"] for a in d["apps"] if not a["ok"]]')" == "['vibe-broken']" ]] || fail "the broken app was not the one reported: $(report 'd["apps"]')"
-[[ "$(report '[a["slug"] for a in d["apps"] if a["ok"]]')" == "['vibe-demo']" ]] || fail "the good app was not reported ok"
+[[ "$(report '[a["slug"] for a in d["apps"] if a["ok"]]')" == "['vibe-demo']" ]] || fail "the good app was not reported ok: $(report 'd["apps"]')"
+report '[a["detail"] for a in d["apps"] if not a["ok"]][0]' | grep -q "vibe-broken-web was never started" || fail "the never-started web tier was not reported as such: $(report 'd["apps"]')"
+grep -q broken-app-says-why "$VIBE/standby/drill-logs/vibe-broken-migrate.log" || fail "the failed app's own log was not kept for the admin"
+report 'd["fix"]' | grep -q drill-logs || fail "the report does not say where the logs are"
 [[ -z "$(docker ps -aq --filter label=com.docker.compose.project=vibe-drill)" ]] || fail "drill containers left after a failed drill"
 
 echo "== a drill killed half-way is cleared by drill-clean"

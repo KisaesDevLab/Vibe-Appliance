@@ -792,7 +792,8 @@ PYEOF
   for dump in "$stage"/db/*.dump; do
     _drill_check_cancel
     local rc=0
-    docker exec -i "$pgc" pg_restore -U "$pg_user" -C -d postgres <"$dump" >>"$VIBE_LOG_FILE" 2>&1 || rc=$?
+    # --clean: a database the image itself creates (paradedb) is replaced, not reported as a clash.
+    docker exec -i "$pgc" pg_restore -U "$pg_user" -C --clean --if-exists -d postgres <"$dump" >>"$VIBE_LOG_FILE" 2>&1 || rc=$?
     if (( rc == 0 )); then restored=$((restored + 1))
     elif (( rc == 1 )); then restored=$((restored + 1)); warns+="$(basename "$dump" .dump) was restored with warnings"$'\x1f'
     else warns+="$(basename "$dump" .dump) could not be restored"$'\x1f'
@@ -803,16 +804,28 @@ PYEOF
   # ---- start the apps, wait, probe --------------------------------------
   log_step "starting the primary's apps in isolation (no internet, no tunnel)"
   _drill_check_cancel
-  # compose waits for each dependency here; watched so a cancel is not kept waiting.
-  timeout "$DRILL_TIMEOUT" "${dc[@]}" up -d >>"$VIBE_LOG_FILE" 2>&1 &
-  local up_pid=$! up_rc=0
-  while kill -0 "$up_pid" 2>/dev/null; do
-    if [[ -f "$DRILL_CANCEL" ]]; then kill "$up_pid" 2>/dev/null || true; fi
+  # Every container and network is created first, then each app is started
+  # on its own: one `up` for everything stops at the first app that fails
+  # and leaves the others never started. Watched so a cancel is not kept waiting.
+  ( "${dc[@]}" create ) >>"$VIBE_LOG_FILE" 2>&1 || log_warn "not every drill container could be created; the report says which"
+  local pids=() line svcs pid up_rc=0
+  while read -r line; do
+    [[ -n "$line" ]] || continue
+    read -r slug svcs <<<"$line"
+    # shellcheck disable=SC2086
+    timeout "$DRILL_TIMEOUT" "${dc[@]}" up -d $svcs >>"$VIBE_LOG_FILE" 2>&1 &
+    pids+=("$!")
+  done < <(python3 -c "import json,sys; [print(a['slug'], ' '.join(a['services'])) for a in json.load(open(sys.argv[1]))['apps']]" "$DRILL_DIR/plan.json")
+  while :; do
+    local alive=0
+    for pid in "${pids[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
+    (( alive )) || break
+    if [[ -f "$DRILL_CANCEL" ]]; then kill "${pids[@]}" 2>/dev/null || true; fi
     sleep 2
   done
-  wait "$up_pid" || up_rc=$?
+  for pid in "${pids[@]}"; do wait "$pid" || up_rc=1; done
   _drill_check_cancel
-  (( up_rc == 0 )) || log_warn "not every drill service started; the report says which"
+  (( up_rc == 0 )) || log_warn "not every drill app started; the report says which"
   python3 "$APPLIANCE_DIR/lib/standby_drill.py" wait "$DRILL_DIR" "$DRILL_TIMEOUT" "$DRILL_CANCEL" >>"$VIBE_LOG_FILE" 2>&1 || true
   _drill_check_cancel
   local probe_net probe_img tunnel=0

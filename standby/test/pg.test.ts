@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -65,6 +65,8 @@ test("pg: globals, restore into __incoming, verify, swap; the live copy is untou
 
   // An older copy is already live on the standby.
   await s.applyGlobals(globals);
+  // Nothing is written beside globals.sql: that folder is the sealed copy.
+  assert.ok(!existsSync(`${globals}.filtered`), "a temp file was left in the sealed copy");
   await s.sql("postgres", "DROP DATABASE IF EXISTS vibe_tb_db");
   await s.sql("postgres", "CREATE DATABASE vibe_tb_db OWNER vibetb");
   await s.sql("vibe_tb_db", "CREATE TABLE clients (id int); INSERT INTO clients VALUES (1)");
