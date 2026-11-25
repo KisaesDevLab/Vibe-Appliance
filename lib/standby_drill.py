@@ -490,7 +490,9 @@ def edge_config(base_json, hosts, allow, upstream, session):
     servers = cfg.setdefault("apps", {}).setdefault("http", {}).setdefault("servers", {})
     srv = next((s for s in servers.values() if any(str(l).endswith(":443") for l in s.get("listen") or [])), None)
     if srv is None:
-        raise ValueError("this box's web server does not answer HTTPS on port 443")
+        # A standby that serves only plain HTTP (its own mode is not domain):
+        # an HTTPS server just for the drill's names, gone with the reload.
+        srv = servers.setdefault(EDGE_CA, {"listen": [":443"], "routes": []})
     route = {"match": [{"host": hosts}], "terminal": True, "handle": [{"handler": "subroute", "routes": [
         {"match": [{"not": [{"remote_ip": {"ranges": allow}}]}], "terminal": True,
          "handle": [{"handler": "static_response", "status_code": 403,

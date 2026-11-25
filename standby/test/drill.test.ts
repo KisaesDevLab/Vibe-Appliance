@@ -184,6 +184,8 @@ test("hands-on: the drill stays open for the admin's computer, holds off syncs, 
   assert.deepEqual(h.allow, ["192.168.1.23/32"]);
   assert.equal(h.recordId, r.id);
   assert.equal(r.handsOn!.endedAt, null);
+  assert.equal(r.copyUnchanged, null, "not checked until it ends");
+  assert.match(drillHistoryCsv(drillHistory(w.store)), /"not checked"/);
   assert.equal(w.sent.length, 0);
   assert.match(drillBlocked(w.store)!, /already running/);
 });
@@ -225,8 +227,10 @@ test("hands-on: when the host cannot clean up, the drill stays recorded as open 
 test("hands-on: a restart of the service ends it, without recording a second drill", async () => {
   const w = await setup();
   await runDrill(w.deps(), { actor: "admin", trigger: "admin", handsOn: HANDS_ON });
-  assert.equal(await finishInterruptedDrill({ store: w.store, appliance: w.box }), true);
+  const d = w.deps();
+  assert.equal(await finishInterruptedDrill({ store: w.store, appliance: w.box, paths: d.paths, listDatabases: d.listDatabases }), true);
   assert.equal(w.box.drillsCleaned, 1);
+  assert.equal(drillHistory(w.store)[0]!.copyUnchanged, true, "the copy is checked when a restart ends it");
   assert.equal(handsOnState(w.store), null);
   assert.equal(activeOperation(w.store), undefined);
   assert.equal(drillHistory(w.store).length, 1);
@@ -241,6 +245,7 @@ test("hands-on: a promote closes the record and leaves its own operation alone",
   assert.equal(handsOnState(w.store), null);
   assert.equal(activeOperation(w.store), "promote");
   assert.match(drillHistory(w.store)[0]!.handsOn!.endReason!, /promote/);
+  assert.equal(drillHistory(w.store)[0]!.copyUnchanged, null, "a promote takes over the copy; it is not claimed checked");
 });
 
 test("hands-on: never opened when the drill could reach the outside", async () => {

@@ -26,7 +26,7 @@ trap cleanup EXIT
 REPO_MOUNT="$REPO"; command -v cygpath >/dev/null 2>&1 && REPO_MOUNT="$(cygpath -w "$REPO")"
 MSYS_NO_PATHCONV=1 docker run -d --privileged --name "$NAME" -v "$REPO_MOUNT":/repo:ro -v "$VOL":/opt/vibe docker:27-dind >/dev/null
 for _ in $(seq 1 60); do docker exec "$NAME" docker info >/dev/null 2>&1 && break; sleep 1; done
-docker exec "$NAME" apk add --no-cache -q bash python3 util-linux coreutils grep sed curl >/dev/null
+docker exec "$NAME" apk add --no-cache -q bash python3 util-linux coreutils grep sed curl iproute2 >/dev/null
 
 docker exec -i "$NAME" bash -s <<'INNER'
 set -euo pipefail
@@ -137,7 +137,17 @@ mkdir -p "$VIBE/data/postgres" "$VIBE/data/redis"
 w "$SRC/data/caddy/Caddyfile" <<'CF'
 demo.firm.test {
 	tls internal
-	reverse_proxy vibe-demo-web:8080
+	# What an app behind this web server is told (via one more proxy hop).
+	handle /echo {
+		respond "proto={header.X-Forwarded-Proto} host={host}"
+	}
+	handle /echo-app {
+		rewrite * /echo
+		reverse_proxy 127.0.0.1:80
+	}
+	handle {
+		reverse_proxy vibe-demo-web:8080
+	}
 }
 :80 {
 	reverse_proxy console:3000
@@ -243,11 +253,18 @@ wait "$dpid" && fail "a cancelled drill reported success"
 [[ "$(sum)" == "$before" ]] || fail "the mirror changed after a cancelled drill"
 
 echo "== hands-on: opens to one computer, practice notice first, the drill's own app behind it"
-# What Caddy sees for a request from this host to 127.0.0.1:443 (Docker's
-# port proxy connects from the network's gateway): the "admin's computer".
+# The admin's computer: its own network namespace, like a PC on the LAN,
+# reaching this box at 10.200.0.1 (Docker's port mapping keeps its address).
+ip netns add pc; ip link add pc-host type veth peer name pc-in; ip link set pc-in netns pc
+ip addr add 10.200.0.1/24 dev pc-host; ip link set pc-host up
+ip netns exec pc ip addr add 10.200.0.2/24 dev pc-in; ip netns exec pc ip link set pc-in up; ip netns exec pc ip link set lo up
+ip netns exec pc ip route add default via 10.200.0.1
+handson_ready() { printf '{"snapshotId":"s1","stagePath":"/opt/vibe/standby/stage","handsOn":{"minutes":15,"allow":["%s"],"address":"10.0.0.52"}}' "${1:-10.200.0.2}" > "$VIBE/standby/drill.ready"; }
+C() { ip netns exec pc curl -sk --max-time 10 --resolve "demo.firm.test:443:10.200.0.1" "$@"; }
+R() { C "$@" https://demo.firm.test/; }
 gw="$(docker network inspect vibe_net -f '{{(index .IPAM.Config 0).Gateway}}')"
-handson_ready() { printf '{"snapshotId":"s1","stagePath":"/opt/vibe/standby/stage","handsOn":{"minutes":15,"allow":["%s"],"address":"10.0.0.52"}}' "$gw" > "$VIBE/standby/drill.ready"; }
-R() { curl -sk --max-time 10 --resolve demo.firm.test:443:127.0.0.1 "$@" https://demo.firm.test/; }
+handson_ready "$gw"; run drill >/tmp/hogw.out 2>&1 && fail "a hands-on drill opened to a Docker gateway address"
+grep -q "cannot tell your computer apart" /tmp/hogw.out || fail "no plain reason for the gateway address: $(tail -3 /tmp/hogw.out)"
 before="$(sum)"
 handson_ready; run drill >/tmp/ho.out 2>&1 || { tail -20 /tmp/ho.out; fail "the hands-on drill did not open"; }
 [[ "$(report 'd["handsOn"]["hosts"]')" == "['demo.firm.test']" ]] || fail "hands-on names: $(report 'd.get("handsOn")')"
@@ -258,9 +275,11 @@ notice="$(R -H 'Accept: text/html')"
 echo "$notice" | grep -q "PRACTICE COPY" || fail "no practice notice: $notice"
 sid="$(echo "$notice" | grep -o 'vibe_drill_ok=[0-9a-f]*' | head -1)"
 [[ "$(R -H 'Accept: text/html' -H "Cookie: $sid")" == "changed-by-drill" ]] || fail "the drill's app was not served: $(R -H 'Accept: text/html' -H "Cookie: $sid")"
-[[ "$(curl -sk --max-time 10 --resolve demo.firm.test:443:127.0.0.1 https://demo.firm.test/health)" == "ok" ]] || fail "an app request (not a page) was held up"
-cert="$(curl -skv --max-time 10 --resolve demo.firm.test:443:127.0.0.1 https://demo.firm.test/health 2>&1 || true)"
+[[ "$(C https://demo.firm.test/health)" == "ok" ]] || fail "an app request (not a page) was held up"
+cert="$(C -v https://demo.firm.test/health 2>&1 || true)"
 [[ "$cert" == *"issuer: CN=Vibe practice drill"* ]] || fail "the certificate is not the drill's throwaway one: $(grep -i issuer <<<"$cert")"
+# The app behind both web servers is told the request was HTTPS, for its own name.
+[[ "$(C https://demo.firm.test/echo-app)" == "proto=https host=demo.firm.test" ]] || fail "the app is not told HTTPS and its name: $(C https://demo.firm.test/echo-app)"
 [[ -s "$VIBE/standby/drill-ca.crt" ]] || fail "the drill's certificate was not kept for the panel"
 cip="$(docker inspect vibe-caddy -f '{{(index .NetworkSettings.Networks "vibe_net").IPAddress}}')"
 [[ "$(docker exec vibe-console curl -sk --max-time 10 -o /dev/null -w '%{http_code}' --resolve "demo.firm.test:443:$cip" https://demo.firm.test/)" == "403" ]] || fail "another computer was let in"
@@ -288,9 +307,24 @@ handson_ready; run drill >/tmp/ho2.out 2>&1 || { tail -20 /tmp/ho2.out; fail "th
 [[ "$(R -H "Accept: text/html")" == *"PRACTICE COPY"* ]] || fail "second hands-on drill not served"
 run drill-clean >/dev/null 2>&1 || fail "drill-clean failed"
 [[ "$(R)" == "standby: app stopped" ]] || fail "the web server still serves the drill after the clean-up: $(R)"
-cert="$(curl -skv --max-time 10 --resolve demo.firm.test:443:127.0.0.1 https://demo.firm.test/ 2>&1 || true)"
+cert="$(C -v https://demo.firm.test/ 2>&1 || true)"
 [[ "$cert" != *"Vibe practice drill"* ]] || fail "the drill's certificate is still served"
 [[ "$(docker ps -a --filter label=com.docker.compose.project=vibe --format '{{.Names}} {{.State}}' | sort)" == "$own_before" ]] || fail "the standby's own containers changed"
+[[ "$(sum)" == "$before" ]] || fail "the mirror changed"
+
+echo "== hands-on: works on a standby whose web server has no HTTPS site of its own"
+before="$(sum)"
+cp "$VIBE/data/caddy/Caddyfile" /tmp/Caddyfile.orig
+printf ':80 {
+	respond "standby console" 200
+}
+' > "$VIBE/data/caddy/Caddyfile"
+docker exec vibe-caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1 || fail "could not give the standby a plain-HTTP web server"
+handson_ready; run drill >/tmp/ho4.out 2>&1 || { tail -20 /tmp/ho4.out; fail "the hands-on drill did not open on a plain-HTTP standby"; }
+[[ "$(R -H "Accept: text/html")" == *"PRACTICE COPY"* ]] || fail "hands-on not served on a plain-HTTP standby"
+run drill-clean >/dev/null 2>&1 || fail "drill-clean failed"
+[[ "$(C -o /dev/null -w '%{http_code}' https://demo.firm.test/ || true)" == "000" ]] || fail "HTTPS still answers after the clean-up on a plain-HTTP standby"
+cp /tmp/Caddyfile.orig "$VIBE/data/caddy/Caddyfile"; docker exec vibe-caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1
 [[ "$(sum)" == "$before" ]] || fail "the mirror changed"
 
 echo "== hands-on: refused for a copy that reaches its apps by IP address"

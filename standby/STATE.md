@@ -108,7 +108,7 @@ Vibe Standby is independent of Vibe Backup: it captures on the primary, ships wi
 | 7 | Role lease and fencing | Built, untested on real boxes | Built to the admin-controlled design (hold at boot, warn while running). |
 | 8 | Promote wizard | Built, untested on real boxes | Built. Automatic DNS update missing. |
 | 9 | Failback | Built, untested on real boxes | Built: rejoin with archive, planned switchover. |
-| 10 | Scheduled test promote | Built 2026-11-24; host side proven on real Docker, not yet run on the firm's boxes | Throwaway project instead of run-then-re-restore (see PHASES.md). `tests/standby/drill-dind.sh`. |
+| 10 | Scheduled test promote | Built 2026-11-24; first real run 2026-11-25 found four drill bugs (fixed) and a real one in Vibe-1099 (pnpm downloaded at every start; fixed upstream, needs a release). Hands-on drill built 2026-11-25 on `feat/standby-drill-handson`: proven on real Docker with a real Caddy, not yet on the firm's boxes; single sign-on inside the drill and the host's systemd timer unproven | Throwaway project instead of run-then-re-restore (see PHASES.md). `tests/standby/drill-dind.sh`. |
 | 11 | Hardening and docs | Not started | Not started. |
 
 ## Contract reconciliation

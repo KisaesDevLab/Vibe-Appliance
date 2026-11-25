@@ -231,7 +231,7 @@ function drillCard() {
       (last.restoreWarnings || []).length ? h("ul", {}, last.restoreWarnings.map((x) => h("li", {}, "Database: ", x))) : null,
       last.error ? P(last.error) : null, last.fix ? M(last.fix) : null,
       last.isolated === false ? P(h("strong", {}, "The drill could reach the internet, which must never happen. Do not run another drill; contact support with the drill history.")) : null,
-      last.copyUnchanged ? null : P("This box's copy no longer matches what was verified. Choose Sync now before relying on it.")));
+      last.copyUnchanged !== false ? null : P("This box's copy no longer matches what was verified. Choose Sync now before relying on it.")));
   }
   if (d.handsOn) kids.push(handsOnOpen(d.handsOn));
   else if (last && last.handsOn && last.handsOn.endedAt) kids.push(M("Hands-on drill ended ", when(last.handsOn.endedAt), ": ", last.handsOn.endReason || "", " Remove the drill's lines from your computer's hosts file and its certificate, if you have not yet."));

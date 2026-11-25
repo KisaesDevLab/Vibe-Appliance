@@ -698,8 +698,9 @@ export class Runtime {
     if (op === "drill") {
       // Open on purpose, and this process keeps its time limit.
       if (this.#handsOnOwned && handsOnState(this.store)) return;
+      const pg = await this.pg().catch(() => null);
       const done = await this.#track("drill", () => finishInterruptedDrill({
-        store: this.store, appliance: this.appliance,
+        store: this.store, appliance: this.appliance, paths: this.paths, ...(pg ? { listDatabases: () => pg.listDatabases() } : {}),
         mailer: () => this.#mailer(), to: () => this.store.get<string>("alertEmail") ?? this.config.alertEmail, boxName: () => this.store.nodeId.slice(0, 8),
       }));
       if (done) this.#log("warn", "a practice drill was interrupted by a restart; everything it started was removed");

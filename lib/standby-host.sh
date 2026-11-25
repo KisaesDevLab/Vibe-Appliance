@@ -13,8 +13,12 @@
 #                    re-run bootstrap (the standby follows the primary)
 #   archive          REJOIN: set this box's current data aside, read-only
 #   drill            PRACTICE: start the primary's apps from the verified copy
-#                    in an isolated, throwaway project, check them, remove it
-#   drill-clean      remove every trace of a drill (safe at any time)
+#                    in an isolated, throwaway project, check them, remove it.
+#                    Hands-on (handsOn in drill.ready): leave it running and
+#                    put it in front of the admin's computer only
+#   drill-clean      remove every trace of a drill, and give this box's web
+#                    server back its own settings (safe at any time)
+#   drill-expire     queue drill-clean (the hands-on time limit's timer)
 #   tunnel-up        start cloudflared with the token already in shared.env
 #   tunnel-teardown  a new standby removes its OWN tunnel and DNS records
 #   boot-hold, shutdown-hold, boot-release, boot-release-safety
@@ -640,7 +644,9 @@ _caddy_running() { [[ "$(docker inspect -f '{{.State.Running}}' vibe-caddy 2>/de
 _drill_edge_close() {
   local held=0 rc=0
   [[ -f "$DRILL_HANDSON" ]] && held=1
-  docker inspect -f '{{json .NetworkSettings.Networks}}' vibe-caddy 2>/dev/null | grep -q "\"${DRILL_EDGE_NET}\"" && held=1
+  local nets
+  nets="$(docker inspect -f '{{json .NetworkSettings.Networks}}' vibe-caddy 2>/dev/null || true)"
+  [[ "$nets" == *"\"${DRILL_EDGE_NET}\""* ]] && held=1
   (( held )) || return 0
   systemctl stop "${DRILL_EXPIRE_UNIT}.timer" "${DRILL_EXPIRE_UNIT}.service" >/dev/null 2>&1 || true
   if _caddy_running; then
@@ -691,7 +697,8 @@ _drill_edge_open() { # <minutes> <allow csv> <address>
   # with it: restart "no", and Caddy starts from its Caddyfile.)
   if command -v systemd-run >/dev/null 2>&1; then
     systemctl stop "${DRILL_EXPIRE_UNIT}.timer" >/dev/null 2>&1 || true
-    systemd-run --quiet --unit "$DRILL_EXPIRE_UNIT" --on-active="$((minutes * 60))s" --timer-property=AccuracySec=30s \
+    systemctl reset-failed "${DRILL_EXPIRE_UNIT}.service" "${DRILL_EXPIRE_UNIT}.timer" >/dev/null 2>&1 || true
+    systemd-run --quiet --collect --unit "$DRILL_EXPIRE_UNIT" --on-active="$((minutes * 60))s" --timer-property=AccuracySec=30s \
       /bin/bash "$APPLIANCE_DIR/lib/standby-host.sh" drill-expire >>"$VIBE_LOG_FILE" 2>&1 \
       || log_warn "could not set the host's own time limit; the Standby service ends the drill on time"
   fi
@@ -811,6 +818,18 @@ PYEOF
            "use the ordinary practice drill, or a planned switchover after hours"
     _caddy_running || _drill_fail "this box's web server (vibe-caddy) is not running, so a hands-on drill could not be reached" \
       "sudo docker start vibe-caddy — then start the hands-on drill again"
+    # This box itself, or a Docker network's gateway, as "the admin's computer"
+    # would let in everything that reaches the web server that way.
+    local gws
+    gws="$(docker network inspect $(docker network ls -q) -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' 2>/dev/null | tr '\n' ' ' || true)"
+    python3 - "$ho_allow" "$gws" <<'PYEOF' || _drill_fail "the panel was opened from this box itself or through a Docker network, so the drill cannot tell your computer apart" \
+      "open the Standby panel from your own computer, by this box's address, and start the hands-on drill again"
+import ipaddress, sys
+gws = {g for g in sys.argv[2].split() if g}
+for a in sys.argv[1].split(","):
+    ip = ipaddress.ip_network(a).network_address
+    if ip.is_loopback or ip.is_unspecified or str(ip) in gws: sys.exit(1)
+PYEOF
   fi
   _drill_check_cancel
   action_drill_clean keep-cancel >/dev/null || _drill_fail "an earlier drill could not be cleared away" "sudo tail -30 $VIBE_LOG_FILE"
