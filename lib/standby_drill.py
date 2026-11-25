@@ -28,9 +28,9 @@ drill from touching the verified copy or the outside world:
     "drilled with a real mount";
   - TUNNEL_TOKEN is removed from every environment (invariant 2).
 
-Usage: standby_drill.py <drill-dir> <vibe-dir> <appliance-dir>
-  reads  <drill-dir>/render/<slug>.json
-  writes <drill-dir>/compose.json and <drill-dir>/plan.json
+Usage: standby_drill.py render <drill-dir> <vibe-dir> <appliance-dir>
+Subcommands (see __main__): render, wait, probe-script, report. `render`
+reads <drill-dir>/render/<slug>.json and writes compose.json and plan.json.
 """
 import json
 import os
@@ -243,7 +243,7 @@ def service_state(c, is_job):
     return "waiting" if c["health"] == "starting" else "reports unhealthy"
 
 
-def wait(drill, timeout, poll=5):
+def wait(drill, timeout, cancel_file=None, poll=5):
     """Wait until every app is ready or the time is up. Writes wait.json: per app, ok, seconds to ready, detail."""
     import time
     with open(os.path.join(drill, "plan.json")) as f:
@@ -266,6 +266,8 @@ def wait(drill, timeout, poll=5):
             else:
                 detail[a["slug"]] = "; ".join("%s %s" % kv for kv in sorted(states.items()) if kv[1] != "ready")
         if all(r is not None for r in result.values()) or time.time() - start > timeout:
+            break
+        if cancel_file and os.path.exists(cancel_file):
             break
         time.sleep(poll)
     for slug, r in result.items():
@@ -344,8 +346,8 @@ if __name__ == "__main__":
     if cmd == "render" and len(args) == 3:
         _, plan = build(*args)
         print(json.dumps({"apps": [a["slug"] for a in plan["apps"]], "skipped": plan["skipped"]}))
-    elif cmd == "wait" and len(args) == 2:
-        print(json.dumps(wait(args[0], int(args[1]))))
+    elif cmd == "wait" and len(args) in (2, 3):
+        print(json.dumps(wait(args[0], int(args[1]), args[2] if len(args) == 3 else None)))
     elif cmd == "probe-script" and len(args) == 1:
         with open(os.path.join(args[0], "plan.json")) as f:
             sys.stdout.write(probe_script(json.load(f)))

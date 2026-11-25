@@ -188,5 +188,17 @@ grep -q " $VIBE/standby/drill" /proc/mounts && fail "drill-clean left the mount"
 [[ "$(sum)" == "$before" ]] || fail "the mirror changed after a killed drill"
 run drill-clean >/dev/null 2>&1 || fail "drill-clean is not idempotent"
 
+echo "== a promote stops a running drill quickly (drill.cancel)"
+ready; run drill >/tmp/drill3.out 2>&1 &
+dpid=$!
+for _ in $(seq 1 120); do [[ -n "$(docker ps -q --filter label=com.docker.compose.project=vibe-drill)" ]] && break; sleep 1; done
+touch "$VIBE/standby/drill.cancel"; t0=$(date +%s)
+wait "$dpid" && fail "a cancelled drill reported success"
+(( $(date +%s) - t0 < 60 )) || fail "the drill took more than a minute to stop after a cancel"
+[[ "$(report 'd["error"]')" == "the drill was stopped because a promote started" ]] || fail "cancel not reported: $(report 'd')"
+[[ -z "$(docker ps -aq --filter label=com.docker.compose.project=vibe-drill)" ]] || fail "a cancelled drill left containers"
+[[ ! -e "$VIBE/standby/drill.cancel" ]] || fail "the cancel marker was left behind"
+[[ "$(sum)" == "$before" ]] || fail "the mirror changed after a cancelled drill"
+
 echo "ALL DRILL CHECKS PASSED"
 INNER

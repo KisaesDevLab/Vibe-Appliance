@@ -617,6 +617,9 @@ action_boot_release_safety() {
 DRILL_DIR="${SB_DIR}/drill"
 DRILL_READY="${SB_DIR}/drill.ready"
 DRILL_REPORT="${SB_DIR}/drill-report.json"
+# Written by the Standby service when a promote starts during a drill: the
+# drill stops at its next check instead of holding the host runner.
+DRILL_CANCEL="${SB_DIR}/drill.cancel"
 DRILL_PROJECT="vibe-drill"
 DRILL_TIMEOUT="${VIBE_DRILL_TIMEOUT:-900}"
 
@@ -648,8 +651,13 @@ action_drill_clean() {
   if mountpoint -q "$DRILL_DIR/data" 2>/dev/null; then
     die "the drill's file view is still mounted at $DRILL_DIR/data" "sudo umount -l $DRILL_DIR/data, then run the drill clean-up again"
   fi
-  rm -rf "$DRILL_DIR" "$DRILL_READY"
+  rm -rf "$DRILL_DIR" "$DRILL_READY" "$DRILL_CANCEL"
   log_ok "no drill is left on this box"
+}
+
+_drill_check_cancel() {
+  [[ -f "$DRILL_CANCEL" ]] || return 0
+  _drill_fail "the drill was stopped because a promote started" "nothing to do: the promote continues"
 }
 
 _drill_fail() { # <what failed> <fix>  — record the failure for the panel, clean up, stop
@@ -746,6 +754,7 @@ PYEOF
 
   # ---- throwaway database, restored from the verified copy's dumps -------
   log_step "restoring the copy's databases into a throwaway database server"
+  _drill_check_cancel
   ( "${dc[@]}" up -d --wait --wait-timeout 240 postgres redis ) >>"$VIBE_LOG_FILE" 2>&1 \
     || _drill_fail "the drill's throwaway database server did not start" "sudo tail -30 $VIBE_LOG_FILE"
   local pgc pg_user restored=0 warns="" dump
@@ -757,6 +766,7 @@ PYEOF
   fi
   shopt -s nullglob
   for dump in "$stage"/db/*.dump; do
+    _drill_check_cancel
     local rc=0
     docker exec -i "$pgc" pg_restore -U "$pg_user" -C -d postgres <"$dump" >>"$VIBE_LOG_FILE" 2>&1 || rc=$?
     if (( rc == 0 )); then restored=$((restored + 1))
@@ -768,9 +778,19 @@ PYEOF
 
   # ---- start the apps, wait, probe --------------------------------------
   log_step "starting the primary's apps in isolation (no internet, no tunnel)"
-  ( timeout "$DRILL_TIMEOUT" "${dc[@]}" up -d ) >>"$VIBE_LOG_FILE" 2>&1 \
-    || log_warn "not every drill service started; the report says which"
-  python3 "$APPLIANCE_DIR/lib/standby_drill.py" wait "$DRILL_DIR" "$DRILL_TIMEOUT" >>"$VIBE_LOG_FILE" 2>&1 || true
+  _drill_check_cancel
+  # compose waits for each dependency here; watched so a cancel is not kept waiting.
+  timeout "$DRILL_TIMEOUT" "${dc[@]}" up -d >>"$VIBE_LOG_FILE" 2>&1 &
+  local up_pid=$! up_rc=0
+  while kill -0 "$up_pid" 2>/dev/null; do
+    if [[ -f "$DRILL_CANCEL" ]]; then kill "$up_pid" 2>/dev/null || true; fi
+    sleep 2
+  done
+  wait "$up_pid" || up_rc=$?
+  _drill_check_cancel
+  (( up_rc == 0 )) || log_warn "not every drill service started; the report says which"
+  python3 "$APPLIANCE_DIR/lib/standby_drill.py" wait "$DRILL_DIR" "$DRILL_TIMEOUT" "$DRILL_CANCEL" >>"$VIBE_LOG_FILE" 2>&1 || true
+  _drill_check_cancel
   local probe_net probe_img tunnel=0
   probe_net="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('probeNetwork') or '')" "$DRILL_DIR/plan.json")"
   probe_img="$(docker inspect vibe-console --format '{{.Config.Image}}' 2>/dev/null || true)"
