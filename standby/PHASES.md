@@ -205,18 +205,38 @@ Two paths, chosen in the console of the current primary.
 
 ## Phase 10 — Scheduled test promote (drill)
 
-- Schedule setting (QUESTIONS Q5) plus "Run a drill now".
-- Runs after a successful sync, under the pipeline lock.
-- Starts apps on an isolated network through the agent: no tunnel, outbound egress blocked, queues held, email blackholed.
-- Per-app health checks and a sign-in page check.
-- Stops apps, then re-restores databases, Redis and any volume the apps wrote to, so that the standby returns to the exact verified snapshot.
+**Built 2026-11-24.** Deviation from the first plan: the drill does not run
+the apps against the standby's own databases and files and then re-restore
+them. It never touches the verified copy at all, so a drill that crashes
+leaves Promote ready with nothing to repair:
+
+- a separate compose project, `vibe-drill`, built from the primary's enabled
+  app overlays (`lib/standby_drill.py`), so none of the appliance's sweeps
+  (which key on project `vibe`) see it;
+- databases restored from the copy's dumps into a throwaway Postgres, and an
+  empty throwaway Redis (queues held: nothing queued on the primary exists);
+- app files as an overlayfs view with the mirror as the read-only lower layer;
+- settings copied from the restored env, without `TUNNEL_TOKEN`;
+- every network `internal: true` (no route out, external names do not
+  resolve, so email and webhooks cannot leave); no ports, restart "no",
+  pull_policy never. An app with any other host mount, the Docker socket,
+  privileged mode or host networking is reported "not drilled".
+
+Then:
+
+- Schedule setting (QUESTIONS Q5, default first Sunday after that night's sync) plus "Run a practice drill".
+- Runs under the operation flag, so no sync replaces the copy meanwhile. A promote stops a running drill (`drill.cancel`) instead of waiting for it, and `place` clears any drill first.
+- Per-app readiness (Docker health, jobs finished), health URL and sign-in page from the manifest, and a probe that must fail to reach an outside address and name.
+- Afterwards the copy's seal and databases are checked again.
 - Report in the panel and by email: pass or fail per app, time to ready.
-- Exportable drill history for the firm's WISP and compliance evidence.
+- Exportable drill history (`api/drills.csv`) for the firm's WISP and compliance evidence.
+- Not covered by a drill, and said so in the panel and email: DNS, the tunnel, this box's own web address, Caddy.
 
 **Acceptance:**
-- Drill passes in the harness; a deliberately broken app fails it and alerts.
-- During a drill, no connection leaves the isolated network and `cloudflared` never runs.
-- After the drill, verification matches the pre-drill snapshot.
+- Drill passes in the harness; a deliberately broken app fails it and alerts. *(drill-dind.sh, drill.test.ts)*
+- During a drill, no connection leaves the isolated network and `cloudflared` never runs. *(probe in every drill; drill-dind.sh)*
+- After the drill, verification matches the pre-drill snapshot. *(seal re-check in every drill; mirror hash in drill-dind.sh, also after a killed and a cancelled drill)*
+- Still to do: run on the firm's two boxes with the real apps.
 
 ---
 

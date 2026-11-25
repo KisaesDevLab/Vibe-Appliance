@@ -39,7 +39,6 @@ CI on the scaffold commit was green, including the Docker image build and the tw
 
 | Item | Effect |
 | --- | --- |
-| Test promote / drill (Phase 10) | `startAppsIsolated` throws. No scheduled or on-demand drill. |
 | Automatic DNS update at promote (Q33) | For domain mode without a tunnel the Done screen shows manual DNS steps. |
 | Image pin at promote | Sync pulls the primary's images by digest and tags them, but bootstrap's own pull at promote can fetch a newer `latest`. |
 | Phase 11 | Threat review, novice guide, the printable "If the server is down" sheet, nightly two-VM suite. |
@@ -109,7 +108,7 @@ Vibe Standby is independent of Vibe Backup: it captures on the primary, ships wi
 | 7 | Role lease and fencing | Built, untested on real boxes | Built to the admin-controlled design (hold at boot, warn while running). |
 | 8 | Promote wizard | Built, untested on real boxes | Built. Automatic DNS update missing. |
 | 9 | Failback | Built, untested on real boxes | Built: rejoin with archive, planned switchover. |
-| 10 | Scheduled test promote | Not started | Not built. |
+| 10 | Scheduled test promote | Built 2026-11-24; host side proven on real Docker, not yet run on the firm's boxes | Throwaway project instead of run-then-re-restore (see PHASES.md). `tests/standby/drill-dind.sh`. |
 | 11 | Hardening and docs | Not started | Not started. |
 
 ## Contract reconciliation
