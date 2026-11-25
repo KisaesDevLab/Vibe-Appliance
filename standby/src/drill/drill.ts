@@ -14,7 +14,7 @@
 import { join } from "node:path";
 import type { Mailer } from "../alerts/mailer.ts";
 import { verifySeal } from "../capture/capture.ts";
-import type { ApplianceControl, DrillAppResult, DrillReport } from "../contracts/appliance.ts";
+import type { ApplianceControl, DrillAppResult, DrillReport, HandsOnOpen } from "../contracts/appliance.ts";
 import type { Store } from "../overlay/store.ts";
 import type { Paths } from "../paths.ts";
 import { activeOperation, type VerifiedCopy } from "../sync/sync.ts";
@@ -40,6 +40,14 @@ export interface DrillRecord {
   copyUnchanged: boolean;
   error: string | null;
   fix: string | null;
+  /** A hands-on drill: left running after the checks for the admin to use. */
+  handsOn?: { until: string; hosts: string[]; address: string; endedAt: string | null; endReason: string | null };
+}
+
+/** The hands-on drill that is open now (also kept across a restart, to end it). */
+export interface HandsOnState extends HandsOnOpen {
+  recordId: string;
+  openedAt: string;
 }
 
 export interface DrillDeps {
@@ -93,8 +101,55 @@ export function composeDrillEmail(r: DrillRecord, boxName: string): { subject: s
   return { subject, text: lines.join("\n") };
 }
 
+export function handsOnState(store: Store): HandsOnState | null { return store.get<HandsOnState>("handsOn") ?? null; }
+
+/** After the drill: is the copy still exactly the verified one? Problems, or none. */
+async function copyProblems(d: Pick<DrillDeps, "paths" | "listDatabases">, copy: VerifiedCopy | undefined): Promise<string[]> {
+  const problems = await verifySeal(join(d.paths.mirror, d.paths.stage)).catch((e: Error) => [`could not check the copy: ${e.message}`]);
+  const have = new Set(await d.listDatabases().catch(() => [] as string[]));
+  for (const db of copy?.databases ?? []) if (!have.has(db)) problems.push(`the database ${db} is missing`);
+  return problems;
+}
+
+/** Record how a hands-on drill ended, on its history entry. */
+function recordHandsOnEnd(store: Store, h: HandsOnState, reason: string, problems: string[] | null, now: Date): void {
+  const r = drillHistory(store).find((x) => x.id === h.recordId);
+  if (r) {
+    r.handsOn = { until: h.until, hosts: h.hosts, address: h.address, endedAt: now.toISOString(), endReason: reason };
+    if (problems && problems.length) {
+      r.copyUnchanged = false;
+      r.ok = false;
+      r.error = r.error ?? `after the drill, the copy did not match: ${problems.slice(0, 3).join("; ")}`;
+    }
+    remember(store, r);
+  }
+  store.unset("handsOn");
+}
+
+/**
+ * End the hands-on drill: the host removes it and gives the standby's web
+ * server back its own settings; then the copy is checked. Throws (and keeps
+ * the drill recorded as open) when the host could not clean up.
+ */
+export async function endHandsOn(d: Pick<DrillDeps, "store" | "appliance" | "paths" | "listDatabases" | "now">, reason: string, actor: string): Promise<boolean> {
+  const h = handsOnState(d.store);
+  if (!h) return false;
+  await d.appliance.cleanDrill();
+  const problems = await copyProblems(d, d.store.get<VerifiedCopy>("verifiedCopy"));
+  recordHandsOnEnd(d.store, h, reason, problems, (d.now ?? (() => new Date()))());
+  if (activeOperation(d.store) === "drill") d.store.unset("operation");
+  d.store.audit("drill-hands-on-end", actor, problems.length === 0, { reason, copyUnchanged: problems.length === 0 });
+  return true;
+}
+
+/** A promote took over: its own first step (place) removes the drill. Only the record is closed here. */
+export function forgetHandsOn(store: Store, reason: string): void {
+  const h = handsOnState(store);
+  if (h) recordHandsOnEnd(store, h, reason, null, new Date());
+}
+
 /** Run a drill now. Resolves with the record; throws only if the drill may not start. */
-export async function runDrill(d: DrillDeps, opts: { actor: string; trigger: "admin" | "schedule" }): Promise<DrillRecord> {
+export async function runDrill(d: DrillDeps, opts: { actor: string; trigger: "admin" | "schedule"; handsOn?: { minutes: number; allow: string[]; address: string } }): Promise<DrillRecord> {
   const now = d.now ?? (() => new Date());
   const blocked = drillBlocked(d.store);
   if (blocked) throw new Error(blocked);
@@ -106,23 +161,23 @@ export async function runDrill(d: DrillDeps, opts: { actor: string; trigger: "ad
 
   let report: DrillReport | null = null;
   let error: string | null = null;
+  let opened: HandsOnOpen | null = null;
   try {
     try {
-      report = await d.appliance.runDrill({ snapshotId: copy.snapshotId, stagePath: d.paths.stage }, d.signal);
+      report = await d.appliance.runDrill({ snapshotId: copy.snapshotId, stagePath: d.paths.stage, ...(opts.handsOn ? { handsOn: opts.handsOn } : {}) }, d.signal);
     } catch (err) {
       error = (err as Error).message;
       // A promote that stopped this drill clears it away itself (`place` runs drill-clean first).
       if (!d.signal?.aborted) await d.appliance.cleanDrill().catch(() => { /* retried at the next 5-minute check */ });
     }
     if (d.signal?.aborted) error = "The drill was stopped because a promote started.";
+    // Still running on purpose: the copy is checked when it ends.
+    if (report?.handsOn && !error && opts.handsOn) opened = report.handsOn;
+    else if (opts.handsOn && report && !error) error = report.error ?? "the hands-on drill could not be opened";
 
     // The drill never writes to the copy. Check that, rather than trust it.
     const problems: string[] = [];
-    if (!d.signal?.aborted) {
-      problems.push(...(await verifySeal(join(d.paths.mirror, d.paths.stage)).catch((e: Error) => [`could not check the copy: ${e.message}`])));
-      const have = new Set(await d.listDatabases().catch(() => [] as string[]));
-      for (const db of copy.databases) if (!have.has(db)) problems.push(`the database ${db} is missing`);
-    }
+    if (!d.signal?.aborted && !opened) problems.push(...(await copyProblems(d, copy)));
 
     const record: DrillRecord = {
       id: startedAt, trigger: opts.trigger, startedAt, finishedAt: now().toISOString(),
@@ -134,16 +189,20 @@ export async function runDrill(d: DrillDeps, opts: { actor: string; trigger: "ad
       copyUnchanged: problems.length === 0,
       error: error ?? report?.error ?? (problems.length ? `after the drill, the copy did not match: ${problems.slice(0, 3).join("; ")}` : null),
       fix: report?.fix ?? null,
+      ...(opened ? { handsOn: { until: opened.until, hosts: opened.hosts, address: opened.address, endedAt: null, endReason: null } } : {}),
     };
     remember(d.store, record);
-    d.store.audit("drill", opts.actor, record.ok, { trigger: opts.trigger, failed: record.apps.filter((a) => !a.ok).map((a) => a.slug), skipped: record.skipped.map((s) => s.slug), error: record.error });
+    d.store.audit(opened ? "drill-hands-on-open" : "drill", opts.actor, record.ok, { trigger: opts.trigger, failed: record.apps.filter((a) => !a.ok).map((a) => a.slug), skipped: record.skipped.map((s) => s.slug), error: record.error, ...(opened ? { until: opened.until, allow: opened.allow } : {}) });
+    if (opened) d.store.set("handsOn", { ...opened, recordId: record.id, openedAt: record.finishedAt } satisfies HandsOnState);
 
-    if (!d.signal?.aborted) await emailDrill(d, record);
+    // The admin is at the screen for a hands-on drill; no email.
+    if (!d.signal?.aborted && !opts.handsOn) await emailDrill(d, record);
     return record;
   } finally {
     d.store.unset("drillRunning");
-    // A promote that interrupted the drill has set its own operation.
-    if (activeOperation(d.store) === "drill") d.store.unset("operation");
+    // A promote that interrupted the drill has set its own operation; an
+    // open hands-on drill keeps "drill" (no sync replaces the copy under it).
+    if (activeOperation(d.store) === "drill" && !opened) d.store.unset("operation");
   }
 }
 
@@ -163,6 +222,16 @@ export async function finishInterruptedDrill(d: Pick<DrillDeps, "store" | "appli
   if (activeOperation(d.store) !== "drill") return false;
   // The host's drill can outlive this service; this waits behind it in the host runner.
   await d.appliance.cleanDrill();
+  // A hands-on drill does not survive a restart of this service: it was
+  // opened with a time limit this process kept. Its record says how it ended.
+  const h = handsOnState(d.store);
+  if (h) {
+    recordHandsOnEnd(d.store, h, "The standby service restarted, which ends a hands-on drill. Everything it started has been removed.", null, (d.now ?? (() => new Date()))());
+    d.store.unset("drillRunning");
+    if (activeOperation(d.store) === "drill") d.store.unset("operation");
+    d.store.audit("drill-hands-on-end", "schedule", true, { reason: "service restart" });
+    return true;
+  }
   const running = d.store.get<{ startedAt: string; trigger: "admin" | "schedule"; snapshotId: string }>("drillRunning");
   const copy = d.store.get<VerifiedCopy>("verifiedCopy");
   let record: DrillRecord | null = null;
@@ -194,6 +263,7 @@ export function drillHistoryCsv(records: DrillRecord[]): string {
     r.skipped.map((s) => `${s.slug}: ${s.reason}`).join("; "),
     r.isolated === null ? "not checked" : r.isolated ? "yes" : "NO",
     r.copyUnchanged ? "yes" : "NO", r.error ?? "",
+    r.handsOn ? `open until ${r.handsOn.until}${r.handsOn.endedAt ? `; ended ${r.handsOn.endedAt}: ${r.handsOn.endReason ?? ""}` : ""}` : "",
   ].map(esc).join(","));
-  return ["started,finished,trigger,result,data as of,apps passed,apps failed,not drilled,isolated from the internet,copy unchanged afterwards,problem", ...rows].join("\n");
+  return ["started,finished,trigger,result,data as of,apps passed,apps failed,not drilled,isolated from the internet,copy unchanged afterwards,problem,hands-on", ...rows].join("\n");
 }

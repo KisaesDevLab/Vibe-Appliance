@@ -55,3 +55,32 @@ test("actions that need the runtime say the service is starting, rather than fai
   assert.equal(res.statusCode, 503);
   assert.match(res.json().error, /still starting/);
 });
+
+test("hands-on drill: opened for the computer the web server saw, mapped to the address the admin used", async () => {
+  const store = new Store(":memory:");
+  store.setRole("standby", "test", "setup");
+  store.set("verifiedCopy", { snapshotId: "s", createdAt: "2026-11-25T02:00:00Z", verifiedAt: "2026-11-25T03:00:00Z", applianceCommit: "a", enabledApps: [], databases: [] });
+  const asked: unknown[] = [];
+  const runtime = {
+    busy: () => null, ownAddresses: async () => ["10.9.9.9", "standby.tailnet"],
+    drillNow: async (...a: unknown[]) => { asked.push(a); return {}; },
+  };
+  const app = buildServer({ config: loadConfig({}), store, quiet: true, runtime: runtime as never });
+  const post = (headers: Record<string, string>, minutes = 120) => app.inject({ method: "POST", url: "/api/drill/hands-on", headers, payload: { minutes } });
+
+  // Caddy's entry is the rightmost one; anything before it came from the client.
+  let res = await post({ "x-forwarded-for": "203.0.113.9, 192.168.1.23", "x-forwarded-host": "192.168.1.20:443" });
+  assert.equal(res.statusCode, 202);
+  assert.deepEqual(asked.at(-1), ["admin", "admin", { minutes: 120, allow: ["192.168.1.23"], address: "192.168.1.20" }]);
+  // Reached by a name: the box's own IP address is used for the hosts file.
+  res = await post({ "x-forwarded-for": "192.168.1.23", "x-forwarded-host": "standby.firm.local" });
+  assert.deepEqual((asked.at(-1) as unknown[])[2], { minutes: 120, allow: ["192.168.1.23"], address: "10.9.9.9" });
+  // No way to tell who is asking: refused with a plain reason.
+  res = await post({});
+  assert.equal(res.statusCode, 400);
+  assert.match(res.json().error, /could not tell which computer/);
+  assert.equal((await post({ "x-forwarded-for": "192.168.1.23" }, 30)).statusCode, 400, "only 1, 2 or 4 hours");
+  // Nothing open: no certificate to hand out, nothing to end.
+  assert.equal((await app.inject({ method: "GET", url: "/api/drill/ca.crt" })).statusCode, 404);
+  assert.equal((await app.inject({ method: "POST", url: "/api/drill/hands-on/end" })).statusCode, 409);
+});

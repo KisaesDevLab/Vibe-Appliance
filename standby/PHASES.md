@@ -238,6 +238,13 @@ Then:
 - After the drill, verification matches the pre-drill snapshot. *(seal re-check in every drill; mirror hash in drill-dind.sh, also after a killed and a cancelled drill)*
 - Still to do: run on the firm's two boxes with the real apps.
 
+**Hands-on drill (built 2026-11-25, Kurt asked for it after the first real drill):** the same drill, left running 1, 2 or 4 hours so the admin can sign in and check the data by hand.
+- Host: `drill` with `handsOn` in `drill.ready` runs the checks, then starts the copy's own Caddy in the drill (the primary's Caddyfile adapted to plain HTTP, no certificates, no ACME, `CLOUDFLARE_API_TOKEN` stripped) on an internal network `vibe-drill_drill-edge`, connects the standby's real `vibe-caddy` to it, and loads into the real Caddy, **in memory only** (admin API, never the Caddyfile), a route for the primary's names: refused (403) unless from the admin's address; a PRACTICE COPY notice on the first page of each app (cookie per drill); then the drill's Caddy. TLS for those names from a throwaway CA `vibe-drill`. The action returns, so the host runner is not held; `place` and `drill-clean` reload the real Caddyfile, disconnect, delete the CA. A systemd-run timer queues `drill-clean` at the time limit even if the service is down; a restart of Caddy or the box drops the in-memory routes by itself.
+- Service: `handsOn` state keeps `operation` "drill" (no sync), ends at the time limit, by End, at a promote (`forgetHandsOn`; place removes it), or at a restart of the service; the copy is checked when it ends. The admin's address is the rightmost X-Forwarded-For entry (set by Caddy, passed by the console); the hosts-file address is the IP the admin used, or this box's `host_ip`.
+- Domain mode only (a hosts file maps names, not IP addresses). Refused otherwise.
+- Not yet proven on real apps: single sign-on through vibe-auth inside the drill (apps use `VIBE_OIDC_INTERNAL_BASE` server-side, which should resolve in the drill).
+- Proven: drill-dind.sh (real Caddy: notice, app behind it, throwaway CA, other address refused, standby console unchanged, drill Caddy has no way out, restart of Caddy and drill-clean revert, LAN copy refused), drill.test.ts, server.test.ts.
+
 ---
 
 ## Phase 11 — Hardening and docs

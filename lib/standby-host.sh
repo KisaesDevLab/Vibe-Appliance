@@ -623,6 +623,93 @@ DRILL_REPORT="${SB_DIR}/drill-report.json"
 DRILL_CANCEL="${SB_DIR}/drill.cancel"
 DRILL_PROJECT="vibe-drill"
 DRILL_TIMEOUT="${VIBE_DRILL_TIMEOUT:-900}"
+# Hands-on drill: the drill is left running for a set time and the
+# standby's real Caddy puts it in front of ONE computer, in memory only
+# (see _drill_edge_open). Marker present = the real Caddy may hold it.
+DRILL_HANDSON="${SB_DIR}/drill-handson.json"
+DRILL_CA="${SB_DIR}/drill-ca.crt"
+DRILL_EDGE_NET="${DRILL_PROJECT}_drill-edge"
+DRILL_EXPIRE_UNIT="vibe-drill-expire"
+
+_caddy_running() { [[ "$(docker inspect -f '{{.State.Running}}' vibe-caddy 2>/dev/null)" == "true" ]]; }
+
+# Undo everything a hands-on drill did to the standby's real Caddy: reload
+# its own Caddyfile (drops the in-memory drill routes and certificate
+# authority), leave the drill network, delete the throwaway authority.
+# Returns 1 only when the real Caddy may still hold the drill's settings.
+_drill_edge_close() {
+  local held=0 rc=0
+  [[ -f "$DRILL_HANDSON" ]] && held=1
+  docker inspect -f '{{json .NetworkSettings.Networks}}' vibe-caddy 2>/dev/null | grep -q "\"${DRILL_EDGE_NET}\"" && held=1
+  (( held )) || return 0
+  systemctl stop "${DRILL_EXPIRE_UNIT}.timer" "${DRILL_EXPIRE_UNIT}.service" >/dev/null 2>&1 || true
+  if _caddy_running; then
+    docker exec vibe-caddy caddy reload --config /etc/caddy/Caddyfile >>"$VIBE_LOG_FILE" 2>&1 || rc=1
+    docker exec vibe-caddy rm -rf "/data/caddy/pki/authorities/${DRILL_PROJECT}" "/data/caddy/certificates/${DRILL_PROJECT}" >/dev/null 2>&1 || true
+  fi
+  docker network disconnect -f "$DRILL_EDGE_NET" vibe-caddy >/dev/null 2>&1 || true
+  # Stopped Caddy (or a reboot): it starts from its Caddyfile anyway.
+  rm -rf "${VIBE_DIR}/data/caddy/data/caddy/pki/authorities/${DRILL_PROJECT}" "${VIBE_DIR}/data/caddy/data/caddy/certificates/${DRILL_PROJECT}"
+  (( rc == 0 )) || return 1
+  rm -f "$DRILL_HANDSON" "$DRILL_CA"
+}
+
+# Put the running drill in front of the allowed computer(s). Fails the drill
+# (which cleans up, reverting the real Caddy) on any problem.
+_drill_edge_open() { # <minutes> <allow csv> <address>
+  local minutes="$1" allow="$2" address="$3" dc=(docker compose -p "$DRILL_PROJECT" -f "$DRILL_DIR/compose.json") session until
+  _caddy_running || _drill_fail "this box's web server (vibe-caddy) is not running, so the drill cannot be reached" \
+    "sudo docker start vibe-caddy — then start the hands-on drill again"
+  ( "${dc[@]}" up -d caddy ) >>"$VIBE_LOG_FILE" 2>&1 \
+    || _drill_fail "the copy's web server did not start in the drill" "sudo tail -30 $VIBE_LOG_FILE"
+  docker network connect "$DRILL_EDGE_NET" vibe-caddy >>"$VIBE_LOG_FILE" 2>&1 \
+    || _drill_fail "this box's web server could not be connected to the drill" "sudo tail -30 $VIBE_LOG_FILE"
+  # From here on the real Caddy is touched: drill-clean undoes it.
+  printf '{"state":"opening"}\n' > "$DRILL_HANDSON"
+  docker exec vibe-caddy wget -qO- http://127.0.0.1:2019/config/ > "$DRILL_DIR/edge-base.json" 2>>"$VIBE_LOG_FILE" \
+    || _drill_fail "could not read this box's web server settings" "sudo docker logs --tail 30 vibe-caddy"
+  session="$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  python3 "$APPLIANCE_DIR/lib/standby_drill.py" edge-config "$DRILL_DIR/edge-base.json" "$DRILL_DIR/caddy/hosts.json" \
+    "$allow" "vibe-drill-caddy:80" "$session" > "$DRILL_DIR/edge.json" 2>>"$VIBE_LOG_FILE" \
+    || _drill_fail "could not prepare the web server settings for the drill" "sudo tail -30 $VIBE_LOG_FILE"
+  docker exec -i vibe-caddy sh -c 'cat > /tmp/vibe-drill.json && caddy reload --config /tmp/vibe-drill.json && rm -f /tmp/vibe-drill.json' \
+    < "$DRILL_DIR/edge.json" >>"$VIBE_LOG_FILE" 2>&1 \
+    || _drill_fail "this box's web server refused the drill's settings (it keeps its own)" "sudo docker logs --tail 30 vibe-caddy"
+  local i
+  for i in $(seq 1 30); do
+    docker exec vibe-caddy cat "/data/caddy/pki/authorities/${DRILL_PROJECT}/root.crt" > "$DRILL_CA.tmp" 2>/dev/null && [[ -s "$DRILL_CA.tmp" ]] && break
+    sleep 1
+  done
+  [[ -s "$DRILL_CA.tmp" ]] || _drill_fail "the drill's certificate was not created" "sudo docker logs --tail 30 vibe-caddy"
+  chmod 644 "$DRILL_CA.tmp"; mv "$DRILL_CA.tmp" "$DRILL_CA"
+  until="$(date -u -d "+${minutes} minutes" +%Y-%m-%dT%H:%M:%SZ)"
+  python3 "$APPLIANCE_DIR/lib/standby_drill.py" hands-on-report "$DRILL_REPORT" "$until" "$DRILL_DIR/caddy/hosts.json" "$allow" "$address" \
+    || _drill_fail "could not write the drill report" "sudo tail -30 $VIBE_LOG_FILE"
+  printf '{"state":"open","until":"%s"}\n' "$until" > "$DRILL_HANDSON"
+  # The time limit holds even when the Standby service is down: the host
+  # queues the clean-up itself. (A reboot drops the timer, and the drill
+  # with it: restart "no", and Caddy starts from its Caddyfile.)
+  if command -v systemd-run >/dev/null 2>&1; then
+    systemctl stop "${DRILL_EXPIRE_UNIT}.timer" >/dev/null 2>&1 || true
+    systemd-run --quiet --unit "$DRILL_EXPIRE_UNIT" --on-active="$((minutes * 60))s" --timer-property=AccuracySec=30s \
+      /bin/bash "$APPLIANCE_DIR/lib/standby-host.sh" drill-expire >>"$VIBE_LOG_FILE" 2>&1 \
+      || log_warn "could not set the host's own time limit; the Standby service ends the drill on time"
+  fi
+  log_ok "hands-on drill open until $until"
+}
+
+# Queue drill-clean through the host runner (so it waits its turn behind any
+# other host action). Run by the expiry timer.
+action_drill_expire() {
+  [[ -f "$DRILL_HANDSON" ]] || { log_info "no hands-on drill to end"; return 0; }
+  local ha="${VIBE_HOST_ACTIONS_DIR:-${VIBE_DIR}/host-actions}" id
+  id="$(date +%s%3N)-$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  mkdir -p "$ha/queue"
+  printf '{"id":"%s","action":"standby-drill-clean","slug":"vibe-standby","args":{},"requested_at":"%s"}\n' \
+    "$id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ha/.stage-$id"
+  mv "$ha/.stage-$id" "$ha/queue/$id.json"
+  log_ok "the hands-on drill's time is up; clean-up queued" id="$id"
+}
 
 _drill_ids() { # <kind: ps|volume|network>
   case "$1" in
@@ -633,7 +720,9 @@ _drill_ids() { # <kind: ps|volume|network>
 }
 
 action_drill_clean() { # [keep-cancel]: the drill's own opening clean must not eat a cancel that came first
-  local ids
+  local ids edge_ok=1
+  # The standby's real Caddy first: it must stop pointing at the drill.
+  _drill_edge_close || edge_ok=0
   docker rm -f vibe-drill-probe >/dev/null 2>&1 || true
   if [[ -f "$DRILL_DIR/compose.json" ]]; then
     docker compose -p "$DRILL_PROJECT" -f "$DRILL_DIR/compose.json" down -v --remove-orphans -t 10 >>"$VIBE_LOG_FILE" 2>&1 || true
@@ -654,6 +743,8 @@ action_drill_clean() { # [keep-cancel]: the drill's own opening clean must not e
   fi
   rm -rf "$DRILL_DIR"
   if [[ "${1:-}" != "keep-cancel" ]]; then rm -f "$DRILL_READY" "$DRILL_CANCEL"; fi
+  (( edge_ok )) || die "this box's web server may still hold the practice drill's settings" \
+    "sudo docker restart vibe-caddy (it starts from its own Caddyfile), then run the drill clean-up again from the Standby panel"
   log_ok "no drill is left on this box"
 }
 
@@ -688,6 +779,22 @@ action_drill() {
   [[ "$stage_path" =~ ^/[A-Za-z0-9/_.-]+$ && "$stage_path" != *..* ]] || die "the drill request names no valid copy" \
     "start the drill again from the Standby panel"
   local stage="${MIRROR_ROOT}${stage_path}"
+  # Hands-on: "<minutes>\t<allowed addresses as CIDRs, comma-separated>\t<address to map names to>",
+  # validated here; empty for an ordinary drill.
+  local handson="" ho_min="" ho_allow="" ho_addr=""
+  handson="$(python3 - "$DRILL_READY" <<'PYEOF'
+import ipaddress, json, sys
+h = json.load(open(sys.argv[1])).get("handsOn")
+if not h: sys.exit(0)
+m = int(h.get("minutes", 0))
+if not 15 <= m <= 480: sys.exit("minutes")
+allow = [ipaddress.ip_address(str(a)) for a in h.get("allow") or []]
+if not allow: sys.exit("allow")
+addr = ipaddress.ip_address(str(h.get("address")))
+print("%d\t%s\t%s" % (m, ",".join("%s/%d" % (a, a.max_prefixlen) for a in allow), addr))
+PYEOF
+)" || die "the hands-on drill request is not valid" "start the hands-on drill again from the Standby panel"
+  [[ -z "$handson" ]] || IFS=$'\t' read -r ho_min ho_allow ho_addr <<<"$handson"
   DRILL_STARTED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   rm -f "$DRILL_REPORT"
   [[ -d "$SRC/data" && -d "$SRC/env" && -f "$SRC/state.json" && -d "$stage/db" ]] || _drill_fail "this box holds no complete verified copy to drill with" \
@@ -695,6 +802,15 @@ action_drill() {
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx vibe-cloudflared; then
     _drill_fail "the tunnel is running on this standby, which must never happen" \
       "the Standby service stops it within 5 minutes; then start the drill again. If it keeps running: sudo docker stop vibe-cloudflared"
+  fi
+  if [[ -n "$ho_min" ]]; then
+    # A hosts file can only point names somewhere; it cannot change an IP
+    # address the apps were set up with.
+    [[ "$(python3 -c "import json,sys; print((json.load(open(sys.argv[1])).get('config') or {}).get('mode',''))" "$SRC/state.json" 2>/dev/null)" == "domain" ]] \
+      || _drill_fail "a hands-on drill needs the primary to use its own web addresses (domain mode); this copy reaches its apps by IP address" \
+           "use the ordinary practice drill, or a planned switchover after hours"
+    _caddy_running || _drill_fail "this box's web server (vibe-caddy) is not running, so a hands-on drill could not be reached" \
+      "sudo docker start vibe-caddy — then start the hands-on drill again"
   fi
   _drill_check_cancel
   action_drill_clean keep-cancel >/dev/null || _drill_fail "an earlier drill could not be cleared away" "sudo tail -30 $VIBE_LOG_FILE"
@@ -772,9 +888,25 @@ PYEOF
       ' _ "$DRILL_DIR/env" "$VIBE_DIR" "$APPLIANCE_DIR" "$DRILL_DIR/render" "$slug" ) >>"$VIBE_LOG_FILE" 2>&1 \
       || { log_warn "could not render the services of $slug for the drill" slug="$slug"; rm -f "$DRILL_DIR/render/$slug.json.tmp"; : > "$DRILL_DIR/render/$slug.failed"; }
   done <<<"$slugs"
-  python3 "$APPLIANCE_DIR/lib/standby_drill.py" render "$DRILL_DIR" "$VIBE_DIR" "$APPLIANCE_DIR" >>"$VIBE_LOG_FILE" 2>&1 \
+  python3 "$APPLIANCE_DIR/lib/standby_drill.py" render "$DRILL_DIR" "$VIBE_DIR" "$APPLIANCE_DIR" ${ho_min:+hands-on} >>"$VIBE_LOG_FILE" 2>&1 \
     || _drill_fail "could not build the isolated drill from the primary's apps" "sudo tail -30 $VIBE_LOG_FILE"
   local dc=(docker compose -p "$DRILL_PROJECT" -f "$DRILL_DIR/compose.json")
+  if [[ -n "$ho_min" ]]; then
+    # The primary's own routing, from the copy's Caddyfile, for the drill's Caddy.
+    local edge_err edge_img
+    edge_err="$(python3 -c "import json,sys; print((json.load(open(sys.argv[1])).get('edge') or {}).get('error') or '')" "$DRILL_DIR/plan.json")"
+    [[ -z "$edge_err" ]] || _drill_fail "$edge_err" "sudo tail -30 $VIBE_LOG_FILE"
+    edge_img="$(python3 -c "import json,sys; print((json.load(open(sys.argv[1])).get('edge') or {}).get('image') or '')" "$DRILL_DIR/plan.json")"
+    install -d -m 755 "$DRILL_DIR/caddy"
+    docker run --rm --network none --pull never -v "$DRILL_DIR/data/caddy:/etc/caddy:ro" --entrypoint caddy "$edge_img" \
+      adapt --config /etc/caddy/Caddyfile > "$DRILL_DIR/caddy/copy.json" 2>>"$VIBE_LOG_FILE" \
+      || _drill_fail "could not read the primary's web server settings from the copy" "sudo tail -30 $VIBE_LOG_FILE"
+    python3 "$APPLIANCE_DIR/lib/standby_drill.py" drill-caddy "$DRILL_DIR/caddy/copy.json" "$DRILL_DIR/caddy/caddy.json" \
+      > "$DRILL_DIR/caddy/hosts.json" 2>>"$VIBE_LOG_FILE" \
+      || _drill_fail "could not prepare the primary's web server settings for the drill" "sudo tail -30 $VIBE_LOG_FILE"
+    [[ "$(cat "$DRILL_DIR/caddy/hosts.json")" != "[]" ]] || _drill_fail "the copy's web server answers no names a computer could be pointed at" \
+      "use the ordinary practice drill"
+  fi
 
   # ---- throwaway database, restored from the verified copy's dumps -------
   log_step "restoring the copy's databases into a throwaway database server"
@@ -840,6 +972,15 @@ PYEOF
   python3 "$APPLIANCE_DIR/lib/standby_drill.py" report "$DRILL_DIR" "$DRILL_REPORT" "$DRILL_SNAPSHOT" "$DRILL_STARTED" \
     "$restored" "$warns" "$DRILL_DIR/probe.txt" "$tunnel" || _drill_fail "could not write the drill report" "sudo tail -30 $VIBE_LOG_FILE"
 
+  # ---- hands-on: leave it running, in front of the admin's computer only --
+  # Never when isolation failed: that drill is removed at once.
+  if [[ -n "$ho_min" ]] && [[ "$(python3 -c "import json,sys; print(bool((json.load(open(sys.argv[1])).get('isolation') or {}).get('ok')))" "$DRILL_REPORT")" == "True" ]]; then
+    log_step "opening the hands-on drill" minutes="$ho_min"
+    _drill_edge_open "$ho_min" "$ho_allow" "$ho_addr"
+    trap - EXIT
+    return 0
+  fi
+
   # ---- remove every trace -----------------------------------------------
   log_step "removing the drill"
   trap - EXIT
@@ -850,6 +991,7 @@ PYEOF
 case "${1:-}" in
   drill)          action_drill ;;
   drill-clean)    action_drill_clean ;;
+  drill-expire)   action_drill_expire ;;
   mode-on)        action_mode_on ;;
   boot-hold)      action_boot_hold ;;
   shutdown-hold)  action_shutdown_hold ;;
@@ -861,5 +1003,5 @@ case "${1:-}" in
   tunnel-teardown) action_tunnel_teardown ;;
   follow-version) action_follow_version ;;
   archive)        action_archive ;;
-  *) die "unknown standby action '${1:-}'" "valid: drill drill-clean mode-on mode-off place tunnel-up tunnel-teardown follow-version archive boot-hold shutdown-hold boot-release boot-release-safety" ;;
+  *) die "unknown standby action '${1:-}'" "valid: drill drill-clean drill-expire mode-on mode-off place tunnel-up tunnel-teardown follow-version archive boot-hold shutdown-hold boot-release boot-release-safety" ;;
 esac

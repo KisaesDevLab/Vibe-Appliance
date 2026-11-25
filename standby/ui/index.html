@@ -28,6 +28,9 @@
   label { display:block; margin:10px 0 4px; font-weight:600; }
   input[type=text], input[type=password], textarea { width:100%; font:inherit; padding:10px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--text); }
   textarea { min-height:5.5rem; font-family:ui-monospace, monospace; font-size:.9rem; }
+  .handson select { font:inherit; padding:8px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:inherit; }
+  .handson ol { padding-left:20px; } .handson ol > li { margin:10px 0; }
+  pre.code { white-space:pre-wrap; margin:8px 0; }
   details.guide { margin-top:12px; border-top:1px solid var(--line); padding-top:10px; }
   details.guide summary { cursor:pointer; font-weight:600; }
   details.guide h3 { font-size:1rem; margin:16px 0 4px; }
@@ -230,12 +233,45 @@ function drillCard() {
       last.isolated === false ? P(h("strong", {}, "The drill could reach the internet, which must never happen. Do not run another drill; contact support with the drill history.")) : null,
       last.copyUnchanged ? null : P("This box's copy no longer matches what was verified. Choose Sync now before relying on it.")));
   }
+  if (d.handsOn) kids.push(handsOnOpen(d.handsOn));
+  else if (last && last.handsOn && last.handsOn.endedAt) kids.push(M("Hands-on drill ended ", when(last.handsOn.endedAt), ": ", last.handsOn.endReason || "", " Remove the drill's lines from your computer's hosts file and its certificate, if you have not yet."));
   kids.push(errLine(), h("div", { class: "row" },
     btn(d.running ? "Drill running…" : "Run a practice drill", () => act(() => api("POST", "api/drill/run")), "", !!d.running || !!S.busy || !!d.blocked || !S.dataAt),
     d.history.length ? h("a", { href: "api/drills.csv", download: "vibe-standby-drills.csv", style: "align-self:center" }, "Download drill history") : null),
     M("A drill does not test DNS, the Cloudflare tunnel or this box's own web address; those change only at a real promote."),
+    d.handsOn ? null : handsOnStart(d),
     drillGuide());
   return card(...kids);
+}
+
+// Hands-on drill: the same drill, left running for the admin's own computer.
+function handsOnStart(d) {
+  const off = !!d.running || !!S.busy || !!d.blocked || !S.dataAt;
+  return h("div", { class: "handson" },
+    h("h3", {}, "Use the apps yourself"),
+    P("A hands-on drill runs the same checks, then leaves the apps running so you can sign in and look: clients, recent entries, reports, attachments. It is open to this computer only, while your staff keep working on the primary. Anything you enter is thrown away when it ends."),
+    M("You will add a few lines to this computer's hosts file and trust a temporary certificate; the panel shows how. Open this panel by the box's IP address while the drill is open. No nightly sync runs while it is open."),
+    h("div", { class: "row" },
+      h("label", { for: "ho-min", style: "align-self:center" }, "Keep it open for"),
+      h("select", { id: "ho-min" }, h("option", { value: "60" }, "1 hour"), h("option", { value: "120", selected: true }, "2 hours"), h("option", { value: "240" }, "4 hours")),
+      btn("Start hands-on drill", () => act(() => api("POST", "api/drill/hands-on", { minutes: Number(val("ho-min")) })), "", off)));
+}
+
+function handsOnOpen(ho) {
+  const lines = ho.hosts.map((x) => `${ho.address}  ${x}`).join("\n");
+  const step = (title, ...body) => h("li", {}, h("strong", {}, title), ...body);
+  return h("div", { class: "banner warn handson" },
+    h("p", { class: "big" }, "Hands-on drill open until ", new Date(ho.until).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })),
+    M("Open to this computer only (", ho.allow.map((a) => a.replace(/\/(32|128)$/, "")).join(", "), "). Anything entered in it is thrown away."),
+    h("ol", {},
+      step("Trust the drill's certificate. ", h("a", { href: "api/drill/ca.crt", download: "vibe-practice-drill.crt" }, "Download it"),
+        M("Windows: double-click it, Install Certificate, Current User, \"Place all certificates in the following store\", Trusted Root Certification Authorities. Mac: double-click it, then in Keychain Access open \"Vibe practice drill\" and set Trust to Always Trust. Restart the browser.")),
+      step("Point this computer at the drill. ", M("Add these lines to the hosts file (Windows: open Notepad as administrator, then C:\\Windows\\System32\\drivers\\etc\\hosts. Mac: sudo nano /etc/hosts):"),
+        h("pre", { class: "code" }, lines)),
+      step("Open the apps. ", M("Each one first shows a red PRACTICE COPY page; then sign in as usual."),
+        h("ul", {}, ho.hosts.map((x) => h("li", {}, h("a", { href: `https://${x}/`, target: "_blank", rel: "noopener" }, x))))),
+      step("When you are done: ", M("press End, then delete the lines from the hosts file and remove the \"Vibe practice drill\" certificate (Windows: certmgr.msc, Trusted Root Certification Authorities; Mac: Keychain Access). Until you remove the lines, this computer cannot reach the live apps."))),
+    h("div", { class: "row" }, btn("End the hands-on drill", () => act(() => api("POST", "api/drill/hands-on/end")), "", !!S.busy && S.busy !== "drill")));
 }
 
 // The drill, explained for the admin: what it does, how to read a result,
@@ -269,6 +305,13 @@ function drillGuide() {
         "It does not test DNS, the Cloudflare tunnel or this box's web address; only a real promote does. A planned switchover after hours tests everything.",
         "A drill needs memory for every app plus a second database server. On a small box it may refuse with \"not enough free memory\".",
         "A promote never waits for a drill: it stops it within seconds and takes over.")),
+    ...sec("Hands-on drill",
+      li("Runs the same checks, then leaves the apps running for 1, 2 or 4 hours so you can sign in and look at the data yourself.",
+        "Only the computer that pressed Start can reach it; any other computer is refused. Your staff keep using the primary.",
+        "This box's own web server answers the primary's app addresses for your computer only, in memory. A restart of the web server, End, the time limit or a promote takes it away again.",
+        "Its certificate comes from a throwaway authority made for this drill and deleted when it ends; remove it from your computer afterwards too.",
+        "Anything entered is thrown away. Nothing in it can send email, file returns or reach the internet, so things that need the internet (bank feeds, e-filing, single sign-on through an outside provider) will not work in it.",
+        "Needs the primary to use its own web addresses (domain mode). No sync runs while it is open, so end it before the nightly copy is due.")),
     ...sec("Records",
       li("Download drill history gives a spreadsheet of every drill (date, result, apps, isolation, problems) for the firm's WISP.",
         "The last 100 drills are kept.")));

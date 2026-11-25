@@ -13,7 +13,7 @@ import type { Config } from "./config.ts";
 import type { ApplianceControl } from "./contracts/appliance.ts";
 import type { Repository } from "./contracts/repository.ts";
 import type { Identity } from "./crypto/identity.ts";
-import { drillBlocked, finishInterruptedDrill, runDrill, type DrillRecord } from "./drill/drill.ts";
+import { drillBlocked, endHandsOn, finishInterruptedDrill, forgetHandsOn, handsOnState, runDrill, type DrillRecord } from "./drill/drill.ts";
 import { highest, isLease, type Lease } from "./link/lease.ts";
 import { BucketLink, DirectLink, knownLease, rememberLease, type Link, type StatusReport } from "./link/link.ts";
 import { S3Client } from "./link/s3.ts";
@@ -81,6 +81,8 @@ export class Runtime {
   #bootHoldBusy = false;
   /** Aborted when a promote starts during a drill. */
   #drillAbort: AbortController | null = null;
+  /** A hands-on drill this process opened (and so keeps the time limit of). */
+  #handsOnOwned = false;
   /** Result of the last promote attempt, for the wizard to show. */
   promoteResult: PromoteResult | null = null;
   promoteRunning = false;
@@ -423,7 +425,7 @@ export class Runtime {
   }
 
   /** Run a practice drill now. Rejects at once if one may not start. */
-  async drillNow(actor: string, trigger: "admin" | "schedule"): Promise<DrillRecord> {
+  async drillNow(actor: string, trigger: "admin" | "schedule", handsOn?: { minutes: number; allow: string[]; address: string }): Promise<DrillRecord> {
     const blocked = drillBlocked(this.store);
     if (blocked) throw new Error(blocked);
     return this.#exclusive("drill", async () => {
@@ -435,8 +437,18 @@ export class Runtime {
           store: this.store, appliance: this.appliance, paths: this.paths, signal: abort.signal,
           listDatabases: () => pg.listDatabases(),
           mailer: () => this.#mailer(), to: () => this.store.get<string>("alertEmail") ?? this.config.alertEmail, boxName: () => this.store.nodeId.slice(0, 8),
-        }, { actor, trigger });
+        }, { actor, trigger, ...(handsOn ? { handsOn } : {}) }).then((r) => { if (handsOnState(this.store)) this.#handsOnOwned = true; return r; });
       } finally { this.#drillAbort = null; }
+    });
+  }
+
+  /** End the hands-on drill now (the admin's End, or its time is up). */
+  async endHandsOnNow(actor: string, reason: string): Promise<boolean> {
+    return this.#exclusive("drill", async () => {
+      const pg = await this.pg();
+      const ended = await endHandsOn({ store: this.store, appliance: this.appliance, paths: this.paths, listDatabases: () => pg.listDatabases() }, reason, actor);
+      this.#handsOnOwned = false;
+      return ended;
     });
   }
 
@@ -497,6 +509,8 @@ export class Runtime {
     // stopped, its own failure handling rolls the copy back to the last
     // verified one, and the promote's first step checks that again.
     const clear = async (): Promise<void> => {
+      // An open hands-on drill: the promote's place step removes it.
+      if (handsOnState(this.store)) { forgetHandsOn(this.store, "A promote started; it removed the drill first."); this.#handsOnOwned = false; }
       // A drill may be running on the host even when this process is not
       // waiting for it (it outlives a restart): ask it to stop either way.
       if (activeOperation(this.store) === "drill") await this.appliance.cancelDrill().catch(() => { /* place clears any drill itself */ });
@@ -606,6 +620,11 @@ export class Runtime {
         const out = await this.syncNow();
         this.#log(out.status === "failed" ? "error" : "info", "sync finished", { ...out });
       }
+      const ho = handsOnState(this.store);
+      if (ho && !this.#busy && now.getTime() >= Date.parse(ho.until)) {
+        await this.endHandsOnNow("schedule", "The time chosen for the hands-on drill is up.").catch((e: Error) =>
+          this.#log("error", "the hands-on drill could not be ended; trying again in 5 minutes", { error: e.message }));
+      }
       if (!this.#busy && await this.#drillDue(now)) {
         this.store.set("lastScheduledDrillAt", now.toISOString());
         await this.drillNow("schedule", "schedule").then(
@@ -677,6 +696,8 @@ export class Runtime {
     }
     if (op === "start-anyway") { this.store.unset("operation"); return; }
     if (op === "drill") {
+      // Open on purpose, and this process keeps its time limit.
+      if (this.#handsOnOwned && handsOnState(this.store)) return;
       const done = await this.#track("drill", () => finishInterruptedDrill({
         store: this.store, appliance: this.appliance,
         mailer: () => this.#mailer(), to: () => this.store.get<string>("alertEmail") ?? this.config.alertEmail, boxName: () => this.store.nodeId.slice(0, 8),

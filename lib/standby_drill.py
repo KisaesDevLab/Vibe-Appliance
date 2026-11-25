@@ -40,7 +40,15 @@ PROJECT = "vibe-drill"
 # Keep in step with standby/src/paths.ts NOT_REPLICATED.
 NOT_REPLICATED = ("postgres", "redis", "duplicati", "portainer", "emergency-proxy", "apps/vibe-backup")
 SHARED = ("postgres", "redis")
-SECRET_KEYS = ("TUNNEL_TOKEN",)
+# Never in a drill: the tunnel token (invariant 2) and the DNS token the
+# primary's Caddy could renew certificates with.
+SECRET_KEYS = ("TUNNEL_TOKEN", "CLOUDFLARE_API_TOKEN")
+# Hands-on drill: the drill's own Caddy, reached by the standby's real Caddy
+# over this one internal network, which nothing else of the drill joins.
+EDGE_NET = "drill-edge"
+EDGE_ALIAS = "vibe-drill-caddy"
+EDGE_CA = "vibe-drill"
+PRIVATE_RANGES = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "100.64.0.0/10", "fc00::/7", "::1/128"]
 
 
 class Unsafe(Exception):
@@ -139,7 +147,23 @@ def manifest_checks(appliance, slug):
     return hurl, surl, None, first.get("type") == "setup-wizard"
 
 
-def build(drill, vibe, appliance):
+def edge_service(drill, vibe, core_cfg):
+    """The copy's own Caddy for a hands-on drill: the primary's routing,
+    served over plain HTTP on the drill network, its config from
+    drill_caddy(). Raises Unsafe or KeyError when it cannot be built."""
+    svc = (core_cfg.get("services") or {})["caddy"]
+    out = drill_service("caddy", svc, vibe, drill, core_cfg.get("volumes") or {})
+    out.pop("depends_on", None)
+    out.pop("healthcheck", None)
+    out["command"] = ["caddy", "run", "--config", "/drill-caddy/caddy.json"]
+    out["entrypoint"] = []
+    out["volumes"] = out.get("volumes", []) + [{"type": "bind", "source": os.path.join(drill, "caddy"),
+                                                 "target": "/drill-caddy", "read_only": True}]
+    out["networks"][EDGE_NET] = {"aliases": [EDGE_ALIAS]}
+    return out
+
+
+def build(drill, vibe, appliance, handson=False):
     render = os.path.join(drill, "render")
     slugs = sorted(f[:-5] for f in os.listdir(render) if f.endswith(".json") and not f.startswith("_"))
     services, networks, volumes = {}, {}, {}
@@ -205,11 +229,23 @@ def build(drill, vibe, appliance):
         for net in s["networks"]:
             count[net] = count.get(net, 0) + 1
     probe_net = max(count, key=count.get) if count else None
+    edge = None
+    if handson and apps:
+        try:
+            with open(os.path.join(render, "_core.json")) as f:
+                core_cfg = json.load(f)
+            services["caddy"] = edge_service(drill, vibe, core_cfg)
+            for net in services["caddy"]["networks"]:
+                networks[net] = {"driver": "bridge", "internal": True}
+            edge = {"network": "%s_%s" % (PROJECT, EDGE_NET), "upstream": EDGE_ALIAS + ":80",
+                    "image": core_cfg["services"]["caddy"].get("image")}
+        except (Unsafe, KeyError, OSError, ValueError) as e:
+            edge = {"error": "the copy's web server could not be set up for the drill (%s)" % e}
     compose = {"name": PROJECT, "services": services, "networks": networks}
     if volumes:
         compose["volumes"] = volumes
     plan = {"apps": apps, "skipped": skipped, "probeNetwork": "%s_%s" % (PROJECT, probe_net) if probe_net else None,
-            "hasPostgres": "postgres" in services, "hasRedis": "redis" in services}
+            "hasPostgres": "postgres" in services, "hasRedis": "redis" in services, "edge": edge}
     for name, body in (("compose.json", compose), ("plan.json", plan)):
         tmp = os.path.join(drill, name + ".tmp")
         with open(tmp, "w") as f:
@@ -391,10 +427,99 @@ def report(drill, out_path, snapshot, started, restored, restore_warnings, probe
     return body
 
 
+def _route_hosts(routes):
+    hosts = []
+    for r in routes or []:
+        for m in r.get("match") or []:
+            for h in m.get("host") or []:
+                if h not in hosts:
+                    hosts.append(h)
+    return hosts
+
+
+def drill_caddy(copy_json, out_json):
+    """The copy's Caddy config (adapted to JSON), changed to serve inside the
+    drill: one plain-HTTP server on :80 with every route of the primary, in
+    the primary's order (HTTPS sites first); no certificates, no ACME, no
+    redirects. TLS is the standby's real Caddy's job. Returns the public
+    names it serves (wildcards dropped: a hosts file cannot map them)."""
+    with open(copy_json) as f:
+        cfg = json.load(f)
+    servers = ((cfg.get("apps") or {}).get("http") or {}).get("servers") or {}
+    order = sorted(servers.values(), key=lambda s: 0 if any(str(l).endswith(":443") for l in s.get("listen") or []) else 1)
+    routes = [r for s in order for r in (s.get("routes") or [])]
+    hosts = [h for s in order if any(str(l).endswith(":443") for l in s.get("listen") or []) for h in _route_hosts(s.get("routes"))]
+    hosts = [h for i, h in enumerate(hosts) if "*" not in h and h not in hosts[:i] and not h.replace(".", "").isdigit()]
+    out = {"apps": {"http": {"servers": {"drill": {
+        "listen": [":80"], "routes": routes, "automatic_https": {"disable": True},
+        # The standby's real Caddy, one hop away, says the request was HTTPS.
+        "trusted_proxies": {"source": "static", "ranges": PRIVATE_RANGES}}}}}}
+    if cfg.get("logging"):
+        out["logging"] = cfg["logging"]
+    tmp = out_json + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(out, f)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, out_json)
+    return hosts
+
+
+NOTICE = """<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PRACTICE COPY</title>
+<body style="margin:0;font-family:system-ui,sans-serif;background:#7a1010;color:#fff;display:flex;min-height:100vh;align-items:center;justify-content:center">
+<main style="max-width:36rem;padding:32px">
+<h1 style="font-size:2rem;margin:0 0 16px">PRACTICE COPY</h1>
+<p style="font-size:1.1rem;line-height:1.5">You are on the standby's hands-on practice drill, not the live system.
+It holds a copy of the firm's data. <strong>Anything you enter here is thrown away</strong> when the drill ends,
+and nothing here can send email, file or reach the internet.</p>
+<p style="font-size:1.1rem;line-height:1.5">Do real work on the primary only.</p>
+<button style="font-size:1rem;padding:12px 20px;border:0;border-radius:8px;background:#fff;color:#7a1010;font-weight:600;cursor:pointer"
+ onclick="document.cookie='vibe_drill_ok=%s; path=/; secure; samesite=lax';location.reload()">I understand: show me the practice copy</button>
+</main></body></html>"""
+
+
+def edge_config(base_json, hosts, allow, upstream, session):
+    """The standby's live Caddy config with the drill in front: for the
+    primary's names only, and only from the allowed addresses, a practice
+    notice on the first page of each app, then the drill's own Caddy. TLS
+    for those names from a throwaway certificate authority. The live
+    config is loaded in memory only: a reload of the Caddyfile (drill-clean)
+    or a restart drops all of it."""
+    with open(base_json) as f:
+        cfg = json.load(f)
+    servers = cfg.setdefault("apps", {}).setdefault("http", {}).setdefault("servers", {})
+    srv = next((s for s in servers.values() if any(str(l).endswith(":443") for l in s.get("listen") or [])), None)
+    if srv is None:
+        raise ValueError("this box's web server does not answer HTTPS on port 443")
+    route = {"match": [{"host": hosts}], "terminal": True, "handle": [{"handler": "subroute", "routes": [
+        {"match": [{"not": [{"remote_ip": {"ranges": allow}}]}], "terminal": True,
+         "handle": [{"handler": "static_response", "status_code": 403,
+                     "body": "This practice drill is open only to the computer that started it."}]},
+        {"match": [{"method": ["GET"], "header": {"Accept": ["*text/html*"]},
+                    "not": [{"header": {"Cookie": ["*vibe_drill_ok=%s*" % session]}}]}], "terminal": True,
+         "handle": [{"handler": "static_response", "status_code": 200, "body": NOTICE % session,
+                     "headers": {"Content-Type": ["text/html; charset=utf-8"], "Cache-Control": ["no-store"]}}]},
+        {"handle": [{"handler": "headers", "response": {"set": {"X-Vibe-Practice-Drill": ["1"]}}},
+                    {"handler": "reverse_proxy", "upstreams": [{"dial": upstream}]}]}]}]}
+    srv["routes"] = [route] + (srv.get("routes") or [])
+    auto = cfg["apps"].setdefault("tls", {}).setdefault("automation", {})
+    policies = []
+    for p in auto.get("policies") or []:
+        if p.get("subjects"):
+            p["subjects"] = [s for s in p["subjects"] if s not in hosts]
+            if not p["subjects"]:
+                continue
+        policies.append(p)
+    auto["policies"] = [{"subjects": hosts, "issuers": [{"module": "internal", "ca": EDGE_CA}]}] + policies
+    cfg["apps"].setdefault("pki", {}).setdefault("certificate_authorities", {})[EDGE_CA] = {
+        "name": "Vibe practice drill - remove after use", "install_trust": False}
+    return cfg
+
+
 if __name__ == "__main__":
     cmd, args = (sys.argv[1] if len(sys.argv) > 1 else ""), sys.argv[2:]
-    if cmd == "render" and len(args) == 3:
-        _, plan = build(*args)
+    if cmd == "render" and len(args) in (3, 4):
+        _, plan = build(args[0], args[1], args[2], handson=len(args) == 4 and args[3] == "hands-on")
         print(json.dumps({"apps": [a["slug"] for a in plan["apps"]], "skipped": plan["skipped"]}))
     elif cmd == "wait" and len(args) in (2, 3):
         print(json.dumps(wait(args[0], int(args[1]), args[2] if len(args) == 3 else None)))
@@ -405,6 +530,25 @@ if __name__ == "__main__":
         d, out, snap, started, restored, warns, probe, tunnel = args
         body = report(d, out, snap, started, int(restored), [w for w in warns.split("\x1f") if w], probe, tunnel == "1")
         print("drill %s: %d app(s) checked, %d not drilled" % ("passed" if body["ok"] else "FAILED", len(body["apps"]), len(body["skipped"])))
+    elif cmd == "drill-caddy" and len(args) == 2:
+        print(json.dumps(drill_caddy(args[0], args[1])))
+    elif cmd == "edge-config" and len(args) == 5:
+        base, hosts_file, allow, upstream, session = args
+        with open(hosts_file) as f:
+            hosts = json.load(f)
+        json.dump(edge_config(base, hosts, [a for a in allow.split(",") if a], upstream, session), sys.stdout)
+    elif cmd == "hands-on-report" and len(args) == 5:
+        # Add the hands-on details to a finished report: until, names, who may connect.
+        out, until, hosts_file, allow, address = args
+        with open(out) as f:
+            body = json.load(f)
+        with open(hosts_file) as f:
+            hosts = json.load(f)
+        body["handsOn"] = {"until": until, "hosts": hosts, "allow": [a for a in allow.split(",") if a], "address": address}
+        with open(out + ".tmp", "w") as f:
+            json.dump(body, f, indent=1)
+        os.chmod(out + ".tmp", 0o644)
+        os.replace(out + ".tmp", out)
     else:
         print("usage: standby_drill.py render <drill-dir> <vibe-dir> <appliance-dir> | wait <drill-dir> <seconds> | probe-script <drill-dir> | report ...", file=sys.stderr)
         sys.exit(2)

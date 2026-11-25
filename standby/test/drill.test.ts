@@ -9,7 +9,7 @@ import { test } from "node:test";
 import type { Mailer } from "../src/alerts/mailer.ts";
 import { sealStage } from "../src/capture/capture.ts";
 import { FakeAppliance } from "../src/contracts/fakes/fakeAppliance.ts";
-import { composeDrillEmail, drillBlocked, drillHistory, drillHistoryCsv, finishInterruptedDrill, runDrill, type DrillDeps } from "../src/drill/drill.ts";
+import { composeDrillEmail, drillBlocked, drillHistory, drillHistoryCsv, endHandsOn, finishInterruptedDrill, forgetHandsOn, handsOnState, runDrill, type DrillDeps } from "../src/drill/drill.ts";
 import { Store } from "../src/overlay/store.ts";
 import type { Paths } from "../src/paths.ts";
 import { activeOperation, type VerifiedCopy } from "../src/sync/sync.ts";
@@ -167,4 +167,89 @@ test("drill: apps left out are named in the subject of a passing drill, and rest
   assert.deepEqual(r.restoreWarnings, ["vibe_tb_db was restored with warnings"]);
   assert.match(w.sent[0]!.subject, /passed, 1 app not drilled/);
   assert.match(w.sent[0]!.text, /database: vibe_tb_db was restored with warnings/);
+});
+
+// ---- hands-on drill ----------------------------------------------------------
+
+const HANDS_ON = { minutes: 120, allow: ["192.168.1.23"], address: "192.168.1.20" };
+
+test("hands-on: the drill stays open for the admin's computer, holds off syncs, and sends no email", async () => {
+  const w = await setup();
+  const r = await runDrill(w.deps(), { actor: "admin", trigger: "admin", handsOn: HANDS_ON });
+  assert.equal(r.ok, true);
+  assert.deepEqual(w.box.drills[0]!.handsOn, HANDS_ON, "the host was asked for a hands-on drill");
+  assert.equal(w.box.drillsCleaned, 0, "nothing is removed while it is open");
+  assert.equal(activeOperation(w.store), "drill", "no sync replaces the copy under an open drill");
+  const h = handsOnState(w.store)!;
+  assert.deepEqual(h.allow, ["192.168.1.23/32"]);
+  assert.equal(h.recordId, r.id);
+  assert.equal(r.handsOn!.endedAt, null);
+  assert.equal(w.sent.length, 0);
+  assert.match(drillBlocked(w.store)!, /already running/);
+});
+
+test("hands-on: ending it removes the drill, checks the copy and records how it ended", async () => {
+  const w = await setup();
+  await runDrill(w.deps(), { actor: "admin", trigger: "admin", handsOn: HANDS_ON });
+  assert.equal(await endHandsOn(w.deps(), "Ended by the admin.", "admin"), true);
+  assert.equal(w.box.drillsCleaned, 1);
+  assert.equal(handsOnState(w.store), null);
+  assert.equal(activeOperation(w.store), undefined);
+  const [rec] = drillHistory(w.store);
+  assert.equal(rec!.handsOn!.endReason, "Ended by the admin.");
+  assert.ok(rec!.handsOn!.endedAt);
+  assert.equal(rec!.copyUnchanged, true);
+  assert.equal(await endHandsOn(w.deps(), "again", "admin"), false, "ending twice does nothing");
+  assert.match(drillHistoryCsv(drillHistory(w.store)), /ended .*Ended by the admin/);
+});
+
+test("hands-on: a copy changed while it was open fails the drill when it ends", async () => {
+  const w = await setup();
+  await runDrill(w.deps(), { actor: "admin", trigger: "admin", handsOn: HANDS_ON });
+  writeFileSync(join(w.inMirror, "db", "vibe_tb_db.dump"), "changed");
+  await endHandsOn(w.deps(), "time is up", "schedule");
+  const [rec] = drillHistory(w.store);
+  assert.equal(rec!.ok, false);
+  assert.equal(rec!.copyUnchanged, false);
+});
+
+test("hands-on: when the host cannot clean up, the drill stays recorded as open (and is retried)", async () => {
+  const w = await setup();
+  await runDrill(w.deps(), { actor: "admin", trigger: "admin", handsOn: HANDS_ON });
+  w.box.failNext.set("cleanDrill", new Error("standby-drill-clean failed on the host"));
+  await assert.rejects(endHandsOn(w.deps(), "time is up", "schedule"), /clean failed/);
+  assert.ok(handsOnState(w.store));
+  assert.equal(activeOperation(w.store), "drill");
+});
+
+test("hands-on: a restart of the service ends it, without recording a second drill", async () => {
+  const w = await setup();
+  await runDrill(w.deps(), { actor: "admin", trigger: "admin", handsOn: HANDS_ON });
+  assert.equal(await finishInterruptedDrill({ store: w.store, appliance: w.box }), true);
+  assert.equal(w.box.drillsCleaned, 1);
+  assert.equal(handsOnState(w.store), null);
+  assert.equal(activeOperation(w.store), undefined);
+  assert.equal(drillHistory(w.store).length, 1);
+  assert.match(drillHistory(w.store)[0]!.handsOn!.endReason!, /restarted/);
+});
+
+test("hands-on: a promote closes the record and leaves its own operation alone", async () => {
+  const w = await setup();
+  await runDrill(w.deps(), { actor: "admin", trigger: "admin", handsOn: HANDS_ON });
+  w.store.set("operation", "promote");
+  forgetHandsOn(w.store, "A promote started; it removed the drill first.");
+  assert.equal(handsOnState(w.store), null);
+  assert.equal(activeOperation(w.store), "promote");
+  assert.match(drillHistory(w.store)[0]!.handsOn!.endReason!, /promote/);
+});
+
+test("hands-on: never opened when the drill could reach the outside", async () => {
+  const w = await setup();
+  const base = w.box.drillResult;
+  w.box.drillResult = (req) => ({ ...base(req), ok: false, error: "the drill network was NOT isolated", isolation: { outsideReachable: { ip: true }, tunnelRunning: false, ok: false } });
+  const r = await runDrill(w.deps(), { actor: "admin", trigger: "admin", handsOn: HANDS_ON });
+  assert.equal(r.ok, false);
+  assert.equal(handsOnState(w.store), null);
+  assert.equal(activeOperation(w.store), undefined);
+  assert.equal(r.handsOn, undefined);
 });

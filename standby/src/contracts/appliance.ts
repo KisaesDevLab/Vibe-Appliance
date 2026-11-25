@@ -74,6 +74,22 @@ export interface DrillRequest {
   snapshotId: string;
   /** Where the copy's database dumps are, as captured (same absolute path on both boxes). */
   stagePath: string;
+  /**
+   * Hands-on drill: after the checks, leave the drill running for this long
+   * and put the primary's web addresses in front of the allowed computers
+   * only (the standby's own web server, in memory; drill-clean undoes it).
+   */
+  handsOn?: { minutes: number; allow: string[]; address: string };
+}
+
+export interface HandsOnOpen {
+  until: string;
+  /** The primary's web addresses the drill answers. */
+  hosts: string[];
+  /** Addresses (CIDR) allowed in. */
+  allow: string[];
+  /** This box's address, for the admin's hosts file. */
+  address: string;
 }
 
 export interface DrillAppResult {
@@ -97,6 +113,8 @@ export interface DrillReport {
   databasesRestored?: number;
   restoreWarnings?: string[];
   isolation?: { outsideReachable: Record<string, boolean>; tunnelRunning: boolean; ok: boolean };
+  /** Present when a hands-on drill was opened: it is still running. */
+  handsOn?: HandsOnOpen;
   error: string | null;
   fix?: string;
 }

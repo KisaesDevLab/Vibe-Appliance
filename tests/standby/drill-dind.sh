@@ -67,7 +67,27 @@ services:
     entrypoint: ["sleep", "infinity"]
     volumes: ["/opt/vibe:/opt/vibe", "/var/run/docker.sock:/var/run/docker.sock:ro"]
     networks: [vibe_net]
+  caddy:
+    image: caddy:2-alpine
+    container_name: vibe-caddy
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    env_file: [/opt/vibe/env/shared.env]
+    volumes: ["/opt/vibe/data/caddy:/etc/caddy:ro", "/opt/vibe/data/caddy/data:/data"]
+    networks: [vibe_net]
+    extra_hosts: ["host.docker.internal:host-gateway"]
 YML
+# This standby's own web server: its console, and the app's name answering
+# "stopped" (as on a real standby: the apps are down).
+w "$VIBE/data/caddy/Caddyfile" <<'CF'
+:80 {
+	respond "standby console" 200
+}
+demo.firm.test {
+	tls internal
+	respond "standby: app stopped" 502
+}
+CF
 demo_overlay() { # <slug> <web command> [migrate command]
 local migrate="${3:-test \\\"\$\$(psql -h vibe-postgres -U demo -d demo_db -Atc 'select count(*) from t')\\\" = 3}"
 w "$APPL/apps/$1.yml" <<YML
@@ -112,11 +132,21 @@ demo_overlay vibe-broken 'exit 3' 'echo broken-app-says-why >&2; exit 1'
 w "$VIBE/state.json" <<<'{"config":{"standby_mode":true,"host_ip":"10.0.0.52"},"apps":{}}'
 w "$VIBE/env/shared.env" <<<$'POSTGRES_USER=postgres\nPOSTGRES_PASSWORD=standby-own\nREDIS_PASSWORD=standby-own'
 mkdir -p "$VIBE/data/postgres" "$VIBE/data/redis"
-( cd "$APPL" && docker compose -f docker-compose.yml up -d console >/dev/null 2>&1 )
+( cd "$APPL" && docker compose -f docker-compose.yml up -d console caddy >/dev/null 2>&1 )
+# The primary's web server, as the copy has it.
+w "$SRC/data/caddy/Caddyfile" <<'CF'
+demo.firm.test {
+	tls internal
+	reverse_proxy vibe-demo-web:8080
+}
+:80 {
+	reverse_proxy console:3000
+}
+CF
 
 # ---- the verified mirror of the primary --------------------------------------
 w "$SRC/state.json" <<<'{"config":{"mode":"domain"},"apps":{"vibe-demo":{"enabled":true},"vibe-backup":{"enabled":true}}}'
-w "$SRC/env/shared.env" <<<$'POSTGRES_USER=postgres\nPOSTGRES_PASSWORD=primary-pw\nREDIS_PASSWORD=primary-redis\nPGPASSWORD=demo-pw\nTUNNEL_TOKEN=must-never-reach-a-drill'
+w "$SRC/env/shared.env" <<<$'POSTGRES_USER=postgres\nPOSTGRES_PASSWORD=primary-pw\nREDIS_PASSWORD=primary-redis\nPGPASSWORD=demo-pw\nTUNNEL_TOKEN=must-never-reach-a-drill\nCLOUDFLARE_API_TOKEN=must-never-reach-a-drill-either'
 w "$SRC/env/vibe-demo.env" <<<'X=1'
 w "$SRC/env/vibe-broken.env" <<<'X=1'
 w "$SRC/data/apps/vibe-demo/www/index.html" <<<'primary'
@@ -211,6 +241,63 @@ wait "$dpid" && fail "a cancelled drill reported success"
 [[ -z "$(docker ps -aq --filter label=com.docker.compose.project=vibe-drill)" ]] || fail "a cancelled drill left containers"
 [[ ! -e "$VIBE/standby/drill.cancel" ]] || fail "the cancel marker was left behind"
 [[ "$(sum)" == "$before" ]] || fail "the mirror changed after a cancelled drill"
+
+echo "== hands-on: opens to one computer, practice notice first, the drill's own app behind it"
+# What Caddy sees for a request from this host to 127.0.0.1:443 (Docker's
+# port proxy connects from the network's gateway): the "admin's computer".
+gw="$(docker network inspect vibe_net -f '{{(index .IPAM.Config 0).Gateway}}')"
+handson_ready() { printf '{"snapshotId":"s1","stagePath":"/opt/vibe/standby/stage","handsOn":{"minutes":15,"allow":["%s"],"address":"10.0.0.52"}}' "$gw" > "$VIBE/standby/drill.ready"; }
+R() { curl -sk --max-time 10 --resolve demo.firm.test:443:127.0.0.1 "$@" https://demo.firm.test/; }
+before="$(sum)"
+handson_ready; run drill >/tmp/ho.out 2>&1 || { tail -20 /tmp/ho.out; fail "the hands-on drill did not open"; }
+[[ "$(report 'd["handsOn"]["hosts"]')" == "['demo.firm.test']" ]] || fail "hands-on names: $(report 'd.get("handsOn")')"
+[[ "$(report 'd["ok"]')" == "True" ]] || fail "the checks before opening did not pass: $(report 'd')"
+[[ -n "$(docker ps -q --filter label=com.docker.compose.project=vibe-drill --filter label=com.docker.compose.service=caddy)" ]] || fail "the drill's web server is not running"
+grep -q CLOUDFLARE_API_TOKEN "$VIBE/standby/drill/compose.json" && fail "the DNS token reached the drill"
+notice="$(R -H 'Accept: text/html')"
+echo "$notice" | grep -q "PRACTICE COPY" || fail "no practice notice: $notice"
+sid="$(echo "$notice" | grep -o 'vibe_drill_ok=[0-9a-f]*' | head -1)"
+[[ "$(R -H 'Accept: text/html' -H "Cookie: $sid")" == "changed-by-drill" ]] || fail "the drill's app was not served: $(R -H 'Accept: text/html' -H "Cookie: $sid")"
+[[ "$(curl -sk --max-time 10 --resolve demo.firm.test:443:127.0.0.1 https://demo.firm.test/health)" == "ok" ]] || fail "an app request (not a page) was held up"
+cert="$(curl -skv --max-time 10 --resolve demo.firm.test:443:127.0.0.1 https://demo.firm.test/health 2>&1 || true)"
+[[ "$cert" == *"issuer: CN=Vibe practice drill"* ]] || fail "the certificate is not the drill's throwaway one: $(grep -i issuer <<<"$cert")"
+[[ -s "$VIBE/standby/drill-ca.crt" ]] || fail "the drill's certificate was not kept for the panel"
+cip="$(docker inspect vibe-caddy -f '{{(index .NetworkSettings.Networks "vibe_net").IPAddress}}')"
+[[ "$(docker exec vibe-console curl -sk --max-time 10 -o /dev/null -w '%{http_code}' --resolve "demo.firm.test:443:$cip" https://demo.firm.test/)" == "403" ]] || fail "another computer was let in"
+[[ "$(curl -s --max-time 10 http://127.0.0.1/)" == "standby console" ]] || fail "the standby's own console route changed"
+dcad="$(docker ps -q --filter label=com.docker.compose.project=vibe-drill --filter label=com.docker.compose.service=caddy)"
+docker exec "$dcad" wget -q -T 5 -O- http://1.1.1.1/ >/dev/null 2>&1 && fail "the drill's web server can reach the internet"
+run drill-expire >/dev/null 2>&1 || fail "drill-expire failed"
+grep -l '"standby-drill-clean"' "$VIBE"/host-actions/queue/*.json >/dev/null 2>&1 || fail "the time limit did not queue the clean-up"
+rm -f "$VIBE"/host-actions/queue/*.json
+
+echo "== hands-on: a restart of the web server drops the drill from it; drill-clean converges"
+docker restart vibe-caddy >/dev/null; sleep 3
+[[ "$(R)" == "standby: app stopped" ]] || fail "after a restart the web server still served the drill: $(R)"
+run drill-clean >/dev/null 2>&1 || fail "drill-clean failed after a web server restart"
+[[ -z "$(docker ps -aq --filter label=com.docker.compose.project=vibe-drill)" ]] || fail "drill containers left"
+[[ -z "$(docker network ls -q --filter label=com.docker.compose.project=vibe-drill)" ]] || fail "drill networks left"
+docker inspect vibe-caddy -f '{{json .NetworkSettings.Networks}}' | grep -q drill-edge && fail "the web server is still on the drill network"
+[[ ! -e "$VIBE/data/caddy/data/caddy/pki/authorities/vibe-drill" && ! -e "$VIBE/data/caddy/data/caddy/certificates/vibe-drill" ]] || fail "the throwaway certificate authority was left"
+[[ ! -e "$VIBE/standby/drill-ca.crt" && ! -e "$VIBE/standby/drill-handson.json" ]] || fail "hands-on files left"
+[[ "$(sum)" == "$before" ]] || fail "the mirror changed during the hands-on drill"
+
+echo "== hands-on: ending it reverts this box's web server at once"
+before="$(sum)"
+handson_ready; run drill >/tmp/ho2.out 2>&1 || { tail -20 /tmp/ho2.out; fail "the hands-on drill did not open again"; }
+[[ "$(R -H "Accept: text/html")" == *"PRACTICE COPY"* ]] || fail "second hands-on drill not served"
+run drill-clean >/dev/null 2>&1 || fail "drill-clean failed"
+[[ "$(R)" == "standby: app stopped" ]] || fail "the web server still serves the drill after the clean-up: $(R)"
+cert="$(curl -skv --max-time 10 --resolve demo.firm.test:443:127.0.0.1 https://demo.firm.test/ 2>&1 || true)"
+[[ "$cert" != *"Vibe practice drill"* ]] || fail "the drill's certificate is still served"
+[[ "$(docker ps -a --filter label=com.docker.compose.project=vibe --format '{{.Names}} {{.State}}' | sort)" == "$own_before" ]] || fail "the standby's own containers changed"
+[[ "$(sum)" == "$before" ]] || fail "the mirror changed"
+
+echo "== hands-on: refused for a copy that reaches its apps by IP address"
+sed -i 's/"mode":"domain"/"mode":"lan"/' "$SRC/state.json"
+handson_ready; run drill >/tmp/ho3.out 2>&1 && fail "a hands-on drill opened for a LAN-mode copy"
+grep -q "domain mode" /tmp/ho3.out || fail "no plain reason: $(tail -3 /tmp/ho3.out)"
+sed -i 's/"mode":"lan"/"mode":"domain"/' "$SRC/state.json"
 
 echo "ALL DRILL CHECKS PASSED"
 INNER

@@ -149,7 +149,11 @@ export class FakeAppliance implements ApplianceControl {
     if (this.drillGate) {
       await Promise.race([this.drillGate, new Promise<void>((_, reject) => signal?.addEventListener("abort", () => reject(new Error("stopped waiting for standby-drill"))))]);
     }
-    return this.drillResult(req);
+    const r = this.drillResult(req);
+    if (req.handsOn && r.isolation?.ok !== false && !r.handsOn) {
+      r.handsOn = { until: new Date(Date.now() + req.handsOn.minutes * 60_000).toISOString(), hosts: ["tb.firm.example"], allow: req.handsOn.allow.map((a) => a + "/32"), address: req.handsOn.address };
+    }
+    return r;
   }
   async cleanDrill(): Promise<void> { this.#call("cleanDrill"); this.drillsCleaned++; }
   async cancelDrill(): Promise<void> { this.#call("cancelDrill"); this.drillCancelled = true; }
