@@ -22,6 +22,7 @@ function fakeDocker(containers) {
       start: async () => {
         calls.push('start:' + id);
         const c = containers.find((x) => x.name === id);
+        if (c.startError) throw Object.assign(new Error(c.startError), { statusCode: 500 });
         // A job runs and exits; a service stays up.
         c.running = !c.job;
       },
@@ -183,6 +184,22 @@ test('apps/start runs jobs to completion before the apps that depend on them', a
   const r = await h.call('POST', '/apps/start');
   assert.equal(r.status, 200);
   assert.deepEqual(h.docker.calls, ['start:vibe-redis', 'start:vibe-1040-migrate', 'start:vibe-1040']);
+  h.close();
+});
+
+test('apps/start: one container Docker cannot start does not keep the other apps down', async () => {
+  const containers = [
+    { name: 'vibe-postgres', service: 'postgres', running: true },
+    { name: 'vibe-redis', service: 'redis', running: false },
+    { name: 'vibe1099-app', service: 'vibe1099-app', running: false, startError: 'network vibe-1099-internal not found' },
+    { name: 'vibe-tb', service: 'vibe-tb', running: false },
+  ];
+  const h = await harness({ config: {} }, containers);
+  const r = await h.call('POST', '/apps/start');
+  assert.equal(r.status, 200);
+  assert.deepEqual(h.docker.calls, ['start:vibe-redis', 'start:vibe1099-app', 'start:vibe-tb']);
+  assert.deepEqual(r.body.started, ['vibe-redis', 'vibe-tb']);
+  assert.deepEqual(r.body.failed, [{ name: 'vibe1099-app', error: 'network vibe-1099-internal not found' }]);
   h.close();
 });
 

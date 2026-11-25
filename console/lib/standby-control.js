@@ -163,12 +163,25 @@ function createStandbyControl(deps) {
   router.post('/apps/start', guard(async (_req, res) => {
     if (standbyMode()) return refuseInStandbyMode(res, 'starting apps');
     const redis = await startKinds(['redis']);
+    // One container Docker refuses to start (missing network, bad mount)
+    // must not keep every other app down at a promote: it is recorded and
+    // the rest still start. The promote's health step names the app.
+    const failed = [];
+    const tryStart = async (c) => {
+      try { await deps.docker.getContainer(c.id).start(); return true; }
+      catch (e) {
+        if (e.statusCode === 304) return true;
+        failed.push({ name: c.name, error: e.message });
+        log('warn', 'standby-control: a container did not start', { container: c.name, err: e.message });
+        return false;
+      }
+    };
     // Jobs first, and to completion: an app's migrate job must finish
     // before the app itself starts, the order `compose up` gives them.
     const stopped = (await projectContainers()).filter((c) => c.kind === 'app' && !c.running);
     const jobs = [];
     for (const c of stopped) { if (await jobExit(c)) jobs.push(c); }
-    for (const c of jobs) await deps.docker.getContainer(c.id).start().catch((e) => { if (e.statusCode !== 304) throw e; });
+    for (const c of jobs) await tryStart(c);
     const deadline = Date.now() + (deps.jobWaitMs || 5 * 60 * 1000);
     while (jobs.length && Date.now() < deadline) {
       const names = new Set(jobs.map((c) => c.name));
@@ -179,11 +192,11 @@ function createStandbyControl(deps) {
     const apps = [];
     for (const c of stopped) {
       if (jobNames.has(c.name)) continue;
-      await deps.docker.getContainer(c.id).start().catch((e) => { if (e.statusCode !== 304) throw e; });
-      apps.push(c.name);
+      if (await tryStart(c)) apps.push(c.name);
     }
-    log('info', 'standby-control: apps started', { count: redis.length + apps.length, jobs: jobs.length });
-    res.json({ started: [...redis, ...jobs.map((c) => c.name), ...apps] });
+    const jobsStarted = jobs.filter((c) => !failed.some((f) => f.name === c.name)).map((c) => c.name);
+    log('info', 'standby-control: apps started', { count: redis.length + apps.length, jobs: jobsStarted.length, failed: failed.length });
+    res.json({ started: [...redis, ...jobsStarted, ...apps], failed });
   }));
 
   router.post('/tunnel/stop', guard(async (_req, res) => res.json({ stopped: await stopKinds(['tunnel'], 5) })));
