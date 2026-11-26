@@ -88,19 +88,21 @@ test('sso: the app hands over to Vibe Auth and Vibe Auth accepts the request: pa
   assert.match(r.calls, /^http:\/\/vibe-auth-authentik-server:9000\/application\/o\/authorize\/\?response_type=code&client_id=cid-x.*\|X-Forwarded-Host: auth\.firm\.test$/m);
 });
 
-test('sso: Vibe Auth refusing the request fails the app, with the fix', () => {
+test('sso: Vibe Auth refusing the request is reported with the fix, and does not fail the app', () => {
   const r = run(drill(), { idp: '400 ' });
-  assert.equal(r.app.ok, false);
+  assert.equal(r.app.ok, true, 'the app is up; Vibe Auth must not fail it');
   assert.equal(r.app.sso, 'failed');
   assert.match(r.app.detail, /Vibe Auth refused the app's sign-in request \(answered 400\).*Single sign-on, Fix/);
 });
 
-test('sso: an app that cannot reach Vibe Auth fails; one that sends staff elsewhere fails', () => {
+test('sso: an app that cannot reach Vibe Auth, or sends staff elsewhere, still passes and says so', () => {
   const down = run(drill(), { start: '503 ' });
-  assert.equal(down.app.ok, false);
+  assert.equal(down.app.ok, true, 'the app is up; Vibe Auth must not fail it');
+  assert.equal(down.app.sso, 'failed');
   assert.match(down.app.detail, /could not reach Vibe Auth/);
   const elsewhere = run(drill(), { start: '302 https://old-box.firm.test/application/o/authorize/?client_id=cid-x' });
-  assert.equal(elsewhere.app.ok, false);
+  assert.equal(elsewhere.app.ok, true);
+  assert.equal(elsewhere.app.sso, 'failed');
   assert.match(elsewhere.app.detail, /sends staff to old-box\.firm\.test, not to Vibe Auth at auth\.firm\.test/);
 });
 

@@ -253,7 +253,7 @@ function appsCard() {
     const r = a.ready[slug];
     if (!r) return h("span", { class: "muted" }, "not tested yet");
     if (r.ok === true) return [h("span", { class: "pass" }, "Ready"), M("tested ", when(r.at), r.secondsToReady != null ? `, came up in ${r.secondsToReady} s` : "",
-      r.sso === "ok" ? "; sign-in through Vibe Auth works" : r.sso === "not checked" ? "; sign-in through Vibe Auth not checked (see the drill result)" : "")];
+      r.sso === "ok" ? "; sign-in through Vibe Auth works" : r.sso === "not checked" ? "; sign-in through Vibe Auth not checked (see the drill result)" : r.sso === "failed" ? `; the app runs, but ${((r.detail || "").split("; ").find((x) => x.startsWith("single sign-on")) || "single sign-on did not work")}` : "")];
     if (r.ok === false) return [h("span", { class: "fail" }, "Did not start"), M(when(r.at), ": ", r.detail || "")];
     return [h("span", { class: "muted" }, "Not tested"), M(r.detail || "")];
   };
@@ -281,7 +281,7 @@ function drillCard() {
     kids.push(h("div", { class: "banner " + (last.ok ? "ok" : "bad") },
       h("p", { class: "big" }, (last.only ? `Last app test (${last.only.join(", ")}) ` : "Last drill ") + (last.ok ? "passed" + (last.skipped.length ? `, ${last.skipped.length} app${last.skipped.length === 1 ? "" : "s"} not drilled` : "") : "did not pass")),
       M(when(last.finishedAt), last.trigger === "schedule" ? " (monthly)" : "", last.dataAt ? ` · copy from ${when(last.dataAt)}` : ""),
-      last.apps.length ? h("ul", {}, last.apps.map((a) => h("li", {}, h("strong", {}, a.slug), a.ok ? ` passed${a.secondsToReady != null ? `, ready in ${a.secondsToReady} s` : ""}${a.sso === "ok" ? "; sign-in through Vibe Auth works" : a.sso === "not checked" ? `; ${(a.detail.split("; ").find((x) => x.startsWith("single sign-on")) || "single sign-on not checked")}` : ""}` : `: ${a.detail}`))) : null,
+      last.apps.length ? h("ul", {}, last.apps.map((a) => h("li", {}, h("strong", {}, a.slug), a.ok ? ` passed${a.secondsToReady != null ? `, ready in ${a.secondsToReady} s` : ""}${a.sso === "ok" ? "; sign-in through Vibe Auth works" : a.sso === "not checked" ? `; ${(a.detail.split("; ").find((x) => x.startsWith("single sign-on")) || "single sign-on not checked")}` : a.sso === "failed" ? `; the app runs, but ${(a.detail.split("; ").find((x) => x.startsWith("single sign-on")) || "single sign-on did not work")}` : ""}` : `: ${a.detail}`))) : null,
       last.skipped.length ? h("ul", {}, last.skipped.map((x) => h("li", {}, h("strong", {}, x.slug), `: ${x.reason}`))) : null,
       (last.restoreWarnings || []).length ? h("ul", {}, last.restoreWarnings.map((x) => h("li", {}, "Database: ", x))) : null,
       last.error ? P(last.error) : null, last.fix ? M(last.fix) : null,

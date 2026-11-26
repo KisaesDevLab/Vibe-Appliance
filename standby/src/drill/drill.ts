@@ -88,7 +88,7 @@ function recordReadiness(store: Store, r: DrillRecord): void {
   // A drill that did not get as far as the apps says nothing about them.
   if (!r.apps.length && !r.skipped.length) return;
   const ready = { ...appReadiness(store) };
-  for (const a of r.apps) ready[a.slug] = { at: r.finishedAt, ok: a.ok, detail: a.ok ? null : a.detail, secondsToReady: a.secondsToReady ?? null, sso: a.sso ?? null, dataAt: r.dataAt };
+  for (const a of r.apps) ready[a.slug] = { at: r.finishedAt, ok: a.ok, detail: a.ok && a.sso !== "failed" ? null : a.detail, secondsToReady: a.secondsToReady ?? null, sso: a.sso ?? null, dataAt: r.dataAt };
   for (const s of r.skipped) ready[s.slug] = { at: r.finishedAt, ok: null, detail: s.reason, secondsToReady: null, dataAt: r.dataAt };
   store.set("appReady", ready);
 }
@@ -132,7 +132,7 @@ export function composeDrillEmail(r: DrillRecord, boxName: string): { subject: s
   if (r.dataAt) lines.push("", `Copy drilled: the primary's data as of ${r.dataAt}.`);
   if (r.apps.length) {
     lines.push("", "Apps:");
-    for (const a of r.apps) lines.push(`- ${a.slug}: ${a.ok ? `passed${a.secondsToReady != null ? ` (ready in ${a.secondsToReady} s)` : ""}` : `FAILED: ${a.detail}`}`);
+    for (const a of r.apps) lines.push(`- ${a.slug}: ${a.ok ? `passed${a.secondsToReady != null ? ` (ready in ${a.secondsToReady} s)` : ""}${a.sso === "failed" ? `, but ${a.detail.split("; ").find((x) => x.startsWith("single sign-on")) ?? "single sign-on did not work"}` : ""}` : `FAILED: ${a.detail}`}`);
   }
   for (const s of r.skipped) lines.push(`- ${s.slug}: ${s.reason}`);
   for (const w of r.restoreWarnings) lines.push(`- database: ${w}`);

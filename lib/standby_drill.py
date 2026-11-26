@@ -529,9 +529,10 @@ def report(drill, out_path, snapshot, started, restored, restore_warnings, probe
         s = codes.get("signin:" + a["slug"]) if a.get("signIn") else None
         if a.get("signIn") and not (s and s[0] in "23" or s in ("401", "403") or (s == "404" and a.get("signInIsWizard"))):
             ok = False; notes.append("sign-in page answered %s" % (s or "nothing"))
+        # Single sign-on is reported, never a reason to fail the app: the app
+        # itself is up, and its own sign-in (or break-glass) still works. A
+        # Vibe Auth problem belongs to Vibe Auth's own line in this report.
         sso_failed, sso_note = sso_result(a.get("sso"), codes.get("sso:" + a["slug"]), codes.get("idp:" + a["slug"]))
-        if sso_failed:
-            ok = False
         detail = "; ".join(notes) if notes else "ready, health check and sign-in page answered"
         if sso_note:
             detail += "; " + sso_note
