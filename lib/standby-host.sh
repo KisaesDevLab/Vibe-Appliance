@@ -1142,6 +1142,24 @@ PYEOF
   local pgc pg_user restored=0 warns="" dump
   pgc="$("${dc[@]}" ps -q postgres)"
   pg_user="$(_env_get "$DRILL_DIR/env/shared.env" POSTGRES_USER)"; pg_user="${pg_user:-postgres}"
+  # A new Postgres first runs a temporary server for its own set-up, then
+  # stops it and starts the real one. The temporary one already answers the
+  # health check (it listens on the local socket), so `--wait` returns while
+  # that restart is still ahead: the restore then lost its connection part
+  # way through, and the first database in the list (alphabetically, often
+  # vibe_1099_db) came up half restored or empty, so its app failed the
+  # drill about every other run. Only the real server listens on TCP: wait
+  # for that, three times in a row, before restoring anything.
+  local pg_ok=0 pg_try
+  for pg_try in $(seq 1 180); do
+    if docker exec "$pgc" pg_isready -q -h 127.0.0.1 -U "$pg_user" >/dev/null 2>&1; then
+      pg_ok=$((pg_ok + 1)); (( pg_ok >= 3 )) && break
+    else
+      pg_ok=0
+    fi
+    sleep 1
+  done
+  (( pg_ok >= 3 )) || _drill_fail "the drill's throwaway database server did not finish starting" "sudo tail -30 $VIBE_LOG_FILE"
   if [[ -f "$stage/globals.sql" ]]; then
     grep -vE "^(CREATE|ALTER|DROP|COMMENT ON) ROLE \"?${pg_user}\"?[ ;]" "$stage/globals.sql" \
       | docker exec -i "$pgc" psql -X -q -U "$pg_user" -d postgres >/dev/null 2>>"$VIBE_LOG_FILE" || true
