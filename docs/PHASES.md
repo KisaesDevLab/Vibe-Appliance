@@ -1234,6 +1234,17 @@ Append to this list as phases complete. Format:
      public deny rules idempotently; `haproxy/503.http` static error
      page; wired through `phase_pull` (image) and `phase_caddy` (config
      + UFW); CREDENTIALS.txt extended with emergency-access section.
+     2026-11-25: setup now turns UFW on itself (it printed a five-step
+     copy-paste box before, which novices skipped). SSH is allowed first
+     (22, `sshd -T` ports, sshd listeners and live sessions' ports), then
+     80/443, then `ufw --force enable`; any failed SSH allow leaves it
+     off. Once only: if it is turned off later, re-runs leave it off.
+     `--no-firewall` opts out, `--firewall` or `ufw-rules.sh --enable`
+     forces it on. Also fixed: Cockpit :9090 is now allowed from private
+     ranges in every mode (Caddy reaches it from a Docker bridge, so
+     cockpit.<domain> was a 502 under UFW), and `allow in on tailscale0`
+     when Tailscale is on. Tests: `tests/security/ufw-enable.test.js`;
+     checked against real ufw in an Ubuntu 24.04 container.
   4. Workstream A: `infra/cockpit-install.sh` post-install reachability
      poll + tailnet hostname in `Origins`; symmetric `tailscale serve
      --bg --https=9090 https+insecure://localhost:9090` rule in both

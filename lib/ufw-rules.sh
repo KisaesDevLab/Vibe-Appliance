@@ -16,6 +16,10 @@
 # Reverse: `sudo ufw delete allow from <range> to any port <ports>`.
 #   The uninstall.sh script removes these as part of --full.
 #
+# Turning UFW on: bootstrap does it by default (VIBE_UFW_ENABLE=auto), and
+#   `sudo bash lib/ufw-rules.sh --enable` does it by hand. SSH is allowed
+#   first, then 80/443, then `ufw --force enable`. See _ufw_should_turn_on.
+#
 # UFW gracefully degrades:
 #   - ufw not installed                 → no-op (UFW is optional).
 #   - ufw installed but inactive         → log warning, skip rule application
@@ -39,6 +43,14 @@ _EMERGENCY_PORT_RANGE="5171:5198"
 _STANDBY_PEER_PORT="4480"
 
 apply_ufw_rules() {
+  # Asked for by hand (`--enable`) on a box without UFW: install it.
+  # Setup's own default never installs it; a box without it was set up
+  # that way on purpose.
+  if ! command -v ufw >/dev/null 2>&1 && [[ "${VIBE_UFW_ENABLE:-}" == "force" ]] && command -v apt-get >/dev/null 2>&1; then
+    log_step "installing ufw"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ufw >/dev/null 2>&1 \
+      || log_warn "could not install ufw" hint="sudo apt-get update && sudo apt-get install -y ufw"
+  fi
   if ! command -v ufw >/dev/null 2>&1; then
     state_set_host_service ufw "not-installed" "" 2>/dev/null || true
     log_info "ufw not installed; skipping firewall rules"
@@ -51,6 +63,14 @@ apply_ufw_rules() {
   # unenforced; warn the operator rather than silently no-op.
   local ufw_status
   ufw_status="$(ufw status 2>/dev/null | awk '/^Status:/ {print $2; exit}')"
+  # Setup turns UFW on by itself (bootstrap, or `ufw-rules.sh --enable`):
+  # a novice should not have to copy firewall commands. SSH is allowed
+  # before anything is switched on, so the session running this stays up.
+  if [[ "$ufw_status" != "active" ]] && _ufw_should_turn_on; then
+    if _ufw_turn_on; then
+      ufw_status="active"
+    fi
+  fi
   if [[ "$ufw_status" != "active" ]]; then
     state_set_host_service ufw "inactive" "ufw installed but not enabled" 2>/dev/null || true
     # Detect whether the operator is currently on SSH so we can be
@@ -80,29 +100,21 @@ HINT
 HINT
     fi
     cat >&2 <<HINT
-           # 1. Allow SSH (so you don't lose remote access):
-             sudo ufw allow OpenSSH
+           One command turns it on safely. It allows SSH first (every
+           port sshd listens on, and the one you are connected by),
+           then the web ports 80 and 443, then switches UFW on and
+           adds the appliance's rules:
 
-           # 2. Allow appliance public ports (HTTP-01 cert validation
-           #    needs :80 reachable from the internet for cert renewal):
-             sudo ufw allow 80,443/tcp
+             sudo bash ${APPLIANCE_DIR:-/opt/vibe/appliance}/lib/ufw-rules.sh --enable
 
-           # 3. Enable the firewall (with the allow rules above
-           #    already in place):
-             sudo ufw --force enable
-
-           # 4. Add the appliance's emergency-port + Cockpit rules
-           #    (gates ports ${_EMERGENCY_PORT_RANGE} to RFC1918 + Tailscale CGNAT):
-             sudo bash ${APPLIANCE_DIR:-/opt/vibe/appliance}/lib/ufw-rules.sh
-
-           # 5. Verify:
-             sudo ufw status numbered
+           Then check it:  sudo ufw status numbered
 
            If you don't want UFW (e.g. you're behind a cloud-provider
            firewall already), it's safe to leave it off — the
            appliance core works fine. Just understand that emergency
            ports 5171-5198 are then reachable by any source that can
-           route to this host.
+           route to this host. To stop setup turning it on, re-run
+           bootstrap once with --no-firewall.
 
 HINT
     return 0
@@ -166,11 +178,28 @@ except Exception:
   fi
   _ufw_deny_silent "$_STANDBY_PEER_PORT" "tcp" "standby peer public deny"
 
-  # ---- Workstream A — LAN-mode Cockpit --------------------------------
-  if [[ "$mode" == "lan" ]]; then
-    _ufw_allow_silent "10.0.0.0/8"     "9090" "tcp" "cockpit RFC1918 (LAN mode)"
-    _ufw_allow_silent "172.16.0.0/12"  "9090" "tcp" "cockpit RFC1918 (LAN mode)"
-    _ufw_allow_silent "192.168.0.0/16" "9090" "tcp" "cockpit RFC1918 (LAN mode)"
+  # ---- Workstream A — Cockpit -----------------------------------------
+  # LAN mode: staff open https://<host-ip>:9090 directly. Every mode:
+  # Caddy and the console reach Cockpit from their containers by
+  # host.docker.internal:9090, which arrives from a Docker bridge address
+  # (private ranges) and is subject to UFW like any other host port —
+  # without these, cockpit.<domain> answers 502 once UFW is on.
+  _ufw_allow_silent "10.0.0.0/8"     "9090" "tcp" "cockpit RFC1918"
+  _ufw_allow_silent "172.16.0.0/12"  "9090" "tcp" "cockpit RFC1918"
+  _ufw_allow_silent "192.168.0.0/16" "9090" "tcp" "cockpit RFC1918"
+
+  # ---- Tailscale ------------------------------------------------------
+  # `tailscale serve` (Tailscale mode, Cockpit over the tailnet) receives
+  # on tailscale0. Tailscale's own documented rule for UFW hosts; the
+  # tailnet is already allowed to every port above.
+  if [[ "$tailscale_enabled" == "true" ]]; then
+    local ts_out
+    ts_out="$(ufw allow in on tailscale0 comment 'Tailscale (vibe)' 2>&1)" || true
+    if [[ "$ts_out" == *"existing rule"* ]]; then
+      log_info "ufw rule already present" iface="tailscale0"
+    else
+      log_info "ufw rule added" iface="tailscale0"
+    fi
   fi
 
   # ---- DOCKER-USER — make the rules above actually apply to containers -
@@ -268,6 +297,80 @@ EOF
   fi
 }
 
+# ---- Turning UFW on -------------------------------------------------------
+#
+# VIBE_UFW_ENABLE (set by the caller):
+#   force — `ufw-rules.sh --enable`, or bootstrap --firewall: turn it on.
+#   auto  — bootstrap's default: turn it on, unless the operator opted out
+#           (--no-firewall: state.config.firewall=off), or setup turned it
+#           on before and someone has since turned it off (then that was a
+#           choice; it is left off and the hint says how to undo it).
+#   unset — never turn it on (only the hint).
+# Reverse: sudo ufw disable (and bootstrap --no-firewall to keep it off).
+_ufw_should_turn_on() {
+  case "${VIBE_UFW_ENABLE:-}" in
+    force) return 0 ;;
+    auto)
+      if [[ "$(state_get_config_kv firewall 2>/dev/null)" == "off" ]]; then
+        log_info "not turning ufw on: --no-firewall was chosen" hint="bootstrap --firewall turns it on"
+        return 1
+      fi
+      if [[ -n "$(state_get_config_kv firewall_enabled_at 2>/dev/null)" ]]; then
+        log_warn "ufw was turned on by setup and has since been turned off; leaving it off" \
+          hint="sudo bash ${APPLIANCE_DIR:-/opt/vibe/appliance}/lib/ufw-rules.sh --enable"
+        return 1
+      fi
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Every TCP port SSH could be reaching this box on, one per line: 22, the
+# ports sshd is configured for (`sshd -T`, which Ubuntu 24.04's ssh.socket
+# also follows) and listening on, and the local port of every live SSH
+# session — including the one running this, which sudo hides from
+# $SSH_CONNECTION. Over-allowing a port nothing listens on is harmless;
+# missing one locks the operator out.
+_ufw_ssh_ports() {
+  {
+    echo 22
+    [[ -n "${SSH_CONNECTION:-}" ]] && awk '{print $4}' <<<"$SSH_CONNECTION"
+    if command -v sshd >/dev/null 2>&1; then sshd -T 2>/dev/null | awk '$1 == "port" {print $2}'; fi
+    if command -v ss >/dev/null 2>&1; then
+      ss -Htlnp 2>/dev/null | awk '/"sshd/ {n = split($4, a, ":"); print a[n]}'
+      ss -Htnp state established 2>/dev/null | awk '/"sshd/ {n = split($3, a, ":"); print a[n]}'
+    fi
+  } | grep -E '^[0-9]{1,5}$' | sort -un
+}
+
+# Allow SSH and the web ports, then switch UFW on. Refuses to switch it on
+# if any SSH rule could not be added. Returns 0 when UFW is now active.
+_ufw_turn_on() {
+  local p ports
+  ports="$(_ufw_ssh_ports)"
+  log_step "turning ufw on" ssh_ports="$(tr '\n' ' ' <<<"$ports" | sed 's/ $//')"
+  for p in $ports; do
+    if ! ufw allow "${p}/tcp" comment 'SSH (vibe setup)' >/dev/null 2>&1; then
+      log_warn "could not allow SSH on port ${p}; leaving ufw off so this session is not cut off" \
+        hint="sudo ufw allow ${p}/tcp && sudo bash ${APPLIANCE_DIR:-/opt/vibe/appliance}/lib/ufw-rules.sh --enable"
+      return 1
+    fi
+  done
+  # Caddy's ports. Docker-published, so UFW does not filter them anyway;
+  # allowed so `ufw status` tells the truth about what is open.
+  ufw allow 80,443/tcp comment 'web (vibe setup)' >/dev/null 2>&1 || true
+  if ! ufw --force enable >/dev/null 2>&1; then
+    log_warn "ufw enable failed" hint="sudo ufw --force enable; then sudo bash ${APPLIANCE_DIR:-/opt/vibe/appliance}/lib/ufw-rules.sh"
+    return 1
+  fi
+  if [[ "$(ufw status 2>/dev/null | awk '/^Status:/ {print $2; exit}')" != "active" ]]; then
+    log_warn "ufw did not report active after enable" hint="sudo ufw status verbose"
+    return 1
+  fi
+  state_set_config_kv firewall_enabled_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>/dev/null || true
+  log_ok "ufw is on" ssh_ports="$(tr '\n' ' ' <<<"$ports" | sed 's/ $//')" reverse="sudo ufw disable"
+}
+
 # Internal: ufw allow with deduped logging. Returns 0 even if rule
 # already exists (ufw considers that a no-op).
 _ufw_allow_silent() {
@@ -318,6 +421,11 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   . "${APPLIANCE_DIR}/lib/log.sh"
   # shellcheck source=/dev/null
   . "${APPLIANCE_DIR}/lib/state.sh"
+  case "${1:-}" in
+    --enable) VIBE_UFW_ENABLE="force" ;;
+    "") ;;
+    *) echo "usage: sudo bash $0 [--enable]   (--enable: allow SSH, then turn UFW on, then apply the rules)" >&2; exit 2 ;;
+  esac
   log_init
   log_set_phase "ufw"
   apply_ufw_rules

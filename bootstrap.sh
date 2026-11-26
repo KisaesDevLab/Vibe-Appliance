@@ -97,6 +97,10 @@ CONFIG_FORCE="false"
 # off via --no-cockpit on hosts that already have their own admin
 # tooling or that don't need a host-OS UI.
 CONFIG_COCKPIT="true"
+# UFW. Tri-state: "" = default (turn it on once, see lib/ufw-rules.sh
+# _ufw_should_turn_on), "off" = --no-firewall (remembered in
+# state.config.firewall), "on" = --firewall (turn it on now regardless).
+CONFIG_FIREWALL=""
 # Cloudflare DNS-01 token — OPT-IN, used only with the custom Caddy
 # build (caddy/Dockerfile.cloudflare). Default install uses HTTP-01 and
 # ignores this. Read from --cloudflare-api-token flag or the
@@ -177,6 +181,16 @@ FLAGS
   --no-cockpit                    Skip the host Cockpit install (default is to
                                   install). Useful on hosts that already have
                                   their own admin tooling.
+  --no-firewall                   Do not turn the UFW firewall on. By default
+                                  setup turns it on once: SSH allowed first
+                                  (every port sshd uses, and yours), then 80
+                                  and 443, then the appliance's rules. Use this
+                                  behind a cloud firewall you manage yourself.
+                                  Remembered; it never turns UFW off (that is
+                                  `sudo ufw disable`).
+  --firewall                      Turn UFW on now, even if it was turned off
+                                  after an earlier setup or --no-firewall was
+                                  chosen (installs ufw if missing).
   --with-claude-code              [Phase 8.5] Install Claude Code on the host
                                   for operator-driven troubleshooting (opt-in;
                                   reachable only via SSH or Cockpit Terminal).
@@ -230,6 +244,8 @@ parse_flags() {
       --reset-env)       CONFIG_RESET_ENV="true"; shift ;;
       --force)           CONFIG_FORCE="true"; shift ;;
       --no-cockpit)      CONFIG_COCKPIT="false"; shift ;;
+      --no-firewall)     CONFIG_FIREWALL="off"; shift ;;
+      --firewall)        CONFIG_FIREWALL="on"; shift ;;
       --with-claude-code) CONFIG_CLAUDE_CODE="true"; shift ;;
       --lan-only-cookies) CONFIG_LAN_ONLY_COOKIES="true"; shift ;;
       --secure-cookies)   CONFIG_LAN_ONLY_COOKIES="false"; shift ;;
@@ -836,9 +852,16 @@ phase_caddy() {
     log_warn "haproxy.cfg render failed; emergency proxy will not be configured. See $VIBE_LOG_FILE."
   fi
 
-  # UFW rules for emergency-access ports + LAN-mode :9090.
-  # Gracefully no-ops when ufw is missing or inactive.
-  apply_ufw_rules || log_warn "ufw rule application returned non-zero; check $VIBE_LOG_FILE"
+  # UFW: turned on once by default (SSH allowed first), then the rules for
+  # emergency-access ports, the standby peer port and Cockpit :9090.
+  # --no-firewall opts out; --firewall forces it on. Never fatal.
+  case "$CONFIG_FIREWALL" in
+    off) state_set_config_kv firewall "off" || true ;;
+    on)  state_set_config_kv firewall "" || true ;;
+  esac
+  local ufw_enable="auto"
+  [[ "$CONFIG_FIREWALL" == "on" ]] && ufw_enable="force"
+  VIBE_UFW_ENABLE="$ufw_enable" apply_ufw_rules || log_warn "ufw rule application returned non-zero; check $VIBE_LOG_FILE"
 
   # Host bind address for Caddy's :80 / :443. Domain + LAN modes bind
   # all interfaces (0.0.0.0) — domain needs :80 reachable from the

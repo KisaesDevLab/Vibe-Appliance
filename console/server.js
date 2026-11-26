@@ -4971,23 +4971,14 @@ const HOST_SERVICE_FIXES = {
   ufw: {
     'inactive': {
       summary: 'ufw is installed but inactive — emergency ports 5171:5198 are unprotected',
-      // Order is critical: SSH allow MUST land before `ufw enable` so the
-      // operator doesn't lock themselves out. Step 4 re-applies our app
-      // rules so the dormant emergency-port allows go live.
-      command:
-        'sudo ufw allow OpenSSH && \\\n' +
-        '  sudo ufw allow 80,443/tcp && \\\n' +
-        '  sudo ufw --force enable && \\\n' +
-        '  sudo bash /opt/vibe/appliance/lib/ufw-rules.sh',
+      // --enable allows SSH (every port sshd uses, and the session's own)
+      // before `ufw enable`, so the operator can't lock themselves out,
+      // then applies the appliance's rules.
+      command: 'sudo bash /opt/vibe/appliance/lib/ufw-rules.sh --enable',
     },
     'not-installed': {
       summary: 'ufw is not installed — emergency ports 5171:5198 are unprotected',
-      command:
-        'sudo apt-get install -y ufw && \\\n' +
-        '  sudo ufw allow OpenSSH && \\\n' +
-        '  sudo ufw allow 80,443/tcp && \\\n' +
-        '  sudo ufw --force enable && \\\n' +
-        '  sudo bash /opt/vibe/appliance/lib/ufw-rules.sh',
+      command: 'sudo bash /opt/vibe/appliance/lib/ufw-rules.sh --enable',
     },
   },
   // SSH fallback for operators who prefer the terminal; the row's

@@ -1217,7 +1217,7 @@ check_ufw_rules() {
   # Host path — direct ufw probes work.
   if ! command -v ufw >/dev/null 2>&1; then
     _check_warn "ufw not installed; emergency ports are not firewalled" \
-      "Fix: sudo apt-get install -y ufw && sudo ufw enable && sudo bash /opt/vibe/appliance/lib/ufw-rules.sh"
+      "Fix: sudo bash /opt/vibe/appliance/lib/ufw-rules.sh --enable   (installs ufw, allows SSH first, then turns it on)"
     return
   fi
   # Anchored match: "Status: active" only — `grep -q active` would
@@ -1227,7 +1227,7 @@ check_ufw_rules() {
   ufw_status="$(ufw status 2>/dev/null | awk '/^Status:/ {print $2; exit}')"
   if [[ "$ufw_status" != "active" ]]; then
     _check_warn "ufw is installed but inactive (status: ${ufw_status:-unknown})" \
-      "Fix: sudo ufw enable && sudo bash /opt/vibe/appliance/lib/ufw-rules.sh"
+      "Fix: sudo bash /opt/vibe/appliance/lib/ufw-rules.sh --enable   (allows SSH first, then turns it on)"
     return
   fi
   if ufw status 2>/dev/null | grep -q '5171:5198'; then
