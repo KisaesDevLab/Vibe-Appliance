@@ -16,6 +16,8 @@ export interface Paths {
   /** Pre-rejoin archives. */
   archive: string;
   cache: string;
+  /** The hands-on drill tunnel record the host keeps until Cloudflare has removed the tunnel and its names. */
+  drillTunnel?: string;
 }
 
 export function pathsFor(c: Pick<Config, "applianceDir" | "dataDir">): Paths {
@@ -27,6 +29,7 @@ export function pathsFor(c: Pick<Config, "applianceDir" | "dataDir">): Paths {
     hostedRepo: join(c.dataDir, "repo"),
     archive: join(c.dataDir, "local", "archive"),
     cache: join(c.dataDir, "cache"),
+    drillTunnel: join(c.dataDir, "drill-tunnel.json"),
   };
 }
 

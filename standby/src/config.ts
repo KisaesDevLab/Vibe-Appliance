@@ -28,7 +28,7 @@ const schema = z.object({
   syncFallbackAt: hhmm.default("04:00"),
   /** Hours without a verified sync before the standby is marked stale. */
   staleAfterHours: z.coerce.number().positive().default(36),
-  /** Drill schedule: "first-sunday" (monthly) or "off". Run-now is always available. */
+  /** Default drill schedule: "first-sunday" (monthly) or "off". The panel can change it per box (every N days too). Run-now is always available. */
   drillSchedule: z.enum(["first-sunday", "off"]).default("first-sunday"),
   /** Days the pre-rejoin archive is kept on a box that rejoined as standby. */
   archiveDays: z.coerce.number().int().min(0).default(14),

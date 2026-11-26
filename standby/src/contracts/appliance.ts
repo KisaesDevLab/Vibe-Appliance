@@ -100,11 +100,11 @@ export interface DrillRequest {
   /** Where the copy's database dumps are, as captured (same absolute path on both boxes). */
   stagePath: string;
   /**
-   * Hands-on drill: after the checks, leave the drill running for this long
-   * and put the primary's web addresses in front of the allowed computers
-   * only (the standby's own web server, in memory; drill-clean undoes it).
+   * Hands-on drill: after the checks, leave the drill running for this long,
+   * open at drill names (hod-<name>) through a Cloudflare tunnel of its own;
+   * drill-clean removes the tunnel and the names.
    */
-  handsOn?: { minutes: number; allow: string[]; address: string };
+  handsOn?: { minutes: number };
   /**
    * Test only these apps (plus the enabled apps they need, such as the sign-in
    * app), with only their databases restored. Absent: every enabled app.
@@ -114,12 +114,19 @@ export interface DrillRequest {
 
 export interface HandsOnOpen {
   until: string;
-  /** The primary's web addresses the drill answers. */
+  /** The drill names it answers (hod-<name>), on the internet until it ends. */
   hosts: string[];
-  /** Addresses (CIDR) allowed in. */
-  allow: string[];
-  /** This box's address, for the admin's hosts file. */
-  address: string;
+  /** Open to anyone with the link (only the apps' own sign-in protects it). */
+  public?: boolean;
+  /** The primary's names that got no drill name, each with the reason. */
+  skipped?: { host: string; reason: string }[];
+  /** Live names still in the drill's settings after renaming. */
+  leftovers?: string[];
+  /** A problem moving sign-in through Vibe Auth to the drill names, or null. */
+  signIn?: string | null;
+  /** Older hands-on drills (hosts file): who was let in, and this box's address. */
+  allow?: string[];
+  address?: string;
 }
 
 export interface DrillAppResult {

@@ -274,13 +274,13 @@ function drillCard() {
   const d = S.drill || { history: [] }, last = d.history[0];
   const kids = [h("h2", {}, "Practice drill"),
     P("Checks that this box could really take over: it starts the firm's apps from its copy, cut off from the internet and from your staff, checks that each one comes up and shows its sign-in page, then removes everything. Your copy, the primary and your staff are not affected."),
-    M(S.settings && S.settings.drillSchedule === "first-sunday" ? "Runs by itself on the first Sunday of each month, after that night's sync." : "Not scheduled; run it here when you want.")];
+    drillScheduleLine()];
   if (d.running) {
     kids.push(h("p", { class: "big" }, d.running.only ? `Testing ${d.running.only.join(", ")}…` : "Drill running…"), M("Started ", when(d.running.startedAt), ". This usually takes 5 to 15 minutes. If the primary fails meanwhile, Promote still works: it stops the drill first."));
   } else if (last) {
     kids.push(h("div", { class: "banner " + (last.ok ? "ok" : "bad") },
       h("p", { class: "big" }, (last.only ? `Last app test (${last.only.join(", ")}) ` : "Last drill ") + (last.ok ? "passed" + (last.skipped.length ? `, ${last.skipped.length} app${last.skipped.length === 1 ? "" : "s"} not drilled` : "") : "did not pass")),
-      M(when(last.finishedAt), last.trigger === "schedule" ? " (monthly)" : "", last.dataAt ? ` · copy from ${when(last.dataAt)}` : ""),
+      M(when(last.finishedAt), last.trigger === "schedule" ? " (scheduled)" : "", last.dataAt ? ` · copy from ${when(last.dataAt)}` : ""),
       last.apps.length ? h("ul", {}, last.apps.map((a) => h("li", {}, h("strong", {}, a.slug), a.ok ? ` passed${a.secondsToReady != null ? `, ready in ${a.secondsToReady} s` : ""}${a.sso === "ok" ? "; sign-in through Vibe Auth works" : a.sso === "not checked" ? `; ${(a.detail.split("; ").find((x) => x.startsWith("single sign-on")) || "single sign-on not checked")}` : a.sso === "failed" ? `; the app runs, but ${(a.detail.split("; ").find((x) => x.startsWith("single sign-on")) || "single sign-on did not work")}` : ""}` : `: ${a.detail}`))) : null,
       last.skipped.length ? h("ul", {}, last.skipped.map((x) => h("li", {}, h("strong", {}, x.slug), `: ${x.reason}`))) : null,
       (last.restoreWarnings || []).length ? h("ul", {}, last.restoreWarnings.map((x) => h("li", {}, "Database: ", x))) : null,
@@ -289,11 +289,11 @@ function drillCard() {
       last.copyUnchanged !== false ? null : P("This box's copy no longer matches what was verified. Choose Sync now before relying on it.")));
   }
   if (d.handsOn) kids.push(handsOnOpen(d.handsOn));
-  else if (last && last.handsOn && last.handsOn.endedAt) kids.push(M("Hands-on drill ended ", when(last.handsOn.endedAt), ": ", last.handsOn.endReason || "", " Remove the drill's lines from your computer's hosts file and its certificate, if you have not yet."));
+  else if (last && last.handsOn && last.handsOn.endedAt) kids.push(M("Hands-on drill ended ", when(last.handsOn.endedAt), ": ", last.handsOn.endReason || "", last.handsOn.address ? " Remove the drill's lines from your computer's hosts file and its certificate, if you have not yet." : last.handsOn.tunnelLeft ? " Its tunnel or practice names may still be in Cloudflare: the next drill removes them, or delete the vibe-practice-drill tunnel and its hod- DNS records in the Cloudflare dashboard." : " Its tunnel and practice names were removed."));
   kids.push(errLine(), h("div", { class: "row" },
     btn(d.running ? "Drill running…" : "Run a practice drill", () => act(() => api("POST", "api/drill/run")), "", !!d.running || !!S.busy || !!d.blocked || !S.dataAt),
     d.history.length ? h("a", { href: "api/drills.csv", download: "vibe-standby-drills.csv", style: "align-self:center" }, "Download drill history") : null),
-    M("A drill does not test DNS, the Cloudflare tunnel or this box's own web address; those change only at a real promote."),
+    M("A drill does not test DNS, the Cloudflare tunnel or this box's own web address. A hands-on drill goes through Cloudflare at practice names; only a real promote moves the real names."),
     d.handsOn ? null : handsOnStart(d),
     drillGuide());
   return card(...kids);
@@ -307,12 +307,46 @@ function readyLine(r) {
 }
 
 // Hands-on drill: the same drill, left running for the admin's own computer.
+// When the drill runs by itself: first Sunday of the month, every N days, or never.
+function drillScheduleLine() {
+  const ds = (S.settings && S.settings.drillSchedule) || { kind: "off" };
+  const day = (ymd) => { const [y, m, d] = ymd.split("-").map(Number); return new Date(y, m - 1, d).toLocaleDateString([], { weekday: "long", month: "short", day: "numeric" }); };
+  // The firm's own date, from the service (the browser may be elsewhere).
+  const today = ds.today;
+  if (view.schedEdit) {
+    const kind = val("ds-kind") || ds.kind;
+    return h("div", { class: "handson" },
+      h("h3", {}, "When should the drill run by itself?"),
+      h("div", { class: "row" },
+        h("select", { id: "ds-kind", onchange: () => render() },
+          h("option", { value: "first-sunday", selected: ds.kind === "first-sunday" }, "On the first Sunday of each month"),
+          h("option", { value: "every", selected: ds.kind === "every" }, "Every few days"),
+          h("option", { value: "off", selected: ds.kind === "off" }, "Never (only when I start one here)")),
+        kind === "every" ? [h("label", { for: "ds-days", style: "align-self:center" }, "every"),
+          h("input", { id: "ds-days", type: "number", min: "1", max: "90", step: "1", value: String(ds.days || 7), style: "width:5em" }),
+          h("span", { style: "align-self:center" }, "days")] : null),
+      M("It runs after that night's sync has succeeded. Every few days counts from the last full drill, including one you start here. A drill takes 5 to 15 minutes and does not affect the primary or your staff."),
+      h("div", { class: "row" },
+        btn("Save", () => act(async () => {
+          const k = val("ds-kind");
+          await api("POST", "api/settings/drill-schedule", k === "every" ? { kind: k, days: Number(val("ds-days")) } : { kind: k });
+          view.schedEdit = false;
+        }), "primary"),
+        btn("Cancel", () => { view.schedEdit = false; formErr = ""; render(); })));
+  }
+  const text = ds.kind === "first-sunday" ? "Runs by itself on the first Sunday of each month, after that night's sync."
+    : ds.kind === "every" ? `Runs by itself every ${ds.days === 1 ? "day" : ds.days + " days"}, after that night's sync.`
+    : "Not scheduled; run it here when you want.";
+  return M(text, ds.next ? ` Next: ${ds.next === today ? "today" : day(ds.next)}.` : "", " ",
+    h("a", { href: "#", onclick: (e) => { e.preventDefault(); view.schedEdit = true; formErr = ""; render(); } }, "Change"));
+}
+
 function handsOnStart(d) {
   const off = !!d.running || !!S.busy || !!d.blocked || !S.dataAt;
   return h("div", { class: "handson" },
     h("h3", {}, "Use the apps yourself"),
-    P("A hands-on drill runs the same checks, then leaves the apps running so you can sign in and look: clients, recent entries, reports, attachments. It is open to this computer only, while your staff keep working on the primary. Anything you enter is thrown away when it ends."),
-    M("You will add a few lines to this computer's hosts file and trust a temporary certificate; the panel shows how. Open this panel by the box's IP address while the drill is open. No nightly sync runs while it is open."),
+    P("A hands-on drill runs the same checks, then leaves the apps running so you can sign in and look: clients, recent entries, reports, attachments. It opens at practice names, with hod- in front (for example hod-tb.yourfirm.com instead of tb.yourfirm.com), through a Cloudflare tunnel made just for the drill. Your staff keep working on the primary. Anything you enter is thrown away when it ends."),
+    M("It goes through Cloudflare exactly as the real apps do, so it also proves the tunnel and the names would work. It needs the firm's Cloudflare tunnel. While it is open, anyone with a link can reach the practice names; only the apps' own sign-in protects them. No nightly sync runs while it is open."),
     h("div", { class: "row" },
       h("label", { for: "ho-min", style: "align-self:center" }, "Keep it open for"),
       h("select", { id: "ho-min" }, h("option", { value: "60" }, "1 hour"), h("option", { value: "120", selected: true }, "2 hours"), h("option", { value: "240" }, "4 hours")),
@@ -320,19 +354,19 @@ function handsOnStart(d) {
 }
 
 function handsOnOpen(ho) {
-  const lines = ho.hosts.map((x) => `${ho.address}  ${x}`).join("\n");
   const step = (title, ...body) => h("li", {}, h("strong", {}, title), ...body);
   return h("div", { class: "banner warn handson" },
     h("p", { class: "big" }, "Hands-on drill open until ", new Date(ho.until).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })),
-    M("Open to this computer only (", ho.allow.map((a) => a.replace(/\/(32|128)$/, "")).join(", "), "). Anything entered in it is thrown away."),
+    ho.allow && ho.allow.length
+      ? M("Open to this computer only (", ho.allow.map((a) => a.replace(/\/(32|128)$/, "")).join(", "), "), from an older version of this panel. End it and start it again to use the practice names.")
+      : M("Open on the internet at the practice names below until you end it: anyone with a link can reach them, and only the apps' own sign-in protects them. Anything entered in it is thrown away."),
     h("ol", {},
-      step("Trust the drill's certificate. ", h("a", { href: "api/drill/ca.crt", download: "vibe-practice-drill.crt" }, "Download it"),
-        M("Windows: double-click it, Install Certificate, Current User, \"Place all certificates in the following store\", Trusted Root Certification Authorities. Mac: double-click it, then in Keychain Access open \"Vibe practice drill\" and set Trust to Always Trust. Restart the browser.")),
-      step("Point this computer at the drill. ", M("Add these lines to the hosts file (Windows: open Notepad as administrator, then C:\\Windows\\System32\\drivers\\etc\\hosts. Mac: sudo nano /etc/hosts):"),
-        h("pre", { class: "code" }, lines)),
-      step("Open the apps. ", M("Each one first shows a red PRACTICE COPY page; then sign in as usual."),
+      step("Open the apps. ", M("Each one first shows a red PRACTICE COPY page; then sign in as usual. The addresses start with hod-, so you cannot mistake them for the live apps."),
         h("ul", {}, ho.hosts.map((x) => h("li", {}, h("a", { href: `https://${x}/`, target: "_blank", rel: "noopener" }, x))))),
-      step("When you are done: ", M("press End, then delete the lines from the hosts file and remove the \"Vibe practice drill\" certificate (Windows: certmgr.msc, Trusted Root Certification Authorities; Mac: Keychain Access). Until you remove the lines, this computer cannot reach the live apps."))),
+      step("When you are done: ", M("press End. The apps, the tunnel and the practice names are removed; nothing to undo on your computer."))),
+    ho.signIn ? P(h("strong", {}, "Sign-in: "), ho.signIn) : null,
+    (ho.skipped || []).length ? M("Not in the drill: ", ho.skipped.map((x) => `${x.host} (${x.reason})`).join("; "), ".") : null,
+    (ho.leftovers || []).length ? M("These live names are still mentioned in the drill's settings, so a link or a redirect may lead to the live app; check the address bar starts with hod-: ", ho.leftovers.join(", "), ".") : null,
     h("div", { class: "row" }, btn("End the hands-on drill", () => act(() => api("POST", "api/drill/hands-on/end")), "", !!S.busy && S.busy !== "drill")));
 }
 
@@ -342,7 +376,7 @@ function drillGuide() {
   const sec = (title, ...body) => [h("h3", {}, title), ...body];
   const li = (...items) => h("ul", {}, items.map((x) => h("li", {}, x)));
   const code = (t) => h("code", {}, t);
-  return h("details", { class: "guide" }, h("summary", {}, "How the practice drill works"),
+  return h("details", { class: "guide", id: "drill-guide" }, h("summary", {}, "How the practice drill works"),
     ...sec("What it does",
       li("Starts every app the primary runs, from this box's last verified copy, in a separate, throwaway setup.",
         "Databases go into a throwaway database server; files are a copy-on-write view of the copy. Nothing is ever written to the copy itself.",
@@ -367,16 +401,17 @@ function drillGuide() {
         h("span", {}, h("strong", {}, "NOT isolated"), ": the drill could reach the outside. This must never happen: run no further drills and contact support with the drill history."))),
     ...sec("Before you rely on a pass",
       li("A pass means the apps start on the copy and answer. It does not mean someone checked the data by hand.",
-        "It does not test DNS, the Cloudflare tunnel or this box's web address; only a real promote does. A planned switchover after hours tests everything.",
+        "It does not test DNS, the Cloudflare tunnel or this box's web address; a hands-on drill tests the Cloudflare path at practice names, and only a real promote moves the real names. A planned switchover after hours tests everything.",
         "A drill needs memory for every app plus a second database server. On a small box it may refuse with \"not enough free memory\".",
         "A promote never waits for a drill: it stops it within seconds and takes over.")),
     ...sec("Hands-on drill",
       li("Runs the same checks, then leaves the apps running for 1, 2 or 4 hours so you can sign in and look at the data yourself.",
-        "Only the computer that pressed Start can reach it; any other computer is refused. Your staff keep using the primary.",
-        "This box's own web server answers the primary's app addresses for your computer only, in memory. A restart of the web server, End, the time limit or a promote takes it away again.",
-        "Its certificate comes from a throwaway authority made for this drill and deleted when it ends; remove it from your computer afterwards too.",
-        "Anything entered is thrown away. Nothing in it can send email, file returns or reach the internet, so things that need the internet (bank feeds, e-filing, single sign-on through an outside provider) will not work in it.",
-        "Needs the primary to use its own web addresses (domain mode). No sync runs while it is open, so end it before the nightly copy is due.")),
+        "It opens at practice names: each name the primary publishes through its Cloudflare tunnel, with hod- in front (tb.yourfirm.com becomes hod-tb.yourfirm.com). The admin tools (Cockpit, Portainer, Backup) and the bare domain are never published.",
+        "The standby makes a Cloudflare tunnel just for the drill, with the firm's tunnel key from the copy, and adds the practice names to the firm's DNS. The firm's own tunnel and names are never touched. End, the time limit, a restart of the standby or a promote removes the tunnel and the names again.",
+        "The drill's copy is told its practice names, and the copy of Vibe Auth is pointed at them, so sign-in works there as it would after a real promote. The live Vibe Auth is never touched.",
+        "While it is open, anyone with a link can reach the practice names; only the apps' own sign-in protects them. End it when you are done.",
+        "Anything entered is thrown away. The apps still cannot send email, file returns or reach the internet (only the drill's tunnel connector goes out), so bank feeds and e-filing will not work in it.",
+        "Needs the primary to use its own web addresses (domain mode) and a Cloudflare tunnel. No sync runs while it is open, so end it before the nightly copy is due.")),
     ...sec("Records",
       li("Download drill history gives a spreadsheet of every drill (date, result, apps, isolation, problems) for the firm's WISP.",
         "The last 100 drills are kept.")));
@@ -480,7 +515,9 @@ function footer() {
 function render() {
   if (!S) return;
   const focus = document.activeElement && document.activeElement.id, keep = {};
-  document.querySelectorAll("input, textarea").forEach((i) => { if (i.id) keep[i.id] = i.type === "checkbox" ? i.checked : i.value; });
+  document.querySelectorAll("input, textarea, select").forEach((i) => { if (i.id) keep[i.id] = i.type === "checkbox" ? i.checked : i.value; });
+  // The panel redraws every few seconds: keep open sections (the drill guide) open.
+  const opened = [...document.querySelectorAll("details[id]")].filter((d) => d.open).map((d) => d.id);
   let body;
   // A finished promote changes this box's role and ends its pairing, so its
   // closing screen is shown first, whatever the role is by now.
@@ -490,6 +527,7 @@ function render() {
   else body = [view.name === "home" || view.name === "home-email" ? banner() : null, view.name === "home" ? afterPromoteCard() : null, S.role === "primary" ? primary() : standby()];
   $app.replaceChildren(...[body, footer()].flat(3).filter(Boolean));
   for (const [id, v] of Object.entries(keep)) { const el = document.getElementById(id); if (el) { if (el.type === "checkbox") el.checked = v; else el.value = v; } }
+  for (const id of opened) { const el = document.getElementById(id); if (el) el.open = true; }
   if (focus && document.getElementById(focus)) document.getElementById(focus).focus();
 }
 

@@ -13,7 +13,7 @@ import type { Config } from "./config.ts";
 import type { ApplianceControl } from "./contracts/appliance.ts";
 import type { Repository } from "./contracts/repository.ts";
 import type { Identity } from "./crypto/identity.ts";
-import { drillBlocked, endHandsOn, finishInterruptedDrill, forgetHandsOn, handsOnState, runDrill, type DrillRecord } from "./drill/drill.ts";
+import { drillBlocked, drillSchedule, endHandsOn, finishInterruptedDrill, forgetHandsOn, handsOnState, lastFullDrillAt, runDrill, type DrillRecord } from "./drill/drill.ts";
 import { highest, isLease, type Lease } from "./link/lease.ts";
 import { BucketLink, DirectLink, knownLease, rememberLease, type Link, type StatusReport } from "./link/link.ts";
 import { S3Client } from "./link/s3.ts";
@@ -28,7 +28,7 @@ import { cancelSwitchover, expireArchives, listArchives, prepareRejoin, startSwi
 import { activePromote, cancelPromote, promoteChecks, runPromote, type PromoteDeps, type PromoteResult } from "./promote/promote.ts";
 import { ResticRepository } from "./repo/restic.ts";
 import { checkRole, readBootId, requireRecorded, startAnyway, type GuardDeps } from "./role/guard.ts";
-import { dueDaily, isFirstSunday } from "./schedule.ts";
+import { drillDayToday, dueDaily } from "./schedule.ts";
 import { computeStatus, type LastCapture, type Status } from "./status.ts";
 import { activeOperation, recover, runSync, type SyncDeps, type SyncOutcome, type VerifiedCopy } from "./sync/sync.ts";
 import { killRunning } from "./util/run.ts";
@@ -425,7 +425,7 @@ export class Runtime {
   }
 
   /** Run a practice drill now. Rejects at once if one may not start. */
-  async drillNow(actor: string, trigger: "admin" | "schedule", handsOn?: { minutes: number; allow: string[]; address: string }, apps?: string[]): Promise<DrillRecord> {
+  async drillNow(actor: string, trigger: "admin" | "schedule", handsOn?: { minutes: number }, apps?: string[]): Promise<DrillRecord> {
     const blocked = drillBlocked(this.store);
     if (blocked) throw new Error(blocked);
     return this.#exclusive("drill", async () => {
@@ -452,11 +452,17 @@ export class Runtime {
     });
   }
 
-  /** The scheduled drill: first Sunday of the month, after that night's sync succeeded. */
+  /**
+   * The scheduled drill, on a drill day (first Sunday of the month, or every
+   * N days since the last full drill: see the panel), once that night's sync
+   * succeeded.
+   */
   async #drillDue(now: Date): Promise<boolean> {
-    if (this.config.drillSchedule !== "first-sunday" || drillBlocked(this.store)) return false;
+    const schedule = drillSchedule(this.store, this.config.drillSchedule);
+    if (schedule.kind === "off" || drillBlocked(this.store)) return false;
     const tz = await this.timezone();
-    if (!isFirstSunday(now, tz) || !dueDaily(now, this.config.syncFallbackAt, tz, this.store.get<string>("lastScheduledDrillAt"))) return false;
+    if (!drillDayToday(schedule, now, tz, lastFullDrillAt(this.store))) return false;
+    if (!dueDaily(now, this.config.syncFallbackAt, tz, this.store.get<string>("lastScheduledDrillAt"))) return false;
     const run = this.store.recentSyncRuns(1)[0];
     if (!(run?.status === "ok" && !!run.finishedAt && now.getTime() - Date.parse(run.finishedAt) < 24 * 3_600_000)) return false;
     // A sync that changed version has asked the host to rebuild this very
@@ -628,8 +634,8 @@ export class Runtime {
       if (!this.#busy && await this.#drillDue(now)) {
         this.store.set("lastScheduledDrillAt", now.toISOString());
         await this.drillNow("schedule", "schedule").then(
-          (r) => this.#log(r.ok ? "info" : "error", "monthly practice drill finished", { ok: r.ok, failed: r.apps.filter((a) => !a.ok).map((a) => a.slug) }),
-          (e: Error) => this.#log("error", "monthly practice drill could not run", { error: e.message }));
+          (r) => this.#log(r.ok ? "info" : "error", "scheduled practice drill finished", { ok: r.ok, failed: r.apps.filter((a) => !a.ok).map((a) => a.slug) }),
+          (e: Error) => this.#log("error", "scheduled practice drill could not run", { error: e.message }));
       }
     }
 

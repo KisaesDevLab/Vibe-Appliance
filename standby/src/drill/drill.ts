@@ -1,4 +1,4 @@
-// Practice drill (test promote) on the standby. Manual or monthly.
+// Practice drill (test promote) on the standby. Manual or on a schedule (panel: first Sunday, every N days, off).
 //
 // The host does the work (lib/standby-host.sh `drill`): it starts the
 // primary's apps from this box's verified copy in a separate, throwaway
@@ -11,6 +11,7 @@
 //
 // While a drill runs, `operation` is "drill", so no sync replaces the copy
 // under it. A promote does not wait for a drill: it asks it to stop.
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Mailer } from "../alerts/mailer.ts";
@@ -18,6 +19,7 @@ import { verifySeal } from "../capture/capture.ts";
 import type { ApplianceControl, DrillAppResult, DrillReport, HandsOnOpen } from "../contracts/appliance.ts";
 import type { Store } from "../overlay/store.ts";
 import type { Paths } from "../paths.ts";
+import { parseDrillSchedule, type DrillSchedule } from "../schedule.ts";
 import { activeOperation, type VerifiedCopy } from "../sync/sync.ts";
 
 export const DRILL_HISTORY_MAX = 100;
@@ -44,7 +46,7 @@ export interface DrillRecord {
   /** An app test: only these apps were chosen (the apps they need came along). Absent: every app. */
   only?: string[];
   /** A hands-on drill: left running after the checks for the admin to use. */
-  handsOn?: { until: string; hosts: string[]; address: string; endedAt: string | null; endReason: string | null };
+  handsOn?: { until: string; hosts: string[]; address?: string; endedAt: string | null; endReason: string | null; tunnelLeft?: boolean };
 }
 
 /** The hands-on drill that is open now (also kept across a restart, to end it). */
@@ -68,6 +70,25 @@ export interface DrillDeps {
 }
 
 export function drillHistory(store: Store): DrillRecord[] { return store.get<DrillRecord[]>("drills") ?? []; }
+
+/** The schedule chosen on the panel (local overlay), else the configured default. */
+export function drillSchedule(store: Store, fallback: "first-sunday" | "off"): DrillSchedule {
+  return parseDrillSchedule(store.get("drillSchedule"), fallback);
+}
+
+/**
+ * When the last full drill started, by hand or on schedule (app tests do
+ * not count: they drill only some apps). Also the last time the schedule
+ * tried one, so a drill that could not even start is not retried every
+ * night.
+ */
+export function lastFullDrillAt(store: Store): string | null {
+  const full = drillHistory(store).find((r) => !r.only)?.startedAt ?? null;
+  const tried = store.get<string>("lastScheduledDrillAt") ?? null;
+  if (!full) return tried;
+  if (!tried) return full;
+  return Date.parse(full) >= Date.parse(tried) ? full : tried;
+}
 
 /** Each app's latest result from a drill or an app test: is it ready to start at a promote? */
 export interface AppReadiness {
@@ -127,7 +148,7 @@ export function composeDrillEmail(r: DrillRecord, boxName: string): { subject: s
   const left = r.skipped.length ? `, ${r.skipped.length} app${r.skipped.length === 1 ? "" : "s"} not drilled` : "";
   const subject = r.ok ? `Vibe Standby: practice drill passed${left} (${boxName})` : `Vibe Standby: practice drill FAILED (${boxName})`;
   const lines = [r.ok
-    ? "The monthly practice drill passed: every app started from the standby's copy, answered its health check and showed its sign-in page."
+    ? "The practice drill passed: every app started from the standby's copy, answered its health check and showed its sign-in page."
     : "The practice drill did not pass. If the primary failed now, a promote would probably run into the same problem."];
   if (r.dataAt) lines.push("", `Copy drilled: the primary's data as of ${r.dataAt}.`);
   if (r.apps.length) {
@@ -155,10 +176,10 @@ async function copyProblems(d: Pick<DrillDeps, "paths" | "listDatabases">, copy:
 }
 
 /** Record how a hands-on drill ended, on its history entry. */
-function recordHandsOnEnd(store: Store, h: HandsOnState, reason: string, problems: string[] | null, now: Date): void {
+function recordHandsOnEnd(store: Store, h: HandsOnState, reason: string, problems: string[] | null, now: Date, tunnelLeft = false): void {
   const r = drillHistory(store).find((x) => x.id === h.recordId);
   if (r) {
-    r.handsOn = { until: h.until, hosts: h.hosts, address: h.address, endedAt: now.toISOString(), endReason: reason };
+    r.handsOn = { until: h.until, hosts: h.hosts, ...(h.address ? { address: h.address } : {}), endedAt: now.toISOString(), endReason: reason, ...(tunnelLeft ? { tunnelLeft } : {}) };
     if (problems) r.copyUnchanged = problems.length === 0;
     if (problems && problems.length) {
       r.ok = false;
@@ -179,7 +200,9 @@ export async function endHandsOn(d: Pick<DrillDeps, "store" | "appliance" | "pat
   if (!h) return false;
   await d.appliance.cleanDrill();
   const problems = await copyProblems(d, d.store.get<VerifiedCopy>("verifiedCopy"));
-  recordHandsOnEnd(d.store, h, reason, problems, (d.now ?? (() => new Date()))());
+  // The host keeps the record while Cloudflare still holds the tunnel or its names.
+  const tunnelLeft = !!d.paths.drillTunnel && existsSync(d.paths.drillTunnel);
+  recordHandsOnEnd(d.store, h, reason, problems, (d.now ?? (() => new Date()))(), tunnelLeft);
   if (activeOperation(d.store) === "drill") d.store.unset("operation");
   d.store.audit("drill-hands-on-end", actor, problems.length === 0, { reason, copyUnchanged: problems.length === 0 });
   return true;
@@ -192,7 +215,7 @@ export function forgetHandsOn(store: Store, reason: string): void {
 }
 
 /** Run a drill now. Resolves with the record; throws only if the drill may not start. */
-export async function runDrill(d: DrillDeps, opts: { actor: string; trigger: "admin" | "schedule"; handsOn?: { minutes: number; allow: string[]; address: string }; apps?: string[] }): Promise<DrillRecord> {
+export async function runDrill(d: DrillDeps, opts: { actor: string; trigger: "admin" | "schedule"; handsOn?: { minutes: number }; apps?: string[] }): Promise<DrillRecord> {
   const now = d.now ?? (() => new Date());
   const blocked = drillBlocked(d.store);
   if (blocked) throw new Error(blocked);
@@ -242,11 +265,11 @@ export async function runDrill(d: DrillDeps, opts: { actor: string; trigger: "ad
       error: error ?? report?.error ?? (problems.length ? `after the drill, the copy did not match: ${problems.slice(0, 3).join("; ")}` : null),
       fix: report?.fix ?? null,
       ...(only ? { only } : {}),
-      ...(opened ? { handsOn: { until: opened.until, hosts: opened.hosts, address: opened.address, endedAt: null, endReason: null } } : {}),
+      ...(opened ? { handsOn: { until: opened.until, hosts: opened.hosts, endedAt: null, endReason: null } } : {}),
     };
     remember(d.store, record);
     recordReadiness(d.store, record);
-    d.store.audit(opened ? "drill-hands-on-open" : only ? "app-test" : "drill", opts.actor, record.ok, { trigger: opts.trigger, failed: record.apps.filter((a) => !a.ok).map((a) => a.slug), skipped: record.skipped.map((s) => s.slug), error: record.error, ...(opened ? { until: opened.until, allow: opened.allow } : {}) });
+    d.store.audit(opened ? "drill-hands-on-open" : only ? "app-test" : "drill", opts.actor, record.ok, { trigger: opts.trigger, failed: record.apps.filter((a) => !a.ok).map((a) => a.slug), skipped: record.skipped.map((s) => s.slug), error: record.error, ...(opened ? { until: opened.until, hosts: opened.hosts } : {}) });
     if (opened) d.store.set("handsOn", { ...opened, recordId: record.id, openedAt: record.finishedAt } satisfies HandsOnState);
 
     // The admin is at the screen for a hands-on drill or an app test; no email.

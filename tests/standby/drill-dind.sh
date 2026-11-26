@@ -37,7 +37,7 @@ w() { mkdir -p "$(dirname "$1")"; cat > "$1"; }
 
 # ---- appliance checkout: the real libs, a small core compose, one demo app ----
 mkdir -p "$APPL/lib" "$APPL/apps" "$APPL/console/manifests"
-for f in log.sh state.sh standby-host.sh compose-files.sh standby_drill.py; do cp "/repo/lib/$f" "$APPL/lib/"; done
+for f in log.sh state.sh standby-host.sh compose-files.sh standby_drill.py standby_drill_tunnel.py vibe_hosts.py; do cp "/repo/lib/$f" "$APPL/lib/"; done
 w "$APPL/docker-compose.yml" <<'YML'
 name: vibe
 networks:
@@ -297,86 +297,154 @@ grep -q "cannot be limited" /tmp/hoapp.out || fail "no reason given: $(tail -3 /
 sed -i 's/,"vibe-broken":{"enabled":true}//' "$SRC/state.json"
 mpatch vibe-demo '{"database":{"name":"demo_db","user":"demo"}}'
 
-echo "== hands-on: opens to one computer, practice notice first, the drill's own app behind it"
-# The admin's computer: its own network namespace, like a PC on the LAN,
-# reaching this box at 10.200.0.1 (Docker's port mapping keeps its address).
-ip netns add pc; ip link add pc-host type veth peer name pc-in; ip link set pc-in netns pc
-ip addr add 10.200.0.1/24 dev pc-host; ip link set pc-host up
-ip netns exec pc ip addr add 10.200.0.2/24 dev pc-in; ip netns exec pc ip link set pc-in up; ip netns exec pc ip link set lo up
-ip netns exec pc ip route add default via 10.200.0.1
-handson_ready() { printf '{"snapshotId":"s1","stagePath":"/opt/vibe/standby/stage","handsOn":{"minutes":15,"allow":["%s"],"address":"10.0.0.52"}}' "${1:-10.200.0.2}" > "$VIBE/standby/drill.ready"; }
-C() { ip netns exec pc curl -sk --max-time 10 --resolve "demo.firm.test:443:10.200.0.1" "$@"; }
-R() { C "$@" https://demo.firm.test/; }
-gw="$(docker network inspect vibe_net -f '{{(index .IPAM.Config 0).Gateway}}')"
-handson_ready "$gw"; run drill >/tmp/hogw.out 2>&1 && fail "a hands-on drill opened to a Docker gateway address"
-grep -q "cannot tell your computer apart" /tmp/hogw.out || fail "no plain reason for the gateway address: $(tail -3 /tmp/hogw.out)"
+echo "== hands-on: practice names through the drill's own tunnel; notice first, the drill's own app behind it"
+# The copy: a domain-mode primary with a Cloudflare tunnel key; the app
+# answers at demo.firm.test.
+python3 - "$SRC/state.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]; s = json.load(open(p))
+s["config"].update({"domain": "firm.test"}); s["apps"]["vibe-demo"]["subdomain"] = "demo"
+json.dump(s, open(p, "w"))
+PYEOF
+mpatch vibe-demo '{"subdomain":"demo"}'
+w "$SRC/env/appliance.env" <<<$'DOMAIN_ROUTING_MODE=subdomain-per-app\nCLOUDFLARE_TUNNEL_API_TOKEN=cf-key-never-printed\nCLOUDFLARE_ACCOUNT_ID=a1\nCLOUDFLARE_ZONE_ID=z1'
+w "$SRC/env/vibe-demo.env" <<<$'X=1\nALLOWED_ORIGIN=https://demo.firm.test\nSUPPORT=help@demo.firm.test'
+# A stand-in Cloudflare API: tunnels and DNS records in a file.
+cat > /tmp/cf.py <<'PYEOF'
+import json, re, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+DB = "/tmp/cf.json"
+def load():
+    try: return json.load(open(DB))
+    except Exception: return {"tunnels": [], "records": [], "n": 0, "keys": []}
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def ok(self, result):
+        b = json.dumps({"success": True, "errors": [], "result": result}).encode()
+        self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def handle_any(self, method):
+        from urllib.parse import urlparse, parse_qs
+        st = load(); u = urlparse(self.path); q = {k: v[0] for k, v in parse_qs(u.query).items()}; p = u.path
+        st["keys"].append(self.headers.get("Authorization"))
+        n = int(self.headers.get("content-length") or 0); b = json.loads(self.rfile.read(n)) if n else None
+        res = None
+        if p == "/zones/z1": res = {"name": "firm.test"}
+        elif p == "/accounts/a1/cfd_tunnel" and method == "GET": res = [t for t in st["tunnels"] if not t["deleted"] and t["name"] == q.get("name")]
+        elif p == "/accounts/a1/cfd_tunnel": st["n"] += 1; t = {"id": "t%d" % st["n"], "name": b["name"], "deleted": False}; st["tunnels"].append(t); res = t
+        elif re.match(r"^/accounts/a1/cfd_tunnel/[^/]+/configurations$", p): next(t for t in st["tunnels"] if t["id"] == p.split("/")[4])["ingress"] = b["config"]["ingress"]; res = {}
+        elif p.endswith("/token"): res = "connector-token"
+        elif p.endswith("/connections"): res = [{"conns": [{"id": "c"}]}] if method == "GET" else {}
+        elif re.match(r"^/accounts/a1/cfd_tunnel/[^/]+$", p) and method == "DELETE": next(t for t in st["tunnels"] if t["id"] == p.split("/")[4])["deleted"] = True; res = {}
+        elif p == "/zones/z1/dns_records" and method == "GET": res = [r for r in st["records"] if (not q.get("name") or r["name"] == q["name"]) and (not q.get("content") or r["content"] == q["content"])]
+        elif p == "/zones/z1/dns_records": st["n"] += 1; r = dict(b, id="d%d" % st["n"]); st["records"].append(r); res = r
+        elif p.startswith("/zones/z1/dns_records/") and method == "DELETE": st["records"] = [r for r in st["records"] if r["id"] != p.split("/")[-1]]; res = {}
+        json.dump(st, open(DB, "w"))
+        if res is None: self.send_response(404); self.end_headers(); return
+        self.ok(res)
+    def do_GET(self): self.handle_any("GET")
+    def do_POST(self): self.handle_any("POST")
+    def do_PUT(self): self.handle_any("PUT")
+    def do_DELETE(self): self.handle_any("DELETE")
+HTTPServer(("127.0.0.1", 18999), H).serve_forever()
+PYEOF
+rm -f /tmp/cf.json; python3 /tmp/cf.py & cfpid=$!
+cf() { python3 -c "import json,sys; d=json.load(open('/tmp/cf.json')); print(eval(sys.argv[1]))" "$1"; }
+# A stand-in connector: forwards a local port to the drill's web server, as
+# the real one forwards Cloudflare's visitors.
+docker pull -q alpine/socat:1.8.0.0 >/dev/null
+export VIBE_CF_API=http://127.0.0.1:18999 VIBE_DRILL_CONNECTOR_IMAGE=alpine/socat:1.8.0.0 \
+  VIBE_DRILL_CONNECTOR_CMD="TCP-LISTEN:8080,fork,reuseaddr TCP:vibe-drill-caddy:80" VIBE_DRILL_CONNECTOR_TEST_ARGS="-p 127.0.0.1:18080:8080"
+handson_ready() { printf '{"snapshotId":"s1","stagePath":"/opt/vibe/standby/stage","handsOn":{"minutes":15}}' > "$VIBE/standby/drill.ready"; }
+R() { curl -s --max-time 10 -H "Host: hod-demo.firm.test" "$@" http://127.0.0.1:18080/; }
 before="$(sum)"
-handson_ready; run drill >/tmp/ho.out 2>&1 || { tail -20 /tmp/ho.out; fail "the hands-on drill did not open"; }
-[[ "$(report 'd["handsOn"]["hosts"]')" == "['demo.firm.test']" ]] || fail "hands-on names: $(report 'd.get("handsOn")')"
+handson_ready; run drill >/tmp/ho.out 2>&1 || { tail -20 /tmp/ho.out; tail -30 "$VIBE/logs/bootstrap.log" 2>/dev/null; fail "the hands-on drill did not open"; }
+[[ "$(report 'd["handsOn"]["hosts"]')" == "['hod-demo.firm.test']" ]] || fail "hands-on names: $(report 'd.get("handsOn")')"
+[[ "$(report 'd["handsOn"]["public"]')" == "True" ]] || fail "not marked public"
 [[ "$(report 'd["ok"]')" == "True" ]] || fail "the checks before opening did not pass: $(report 'd')"
-[[ -n "$(docker ps -q --filter label=com.docker.compose.project=vibe-drill --filter label=com.docker.compose.service=caddy)" ]] || fail "the drill's web server is not running"
+# Cloudflare: a tunnel of the drill's own, practice names only.
+[[ "$(cf '[t["name"].startswith("vibe-practice-drill-") for t in d["tunnels"] if not t["deleted"]]')" == "[True]" ]] || fail "drill tunnel: $(cf 'd["tunnels"]')"
+[[ "$(cf 'sorted(r["name"] for r in d["records"])')" == "['hod-demo.firm.test', 'hod-vibe.firm.test']" ]] || fail "practice names: $(cf 'd["records"]')"
+[[ "$(cf '[i.get("service") for t in d["tunnels"] for i in t.get("ingress", [])][0]')" == "http://vibe-drill-caddy:80" ]] || fail "ingress: $(cf 'd["tunnels"]')"
+[[ "$(cf 'set(d["keys"])')" == "{'Bearer cf-key-never-printed'}" ]] || fail "the tunnel key was not used"
+grep -rq cf-key-never-printed "$VIBE/logs" 2>/dev/null && fail "the tunnel key reached a log"
+grep -q connector-token "$VIBE/logs"/*.log 2>/dev/null && fail "the connector token reached a log"
+[[ ! -e "$VIBE/standby/drill/connector.env" ]] || fail "the connector token file was left behind"
+# The copy was given its practice names; an email address kept its domain.
+grep -q '"https://hod-demo.firm.test"' "$VIBE/standby/drill/compose.json" || fail "the app was not given its practice name"
+grep -q '"https://demo.firm.test"' "$VIBE/standby/drill/compose.json" && fail "the app still has its live name"
+grep -q 'help@demo.firm.test' "$VIBE/standby/drill/compose.json" || fail "an email address was renamed"
 grep -q CLOUDFLARE_API_TOKEN "$VIBE/standby/drill/compose.json" && fail "the DNS token reached the drill"
+# Served through the connector: notice first, then the drill's own app.
 notice="$(R -H 'Accept: text/html')"
 echo "$notice" | grep -q "PRACTICE COPY" || fail "no practice notice: $notice"
 sid="$(echo "$notice" | grep -o 'vibe_drill_ok=[0-9a-f]*' | head -1)"
 [[ "$(R -H 'Accept: text/html' -H "Cookie: $sid")" == "changed-by-drill" ]] || fail "the drill's app was not served: $(R -H 'Accept: text/html' -H "Cookie: $sid")"
-[[ "$(C https://demo.firm.test/health)" == "ok" ]] || fail "an app request (not a page) was held up"
-cert="$(C -v https://demo.firm.test/health 2>&1 || true)"
-[[ "$cert" == *"issuer: CN=Vibe practice drill"* ]] || fail "the certificate is not the drill's throwaway one: $(grep -i issuer <<<"$cert")"
-# The app behind both web servers is told the request was HTTPS, for its own name.
-[[ "$(C https://demo.firm.test/echo-app)" == "proto=https host=demo.firm.test" ]] || fail "the app is not told HTTPS and its name: $(C https://demo.firm.test/echo-app)"
-[[ -s "$VIBE/standby/drill-ca.crt" ]] || fail "the drill's certificate was not kept for the panel"
-cip="$(docker inspect vibe-caddy -f '{{(index .NetworkSettings.Networks "vibe_net").IPAddress}}')"
-[[ "$(docker exec vibe-console curl -sk --max-time 10 -o /dev/null -w '%{http_code}' --resolve "demo.firm.test:443:$cip" https://demo.firm.test/)" == "403" ]] || fail "another computer was let in"
-[[ "$(curl -s --max-time 10 http://127.0.0.1/)" == "standby console" ]] || fail "the standby's own console route changed"
+[[ "$(curl -s --max-time 10 -H 'Host: hod-demo.firm.test' http://127.0.0.1:18080/health)" == "ok" ]] || fail "an app request (not a page) was held up"
+# Behind both web servers the app is told HTTPS (as Cloudflare says) and its practice name.
+[[ "$(curl -s --max-time 10 -H 'Host: hod-demo.firm.test' -H 'X-Forwarded-Proto: https' http://127.0.0.1:18080/echo-app)" == "proto=https host=hod-demo.firm.test" ]] \
+  || fail "the app is not told HTTPS and its practice name: $(curl -s -H 'Host: hod-demo.firm.test' -H 'X-Forwarded-Proto: https' http://127.0.0.1:18080/echo-app)"
+[[ "$(curl -s --max-time 10 -H 'Host: demo.firm.test' http://127.0.0.1:18080/)" == "changed-by-drill" ]] && fail "the drill answers the live name"
+# Only the connector goes out; the apps and the drill's web server cannot.
 dcad="$(docker ps -q --filter label=com.docker.compose.project=vibe-drill --filter label=com.docker.compose.service=caddy)"
 docker exec "$dcad" wget -q -T 5 -O- http://1.1.1.1/ >/dev/null 2>&1 && fail "the drill's web server can reach the internet"
+docker inspect vibe-drill-connector -f '{{json .NetworkSettings.Networks}}' | grep -q vibe-drill_egress || fail "the connector is not on its own network out"
+docker inspect "$dcad" -f '{{json .NetworkSettings.Networks}}' | grep -q egress && fail "the drill's web server joined the network out"
+[[ "$(curl -s --max-time 10 http://127.0.0.1/)" == "standby console" ]] || fail "the standby's own web server changed"
 run drill-expire >/dev/null 2>&1 || fail "drill-expire failed"
 grep -l '"standby-drill-clean"' "$VIBE"/host-actions/queue/*.json >/dev/null 2>&1 || fail "the time limit did not queue the clean-up"
 rm -f "$VIBE"/host-actions/queue/*.json
 
-echo "== hands-on: a restart of the web server drops the drill from it; drill-clean converges"
-docker restart vibe-caddy >/dev/null; sleep 3
-[[ "$(R)" == "standby: app stopped" ]] || fail "after a restart the web server still served the drill: $(R)"
-run drill-clean >/dev/null 2>&1 || fail "drill-clean failed after a web server restart"
+echo "== hands-on: End removes the connector, the tunnel and the practice names"
+run drill-clean >/dev/null 2>&1 || fail "drill-clean failed"
 [[ -z "$(docker ps -aq --filter label=com.docker.compose.project=vibe-drill)" ]] || fail "drill containers left"
 [[ -z "$(docker network ls -q --filter label=com.docker.compose.project=vibe-drill)" ]] || fail "drill networks left"
-docker inspect vibe-caddy -f '{{json .NetworkSettings.Networks}}' | grep -q drill-edge && fail "the web server is still on the drill network"
-[[ ! -e "$VIBE/data/caddy/data/caddy/pki/authorities/vibe-drill" && ! -e "$VIBE/data/caddy/data/caddy/certificates/vibe-drill" ]] || fail "the throwaway certificate authority was left"
-[[ ! -e "$VIBE/standby/drill-ca.crt" && ! -e "$VIBE/standby/drill-handson.json" ]] || fail "hands-on files left"
+[[ "$(cf '[t["deleted"] for t in d["tunnels"]]')" == "[True]" ]] || fail "the drill tunnel was not deleted: $(cf 'd["tunnels"]')"
+[[ "$(cf 'd["records"]')" == "[]" ]] || fail "practice names left in DNS: $(cf 'd["records"]')"
+[[ ! -e "$VIBE/standby/drill-tunnel.json" && ! -e "$VIBE/standby/drill-open.json" ]] || fail "hands-on files left"
+[[ "$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' -H 'Host: hod-demo.firm.test' http://127.0.0.1:18080/ || true)" == "000" ]] || fail "still served after End"
 [[ "$(sum)" == "$before" ]] || fail "the mirror changed during the hands-on drill"
-
-echo "== hands-on: ending it reverts this box's web server at once"
-before="$(sum)"
-handson_ready; run drill >/tmp/ho2.out 2>&1 || { tail -20 /tmp/ho2.out; fail "the hands-on drill did not open again"; }
-[[ "$(R -H "Accept: text/html")" == *"PRACTICE COPY"* ]] || fail "second hands-on drill not served"
-run drill-clean >/dev/null 2>&1 || fail "drill-clean failed"
-[[ "$(R)" == "standby: app stopped" ]] || fail "the web server still serves the drill after the clean-up: $(R)"
-cert="$(C -v https://demo.firm.test/ 2>&1 || true)"
-[[ "$cert" != *"Vibe practice drill"* ]] || fail "the drill's certificate is still served"
 [[ "$(docker ps -a --filter label=com.docker.compose.project=vibe --format '{{.Names}} {{.State}}' | sort)" == "$own_before" ]] || fail "the standby's own containers changed"
-[[ "$(sum)" == "$before" ]] || fail "the mirror changed"
 
-echo "== hands-on: works on a standby whose web server has no HTTPS site of its own"
-before="$(sum)"
-cp "$VIBE/data/caddy/Caddyfile" /tmp/Caddyfile.orig
-printf ':80 {
-	respond "standby console" 200
-}
-' > "$VIBE/data/caddy/Caddyfile"
-docker exec vibe-caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1 || fail "could not give the standby a plain-HTTP web server"
-handson_ready; run drill >/tmp/ho4.out 2>&1 || { tail -20 /tmp/ho4.out; fail "the hands-on drill did not open on a plain-HTTP standby"; }
-[[ "$(R -H "Accept: text/html")" == *"PRACTICE COPY"* ]] || fail "hands-on not served on a plain-HTTP standby"
-run drill-clean >/dev/null 2>&1 || fail "drill-clean failed"
-[[ "$(C -o /dev/null -w '%{http_code}' https://demo.firm.test/ || true)" == "000" ]] || fail "HTTPS still answers after the clean-up on a plain-HTTP standby"
-cp /tmp/Caddyfile.orig "$VIBE/data/caddy/Caddyfile"; docker exec vibe-caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1
-[[ "$(sum)" == "$before" ]] || fail "the mirror changed"
+[[ ! -e "$VIBE/standby/drill-cf.env" ]] || fail "the saved Cloudflare key was left after End"
 
-echo "== hands-on: refused for a copy that reaches its apps by IP address"
-sed -i 's/"mode":"domain"/"mode":"lan"/' "$SRC/state.json"
+echo "== hands-on: a promote does not wait for Cloudflare; the tunnel is still removed, in the background"
+handson_ready; run drill >/tmp/ho7.out 2>&1 || { tail -20 /tmp/ho7.out; fail "the hands-on drill did not open again"; }
+[[ "$(stat -c %a "$VIBE/standby/drill-cf.env")" == "600" ]] || fail "the saved Cloudflare key is not private"
+grep -vqE '^CLOUDFLARE_(TUNNEL_API_TOKEN|ACCOUNT_ID|ZONE_ID)=' "$VIBE/standby/drill-cf.env" && fail "more than the Cloudflare key was saved"
+touch "$VIBE/standby/drill.cancel"; t0=$(date +%s)
+run drill-clean >/dev/null 2>&1 || fail "drill-clean failed during a promote"
+(( $(date +%s) - t0 < 30 )) || fail "drill-clean waited for Cloudflare during a promote"
+[[ -z "$(docker ps -aq --filter label=com.docker.compose.project=vibe-drill)" ]] || fail "drill containers left"
+for _ in $(seq 1 30); do [[ "$(cf 'd["records"]')" == "[]" && "$(cf 'all(t["deleted"] for t in d["tunnels"])')" == "True" ]] && break; sleep 1; done
+[[ "$(cf 'd["records"]')" == "[]" ]] || fail "practice names left after a promote: $(cf 'd["records"]')"
+[[ "$(cf 'all(t["deleted"] for t in d["tunnels"])')" == "True" ]] || fail "drill tunnel left after a promote"
+for _ in $(seq 1 10); do [[ ! -e "$VIBE/standby/drill-tunnel.json" ]] && break; sleep 1; done
+[[ ! -e "$VIBE/standby/drill-tunnel.json" && ! -e "$VIBE/standby/drill-cf.env" ]] || fail "hands-on files left after a promote"
+
+echo "== hands-on: a practice name the firm already uses is never taken over"
+python3 - <<'PYEOF'
+import json
+d = json.load(open("/tmp/cf.json")); d["records"].append({"id": "firm1", "type": "A", "name": "hod-demo.firm.test", "content": "203.0.113.7"}); json.dump(d, open("/tmp/cf.json", "w"))
+PYEOF
+handson_ready; run drill >/tmp/ho5.out 2>&1 && fail "a hands-on drill took over a name the firm uses"
+report 'd["error"]' | grep -q "already exists in the firm's DNS" || fail "no plain reason: $(report 'd')"
+[[ "$(cf '[r["name"] for r in d["records"]]')" == "['hod-demo.firm.test']" ]] || fail "the firm's record changed: $(cf 'd["records"]')"
+[[ -z "$(docker ps -aq --filter label=com.docker.compose.project=vibe-drill)" ]] || fail "drill containers left after a refused hands-on drill"
+python3 - <<'PYEOF'
+import json
+d = json.load(open("/tmp/cf.json")); d["records"] = []; json.dump(d, open("/tmp/cf.json", "w"))
+PYEOF
+
+echo "== hands-on: refused when the copy has no Cloudflare tunnel key, or reaches its apps by IP address"
+mv "$SRC/env/appliance.env" /tmp/appliance.env.keep
+handson_ready; run drill >/tmp/ho6.out 2>&1 && fail "a hands-on drill opened without a tunnel key"
+grep -q "does not use a Cloudflare tunnel" /tmp/ho6.out || fail "no plain reason: $(tail -3 /tmp/ho6.out)"
+mv /tmp/appliance.env.keep "$SRC/env/appliance.env"
+sed -i 's/"mode": "domain"/"mode": "lan"/; s/"mode":"domain"/"mode":"lan"/' "$SRC/state.json"
 handson_ready; run drill >/tmp/ho3.out 2>&1 && fail "a hands-on drill opened for a LAN-mode copy"
 grep -q "domain mode" /tmp/ho3.out || fail "no plain reason: $(tail -3 /tmp/ho3.out)"
-sed -i 's/"mode":"lan"/"mode":"domain"/' "$SRC/state.json"
+sed -i 's/"mode": "lan"/"mode": "domain"/; s/"mode":"lan"/"mode":"domain"/' "$SRC/state.json"
+kill "$cfpid" 2>/dev/null || true
 
 echo "ALL DRILL CHECKS PASSED"
 INNER

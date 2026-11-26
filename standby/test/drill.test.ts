@@ -172,9 +172,9 @@ test("drill: apps left out are named in the subject of a passing drill, and rest
 
 // ---- hands-on drill ----------------------------------------------------------
 
-const HANDS_ON = { minutes: 120, allow: ["192.168.1.23"], address: "192.168.1.20" };
+const HANDS_ON = { minutes: 120 };
 
-test("hands-on: the drill stays open for the admin's computer, holds off syncs, and sends no email", async () => {
+test("hands-on: the drill stays open at its practice names, holds off syncs, and sends no email", async () => {
   const w = await setup();
   const r = await runDrill(w.deps(), { actor: "admin", trigger: "admin", handsOn: HANDS_ON });
   assert.equal(r.ok, true);
@@ -182,7 +182,9 @@ test("hands-on: the drill stays open for the admin's computer, holds off syncs, 
   assert.equal(w.box.drillsCleaned, 0, "nothing is removed while it is open");
   assert.equal(activeOperation(w.store), "drill", "no sync replaces the copy under an open drill");
   const h = handsOnState(w.store)!;
-  assert.deepEqual(h.allow, ["192.168.1.23/32"]);
+  assert.deepEqual(h.hosts, ["hod-tb.firm.example"]);
+  assert.equal(h.public, true);
+  assert.deepEqual(r.handsOn!.hosts, ["hod-tb.firm.example"]);
   assert.equal(h.recordId, r.id);
   assert.equal(r.handsOn!.endedAt, null);
   assert.equal(r.copyUnchanged, null, "not checked until it ends");
@@ -204,6 +206,20 @@ test("hands-on: ending it removes the drill, checks the copy and records how it 
   assert.equal(rec!.copyUnchanged, true);
   assert.equal(await endHandsOn(w.deps(), "again", "admin"), false, "ending twice does nothing");
   assert.match(drillHistoryCsv(drillHistory(w.store)), /ended .*Ended by the admin/);
+  assert.equal(rec!.handsOn!.tunnelLeft, undefined, "the tunnel was removed");
+});
+
+test("hands-on: a tunnel Cloudflare still holds is recorded; an older drill keeps its hosts-file address for the reminder", async () => {
+  const w = await setup();
+  const tunnel = join(w.paths.cache, "..", "drill-tunnel.json");
+  await runDrill(w.deps(), { actor: "admin", trigger: "admin", handsOn: HANDS_ON });
+  // An older hands-on drill (hosts file) still open across the update.
+  w.store.set("handsOn", { ...handsOnState(w.store)!, address: "192.168.1.20", allow: ["192.168.1.23/32"] });
+  writeFileSync(tunnel, "{}");
+  await endHandsOn({ ...w.deps(), paths: { ...w.paths, drillTunnel: tunnel } }, "Ended by the admin.", "admin");
+  const [rec] = drillHistory(w.store);
+  assert.equal(rec!.handsOn!.address, "192.168.1.20");
+  assert.equal(rec!.handsOn!.tunnelLeft, true);
 });
 
 test("hands-on: a copy changed while it was open fails the drill when it ends", async () => {
@@ -303,7 +319,7 @@ test("app test: a later failure replaces the app's earlier pass; apps not drille
 test("app test: an app the primary does not run, or a hands-on drill limited to some apps, is refused", async () => {
   const w = await setup();
   await assert.rejects(runDrill(w.deps(), { actor: "admin", trigger: "admin", apps: ["vibe-nope"] }), /does not run vibe-nope/);
-  await assert.rejects(runDrill(w.deps(), { actor: "admin", trigger: "admin", apps: ["vibe-tb"], handsOn: { minutes: 60, allow: ["10.0.0.5"], address: "10.0.0.2" } }), /cannot be limited/);
+  await assert.rejects(runDrill(w.deps(), { actor: "admin", trigger: "admin", apps: ["vibe-tb"], handsOn: { minutes: 60 } }), /cannot be limited/);
   assert.equal(w.box.drills.length, 0);
   assert.equal(activeOperation(w.store), undefined);
 });

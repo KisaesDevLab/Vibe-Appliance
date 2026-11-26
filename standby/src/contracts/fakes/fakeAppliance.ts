@@ -155,7 +155,7 @@ export class FakeAppliance implements ApplianceControl {
     }
     const r = this.drillResult(req);
     if (req.handsOn && r.isolation?.ok !== false && !r.handsOn) {
-      r.handsOn = { until: new Date(Date.now() + req.handsOn.minutes * 60_000).toISOString(), hosts: ["tb.firm.example"], allow: req.handsOn.allow.map((a) => a + "/32"), address: req.handsOn.address };
+      r.handsOn = { until: new Date(Date.now() + req.handsOn.minutes * 60_000).toISOString(), hosts: ["hod-tb.firm.example"], public: true, skipped: [], leftovers: [], signIn: null };
     }
     return r;
   }

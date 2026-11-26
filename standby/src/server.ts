@@ -4,11 +4,10 @@
 // relative URLs only. No response ever carries a secret (invariant 7).
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import { readFile } from "node:fs/promises";
-import { isIP } from "node:net";
-import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Config } from "./config.ts";
-import { appReadiness, drillBlocked, drillHistory, drillHistoryCsv, handsOnState } from "./drill/drill.ts";
+import { appReadiness, drillBlocked, drillHistory, drillHistoryCsv, drillSchedule, handsOnState, lastFullDrillAt } from "./drill/drill.ts";
+import { DRILL_EVERY_MAX, DRILL_EVERY_MIN, localDate, nextDrillDate, type DrillSchedule } from "./schedule.ts";
 import { loggerOptions } from "./logger.ts";
 import type { Store } from "./overlay/store.ts";
 import { BadCodeError } from "./pairing/codes.ts";
@@ -62,11 +61,13 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
 
   app.get("/api/status", async () => {
     const s = runtime ? runtime.status() : computeStatus(store, config);
+    const tz = runtime ? await runtime.timezone() : config.timezone;
+    const schedule = drillSchedule(store, config.drillSchedule);
     return {
       version: VERSION, ...s,
       busy: runtime?.busy() ?? null,
       alertEmail: store.get<string>("alertEmail") ?? config.alertEmail,
-      settings: { captureAt: config.captureAt, syncFallbackAt: config.syncFallbackAt, staleAfterHours: config.staleAfterHours, drillSchedule: config.drillSchedule, archiveDays: config.archiveDays, timezone: runtime ? await runtime.timezone() : config.timezone },
+      settings: { captureAt: config.captureAt, syncFallbackAt: config.syncFallbackAt, staleAfterHours: config.staleAfterHours, drillSchedule: { ...schedule, today: localDate(new Date(), tz), next: nextDrillDate(schedule, new Date(), tz, schedule.kind === "first-sunday" ? store.get<string>("lastScheduledDrillAt") ?? null : lastFullDrillAt(store)) }, archiveDays: config.archiveDays, timezone: tz },
       syncRuns: store.recentSyncRuns(10),
       archives: runtime ? await runtime.archives() : [],
       promote: runtime ? runtime.promoteState() : null,
@@ -93,6 +94,21 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
     store.set("alertEmail", email);
     store.audit("alert-email-set", ACTOR, true, { email });
     return { email };
+  });
+
+  // When the standby runs the practice drill by itself. Local overlay: each box has its own.
+  app.post("/api/settings/drill-schedule", async (req, reply) => {
+    const b = (req.body ?? {}) as Record<string, unknown>;
+    const kind = str(b.kind);
+    const days = typeof b.days === "number" ? b.days : Number(str(b.days));
+    if (kind !== "first-sunday" && kind !== "every" && kind !== "off") return reply.code(400).send({ error: "Choose when the drill runs.", code: "bad-schedule" });
+    if (kind === "every" && !(Number.isInteger(days) && days >= DRILL_EVERY_MIN && days <= DRILL_EVERY_MAX)) {
+      return reply.code(400).send({ error: `Enter a whole number of days from ${DRILL_EVERY_MIN} to ${DRILL_EVERY_MAX}.`, code: "bad-days" });
+    }
+    const schedule: DrillSchedule = kind === "every" ? { kind, days } : { kind };
+    store.set("drillSchedule", schedule);
+    store.audit("drill-schedule-set", ACTOR, true, { ...schedule });
+    return schedule;
   });
 
   app.get("/api/audit", async () => store.auditRecords(500));
@@ -189,36 +205,21 @@ export function buildServer({ config, store, runtime, quiet }: ServerDeps): Fast
     void r.drillNow(ACTOR, "admin", undefined, apps as string[]).catch(() => { /* recorded in the history */ });
     return reply.code(202).send({ started: true });
   });
-  // Hands-on: the same drill, left running for the admin's computer only.
-  // Who that is comes from the web server: Caddy sets X-Forwarded-For (the
-  // rightmost entry is the address it saw), the console passes it on, and
-  // nothing else can reach this service.
+  // Hands-on: the same drill, left running and opened at drill names
+  // (hod-<name>) through a Cloudflare tunnel of its own until it ends.
   app.post("/api/drill/hands-on", async (req, reply) => {
     const r = rt(reply); if (!r) return;
     const minutes = Number((req.body as { minutes?: unknown } | undefined)?.minutes);
     if (![60, 120, 240].includes(minutes)) return reply.code(400).send({ error: "Choose 1, 2 or 4 hours." });
     const blocked = drillBlocked(store) ?? (r.busy() ? `A ${r.busy()} is already running.` : null);
     if (blocked) return reply.code(409).send({ error: blocked, code: "busy" });
-    const xff = String(req.headers["x-forwarded-for"] ?? "").split(",").map((s) => s.trim().replace(/^::ffff:/, "")).filter(Boolean);
-    const you = xff.at(-1) ?? "";
-    if (!isIP(you)) return reply.code(400).send({ error: "This panel could not tell which computer you are using, so it cannot open the drill to it. Open the panel through this box's web address (not a tunnel or another proxy) and try again." });
-    const fwdHost = String(req.headers["x-forwarded-host"] ?? "").replace(/:\d+$/, "").replace(/^\[|\]$/g, "");
-    const address = isIP(fwdHost) ? fwdHost : (await r.ownAddresses()).find((a) => isIP(a)) ?? "";
-    if (!address) return reply.code(400).send({ error: "This box does not know its own IP address. Open this panel by the box's IP address (for example https://192.168.1.20/admin/standby/) and try again." });
-    void r.drillNow(ACTOR, "admin", { minutes, allow: [you], address }).catch(() => { /* recorded in the history */ });
-    return reply.code(202).send({ started: true, allow: you, address });
+    void r.drillNow(ACTOR, "admin", { minutes }).catch(() => { /* recorded in the history */ });
+    return reply.code(202).send({ started: true });
   });
   app.post("/api/drill/hands-on/end", async (_req, reply) => {
     const r = rt(reply); if (!r) return;
     if (!handsOnState(store)) return reply.code(409).send({ error: "No hands-on drill is open." });
     try { await r.endHandsOnNow(ACTOR, "Ended by the admin."); return { ended: true }; } catch (e) { return fail(reply, e); }
-  });
-  // The throwaway certificate authority of the open hands-on drill, for the admin's computer to trust while it lasts.
-  app.get("/api/drill/ca.crt", async (_req, reply) => {
-    if (!handsOnState(store)) return reply.code(404).send({ error: "No hands-on drill is open." });
-    const pem = await readFile(join(config.dataDir, "drill-ca.crt"), "utf8").catch(() => null);
-    if (!pem) return reply.code(404).send({ error: "The drill's certificate is not there. End the drill and start it again." });
-    return reply.type("application/x-x509-ca-cert").header("content-disposition", "attachment; filename=vibe-practice-drill.crt").send(pem);
   });
   app.get("/api/drills", async () => drillHistory(store));
   app.get("/api/drills.csv", async (_req, reply) => reply.type("text/csv").header("content-disposition", "attachment; filename=vibe-standby-drills.csv").send(drillHistoryCsv(drillHistory(store))));

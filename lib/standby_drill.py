@@ -34,6 +34,7 @@ reads <drill-dir>/render/<slug>.json and writes compose.json and plan.json.
 """
 import json
 import os
+import re
 import sys
 
 PROJECT = "vibe-drill"
@@ -43,11 +44,14 @@ SHARED = ("postgres", "redis")
 # Never in a drill: the tunnel token (invariant 2) and the DNS token the
 # primary's Caddy could renew certificates with.
 SECRET_KEYS = ("TUNNEL_TOKEN", "CLOUDFLARE_API_TOKEN")
-# Hands-on drill: the drill's own Caddy, reached by the standby's real Caddy
-# over this one internal network, which nothing else of the drill joins.
+# Hands-on drill: the drill's own Caddy, reached by the drill's own Cloudflare
+# connector over this one internal network, which no app joins.
 EDGE_NET = "drill-edge"
 EDGE_ALIAS = "vibe-drill-caddy"
-EDGE_CA = "vibe-drill"
+# The drill's public names: every name the primary's tunnel publishes, with
+# this in front of its first label (tb.firm.com -> hod-tb.firm.com). One
+# level under the domain, so Cloudflare's free certificate covers it.
+HOD_PREFIX = "hod-"
 PRIVATE_RANGES = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "100.64.0.0/10", "fc00::/7", "::1/128"]
 
 
@@ -576,12 +580,38 @@ def _route_hosts(routes):
     return hosts
 
 
-def drill_caddy(copy_json, out_json):
+def _rename_routes(routes, mapping):
+    """The routes, answering the drill names instead of the primary's. A
+    match set (Caddy ORs a route's match sets) whose names are all left out
+    (not published by the tunnel) is removed; a route left with no match
+    set is dropped, since with none it would answer every name."""
+    out = []
+    for r in routes or []:
+        r = json.loads(json.dumps(r))
+        if not r.get("match"):
+            out.append(r)
+            continue
+        kept = []
+        for m in r["match"]:
+            if "host" in m:
+                m["host"] = [mapping[h.lower()] for h in m["host"] if h.lower() in mapping]
+                if not m["host"]:
+                    continue
+            kept.append(m)
+        if kept:
+            r["match"] = kept
+            out.append(r)
+    return out
+
+
+def drill_caddy(copy_json, out_json, mapping=None, session=None):
     """The copy's Caddy config (adapted to JSON), changed to serve inside the
-    drill: one plain-HTTP server on :80 with every route of the primary, in
-    the primary's order (HTTPS sites first); no certificates, no ACME, no
-    redirects. TLS is the standby's real Caddy's job. Returns the public
-    names it serves (wildcards dropped: a hosts file cannot map them)."""
+    drill: one plain-HTTP server on :80 with the primary's routes, in the
+    primary's order (HTTPS sites first); no certificates, no ACME, no
+    redirects. HTTPS is Cloudflare's job, through the drill's own tunnel.
+    With `mapping` (live name -> drill name) the routes answer the drill
+    names only, and with `session` each app's first page in a browser is
+    the PRACTICE COPY notice. Returns the names it serves."""
     with open(copy_json) as f:
         cfg = json.load(f)
     servers = ((cfg.get("apps") or {}).get("http") or {}).get("servers") or {}
@@ -589,9 +619,15 @@ def drill_caddy(copy_json, out_json):
     routes = [r for s in order for r in (s.get("routes") or [])]
     hosts = [h for s in order if any(str(l).endswith(":443") for l in s.get("listen") or []) for h in _route_hosts(s.get("routes"))]
     hosts = [h for i, h in enumerate(hosts) if "*" not in h and h not in hosts[:i] and not h.replace(".", "").isdigit()]
+    if mapping is not None:
+        mapping = {k.lower(): v for k, v in mapping.items()}
+        routes = _rename_routes(routes, mapping)
+        hosts = [mapping[h.lower()] for h in hosts if h.lower() in mapping]
+        if session and hosts:
+            routes = [_notice_route(hosts, session)] + routes
     out = {"apps": {"http": {"servers": {"drill": {
         "listen": [":80"], "routes": routes, "automatic_https": {"disable": True},
-        # The standby's real Caddy, one hop away, says the request was HTTPS.
+        # The drill's Cloudflare connector, one hop away, says the request was HTTPS.
         "trusted_proxies": {"source": "static", "ranges": PRIVATE_RANGES}}}}}}
     if cfg.get("logging"):
         out["logging"] = cfg["logging"]
@@ -617,44 +653,210 @@ and nothing here can send email, file or reach the internet.</p>
 </main></body></html>"""
 
 
-def edge_config(base_json, hosts, allow, upstream, session):
-    """The standby's live Caddy config with the drill in front: for the
-    primary's names only, and only from the allowed addresses, a practice
-    notice on the first page of each app, then the drill's own Caddy. TLS
-    for those names from a throwaway certificate authority. The live
-    config is loaded in memory only: a reload of the Caddyfile (drill-clean)
-    or a restart drops all of it."""
-    with open(base_json) as f:
-        cfg = json.load(f)
-    servers = cfg.setdefault("apps", {}).setdefault("http", {}).setdefault("servers", {})
-    srv = next((s for s in servers.values() if any(str(l).endswith(":443") for l in s.get("listen") or [])), None)
-    if srv is None:
-        # A standby that serves only plain HTTP (its own mode is not domain):
-        # an HTTPS server just for the drill's names, gone with the reload.
-        srv = servers.setdefault(EDGE_CA, {"listen": [":443"], "routes": []})
-    route = {"match": [{"host": hosts}], "terminal": True, "handle": [{"handler": "subroute", "routes": [
-        {"match": [{"not": [{"remote_ip": {"ranges": allow}}]}], "terminal": True,
-         "handle": [{"handler": "static_response", "status_code": 403,
-                     "body": "This practice drill is open only to the computer that started it."}]},
-        {"match": [{"method": ["GET"], "header": {"Accept": ["*text/html*"]},
-                    "not": [{"header": {"Cookie": ["*vibe_drill_ok=%s*" % session]}}]}], "terminal": True,
-         "handle": [{"handler": "static_response", "status_code": 200, "body": NOTICE % session,
-                     "headers": {"Content-Type": ["text/html; charset=utf-8"], "Cache-Control": ["no-store"]}}]},
-        {"handle": [{"handler": "headers", "response": {"set": {"X-Vibe-Practice-Drill": ["1"]}}},
-                    {"handler": "reverse_proxy", "upstreams": [{"dial": upstream}]}]}]}]}
-    srv["routes"] = [route] + (srv.get("routes") or [])
-    auto = cfg["apps"].setdefault("tls", {}).setdefault("automation", {})
-    policies = []
-    for p in auto.get("policies") or []:
-        if p.get("subjects"):
-            p["subjects"] = [s for s in p["subjects"] if s not in hosts]
-            if not p["subjects"]:
+def _notice_route(hosts, session):
+    """Each app's first page in a browser: the PRACTICE COPY notice, until
+    the admin clicks through (a cookie for this drill only)."""
+    return {"match": [{"host": hosts, "method": ["GET"], "header": {"Accept": ["*text/html*"]},
+                       "not": [{"header": {"Cookie": ["*vibe_drill_ok=%s*" % session]}}]}], "terminal": True,
+            "handle": [{"handler": "static_response", "status_code": 200, "body": NOTICE % session,
+                        "headers": {"Content-Type": ["text/html; charset=utf-8"], "Cache-Control": ["no-store"],
+                                    "X-Robots-Tag": ["noindex"]}}]}
+
+
+def hod_map(hosts, zone):
+    """({live name: drill name}, [{host, reason}]) for the names the
+    primary's tunnel publishes. Only a name one level under the Cloudflare
+    zone gets a drill name: hod-<label>.<zone>."""
+    zone = zone.strip().strip(".").lower()
+    mapping, skipped = {}, []
+    for h in hosts:
+        h = h.strip().strip(".").lower()
+        if not h or h in mapping:
+            continue
+        if not h.endswith("." + zone):
+            skipped.append({"host": h, "reason": "not in the Cloudflare zone %s" % zone}); continue
+        label = h[: -len(zone) - 1]
+        if "." in label:
+            skipped.append({"host": h, "reason": "two levels under %s; Cloudflare's free certificate would not cover a drill name for it" % zone}); continue
+        if len(HOD_PREFIX + label) > 63:
+            skipped.append({"host": h, "reason": "its name is too long to take the drill prefix"}); continue
+        mapping[h] = "%s%s.%s" % (HOD_PREFIX, label, zone)
+    return mapping, skipped
+
+
+def _host_re(mapping):
+    # A whole name only: not part of a longer name (x.tb.firm.com,
+    # hod-tb.firm.com) and not the domain of an email address.
+    alts = sorted(mapping, key=len, reverse=True)
+    return re.compile(r"(?<![A-Za-z0-9.@_-])(%s)(?![A-Za-z0-9_-])" % "|".join(re.escape(h) for h in alts), re.I)
+
+
+def rename_text(text, mapping):
+    """`text` with every live name replaced by its drill name: (text, count)."""
+    if not mapping:
+        return text, 0
+    return _host_re(mapping).subn(lambda m: mapping[m.group(1).lower()], text)
+
+
+def _rename_obj(o, mapping):
+    n = 0
+    if isinstance(o, dict):
+        for k in list(o):
+            o[k], c = _rename_obj(o[k], mapping)
+            n += c
+    elif isinstance(o, list):
+        for i in range(len(o)):
+            o[i], c = _rename_obj(o[i], mapping)
+            n += c
+    elif isinstance(o, str):
+        o, n = rename_text(o, mapping)
+    return o, n
+
+
+def rename_drill(drill, mapping, where):
+    """Give the drill's copy the drill names. `where`: "env" (the drill's
+    copy of the settings, before compose reads them; also what an app
+    reads from a mounted settings file) or "render" (each app's rendered
+    services, which also catches names compose built from other settings).
+    Returns {file: replacements}."""
+    counts = {}
+    if where == "env":
+        d = os.path.join(drill, "env")
+        for f in sorted(os.listdir(d)):
+            p = os.path.join(d, f)
+            if not os.path.isfile(p):
                 continue
-        policies.append(p)
-    auto["policies"] = [{"subjects": hosts, "issuers": [{"module": "internal", "ca": EDGE_CA}]}] + policies
-    cfg["apps"].setdefault("pki", {}).setdefault("certificate_authorities", {})[EDGE_CA] = {
-        "name": "Vibe practice drill - remove after use", "install_trust": False}
-    return cfg
+            with open(p, encoding="utf-8", errors="surrogateescape") as fh:
+                text = fh.read()
+            new, n = rename_text(text, mapping)
+            if n:
+                with open(p, "w", encoding="utf-8", errors="surrogateescape") as fh:
+                    fh.write(new)
+                counts["env/" + f] = n
+    else:
+        d = os.path.join(drill, "render")
+        for f in sorted(os.listdir(d)):
+            if not f.endswith(".json"):
+                continue
+            p = os.path.join(d, f)
+            with open(p) as fh:
+                cfg = json.load(fh)
+            # _skipped.json and the like are not service definitions.
+            if not isinstance(cfg, dict):
+                continue
+            # What the containers are given only; images and paths keep their names.
+            n = 0
+            for svc in (cfg.get("services") or {}).values():
+                for key in ("environment", "command", "entrypoint", "labels", "healthcheck"):
+                    if key in svc:
+                        svc[key], c = _rename_obj(svc[key], mapping)
+                        n += c
+            if n:
+                with open(p + ".tmp", "w") as fh:
+                    json.dump(cfg, fh)
+                os.replace(p + ".tmp", p)
+                counts["render/" + f] = n
+    return counts
+
+
+def leftover_names(drill, mapping):
+    """Live names still in the drill's settings after renaming (inside a
+    longer word or an email address, say), so the report can name them."""
+    if not mapping:
+        return []
+    rx = re.compile("|".join(re.escape(h) for h in sorted(mapping, key=len, reverse=True)), re.I)
+    paths = [os.path.join(drill, "compose.json")]
+    env_dir = os.path.join(drill, "env")
+    paths += [os.path.join(env_dir, f) for f in sorted(os.listdir(env_dir))] if os.path.isdir(env_dir) else []
+    found = set()
+    for p in paths:
+        try:
+            with open(p, encoding="utf-8", errors="surrogateescape") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        for m in rx.finditer(text):
+            # The tail of a drill name (hod-tb.firm.com) is not a leftover.
+            if text[max(0, m.start() - len(HOD_PREFIX)):m.start()].lower() == HOD_PREFIX:
+                continue
+            found.add(m.group(0).lower())
+    return sorted(found)
+
+
+def _env_file(path):
+    out = {}
+    try:
+        with open(path, encoding="utf-8", errors="surrogateescape") as fh:
+            for line in fh:
+                line = line.rstrip("\n")
+                if "=" not in line or line.lstrip().startswith("#"):
+                    continue
+                k, v = line.split("=", 1)
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+                    v = v[1:-1]
+                out[k.strip()] = v
+    except OSError:
+        pass
+    return out
+
+
+def rebase_request(drill, plan):
+    """The body for Vibe Auth's /rebase inside the drill (after renaming),
+    or None when the drill has no Vibe Auth: the drill name it serves at,
+    and each drilled app's drill address, as lib/identity.sh id_rebase
+    builds them on a real box. `base` is the broker's path prefix."""
+    env_dir = os.path.join(drill, "env")
+    if not any(a["slug"] == "vibe-auth" for a in plan.get("apps") or []):
+        return None
+    va = _env_file(os.path.join(env_dir, "vibe-auth.env"))
+    origin = va.get("VIBE_AUTH_APPLIANCE_ORIGIN", "")
+    if not origin:
+        return None
+    scheme = origin.split("://", 1)[0] if "://" in origin else "https"
+    host = origin.split("://", 1)[-1].split("/", 1)[0]
+    if va.get("VIBE_AUTH_APPLIANCE_MODE", "").endswith("subdomain-per-app") and host.startswith("auth."):
+        host = host[len("auth."):]
+    products = {}
+    for a in plan.get("apps") or []:
+        e = _env_file(os.path.join(env_dir, a["slug"] + ".env"))
+        if not (a.get("sso") or {}).get("registered") or not e.get("ALLOWED_ORIGIN"):
+            continue
+        base = e["ALLOWED_ORIGIN"].split(",")[0].strip().rstrip("/")
+        path = (e.get("VITE_BASE_PATH") or "").strip().strip("/")
+        products[a["slug"]] = base + ("/" + path if path else "")
+    b = (va.get("VIBE_AUTH_BASE_PATH") or "").strip().strip("/")
+    return {"host": host, "scheme": scheme, "products": products, "base": ("/" + b) if b else ""}
+
+
+def apply_rebase(drill, plan, resp):
+    """Vibe Auth's answer to the drill's /rebase: give each app the settings
+    it returned, in the drill's compose file, for the settings its services
+    already have. Returns the services to recreate (those that changed)."""
+    path = os.path.join(drill, "compose.json")
+    with open(path) as fh:
+        compose = json.load(fh)
+    owners = {a["slug"]: a["services"] for a in plan.get("apps") or []}
+    changed = []
+    for p in (resp.get("products") or []):
+        env = p.get("env") or {}
+        for name in owners.get(p.get("slug"), []):
+            svc = (compose.get("services") or {}).get(name)
+            if not svc or not isinstance(svc.get("environment"), dict):
+                continue
+            touched = False
+            for k, v in env.items():
+                if k in svc["environment"] and svc["environment"][k] != str(v):
+                    svc["environment"][k] = str(v)
+                    touched = True
+            if touched:
+                changed.append(name)
+    if changed:
+        with open(path + ".tmp", "w") as fh:
+            json.dump(compose, fh, indent=1)
+        os.chmod(path + ".tmp", 0o600)
+        os.replace(path + ".tmp", path)
+    return changed
 
 
 if __name__ == "__main__":
@@ -671,21 +873,56 @@ if __name__ == "__main__":
         d, out, snap, started, restored, warns, probe, tunnel = args
         body = report(d, out, snap, started, int(restored), [w for w in warns.split("\x1f") if w], probe, tunnel == "1")
         print("drill %s: %d app(s) checked, %d not drilled" % ("passed" if body["ok"] else "FAILED", len(body["apps"]), len(body["skipped"])))
-    elif cmd == "drill-caddy" and len(args) == 2:
-        print(json.dumps(drill_caddy(args[0], args[1])))
-    elif cmd == "edge-config" and len(args) == 5:
-        base, hosts_file, allow, upstream, session = args
-        with open(hosts_file) as f:
-            hosts = json.load(f)
-        json.dump(edge_config(base, hosts, [a for a in allow.split(",") if a], upstream, session), sys.stdout)
-    elif cmd == "hands-on-report" and len(args) == 5:
-        # Add the hands-on details to a finished report: until, names, who may connect.
-        out, until, hosts_file, allow, address = args
+    elif cmd == "drill-caddy" and len(args) in (2, 4):
+        # With <hod.json> <session>: the drill names, and the PRACTICE COPY notice.
+        mapping = None
+        if len(args) == 4:
+            with open(args[2]) as f:
+                mapping = json.load(f)["map"]
+        print(json.dumps(drill_caddy(args[0], args[1], mapping, args[3] if len(args) == 4 else None)))
+    elif cmd == "hod-plan" and len(args) == 3:
+        # <tunnel names file, one per line> <zone> <out hod.json>
+        with open(args[0]) as f:
+            names = [l.strip() for l in f if l.strip()]
+        mapping, skipped = hod_map(names, args[1])
+        with open(args[2], "w") as f:
+            json.dump({"zone": args[1], "map": mapping, "skipped": skipped}, f, indent=1)
+        print(json.dumps({"names": len(mapping), "skipped": skipped}))
+    elif cmd == "hod-rename" and len(args) == 3:
+        # <drill-dir> <hod.json> env|render
+        with open(args[1]) as f:
+            mapping = json.load(f)["map"]
+        print(json.dumps(rename_drill(args[0], mapping, args[2])))
+    elif cmd == "hod-leftovers" and len(args) == 2:
+        with open(args[1]) as f:
+            mapping = json.load(f)["map"]
+        print(json.dumps(leftover_names(args[0], mapping)))
+    elif cmd == "rebase-request" and len(args) == 1:
+        with open(os.path.join(args[0], "plan.json")) as f:
+            body = rebase_request(args[0], json.load(f))
+        print(json.dumps(body) if body else "")
+    elif cmd == "apply-rebase" and len(args) == 2:
+        with open(os.path.join(args[0], "plan.json")) as f:
+            plan = json.load(f)
+        with open(args[1]) as f:
+            resp = json.load(f)
+        print(" ".join(apply_rebase(args[0], plan, resp)))
+    elif cmd == "hands-on-report" and len(args) == 4:
+        # Add the hands-on details to a finished report: until, the drill's
+        # names, the names left out and what else the admin should know.
+        out, until, hosts_file, hod_file = args
         with open(out) as f:
             body = json.load(f)
         with open(hosts_file) as f:
             hosts = json.load(f)
-        body["handsOn"] = {"until": until, "hosts": hosts, "allow": [a for a in allow.split(",") if a], "address": address}
+        hod = {}
+        try:
+            with open(hod_file) as f:
+                hod = json.load(f)
+        except (OSError, ValueError):
+            pass
+        body["handsOn"] = {"until": until, "hosts": hosts, "public": True, "skipped": hod.get("skipped") or [],
+                           "leftovers": hod.get("leftovers") or [], "signIn": hod.get("signIn")}
         with open(out + ".tmp", "w") as f:
             json.dump(body, f, indent=1)
         os.chmod(out + ".tmp", 0o644)

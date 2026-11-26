@@ -16,10 +16,11 @@
 #                    in an isolated, throwaway project, check them, remove it.
 #                    App test (apps in drill.ready): only those apps and the
 #                    apps they need, with only their databases restored.
-#                    Hands-on (handsOn in drill.ready): leave it running and
-#                    put it in front of the admin's computer only
-#   drill-clean      remove every trace of a drill, and give this box's web
-#                    server back its own settings (safe at any time)
+#                    Hands-on (handsOn in drill.ready): give the copy drill
+#                    names (hod-<name>), leave it running and open it through
+#                    a Cloudflare tunnel of its own, made for the drill
+#   drill-clean      remove every trace of a drill, including its tunnel and
+#                    DNS names (safe at any time)
 #   drill-expire     queue drill-clean (the hands-on time limit's timer)
 #   tunnel-up        start cloudflared with the token already in shared.env
 #   tunnel-teardown  a new standby removes its OWN tunnel and DNS records
@@ -777,6 +778,15 @@ DRILL_HANDSON="${SB_DIR}/drill-handson.json"
 DRILL_CA="${SB_DIR}/drill-ca.crt"
 DRILL_EDGE_NET="${DRILL_PROJECT}_drill-edge"
 DRILL_EXPIRE_UNIT="vibe-drill-expire"
+# Hands-on drill through Cloudflare: its own tunnel (never the firm's), its
+# own connector container, on its own network out, joined to the drill's
+# web server only. The record file outlives the drill directory, so a
+# clean-up can always find what to delete.
+DRILL_OPEN="${SB_DIR}/drill-open.json"
+DRILL_TUNNEL_REC="${SB_DIR}/drill-tunnel.json"
+DRILL_CONNECTOR="vibe-drill-connector"
+DRILL_EGRESS_NET="${DRILL_PROJECT}_egress"
+DRILL_CONNECTOR_IMAGE="${VIBE_DRILL_CONNECTOR_IMAGE:-cloudflare/cloudflared:latest}"
 
 _caddy_running() { [[ "$(docker inspect -f '{{.State.Running}}' vibe-caddy 2>/dev/null)" == "true" ]]; }
 
@@ -803,41 +813,142 @@ _drill_edge_close() {
   rm -f "$DRILL_HANDSON" "$DRILL_CA"
 }
 
-# Put the running drill in front of the allowed computer(s). Fails the drill
-# (which cleans up, reverting the real Caddy) on any problem.
-_drill_edge_open() { # <minutes> <allow csv> <address>
-  local minutes="$1" allow="$2" address="$3" dc=(docker compose -p "$DRILL_PROJECT" -f "$DRILL_DIR/compose.json") session until
-  _caddy_running || _drill_fail "this box's web server (vibe-caddy) is not running, so the drill cannot be reached" \
-    "sudo docker start vibe-caddy — then start the hands-on drill again"
+# The drill tunnel's name: one per standby box, never the firm's own tunnel.
+_drill_tunnel_name() {
+  local id
+  id="$(head -c 8 /etc/machine-id 2>/dev/null || true)"
+  [[ "$id" =~ ^[0-9a-f]{8}$ ]] || id="$(hostname | tr -cd 'a-z0-9' | head -c 12)"
+  printf 'vibe-practice-drill-%s' "${id:-box}"
+}
+
+# The firm's tunnel key, for the drill tunnel. Saved beside the record when
+# the drill opens (only the three Cloudflare lines, 0600), so the tunnel can
+# always be deleted: after the drill folder is gone, after a promote has
+# moved the mirror, or after a later copy no longer has the key.
+DRILL_CF_KEY="${SB_DIR}/drill-cf.env"
+_drill_cf_env() {
+  if [[ -f "$DRILL_CF_KEY" ]]; then printf '%s' "$DRILL_CF_KEY"
+  elif [[ -f "$DRILL_DIR/env/appliance.env" ]]; then printf '%s' "$DRILL_DIR/env/appliance.env"
+  else printf '%s' "$SRC/env/appliance.env"; fi
+}
+_drill_cf_save_key() {
+  ( umask 077; grep -E '^(CLOUDFLARE_TUNNEL_API_TOKEN|CLOUDFLARE_ACCOUNT_ID|CLOUDFLARE_ZONE_ID)=' "$1" > "$DRILL_CF_KEY.tmp" ) \
+    && mv "$DRILL_CF_KEY.tmp" "$DRILL_CF_KEY"
+}
+
+# Delete the drill tunnel and its names in Cloudflare; keeps the record and
+# the saved key when anything is left, so a later try can finish.
+_drill_cf_close() {
+  local rc=0
+  timeout 120 python3 "$APPLIANCE_DIR/lib/standby_drill_tunnel.py" close "$(_drill_cf_env)" "$DRILL_TUNNEL_REC" "$(_drill_tunnel_name)" \
+    >>"$VIBE_LOG_FILE" 2>&1 || rc=$?
+  if (( rc == 0 )); then rm -f "$DRILL_TUNNEL_REC" "$DRILL_CF_KEY"; return 0; fi
+  # No key and nothing recorded: there was never a tunnel to delete.
+  if (( rc == 3 )) && [[ ! -f "$DRILL_TUNNEL_REC" ]]; then return 0; fi
+  return 1
+}
+
+# Close the hands-on drill to the outside: stop its connector at once (that
+# alone closes it), then delete its tunnel and DNS names in Cloudflare.
+# Never fatal and never slow for a promote: while a promote waits
+# (drill.cancel) the Cloudflare part runs in the background, retried a few
+# times. A failure is logged and retried by the next clean-up. With no
+# connector the drill names only show Cloudflare's "tunnel offline" page.
+_drill_tunnel_close() {
+  docker rm -f "$DRILL_CONNECTOR" >/dev/null 2>&1 || true
+  docker network rm "$DRILL_EGRESS_NET" >/dev/null 2>&1 || true
+  rm -f "${DRILL_DIR}/connector.env"
+  systemctl stop "${DRILL_EXPIRE_UNIT}.timer" "${DRILL_EXPIRE_UNIT}.service" >/dev/null 2>&1 || true
+  [[ -f "$DRILL_TUNNEL_REC" || -f "$DRILL_OPEN" ]] || return 0
+  rm -f "$DRILL_OPEN"
+  if [[ -f "$DRILL_CANCEL" ]]; then
+    log_info "a promote is waiting; the practice drill's tunnel is removed in the background (its connector is stopped)"
+    # Detached, so neither the promote nor the host runner waits for it.
+    local self="$APPLIANCE_DIR/lib/standby-host.sh"
+    if command -v setsid >/dev/null 2>&1; then
+      setsid -f /bin/bash "$self" drill-cf-close </dev/null >/dev/null 2>&1 || true
+    else
+      nohup /bin/bash "$self" drill-cf-close </dev/null >/dev/null 2>&1 &
+    fi
+    return 0
+  fi
+  _drill_cf_close || log_warn "the practice drill's tunnel or DNS names could not all be removed from Cloudflare yet; the next drill clean-up tries again" \
+    hint="sudo tail -30 $VIBE_LOG_FILE"
+}
+
+# Background clean-up of the drill tunnel (after a promote started): three
+# tries, a minute apart. Safe on any box and at any time.
+action_drill_cf_close() {
+  [[ -f "$DRILL_TUNNEL_REC" ]] || { log_info "no practice drill tunnel to remove"; return 0; }
+  local i
+  for i in 1 2 3; do
+    _drill_cf_close && { log_ok "the practice drill's tunnel and names were removed from Cloudflare"; return 0; }
+    (( i < 3 )) && sleep 60
+  done
+  log_warn "the practice drill's tunnel or names are still in Cloudflare; delete the tunnel named $(_drill_tunnel_name) and its hod- DNS records in the Cloudflare dashboard" \
+    hint="sudo tail -30 $VIBE_LOG_FILE"
+}
+
+# Open the running drill through its own Cloudflare tunnel. Fails the drill
+# (which cleans up, tunnel included) on any problem.
+_drill_tunnel_open() { # <minutes> <zone>
+  local minutes="$1" dc=(docker compose -p "$DRILL_PROJECT" -f "$DRILL_DIR/compose.json") until i
+  printf '{"state":"opening"}\n' > "$DRILL_OPEN"
+  _drill_cf_save_key "$DRILL_DIR/env/appliance.env" || _drill_fail "could not keep the Cloudflare key for removing the drill's tunnel later" "sudo tail -30 $VIBE_LOG_FILE"
   ( "${dc[@]}" up -d caddy ) >>"$VIBE_LOG_FILE" 2>&1 \
     || _drill_fail "the copy's web server did not start in the drill" "sudo tail -30 $VIBE_LOG_FILE"
-  docker network connect "$DRILL_EDGE_NET" vibe-caddy >>"$VIBE_LOG_FILE" 2>&1 \
-    || _drill_fail "this box's web server could not be connected to the drill" "sudo tail -30 $VIBE_LOG_FILE"
-  # From here on the real Caddy is touched: drill-clean undoes it.
-  printf '{"state":"opening"}\n' > "$DRILL_HANDSON"
-  docker exec vibe-caddy wget -qO- http://127.0.0.1:2019/config/ > "$DRILL_DIR/edge-base.json" 2>>"$VIBE_LOG_FILE" \
-    || _drill_fail "could not read this box's web server settings" "sudo docker logs --tail 30 vibe-caddy"
-  session="$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-  python3 "$APPLIANCE_DIR/lib/standby_drill.py" edge-config "$DRILL_DIR/edge-base.json" "$DRILL_DIR/caddy/hosts.json" \
-    "$allow" "vibe-drill-caddy:80" "$session" > "$DRILL_DIR/edge.json" 2>>"$VIBE_LOG_FILE" \
-    || _drill_fail "could not prepare the web server settings for the drill" "sudo tail -30 $VIBE_LOG_FILE"
-  docker exec -i vibe-caddy sh -c 'cat > /tmp/vibe-drill.json && caddy reload --config /tmp/vibe-drill.json && rm -f /tmp/vibe-drill.json' \
-    < "$DRILL_DIR/edge.json" >>"$VIBE_LOG_FILE" 2>&1 \
-    || _drill_fail "this box's web server refused the drill's settings (it keeps its own)" "sudo docker logs --tail 30 vibe-caddy"
-  local i
-  for i in $(seq 1 30); do
-    docker exec vibe-caddy cat "/data/caddy/pki/authorities/${DRILL_PROJECT}/root.crt" > "$DRILL_CA.tmp" 2>/dev/null && [[ -s "$DRILL_CA.tmp" ]] && break
+  local out rc=0
+  out="$(python3 "$APPLIANCE_DIR/lib/standby_drill_tunnel.py" open "$(_drill_cf_env)" "$DRILL_TUNNEL_REC" "$(_drill_tunnel_name)" \
+    "$DRILL_DIR/hod.json" "http://vibe-drill-caddy:80" "$DRILL_DIR/connector.env" 2>&1)" || rc=$?
+  printf '%s\n' "$out" >>"$VIBE_LOG_FILE"
+  (( rc == 0 )) || _drill_fail "Cloudflare: $(tail -1 <<<"$out")" \
+    "check the firm's Cloudflare tunnel key (Settings, Network, on the primary) can edit tunnels and DNS, then start the hands-on drill again"
+  docker network create --label "com.docker.compose.project=${DRILL_PROJECT}" "$DRILL_EGRESS_NET" >>"$VIBE_LOG_FILE" 2>&1 \
+    || _drill_fail "could not create the drill connector's network" "sudo tail -30 $VIBE_LOG_FILE"
+  local cmd=(tunnel --no-autoupdate run) extra=()
+  # Test harness only: a stand-in connector.
+  [[ -n "${VIBE_DRILL_CONNECTOR_CMD:-}" ]] && read -r -a cmd <<<"$VIBE_DRILL_CONNECTOR_CMD"
+  [[ -n "${VIBE_DRILL_CONNECTOR_TEST_ARGS:-}" ]] && read -r -a extra <<<"$VIBE_DRILL_CONNECTOR_TEST_ARGS"
+  docker run -d --name "$DRILL_CONNECTOR" --label "com.docker.compose.project=${DRILL_PROJECT}" --restart no \
+    --network "$DRILL_EGRESS_NET" --env-file "$DRILL_DIR/connector.env" --pull never "${extra[@]}" "$DRILL_CONNECTOR_IMAGE" "${cmd[@]}" \
+    >>"$VIBE_LOG_FILE" 2>&1 || { rm -f "$DRILL_DIR/connector.env"; _drill_fail "the drill's Cloudflare connector did not start" "sudo tail -30 $VIBE_LOG_FILE"; }
+  rm -f "$DRILL_DIR/connector.env"
+  docker network connect "$DRILL_EDGE_NET" "$DRILL_CONNECTOR" >>"$VIBE_LOG_FILE" 2>&1 \
+    || _drill_fail "the drill's connector could not reach the drill's web server" "sudo tail -30 $VIBE_LOG_FILE"
+  # The connector goes out; the apps still must not.
+  local probe_net probe_img egress
+  probe_net="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('probeNetwork') or '')" "$DRILL_DIR/plan.json")"
+  probe_img="$(docker inspect vibe-console --format '{{.Config.Image}}' 2>/dev/null || true)"
+  if [[ -n "$probe_net" && -n "$probe_img" ]]; then
+    local erc=0
+    egress="$(docker run --rm --network "$probe_net" --entrypoint sh "$probe_img" -c \
+      'for u in https://1.1.1.1/ https://example.com/; do curl -s -o /dev/null -w "%{http_code} " --max-time 8 "$u"; done; exit 0' 2>>"$VIBE_LOG_FILE")" || erc=$?
+    # Could not check is not "reached the internet", but it still closes the drill.
+    (( erc == 0 )) || _drill_fail "could not check that the drill's apps stay cut off from the internet once its connector started, so the drill was removed" \
+      "start the hands-on drill again; if it keeps happening: sudo tail -30 $VIBE_LOG_FILE"
+    [[ "$egress" == "000 000 " ]] || _drill_fail "the drill's apps could reach the internet once its connector started, which must never happen; the drill was removed" \
+      "do not run another hands-on drill; contact support with the drill history"
+  fi
+  local wait_s="${VIBE_DRILL_CONNECT_WAIT:-60}" deadline
+  deadline=$(( $(date +%s) + wait_s ))
+  while :; do
+    # A promote never waits for this.
+    _drill_check_cancel
+    VIBE_CF_TIMEOUT=5 python3 "$APPLIANCE_DIR/lib/standby_drill_tunnel.py" check "$(_drill_cf_env)" "$DRILL_TUNNEL_REC" >/dev/null 2>&1 && break
+    [[ "$(docker inspect -f '{{.State.Running}}' "$DRILL_CONNECTOR" 2>/dev/null)" == "true" ]] \
+      || _drill_fail "the drill's Cloudflare connector stopped: $(docker logs --tail 3 "$DRILL_CONNECTOR" 2>&1 | tr '\n' ' ' | cut -c1-300)" "sudo tail -30 $VIBE_LOG_FILE"
+    (( $(date +%s) < deadline )) || _drill_fail "the drill's Cloudflare connector did not connect within ${wait_s} seconds" \
+      "check this box can reach the internet (outbound 443 and 7844), then start the hands-on drill again"
     sleep 1
   done
-  [[ -s "$DRILL_CA.tmp" ]] || _drill_fail "the drill's certificate was not created" "sudo docker logs --tail 30 vibe-caddy"
-  chmod 644 "$DRILL_CA.tmp"; mv "$DRILL_CA.tmp" "$DRILL_CA"
   until="$(date -u -d "+${minutes} minutes" +%Y-%m-%dT%H:%M:%SZ)"
-  python3 "$APPLIANCE_DIR/lib/standby_drill.py" hands-on-report "$DRILL_REPORT" "$until" "$DRILL_DIR/caddy/hosts.json" "$allow" "$address" \
+  python3 "$APPLIANCE_DIR/lib/standby_drill.py" hands-on-report "$DRILL_REPORT" "$until" "$DRILL_DIR/caddy/hosts.json" "$DRILL_DIR/hod.json" \
     || _drill_fail "could not write the drill report" "sudo tail -30 $VIBE_LOG_FILE"
-  printf '{"state":"open","until":"%s"}\n' "$until" > "$DRILL_HANDSON"
+  printf '{"state":"open","until":"%s"}\n' "$until" > "$DRILL_OPEN"
   # The time limit holds even when the Standby service is down: the host
   # queues the clean-up itself. (A reboot drops the timer, and the drill
-  # with it: restart "no", and Caddy starts from its Caddyfile.)
+  # with it: restart "no"; the service's start-up clean-up removes the
+  # tunnel.)
   if command -v systemd-run >/dev/null 2>&1; then
     systemctl stop "${DRILL_EXPIRE_UNIT}.timer" >/dev/null 2>&1 || true
     systemctl reset-failed "${DRILL_EXPIRE_UNIT}.service" "${DRILL_EXPIRE_UNIT}.timer" >/dev/null 2>&1 || true
@@ -848,10 +959,55 @@ _drill_edge_open() { # <minutes> <allow csv> <address>
   log_ok "hands-on drill open until $until"
 }
 
+# Vibe Auth inside the drill: point it at the drill names (its own copy of
+# the sign-in database, throwaway), as a real host change would, and give
+# the apps the settings it answers with. Never the box's own Vibe Auth: the
+# call goes to the drill's, on the drill network. A problem is recorded for
+# the report; the drill still opens (apps with their own sign-in work).
+_drill_rebase_sso() { # <probe network> <probe image>
+  local net="$1" img="$2" req base body token resp code svcs
+  req="$(python3 "$APPLIANCE_DIR/lib/standby_drill.py" rebase-request "$DRILL_DIR" 2>>"$VIBE_LOG_FILE" || true)"
+  [[ -n "$req" ]] || return 0
+  token="$(_env_get "$DRILL_DIR/env/vibe-auth.env" VIBE_AUTH_CONSOLE_TOKEN)"
+  _hod_note() { python3 - "$DRILL_DIR/hod.json" "$1" <<'PYEOF' || true
+import json, sys
+p = sys.argv[1]; d = json.load(open(p)); d["signIn"] = sys.argv[2]; json.dump(d, open(p, "w"), indent=1)
+PYEOF
+  }
+  if [[ -z "$token" ]]; then _hod_note "sign-in through Vibe Auth was not moved to the drill names: the copy has no Vibe Auth console token"; return 0; fi
+  base="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('base',''))" "$req")"
+  body="$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); d.pop('base',None); print(json.dumps(d))" "$req")"
+  log_step "pointing the drill's Vibe Auth at the drill names"
+  resp="$({ printf '%s\n' "$token"; printf '%s' "$body"; } | docker run --rm -i --network "$net" --entrypoint sh "$img" -c \
+    'IFS= read -r t; umask 077; printf "header = \"Authorization: Bearer %s\"\n" "$t" > /tmp/h; curl -s -K /tmp/h -o /tmp/r -w "%{http_code}" --max-time 30 -X POST -H "Content-Type: application/json" --data-binary @- "$0"; echo; cat /tmp/r' \
+    "http://vibe-auth:8080${base}/rebase" 2>>"$VIBE_LOG_FILE" || true)"
+  code="${resp%%$'\n'*}"
+  if [[ ! "$code" =~ ^2 ]]; then
+    _hod_note "sign-in through Vibe Auth may not work in the hands-on drill: its sign-in server answered ${code:-nothing} when asked to use the drill names (Vibe Auth 1.0.9 or later is needed)"
+    log_warn "the drill's Vibe Auth did not accept the drill names" code="${code:-none}"
+    return 0
+  fi
+  printf '%s' "${resp#*$'\n'}" > "$DRILL_DIR/rebase.json"
+  # A broker older than 1.0.9 accepts the name but serves sign-in at
+  # auth.<name>, which nothing answers.
+  if grep -q 'auth\.hod-' "$DRILL_DIR/rebase.json" 2>/dev/null; then
+    _hod_note "sign-in through Vibe Auth will not work in the hands-on drill: this Vibe Auth is older than 1.0.9 and cannot serve at a practice name. Update Vibe Auth on the primary, let the standby sync, then try again"
+  fi
+  _drill_check_cancel
+  svcs="$(python3 "$APPLIANCE_DIR/lib/standby_drill.py" apply-rebase "$DRILL_DIR" "$DRILL_DIR/rebase.json" 2>>"$VIBE_LOG_FILE" || true)"
+  rm -f "$DRILL_DIR/rebase.json"
+  if [[ -n "$svcs" ]]; then
+    # shellcheck disable=SC2086
+    ( docker compose -p "$DRILL_PROJECT" -f "$DRILL_DIR/compose.json" up -d --no-deps --force-recreate $svcs ) >>"$VIBE_LOG_FILE" 2>&1 \
+      || log_warn "could not restart the apps with Vibe Auth's drill settings" services="$svcs"
+    python3 "$APPLIANCE_DIR/lib/standby_drill.py" wait "$DRILL_DIR" "$DRILL_TIMEOUT" "$DRILL_CANCEL" >>"$VIBE_LOG_FILE" 2>&1 || true
+  fi
+}
+
 # Queue drill-clean through the host runner (so it waits its turn behind any
 # other host action). Run by the expiry timer.
 action_drill_expire() {
-  [[ -f "$DRILL_HANDSON" ]] || { log_info "no hands-on drill to end"; return 0; }
+  [[ -f "$DRILL_OPEN" || -f "$DRILL_HANDSON" ]] || { log_info "no hands-on drill to end"; return 0; }
   local ha="${VIBE_HOST_ACTIONS_DIR:-${VIBE_DIR}/host-actions}" id
   id="$(date +%s%3N)-$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   mkdir -p "$ha/queue"
@@ -871,7 +1027,10 @@ _drill_ids() { # <kind: ps|volume|network>
 
 action_drill_clean() { # [keep-cancel]: the drill's own opening clean must not eat a cancel that came first
   local ids edge_ok=1
-  # The standby's real Caddy first: it must stop pointing at the drill.
+  # Closed to the outside first: the drill's connector, then its tunnel.
+  _drill_tunnel_close
+  # A hands-on drill opened by an older version (the standby's real Caddy
+  # in front of one computer): give that web server its own settings back.
   _drill_edge_close || edge_ok=0
   docker rm -f vibe-drill-probe >/dev/null 2>&1 || true
   if [[ -f "$DRILL_DIR/compose.json" ]]; then
@@ -929,22 +1088,19 @@ action_drill() {
   [[ "$stage_path" =~ ^/[A-Za-z0-9/_.-]+$ && "$stage_path" != *..* ]] || die "the drill request names no valid copy" \
     "start the drill again from the Standby panel"
   local stage="${MIRROR_ROOT}${stage_path}"
-  # Hands-on: "<minutes>\t<allowed addresses as CIDRs, comma-separated>\t<address to map names to>",
-  # validated here; empty for an ordinary drill.
-  local handson="" ho_min="" ho_allow="" ho_addr=""
+  # Hands-on: how many minutes to keep it open, validated here; empty for an
+  # ordinary drill.
+  local handson="" ho_min="" ho_zone=""
   handson="$(python3 - "$DRILL_READY" <<'PYEOF'
-import ipaddress, json, sys
+import json, sys
 h = json.load(open(sys.argv[1])).get("handsOn")
 if not h: sys.exit(0)
 m = int(h.get("minutes", 0))
 if not 15 <= m <= 480: sys.exit("minutes")
-allow = [ipaddress.ip_address(str(a)) for a in h.get("allow") or []]
-if not allow: sys.exit("allow")
-addr = ipaddress.ip_address(str(h.get("address")))
-print("%d\t%s\t%s" % (m, ",".join("%s/%d" % (a, a.max_prefixlen) for a in allow), addr))
+print(m)
 PYEOF
 )" || die "the hands-on drill request is not valid" "start the hands-on drill again from the Standby panel"
-  [[ -z "$handson" ]] || IFS=$'\t' read -r ho_min ho_allow ho_addr <<<"$handson"
+  ho_min="$handson"
   # App test: only these apps (plus the enabled apps they need), and only
   # their databases. Empty: every enabled app.
   local only=""
@@ -967,25 +1123,28 @@ PYEOF
       "the Standby service stops it within 5 minutes; then start the drill again. If it keeps running: sudo docker stop vibe-cloudflared"
   fi
   if [[ -n "$ho_min" ]]; then
-    # A hosts file can only point names somewhere; it cannot change an IP
-    # address the apps were set up with.
+    # The drill names come from the primary's own web addresses.
     [[ "$(python3 -c "import json,sys; print((json.load(open(sys.argv[1])).get('config') or {}).get('mode',''))" "$SRC/state.json" 2>/dev/null)" == "domain" ]] \
       || _drill_fail "a hands-on drill needs the primary to use its own web addresses (domain mode); this copy reaches its apps by IP address" \
            "use the ordinary practice drill, or a planned switchover after hours"
-    _caddy_running || _drill_fail "this box's web server (vibe-caddy) is not running, so a hands-on drill could not be reached" \
-      "sudo docker start vibe-caddy — then start the hands-on drill again"
-    # This box itself, or a Docker network's gateway, as "the admin's computer"
-    # would let in everything that reaches the web server that way.
-    local gws
-    gws="$(docker network inspect $(docker network ls -q) -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' 2>/dev/null | tr '\n' ' ' || true)"
-    python3 - "$ho_allow" "$gws" <<'PYEOF' || _drill_fail "the panel was opened from this box itself or through a Docker network, so the drill cannot tell your computer apart" \
-      "open the Standby panel from your own computer, by this box's address, and start the hands-on drill again"
-import ipaddress, sys
-gws = {g for g in sys.argv[2].split() if g}
-for a in sys.argv[1].split(","):
-    ip = ipaddress.ip_network(a).network_address
-    if ip.is_loopback or ip.is_unspecified or str(ip) in gws: sys.exit(1)
-PYEOF
+    # It opens through Cloudflare with the firm's tunnel key, from the copy.
+    local zrc=0
+    ho_zone="$(python3 "$APPLIANCE_DIR/lib/standby_drill_tunnel.py" zone "$SRC/env/appliance.env" 2>"$SB_DIR/.drill-zone.err")" || zrc=$?
+    if (( zrc == 3 )); then
+      rm -f "$SB_DIR/.drill-zone.err"
+      _drill_fail "a hands-on drill opens through Cloudflare with the firm's tunnel key, and the primary has none (it does not use a Cloudflare tunnel)" \
+        "use the ordinary practice drill; or set up the Cloudflare tunnel on the primary (Settings, Network), let the standby sync, then start the hands-on drill again"
+    elif (( zrc != 0 )); then
+      local zerr; zerr="$(tail -1 "$SB_DIR/.drill-zone.err" 2>/dev/null)"; rm -f "$SB_DIR/.drill-zone.err"
+      _drill_fail "Cloudflare: ${zerr:-the domain could not be read with the tunnel key}" \
+        "check this box can reach the internet and that the primary's Cloudflare tunnel key is still valid, then start the hands-on drill again"
+    fi
+    rm -f "$SB_DIR/.drill-zone.err"
+    # The connector image: the one the primary runs (never an app image, so
+    # a hands-on drill may fetch it; an ordinary drill never fetches).
+    docker image inspect "$DRILL_CONNECTOR_IMAGE" >/dev/null 2>&1 || docker pull -q "$DRILL_CONNECTOR_IMAGE" >>"$VIBE_LOG_FILE" 2>&1 \
+      || _drill_fail "the Cloudflare connector image ($DRILL_CONNECTOR_IMAGE) is not on this box and could not be downloaded" \
+           "check this box can reach the internet, then start the hands-on drill again"
   fi
   _drill_check_cancel
   action_drill_clean keep-cancel >/dev/null || _drill_fail "an earlier drill could not be cleared away" "sudo tail -30 $VIBE_LOG_FILE"
@@ -1092,6 +1251,21 @@ PYEOF
       compose_files; docker compose "${COMPOSE_FILES[@]}" config --format json > "$4/_core.json"
     ' _ "$DRILL_DIR/env" "$VIBE_DIR" "$APPLIANCE_DIR" "$DRILL_DIR/render" ) >>"$VIBE_LOG_FILE" 2>&1 \
     || _drill_fail "could not read the appliance's own service definitions" "sudo tail -30 $VIBE_LOG_FILE"
+  if [[ -n "$ho_min" ]]; then
+    # The drill names: every name the primary's tunnel publishes, as
+    # hod-<name> (never the admin tools or the bare domain, which the
+    # tunnel never publishes either). Given to the copy's settings before
+    # compose reads them, and to what compose made of them after.
+    python3 "$APPLIANCE_DIR/lib/vibe_hosts.py" list tunnel --state "$SRC/state.json" --env-dir "$DRILL_DIR/env" \
+      --manifests "$APPLIANCE_DIR/console/manifests" > "$DRILL_DIR/tunnel-names.txt" 2>>"$VIBE_LOG_FILE" \
+      || _drill_fail "could not work out which names the primary publishes" "sudo tail -30 $VIBE_LOG_FILE"
+    python3 "$APPLIANCE_DIR/lib/standby_drill.py" hod-plan "$DRILL_DIR/tunnel-names.txt" "$ho_zone" "$DRILL_DIR/hod.json" >>"$VIBE_LOG_FILE" 2>&1 \
+      || _drill_fail "could not plan the drill names" "sudo tail -30 $VIBE_LOG_FILE"
+    [[ "$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))['map']))" "$DRILL_DIR/hod.json")" != "0" ]] \
+      || _drill_fail "none of the primary's names is in its Cloudflare zone ($ho_zone), so the drill has no name to open at" "use the ordinary practice drill"
+    python3 "$APPLIANCE_DIR/lib/standby_drill.py" hod-rename "$DRILL_DIR" "$DRILL_DIR/hod.json" env >>"$VIBE_LOG_FILE" 2>&1 \
+      || _drill_fail "could not give the copy's settings the drill names" "sudo tail -30 $VIBE_LOG_FILE"
+  fi
   while read -r slug; do
     [[ -n "$slug" ]] || continue
     tag="$(python3 -c "import json,sys; print(((json.load(open(sys.argv[1])).get('image') or {}).get('defaultTag')) or 'latest')" "$APPLIANCE_DIR/console/manifests/${slug}.json" 2>/dev/null || echo latest)"
@@ -1104,8 +1278,20 @@ PYEOF
       ' _ "$DRILL_DIR/env" "$VIBE_DIR" "$APPLIANCE_DIR" "$DRILL_DIR/render" "$slug" ) >>"$VIBE_LOG_FILE" 2>&1 \
       || { log_warn "could not render the services of $slug for the drill" slug="$slug"; rm -f "$DRILL_DIR/render/$slug.json.tmp"; : > "$DRILL_DIR/render/$slug.failed"; }
   done <<<"$slugs"
+  if [[ -n "$ho_min" ]]; then
+    python3 "$APPLIANCE_DIR/lib/standby_drill.py" hod-rename "$DRILL_DIR" "$DRILL_DIR/hod.json" render >>"$VIBE_LOG_FILE" 2>&1 \
+      || _drill_fail "could not give the apps the drill names" "sudo tail -30 $VIBE_LOG_FILE"
+  fi
   python3 "$APPLIANCE_DIR/lib/standby_drill.py" render "$DRILL_DIR" "$VIBE_DIR" "$APPLIANCE_DIR" ${ho_min:+hands-on} >>"$VIBE_LOG_FILE" 2>&1 \
     || _drill_fail "could not build the isolated drill from the primary's apps" "sudo tail -30 $VIBE_LOG_FILE"
+  if [[ -n "$ho_min" ]]; then
+    # Anything still carrying a live name (inside a longer word, say) is
+    # named in the report, for the admin to know.
+    python3 - "$DRILL_DIR/hod.json" "$(python3 "$APPLIANCE_DIR/lib/standby_drill.py" hod-leftovers "$DRILL_DIR" "$DRILL_DIR/hod.json" 2>/dev/null || echo '[]')" <<'PYEOF' || true
+import json, sys
+p = sys.argv[1]; d = json.load(open(p)); d["leftovers"] = json.loads(sys.argv[2] or "[]"); json.dump(d, open(p, "w"), indent=1)
+PYEOF
+  fi
   local dc=(docker compose -p "$DRILL_PROJECT" -f "$DRILL_DIR/compose.json")
   if [[ -n "$ho_min" ]]; then
     # The primary's own routing, from the copy's Caddyfile, for the drill's Caddy.
@@ -1118,9 +1304,10 @@ PYEOF
       adapt --config /etc/caddy/Caddyfile > "$DRILL_DIR/caddy/copy.json" 2>>"$VIBE_LOG_FILE" \
       || _drill_fail "could not read the primary's web server settings from the copy" "sudo tail -30 $VIBE_LOG_FILE"
     python3 "$APPLIANCE_DIR/lib/standby_drill.py" drill-caddy "$DRILL_DIR/caddy/copy.json" "$DRILL_DIR/caddy/caddy.json" \
+      "$DRILL_DIR/hod.json" "$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')" \
       > "$DRILL_DIR/caddy/hosts.json" 2>>"$VIBE_LOG_FILE" \
       || _drill_fail "could not prepare the primary's web server settings for the drill" "sudo tail -30 $VIBE_LOG_FILE"
-    [[ "$(cat "$DRILL_DIR/caddy/hosts.json")" != "[]" ]] || _drill_fail "the copy's web server answers no names a computer could be pointed at" \
+    [[ "$(cat "$DRILL_DIR/caddy/hosts.json")" != "[]" ]] || _drill_fail "the copy's web server answers none of the names its tunnel publishes" \
       "use the ordinary practice drill"
   fi
 
@@ -1211,6 +1398,11 @@ PYEOF
   local probe_net probe_img tunnel=0
   probe_net="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('probeNetwork') or '')" "$DRILL_DIR/plan.json")"
   probe_img="$(docker inspect vibe-console --format '{{.Config.Image}}' 2>/dev/null || true)"
+  # Hands-on: sign-in moves to the drill names before it is checked.
+  if [[ -n "$ho_min" && -n "$probe_net" && -n "$probe_img" ]]; then
+    _drill_rebase_sso "$probe_net" "$probe_img"
+    _drill_check_cancel
+  fi
   if [[ -n "$probe_net" && -n "$probe_img" ]]; then
     python3 "$APPLIANCE_DIR/lib/standby_drill.py" probe-script "$DRILL_DIR" \
       | docker run --rm -i --name vibe-drill-probe --network "$probe_net" --entrypoint sh "$probe_img" -s \
@@ -1220,11 +1412,12 @@ PYEOF
   python3 "$APPLIANCE_DIR/lib/standby_drill.py" report "$DRILL_DIR" "$DRILL_REPORT" "$DRILL_SNAPSHOT" "$DRILL_STARTED" \
     "$restored" "$warns" "$DRILL_DIR/probe.txt" "$tunnel" || _drill_fail "could not write the drill report" "sudo tail -30 $VIBE_LOG_FILE"
 
-  # ---- hands-on: leave it running, in front of the admin's computer only --
+  # ---- hands-on: leave it running, open at the drill names ----------------
   # Never when isolation failed: that drill is removed at once.
   if [[ -n "$ho_min" ]] && [[ "$(python3 -c "import json,sys; print(bool((json.load(open(sys.argv[1])).get('isolation') or {}).get('ok')))" "$DRILL_REPORT")" == "True" ]]; then
-    log_step "opening the hands-on drill" minutes="$ho_min"
-    _drill_edge_open "$ho_min" "$ho_allow" "$ho_addr"
+    log_step "opening the hands-on drill through its own Cloudflare tunnel" minutes="$ho_min"
+    _drill_check_cancel
+    _drill_tunnel_open "$ho_min" "$ho_zone"
     trap - EXIT
     return 0
   fi
@@ -1240,6 +1433,7 @@ case "${1:-}" in
   drill)          action_drill ;;
   drill-clean)    action_drill_clean ;;
   drill-expire)   action_drill_expire ;;
+  drill-cf-close) action_drill_cf_close ;;
   mode-on)        action_mode_on ;;
   boot-hold)      action_boot_hold ;;
   shutdown-hold)  action_shutdown_hold ;;
@@ -1251,5 +1445,5 @@ case "${1:-}" in
   tunnel-teardown) action_tunnel_teardown ;;
   follow-version) action_follow_version ;;
   archive)        action_archive ;;
-  *) die "unknown standby action '${1:-}'" "valid: drill drill-clean drill-expire mode-on mode-off place tunnel-up tunnel-teardown follow-version archive boot-hold shutdown-hold boot-release boot-release-safety" ;;
+  *) die "unknown standby action '${1:-}'" "valid: drill drill-clean drill-expire drill-cf-close mode-on mode-off place tunnel-up tunnel-teardown follow-version archive boot-hold shutdown-hold boot-release boot-release-safety" ;;
 esac
